@@ -21,7 +21,7 @@ Design summary (see class docstring for the exact recipe):
 * Per-name beta to the market and sector factors, idiosyncratic Student-t
   ("fat tail") noise, mean-reverting volume with spikes on big moves, and
   occasional earnings-day gaps.
-* ~12% of ordinary equities are marked delisted partway through history --
+* Ordinary equities are delisted at roughly 2.2% a year across the history --
   most (not all) after a sustained decline, which is the realistic failure
   mode that makes an *unbiased* backtest possible: a universe that quietly
   drops its losers before you can test against them is the single most common
@@ -378,7 +378,16 @@ def _generate_universe(config: MarketDataConfig, seed: int) -> dict[str, _Genera
     # -- ordinary equities, spread across sectors --------------------------
     n_stocks = 105
     base_per_sector, remainder = divmod(n_stocks, len(_GICS_SECTORS))
-    n_delisted_target = round(n_stocks * 0.12)
+    # Delisting rate. US equities historically leave the exchange at roughly
+    # 2-4% a year once mergers, acquisitions and failures are counted together.
+    # Because these are spread uniformly across ~16 years of history, the
+    # cumulative fraction has to be large for any *individual* backtest window
+    # to contain a realistic number of failures: at 12% total, a two-year window
+    # averaged fewer than two delistings and the delisting code path was
+    # effectively never exercised.
+    _ANNUAL_DELISTING_RATE = 0.022
+    _history_years = max(1.0, (HISTORY_END - HISTORY_START).days / 365.25)
+    n_delisted_target = round(n_stocks * min(0.60, _ANNUAL_DELISTING_RATE * _history_years))
     delisted_so_far = 0
     stock_index = 0
 

@@ -61,7 +61,7 @@ class SnapshotManifest:
         return {
             "manifest_version": self.manifest_version,
             "session": self.session.isoformat(),
-            "symbols": {sym: entry for sym, entry in sorted(self.symbols.items())},
+            "symbols": dict(sorted(self.symbols.items())),
             "providers": dict(sorted(self.providers.items())),
             "earnings_count": self.earnings_count,
             "post_count": self.post_count,

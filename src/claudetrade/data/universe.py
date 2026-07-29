@@ -256,7 +256,8 @@ def _maybe_date(value: str | None) -> dt.date | None:
         return None
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
         try:
-            return dt.datetime.strptime(value, fmt).date()
+            # Date-only field: there is no time or zone to preserve.
+            return dt.datetime.strptime(value, fmt).date()  # noqa: DTZ007
         except ValueError:
             continue
     return None

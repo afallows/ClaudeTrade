@@ -128,7 +128,12 @@ class Pipeline:
         """Pull, validate and store data from every configured source."""
         result = PipelineResult()
 
-        securities = self.market.list_universe(as_of=end)
+        # Deliberately NOT `as_of=end`: that returns point-in-time membership and
+        # would silently drop every company that failed before the end date.
+        # Ingestion must capture the full survivorship-unbiased set; it is
+        # `UniverseSelector.for_session` that applies point-in-time membership
+        # later, per decision session.
+        securities = self.market.list_universe()
         if symbols is not None:
             wanted = set(symbols)
             securities = [s for s in securities if s.symbol in wanted]

@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as dt
 from collections import Counter
 from dataclasses import dataclass, field
+from itertools import pairwise
 
 from sqlalchemy import select
 
@@ -271,7 +272,7 @@ class DataQualityChecker:
         that cries wolf on routine corporate actions trains the operator to
         ignore it.
         """
-        for prev, cur in zip(bars, bars[1:], strict=False):
+        for prev, cur in pairwise(bars):
             prev_adj = prev.effective_adj_close
             cur_adj = cur.effective_adj_close
             if prev_adj <= 0 or prev.close <= 0:
@@ -399,7 +400,7 @@ class DataQualityChecker:
 
         # Two *different* dates for what is evidently the same quarter.
         by_date = sorted(events, key=lambda e: e.report_date)
-        for earlier, later in zip(by_date, by_date[1:], strict=False):
+        for earlier, later in pairwise(by_date):
             gap = (later.report_date - earlier.report_date).days
             if gap == 0 and earlier.source != later.source:
                 continue
