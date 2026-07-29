@@ -37,7 +37,7 @@ from claudetrade.brokers.base import (
     OrderRequest,
 )
 from claudetrade.config import AppConfig
-from claudetrade.db.models import PaperOrderRow, PaperTradeRow
+from claudetrade.db.models import PaperOrderRow, PaperTradeRow, PriceBar
 from claudetrade.db.session import Database
 from claudetrade.domain import (
     ACTIVE_STATUSES,
@@ -429,6 +429,111 @@ class PaperBroker(BrokerProvider):
             "kill switch engaged; %d positions remain open with their stops in force", open_count
         )
         return open_count
+
+    # --- CLI glue --------------------------------------------------------------
+    #
+    # Additive helpers backing `claudetrade paper open/process/close`. They do
+    # not change any behaviour pinned by the tests above -- they only fetch
+    # bars from the database "the way the pipeline does" (see
+    # `DatabaseContextProvider._load_bars` in `claudetrade.data.context`) and
+    # translate an existing lifecycle call into something the CLI can invoke
+    # without duplicating the fill/exit logic.
+
+    def latest_bar(self, symbol: str) -> Bar | None:
+        """Most recent stored daily bar for ``symbol``, or ``None`` if none is stored yet."""
+        with self.db.read_session() as session:
+            row = session.execute(
+                select(PriceBar)
+                .where(PriceBar.symbol == symbol)
+                .order_by(PriceBar.session.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        return self._price_bar_to_bar(row) if row is not None else None
+
+    def next_bar_after(self, symbol: str, session_date: dt.date) -> Bar | None:
+        """First stored bar for ``symbol`` strictly after ``session_date``.
+
+        Used to price a signal's entry without look-ahead: the same
+        post-dates-the-signal rule ``submit_signal`` itself enforces.
+        """
+        with self.db.read_session() as session:
+            row = session.execute(
+                select(PriceBar)
+                .where(PriceBar.symbol == symbol, PriceBar.session > session_date)
+                .order_by(PriceBar.session.asc())
+                .limit(1)
+            ).scalar_one_or_none()
+        return self._price_bar_to_bar(row) if row is not None else None
+
+    def latest_bars_for_open_positions(self) -> dict[str, Bar]:
+        """Most recent stored bar for every symbol currently held.
+
+        Backs ``claudetrade paper process``: a symbol with no stored bar yet
+        is simply absent from the result rather than raising, so the caller
+        can report it and move on instead of one missing bar blocking every
+        other position.
+        """
+        symbols = {row.symbol for row in self.portfolio.open_trades()}
+        out: dict[str, Bar] = {}
+        for symbol in symbols:
+            bar = self.latest_bar(symbol)
+            if bar is not None:
+                out[symbol] = bar
+        return out
+
+    def marks_for_open_positions(self) -> dict[str, float]:
+        """Latest close per open symbol, in the shape ``portfolio_state``/risk checks expect."""
+        return {symbol: bar.close for symbol, bar in self.latest_bars_for_open_positions().items()}
+
+    def close_at_latest_price(self, trade_id: str, *, reason: ExitReason = ExitReason.MANUAL) -> Trade:
+        """Close an open trade at the latest stored price via the existing exit machinery.
+
+        Costs are computed the same way ``process_open_positions`` computes
+        them for a stop/target exit, so a manual close is not artificially
+        cheaper than an automatic one.
+
+        Raises:
+            BrokerOrderError: unknown trade id, the trade is already closed,
+                or no price has been stored yet for its symbol.
+        """
+        trade_row = self.portfolio.get_trade(trade_id)
+        if trade_row is None:
+            raise BrokerOrderError(f"no such paper trade: {trade_id}")
+        if trade_row.exit_session is not None:
+            raise BrokerOrderError(
+                f"paper trade {trade_id} closed on {trade_row.exit_session} and cannot be closed again"
+            )
+        bar = self.latest_bar(trade_row.symbol)
+        if bar is None:
+            raise BrokerOrderError(
+                f"no stored price for {trade_row.symbol}; run 'claudetrade refresh' first"
+            )
+        shares = trade_row.shares
+        commission = self.costs.commission(shares, bar.close)
+        fees = self.costs.regulatory_fees("sell", shares, bar.close * shares)
+        self.portfolio.close_trade(
+            trade_id,
+            exit_session=bar.session,
+            exit_price=bar.close,
+            reason=reason,
+            commission=commission,
+            fees=fees,
+        )
+        return self._trade_row_to_trade(self.portfolio.get_trade(trade_id))
+
+    @staticmethod
+    def _price_bar_to_bar(row: PriceBar) -> Bar:
+        return Bar(
+            symbol=row.symbol,
+            session=row.session,
+            open=row.open,
+            high=row.high,
+            low=row.low,
+            close=row.close,
+            volume=row.volume,
+            adj_close=row.adj_close,
+            source=row.source,
+        )
 
     # --- BrokerProvider: identity --------------------------------------------
 

@@ -149,6 +149,14 @@ def page_scanner() -> None:
                         for i, (name, score) in enumerate(components.items()):
                             cols[i % 4].metric(name, f"{score:.0f}")
 
+                        # --- Open as Paper Trade ---
+                        st.write("**Paper Trading**")
+                        if st.button(
+                            f"Open Paper Trade: {sig.symbol}",
+                            key=f"open_paper_{sig.signal_id}",
+                        ):
+                            _open_paper_trade(pipeline, sig)
+
             else:
                 st.info("No signals match the selected filters")
         else:
@@ -162,3 +170,45 @@ def format_datetime(dt_val, config):
     if dt_val is None:
         return "-"
     return dt_val.strftime("%Y-%m-%d %H:%M")
+
+
+def _open_paper_trade(pipeline, sig) -> None:
+    """Submit ``sig`` to the paper broker through the same seam the CLI uses.
+
+    Mirrors `claudetrade paper open`: prices the entry on the first stored
+    bar after the signal's session (never the signal bar itself -- that would
+    be look-ahead) and reports a fill, a rejection, or "not fillable yet"
+    honestly rather than pretending the order went through.
+    """
+    from claudetrade.brokers.base import OrderRequest, TradingHaltedError
+    from claudetrade.paper.broker import PaperBroker
+
+    try:
+        broker = PaperBroker(pipeline.config, pipeline.db)
+        next_bar = broker.next_bar_after(sig.symbol, sig.session)
+        if next_bar is None:
+            st.warning(
+                f"Not fillable yet: no stored bar for {sig.symbol} after {sig.session}. "
+                "Run a data refresh, then try again."
+            )
+            return
+
+        request = OrderRequest(
+            signal=sig, next_bar=next_bar, marks=broker.marks_for_open_positions()
+        )
+        try:
+            order = broker.submit_order(request)
+        except TradingHaltedError as exc:
+            st.error(f"Refused: {exc}")
+            return
+
+        if order.status.value == "filled":
+            st.success(
+                f"Filled: {order.symbol} {order.filled_shares} shares @ "
+                f"{order.average_fill_price:.2f} on {next_bar.session} "
+                f"(order {order.order_id})"
+            )
+        else:
+            st.error(f"Rejected: {'; '.join(order.reasons) or 'no reason given'}")
+    except Exception as e:
+        st.error(f"Could not submit paper order: {e}")

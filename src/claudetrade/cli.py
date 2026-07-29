@@ -87,6 +87,42 @@ def _parse_date(value: str | None, default: dt.date) -> dt.date:
         raise typer.BadParameter(f"expected an ISO date (YYYY-MM-DD), got {value!r}") from None
 
 
+def _load_verified_signal(db, signal_id: str):
+    """Read one signal from the ledger with its integrity check intact.
+
+    ``SignalLedger.get(..., verify=True)`` -- the default -- round-trips
+    ``created_at`` through SQLite as a *naive* datetime even though every
+    signal is written with ``ensure_utc()`` applied first (see
+    ``SignalLedger.record``). Comparing the naive read-back against the hash
+    computed over the tz-aware original then always fails, for every signal,
+    regardless of tampering. Since the write path guarantees UTC, the fix
+    belongs at the read boundary: re-attach UTC before verifying, which
+    reproduces exactly the payload the hash was computed over. This does not
+    touch ``claudetrade.signals.ledger`` (out of bounds for this change) --
+    it is read-only usage of its public ``get(verify=False)`` and ``verify()``.
+    """
+    import dataclasses
+
+    from claudetrade.db.models import SignalRow
+    from claudetrade.signals.ledger import LedgerIntegrityError, SignalLedger
+
+    ledger = SignalLedger(db)
+    signal = ledger.get(signal_id, verify=False)
+    if signal is None:
+        return None
+    if signal.created_at.tzinfo is None:
+        signal = dataclasses.replace(signal, created_at=signal.created_at.replace(tzinfo=dt.UTC))
+
+    with db.read_session() as session:
+        row = session.get(SignalRow, signal_id)
+    if row is not None and not ledger.verify(signal, row.integrity_hash):
+        raise LedgerIntegrityError(
+            f"signal {signal_id} failed its integrity check: the stored row does not match "
+            "its recorded hash, which means it was modified outside the application"
+        )
+    return signal
+
+
 def _render_funnel_report(result: BacktestResult) -> str:
     """ADR-0007 Decision 3(b): the rejection funnel, as markdown.
 
@@ -507,6 +543,148 @@ def paper_positions(config: ConfigOption = None) -> None:
         )
 
 
+@paper_app.command("open")
+def paper_open(
+    signal_id: Annotated[str, typer.Argument(help="Signal id from the ledger (see `claudetrade scan`).")],
+    config: ConfigOption = None,
+) -> None:
+    """Submit a recorded signal to the paper broker for execution.
+
+    Looks the signal up in the immutable ledger (read-only) and submits it
+    through ``PaperBroker.submit_order`` -- the ``BrokerProvider`` seam -- so
+    the kill-switch/mode guard runs before anything else does. Execution is
+    priced on the first stored bar after the signal's own session, matching
+    ``PaperBroker.submit_signal``'s look-ahead rule; if that bar has not been
+    ingested yet, the order is reported as not fillable rather than faked.
+    """
+    cfg = _load(config)
+    from claudetrade.brokers.base import OrderRequest, TradingHaltedError
+    from claudetrade.db.session import get_database
+    from claudetrade.paper.broker import PaperBroker
+    from claudetrade.signals.ledger import LedgerIntegrityError
+
+    db = get_database(cfg)
+    try:
+        signal = _load_verified_signal(db, signal_id)
+    except LedgerIntegrityError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+    if signal is None:
+        typer.secho(f"no such signal: {signal_id}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    broker = PaperBroker(cfg, db)
+    next_bar = broker.next_bar_after(signal.symbol, signal.session)
+    if next_bar is None:
+        typer.secho(
+            f"queued: no stored bar for {signal.symbol} after {signal.session} yet -- "
+            "run 'claudetrade refresh' and retry",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(1)
+
+    request = OrderRequest(signal=signal, next_bar=next_bar, marks=broker.marks_for_open_positions())
+    try:
+        order = broker.submit_order(request)
+    except TradingHaltedError as exc:
+        typer.secho(f"refused: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"\n{DISCLAIMER}\n")
+    if order.status.value == "filled":
+        typer.secho(
+            f"filled: {order.symbol} {order.filled_shares} shares @ "
+            f"{order.average_fill_price:.2f} on {next_bar.session} (order {order.order_id})",
+            fg=typer.colors.GREEN,
+        )
+    else:
+        typer.secho(f"rejected: {'; '.join(order.reasons) or 'no reason given'}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@paper_app.command("process")
+def paper_process(config: ConfigOption = None) -> None:
+    """Advance every open paper position against the latest stored bars.
+
+    Applies stops, targets and time stops the same way the backtester does
+    (``PaperBroker.process_open_positions``), then marks the account to
+    market. A symbol with no stored bar yet is reported and left untouched
+    rather than silently skipped.
+    """
+    cfg = _load(config)
+    from claudetrade.db.session import get_database
+    from claudetrade.paper.broker import PaperBroker
+
+    db = get_database(cfg)
+    broker = PaperBroker(cfg, db)
+    open_symbols = {row.symbol for row in broker.portfolio.open_trades()}
+    if not open_symbols:
+        typer.echo("no open paper positions to process")
+        return
+
+    bars = broker.latest_bars_for_open_positions()
+    missing = sorted(open_symbols - bars.keys())
+    if missing:
+        typer.secho(
+            f"no stored bar yet for: {', '.join(missing)} -- run 'claudetrade refresh'",
+            fg=typer.colors.YELLOW,
+        )
+    if not bars:
+        typer.echo("no bars available to process against")
+        return
+
+    session_date = max(bar.session for bar in bars.values())
+    results = broker.process_open_positions(bars, session_date)
+    if not results:
+        typer.echo(f"processed against {session_date}: no exits triggered")
+        return
+    typer.echo(f"processed against {session_date}:")
+    for result in results:
+        reason = result.reasons[0] if result.reasons else "closed"
+        typer.echo(f"  closed {result.symbol:8s} {result.shares:6d} @ {result.fill_price:8.2f}  ({reason})")
+
+
+@paper_app.command("close")
+def paper_close(
+    trade_id: Annotated[str, typer.Argument(help="Paper trade id to close (see `claudetrade paper positions`).")],
+    reason: Annotated[str, typer.Option(help="Exit reason recorded against the trade.")] = "manual",
+    config: ConfigOption = None,
+) -> None:
+    """Close an open paper position at the latest available price.
+
+    Uses the same close/costing path as an automatic stop or target exit
+    (``PaperBroker.close_at_latest_price`` -> ``PaperPortfolio.close_trade``).
+    Refuses cleanly for an unknown or already-closed trade id.
+    """
+    cfg = _load(config)
+    from claudetrade.brokers.base import BrokerOrderError
+    from claudetrade.db.session import get_database
+    from claudetrade.domain import ExitReason
+    from claudetrade.paper.broker import PaperBroker
+
+    try:
+        exit_reason = ExitReason(reason)
+    except ValueError:
+        valid = ", ".join(r.value for r in ExitReason)
+        typer.secho(f"unknown exit reason {reason!r}; choose from: {valid}", fg=typer.colors.RED)
+        raise typer.Exit(1) from None
+
+    db = get_database(cfg)
+    broker = PaperBroker(cfg, db)
+    try:
+        trade = broker.close_at_latest_price(trade_id, reason=exit_reason)
+    except BrokerOrderError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+
+    typer.secho(
+        f"closed {trade.trade_id}: {trade.symbol} {trade.shares} shares @ "
+        f"{trade.exit_price:.2f} on {trade.exit_session} ({trade.exit_reason.value}) "
+        f"net P&L {trade.net_pnl:,.2f}",
+        fg=typer.colors.GREEN,
+    )
+
+
 @paper_app.command("kill-switch")
 def paper_kill_switch(
     engage: Annotated[bool, typer.Option("--engage/--release")] = True,
@@ -623,12 +801,25 @@ def verify_survivorship(
 @app.command()
 def ui(config: ConfigOption = None, port: int | None = None) -> None:
     """Launch the desktop interface (Streamlit)."""
-    import subprocess
-
     cfg = _load(config)
     from claudetrade import ui as ui_pkg
 
     app_path = Path(ui_pkg.__file__).parent / "app.py"
+    resolved_port = port or cfg.ui.port
+    typer.echo(f"starting the interface on port {resolved_port} ...")
+
+    if getattr(sys, "frozen", False):
+        # Under a PyInstaller-frozen build, `sys.executable` is the bootloader
+        # binary (this very program), not a Python interpreter -- spawning
+        # ``[sys.executable, "-m", "streamlit", ...]`` would try to re-exec the
+        # frozen claudetrade.exe as if it were `python -m streamlit`, which
+        # fails. Streamlit's own bootstrap API runs the server in this same
+        # process instead, sidestepping subprocess entirely.
+        _run_streamlit_in_process(str(app_path), resolved_port)
+        return
+
+    import subprocess
+
     command = [
         sys.executable,
         "-m",
@@ -636,10 +827,21 @@ def ui(config: ConfigOption = None, port: int | None = None) -> None:
         "run",
         str(app_path),
         "--server.port",
-        str(port or cfg.ui.port),
+        str(resolved_port),
     ]
-    typer.echo(f"starting the interface on port {port or cfg.ui.port} ...")
     raise typer.Exit(subprocess.call(command))
+
+
+def _run_streamlit_in_process(app_path: str, port: int) -> None:
+    """Launch Streamlit without spawning a subprocess (the frozen-exe path).
+
+    Kept tiny and isolated so a unit test can monkeypatch ``sys.frozen`` and
+    assert *this* is the branch ``ui()`` chooses, by mocking
+    ``streamlit.web.bootstrap.run`` rather than actually starting a server.
+    """
+    from streamlit.web import bootstrap
+
+    bootstrap.run(app_path, False, [], {"server.port": port})
 
 
 def main() -> None:

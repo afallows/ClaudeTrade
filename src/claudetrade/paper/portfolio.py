@@ -166,6 +166,19 @@ class PaperPortfolio:
                 ).scalars()
             )
 
+    def get_trade(self, trade_id: str) -> PaperTradeRow | None:
+        """Look up one trade by id, open or closed, scoped to this account.
+
+        Additive glue for `claudetrade paper close`: unlike `open_trades()`/
+        `closed_trades()` this does not filter on exit state, so callers can
+        distinguish "unknown id" from "already closed" themselves.
+        """
+        with self.db.read_session() as session:
+            row = session.get(PaperTradeRow, trade_id)
+            if row is None or row.account_id != self.account_id:
+                return None
+            return row
+
     def closed_trades(self, *, limit: int | None = None) -> list[PaperTradeRow]:
         with self.db.read_session() as session:
             stmt = (

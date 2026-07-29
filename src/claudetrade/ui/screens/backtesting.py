@@ -194,15 +194,23 @@ def page_backtesting() -> None:
 
     with tab4:
         st.write("**Export Results**")
+        # This screen does not run a real backtest yet (see the "Run Backtest"
+        # button above), so there is no result object here to hand to
+        # `claudetrade.backtest.reporting.export_csv`/`export_excel`. A button
+        # that appears to export something it cannot is exactly the pattern
+        # this screen must not repeat -- so the buttons are disabled rather
+        # than faked, and the working equivalent is named instead.
         col1, col2 = st.columns(2)
-
         with col1:
-            if st.button("Export as CSV", key="export_csv"):
-                st.info("CSV export would contain trades.csv, equity_curve.csv, and metrics.csv")
-
+            st.button("Export as CSV", key="export_csv", disabled=True)
         with col2:
-            if st.button("Export as Excel", key="export_xlsx"):
-                st.info("Excel export would contain all results in a formatted workbook")
+            st.button("Export as Excel", key="export_xlsx", disabled=True)
+        st.caption(
+            "Not implemented from this screen: running a backtest here does not yet "
+            "produce a result to export. For a working export today, run "
+            "`claudetrade backtest --export <dir>` from the CLI, or call "
+            "`claudetrade.backtest.reporting.export_csv`/`export_excel` directly."
+        )
 
     # --- Validation Warnings ---
     st.subheader("Validation Warnings")

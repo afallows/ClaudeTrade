@@ -12,6 +12,8 @@ from claudetrade.ui.formatting import (
     format_confidence,
     format_currency,
     format_datetime,
+    format_direction,
+    format_price,
     format_status,
     show_disclaimer,
 )
@@ -42,6 +44,55 @@ def page_dashboard() -> None:
             st.metric("Account Size", format_currency(config.risk.account_size_usd))
     except Exception as e:
         st.error(f"Error loading status: {e}")
+
+    # --- Paper Trading ---
+    st.subheader("Paper Trading")
+    try:
+        from claudetrade.paper.broker import PaperBroker
+
+        broker = PaperBroker(config, pipeline.db)
+        account = broker.portfolio.account()
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Equity", format_currency(account.equity))
+        with col2:
+            st.metric("Cash", format_currency(account.cash))
+        with col3:
+            st.metric("Realised P&L", format_currency(account.realised_pnl))
+        with col4:
+            st.metric("Kill Switch", "🔴 ENGAGED" if account.kill_switch_engaged else "🟢 off")
+
+        marks = broker.marks_for_open_positions()
+        positions = broker.portfolio.positions(marks)
+        if positions:
+            position_data = [
+                {
+                    "Symbol": p.symbol,
+                    "Direction": format_direction(p.direction),
+                    "Shares": p.shares,
+                    "Entry": format_price(p.entry_price),
+                    "Stop": format_price(p.stop_loss),
+                    "Targets": ", ".join(format_price(t) for t in p.targets) if p.targets else "-",
+                    "Last": format_price(p.last_price),
+                    "Unrealised P&L": format_currency(p.unrealised_pnl),
+                    "Unrealised %": f"{p.unrealised_pct:.2f}%",
+                    "Days Held": p.days_held,
+                    "Needs Attention": "; ".join(p.needs_attention()) or "-",
+                }
+                for p in positions
+            ]
+            st.dataframe(position_data, use_container_width=True)
+        else:
+            st.info(
+                "No open paper positions. Use `claudetrade paper open <signal-id>` "
+                "(or the Scanner page's \"Open Paper Trade\" button) to enter one."
+            )
+        st.caption(
+            "Prices shown are the latest stored bar, not a live feed -- run "
+            "`claudetrade refresh` then `claudetrade paper process` to advance positions."
+        )
+    except Exception as e:
+        st.error(f"Error loading paper positions: {e}")
 
     # --- Recent Signals ---
     st.subheader("Recent Signals")

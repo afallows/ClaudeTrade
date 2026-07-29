@@ -65,6 +65,26 @@ class PathsConfig(BaseModel):
     cache_dir: Path = Path("cache")
     snapshots_dir: Path = Path("snapshots")
 
+    @field_validator("app_dir", mode="before")
+    @classmethod
+    def _expand_app_dir(cls, value: object) -> object:
+        """Expand a leading ``~`` before it is used anywhere.
+
+        A ``config.toml`` like ``app_dir = "~/.claudetrade"`` parses as a
+        *literal* path -- there is no shell here to expand it, least of all
+        on Windows, where ``~`` has no special meaning to the filesystem at
+        all. Without this, ``PathsConfig.resolve()`` silently creates a
+        directory named ``~`` next to the process's current working
+        directory instead of the user's home. Expanding here, once, means
+        every consumer (``resolve()``, ``database_url()``, the CLI) sees the
+        intended location without each having to remember to expand it.
+        """
+        if isinstance(value, str):
+            return Path(value).expanduser()
+        if isinstance(value, Path):
+            return value.expanduser()
+        return value
+
     def resolve(self, which: str) -> Path:
         """Absolute path for a named directory, created on demand."""
         value: Path = getattr(self, which)
