@@ -29,10 +29,19 @@ def make_closed_trade(
     r_multiple: float = 1.0,
     holding_days: int = 5,
 ) -> Trade:
-    """Factory for creating closed trades with specified outcomes."""
-    if gross_pnl is None:
-        gross_pnl = net_pnl + 50.0  # Small cost buffer
+    """Factory for creating closed trades with specified outcomes.
 
+    ``net_pnl`` is the P&L *after* costs, matching ``Trade.net_pnl``. The exit
+    price is therefore solved backwards from the requested net figure plus the
+    commission, so that a trade asked for as +3.0 nets +3.0 rather than -47.0.
+    Getting this wrong silently reclassifies small winners as losers, which is
+    exactly the kind of error these metrics exist to catch.
+    """
+    commission = 50.0
+    if gross_pnl is None:
+        gross_pnl = net_pnl + commission
+
+    shares = 100
     return Trade(
         trade_id=trade_id,
         signal_id=signal_id,
@@ -41,12 +50,12 @@ def make_closed_trade(
         direction=Direction.LONG,
         entry_session=dt.date(2023, 1, 3),
         entry_price=100.0,
-        shares=100,
+        shares=shares,
         stop_loss=95.0,
         exit_session=dt.date(2023, 1, 3) + dt.timedelta(days=holding_days),
-        exit_price=100.0 + net_pnl / 100.0,
+        exit_price=100.0 + gross_pnl / shares,
         exit_reason=ExitReason.TARGET if net_pnl > 0 else ExitReason.STOP_LOSS,
-        commission_total=50.0 if net_pnl != gross_pnl else 0.0,
+        commission_total=commission,
         fees_total=0.0,
         borrow_cost_total=0.0,
         initial_risk_per_share=5.0,

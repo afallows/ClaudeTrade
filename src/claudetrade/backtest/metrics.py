@@ -233,7 +233,7 @@ def compute_metrics(
 
     top3_share, max_symbol_share, max_sector_share = _concentration(trades)
 
-    return PerformanceMetrics(
+    metrics = PerformanceMetrics(
         trade_count=trade_count,
         winning_trades=n_wins,
         losing_trades=n_losses,
@@ -271,6 +271,12 @@ def compute_metrics(
         max_symbol_profit_share_pct=max_symbol_share,
         max_sector_profit_share_pct=max_sector_share,
     )
+    # Attach the caveats here rather than leaving it to each caller. A warning
+    # that depends on every consumer remembering to ask for it is a warning
+    # that will eventually be missed, and the whole point of these is that a
+    # flattering win/loss ratio never travels without its caveats.
+    metrics.warnings = validation_warnings(metrics, config)
+    return metrics
 
 
 def _gross_vs_net(

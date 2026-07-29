@@ -21,7 +21,7 @@ from typing import Protocol
 
 from claudetrade.backtest.costs import CostModel
 from claudetrade.backtest.execution import EntryOrder, ExecutionSimulator
-from claudetrade.backtest.metrics import compute_metrics, segment_metrics, validation_warnings
+from claudetrade.backtest.metrics import compute_metrics, segment_metrics
 from claudetrade.backtest.portfolio import BacktestPortfolio, EquityPoint
 from claudetrade.config import AppConfig, BacktestConfig
 from claudetrade.domain import Bar, ExitReason, RegimeState, SecurityInfo, Trade
@@ -439,7 +439,8 @@ class BacktestEngine:
             portfolio.equity_curve,
             self.backtest_config,
         )
-        warnings_list = validation_warnings(metrics_obj, self.backtest_config)
+        # compute_metrics already attaches these; reuse rather than recompute.
+        warnings_list = metrics_obj.warnings
 
         segment_dims = [
             "strategy",
