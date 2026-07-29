@@ -8,10 +8,24 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
-class SentimentClassification(BaseModel):
+class StrictSchema(BaseModel):
+    """Base for every AI response schema.
+
+    ``extra="forbid"`` is the point of this class. Model output is untrusted:
+    if a response carries fields the schema does not define, the model has not
+    answered the question we asked and the result must be rejected rather than
+    silently coerced into defaults. Without this, a malformed response
+    validates as an empty object and a caller cannot tell the difference
+    between "the model said nothing useful" and "the model was not asked".
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class SentimentClassification(StrictSchema):
     """Sentiment scoring for a (post, symbol) pair.
 
     Each label is an independent probability in [0, 1]; a post can score high
@@ -75,7 +89,7 @@ class SentimentClassification(BaseModel):
     )
 
 
-class TickerContextClassification(BaseModel):
+class TickerContextClassification(StrictSchema):
     """Entity resolution hints from post context.
 
     When a post is ambiguous (e.g. 'AI' could be a ticker or just mean
@@ -92,7 +106,7 @@ class TickerContextClassification(BaseModel):
     evidence: list[str] = Field(default_factory=list, max_length=3)
 
 
-class CatalystExtraction(BaseModel):
+class CatalystExtraction(StrictSchema):
     """Structured extraction of event-driving catalysts from a post."""
 
     catalyst_type: str = Field(
@@ -108,7 +122,7 @@ class CatalystExtraction(BaseModel):
     evidence: list[str] = Field(default_factory=list, max_length=3)
 
 
-class SpamAssessment(BaseModel):
+class SpamAssessment(StrictSchema):
     """Assessment of post quality and manipulation risk."""
 
     is_spam: float = Field(
@@ -120,11 +134,11 @@ class SpamAssessment(BaseModel):
     evidence: list[str] = Field(default_factory=list, max_length=3)
 
 
-class ThesisSummary(BaseModel):
+class ThesisSummary(StrictSchema):
     """High-level thesis extracted from grouped posts about a symbol."""
 
     summary: str = Field(
-        "",
+        ...,
         min_length=1,
         max_length=500,
         description="Concise thesis statement: what is the bullish/bearish case?",

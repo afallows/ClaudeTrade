@@ -29,8 +29,19 @@ from claudetrade.providers.base import (
 
 log = logging.getLogger(__name__)
 
-STOOQ_BASE_URL = "https://stooq.com/q/l/"
+#: Historical daily CSV endpoint. NOT ``/q/l/`` -- that is the *last quote*
+#: endpoint and returns a single row, which would silently give the whole
+#: application one bar of history per symbol instead of a price series.
+STOOQ_HISTORY_URL = "https://stooq.com/q/d/l/"
 DEFAULT_RATE_LIMIT = 30  # Calls per minute
+
+#: Stooq namespaces its symbols by market. US listings carry a ``.us`` suffix,
+#: so a bare ``AAPL`` resolves to nothing.
+US_SUFFIX = ".us"
+
+#: Stooq answers a request it cannot serve with this literal body rather than an
+#: HTTP error, so it has to be detected in the payload.
+_NO_DATA_MARKERS = ("N/D", "No data", "Exceeded the daily hits limit")
 
 
 class StooqMarketProvider(MarketDataProvider):
@@ -133,18 +144,22 @@ class StooqMarketProvider(MarketDataProvider):
                 retryable=False,
             ) from exc
 
+        # d1/d2 bound the range server-side so a five-year request does not pull
+        # the full history for every symbol.
         params = {
-            "s": symbol.upper(),
-            "f": "d",  # d = CSV format
-            "e": "csv",  # e=csv parameter
+            "s": self.stooq_symbol(symbol),
+            "d1": start.strftime("%Y%m%d"),
+            "d2": end.strftime("%Y%m%d"),
+            "i": "d",  # daily interval
         }
 
         try:
             with httpx.Client(
                 timeout=self._config.request_timeout_s,
                 verify=True,  # Always verify SSL
+                follow_redirects=True,
             ) as client:
-                response = client.get(STOOQ_BASE_URL, params=params)
+                response = client.get(STOOQ_HISTORY_URL, params=params)
                 response.raise_for_status()
         except httpx.ConnectError as exc:
             raise ProviderError(
@@ -189,47 +204,86 @@ class StooqMarketProvider(MarketDataProvider):
             ) from exc
 
     @staticmethod
+    def stooq_symbol(symbol: str) -> str:
+        """Map an exchange ticker to stooq's namespaced form.
+
+        Stooq expects ``aapl.us``; a bare ``AAPL`` returns no data. A symbol that
+        already carries a market suffix is passed through untouched so non-US
+        listings still work.
+        """
+        lowered = symbol.strip().lower()
+        return lowered if "." in lowered else f"{lowered}{US_SUFFIX}"
+
+    @staticmethod
     def _parse_csv_response(
         csv_text: str, symbol: str, start: dt.date, end: dt.date
     ) -> list[Bar]:
-        """Parse stooq CSV format.
+        """Parse stooq's historical daily CSV.
 
-        Stooq CSV is comma-separated with header:
-        Symbol,Date,Time,Open,High,Low,Close,Volume
+        The history endpoint returns::
+
+            Date,Open,High,Low,Close,Volume
+            2024-01-02,187.15,188.44,183.89,185.64,82488700
+
+        Six columns, no ``Symbol`` or ``Time`` -- unlike the last-quote endpoint,
+        whose eight-column shape this parser previously assumed.
 
         Returns:
-            List of Bar objects in date order.
+            Bars in ascending date order, restricted to ``[start, end]``.
 
         Raises:
-            ValueError: on parse errors.
+            ValueError: on an empty response or a recognised no-data marker.
         """
-        lines = csv_text.strip().split("\n")
-        if len(lines) < 2:
+        text = csv_text.strip()
+        if not text:
             raise ValueError("empty response from stooq")
+        for marker in _NO_DATA_MARKERS:
+            if text.startswith(marker):
+                # Stooq signals "unknown symbol" and "quota exhausted" with a
+                # 200 response and a plain-text body, so this is not an
+                # HTTP-level error and must be caught here.
+                raise ValueError(f"stooq returned no data for {symbol}: {text[:60]!r}")
+
+        lines = text.split("\n")
+        if len(lines) < 2:
+            raise ValueError(f"stooq returned no rows for {symbol}: {text[:60]!r}")
+
+        header = [h.strip().lower() for h in lines[0].split(",")]
+        # The last-quote endpoint's header is a superset of the history one
+        # (Symbol,Date,Time,Open,...), so a plain "are the columns present?"
+        # check accepts it and yields exactly one bar. Reject it explicitly:
+        # silently treating a quote as a price series is the failure this
+        # parser exists to prevent.
+        if "symbol" in header or "time" in header:
+            raise ValueError(
+                f"unexpected stooq header for {symbol}: {header}. This is the last-quote "
+                "layout from /q/l/, not the daily history from /q/d/l/; parsing it would "
+                "yield a single bar instead of a price series."
+            )
+        try:
+            idx = {name: header.index(name) for name in ("date", "open", "high", "low", "close")}
+        except ValueError as exc:
+            raise ValueError(f"unexpected stooq header for {symbol}: {header}") from exc
+        # Some instruments (indices) legitimately carry no volume column.
+        volume_idx = header.index("volume") if "volume" in header else None
 
         bars: list[Bar] = []
-
-        # Skip header, parse data rows.
-        for line_num, line in enumerate(lines, start=1):
-            if line_num == 1:
-                # Skip header line
+        for line_num, line in enumerate(lines[1:], start=2):
+            if not line.strip():
                 continue
-
             try:
                 parts = line.split(",")
-                if len(parts) < 8:
+                if len(parts) < len(header):
                     continue
 
-                date_str = parts[1].strip()
-                open_str = parts[3].strip()
-                high_str = parts[4].strip()
-                low_str = parts[5].strip()
-                close_str = parts[6].strip()
-                vol_str = parts[7].strip()
+                date_str = parts[idx["date"]].strip()
+                open_str = parts[idx["open"]].strip()
+                high_str = parts[idx["high"]].strip()
+                low_str = parts[idx["low"]].strip()
+                close_str = parts[idx["close"]].strip()
+                vol_str = parts[volume_idx].strip() if volume_idx is not None else "0"
 
-                session = dt.datetime.strptime(date_str, "%Y-%m-%d").replace(
-                    tzinfo=dt.UTC
-                ).date()
+                session = dt.date.fromisoformat(date_str)
                 if not (start <= session <= end):
                     continue
 
