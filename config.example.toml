@@ -1,0 +1,328 @@
+# ClaudeTrade Configuration
+#
+# This file documents all configuration options for the swing-trading research system.
+# Defaults are safe, conservative, and offline-capable.
+#
+# CRITICAL SECURITY NOTE: Secrets (API keys, credentials) must NEVER be placed in
+# this file or any .toml configuration. Instead, store them using:
+#   1. Environment variables: CLAUDETRADE_SECRET_<NAME> (e.g. CLAUDETRADE_SECRET_ANTHROPIC_API_KEY)
+#   2. OS credential store: run 'claudetrade secrets set <name>'
+# The config only references credential *names*, not values.
+
+[paths]
+# Filesystem locations for data, logs, exports, and cache files.
+# Relative paths resolve under app_dir. Paths are created on demand.
+app_dir = "~/.claudetrade"          # Per-user application directory
+data_dir = "data"                   # Historical bars, earnings, securities
+logs_dir = "logs"                   # Application and audit logs
+exports_dir = "exports"             # Spreadsheet and JSON exports
+backups_dir = "backups"             # Database backup copies
+cache_dir = "cache"                 # Sentiment/regime computation cache
+snapshots_dir = "snapshots"         # Point-in-time data snapshots for backtests
+
+[database]
+# SQLite by default; PostgreSQL is a URL change (ADR-0003).
+# The schema uses only portable column types, so both backends work identically.
+url = ""                                  # Leave empty to use SQLite. e.g. "postgresql://user:pass@host/db"
+filename = "claudetrade.db"               # SQLite filename (when url is empty)
+echo = false                              # Log all SQL to the application log
+sqlite_wal = true                         # Write-Ahead Logging improves concurrent read/write from UI + scheduler
+busy_timeout_ms = 10000                   # How long to wait if the database is locked
+pool_size = 5                             # Connection pool size for concurrent queries
+
+[logging]
+# Application logging behaviour.
+level = "INFO"                            # DEBUG, INFO, WARNING, ERROR
+json_format = true                        # Structured JSON logs for aggregation
+console = true                            # Log to standard output as well as file
+rotate_max_bytes = 10485760               # Rotate logs when they exceed 10 MB
+rotate_backup_count = 10                  # Keep 10 rotated backup logs
+filename = "claudetrade.log"              # Main application log file
+audit_filename = "audit.log"              # Append-only security and integrity audit log
+
+[market_data]
+# Historical daily OHLCV bars and security reference data.
+provider = "synthetic"                    # Options: synthetic (offline), csv, stooq
+fallbacks = ["csv"]                       # Try these providers if primary fails
+credential = ""                           # Named credential for providers that need auth (not used by default providers)
+csv_dir = ""                              # Path to CSV directory (when provider = "csv")
+stale_after_hours = 30.0                  # Flag bars older than this as stale (data quality check)
+max_symbols_per_request = 100             # Batch size for market data requests
+request_timeout_s = 20.0                  # HTTP request timeout
+rate_limit_per_minute = 60                # Calls per minute (for rate-limited providers)
+benchmark_symbol = "SPY"                  # Market-wide trend reference
+# Sector ETF proxies for relative-strength comparisons
+[market_data.sector_etfs]
+"Technology" = "XLK"
+"Health Care" = "XLV"
+"Financials" = "XLF"
+"Consumer Discretionary" = "XLY"
+"Consumer Staples" = "XLP"
+"Energy" = "XLE"
+"Industrials" = "XLI"
+"Materials" = "XLB"
+"Utilities" = "XLU"
+"Real Estate" = "XLRE"
+"Communication Services" = "XLC"
+
+[earnings]
+# Earnings calendar and reported results.
+provider = "synthetic"                    # Options: synthetic (offline), csv
+fallbacks = ["csv"]
+credential = ""
+csv_path = ""                             # Path to CSV earnings file (when provider = "csv")
+estimated_date_uncertainty_days = 3       # Widen estimated dates by this many days for trading guards
+request_timeout_s = 20.0
+
+[reddit]
+# Official Reddit OAuth API. Disabled by default; enable only when credentials are configured.
+enabled = false
+provider = "synthetic"                    # Options: synthetic (offline), reddit (requires OAuth)
+client_id_credential = "reddit_client_id"         # Environment variable or keyring lookup name
+client_secret_credential = "reddit_client_secret"
+user_agent = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
+subreddits = [
+  "stocks", "investing", "StockMarket", "SecurityAnalysis",
+  "options", "swingtrading"
+]
+posts_per_subreddit = 100
+comments_per_post = 50
+lookback_hours = 72                       # How far back to scan for posts
+rate_limit_per_minute = 60                # Official API guidance: keep conservative
+request_timeout_s = 20.0
+store_author_names = false                # Store only salted hashes of usernames, never plaintext
+
+[x]
+# X (Twitter) API v2. Requires a paid tier for meaningful search volume.
+# Disabled by default; enable only with valid credentials.
+enabled = false
+provider = "synthetic"                    # Options: synthetic (offline), x (requires API v2)
+bearer_credential = "x_bearer_token"      # Environment variable or keyring lookup name
+query_terms = []                          # Search terms, e.g. ["$AAPL", "Apple earnings"]
+max_results_per_query = 100
+lookback_hours = 48
+rate_limit_per_minute = 15                # Paid tier is stricter; adjust if using higher tier
+request_timeout_s = 20.0
+store_author_names = false
+
+[ai]
+# Optional LLM assistance for sentiment classification.
+# The system is fully functional with provider = "null" (default).
+# All AI output is subject to hard risk controls that it cannot relax.
+provider = "null"                         # Options: null (rules only), openai, anthropic
+model = "claude-sonnet-5"                 # Model identifier (selected provider's naming)
+api_key_credential = "anthropic_api_key"  # Environment variable or keyring lookup name
+base_url = ""                             # Custom API endpoint (if any)
+max_output_tokens = 900                   # Maximum response length
+temperature = 0.0                         # 0 = deterministic; keep low for classification
+request_timeout_s = 45.0
+max_calls_per_run = 250                   # Cap API calls per scan/backtest run
+daily_cost_limit_usd = 5.0                # Refuse requests once daily cost exceeds this
+cache_enabled = true                      # Cache LLM responses to reduce costs
+cache_ttl_hours = 168                     # Cache validity (1 week)
+injection_block_threshold = 0.4           # Posts scoring above this on injection heuristic are never sent to AI
+batch_size = 12                           # Posts per classification batch
+prompt_version = "v1"                     # Prompt template version
+input_cost_per_mtok_usd = 3.0             # Local cost tracking (update to current pricing)
+output_cost_per_mtok_usd = 15.0
+
+[universe]
+# Which securities are eligible for scanning and trading.
+source = "database"                       # Options: database (from market provider), csv, static
+csv_path = ""                             # Path to symbol list CSV
+static_symbols = []                       # Hardcoded list of symbols (if source = "static")
+permitted_exchanges = ["NYSE", "NASDAQ", "AMEX"]
+max_symbols = 2000                        # Cap the universe size
+include_etfs = false                      # Whether to include exchange-traded funds
+
+[filters]
+# Candidate filters applied before strategy evaluation.
+# Defaults exclude illiquid, pump-and-dump-prone names.
+min_price = 5.0
+max_price = 1000.0
+min_market_cap_usd = 500_000_000          # 500M minimum (excludes micro-caps)
+min_avg_dollar_volume_usd = 10_000_000    # 10M minimum daily volume
+max_bid_ask_spread_pct = 0.5              # Maximum spread for entry/exit
+exclude_penny_stocks = true
+exclude_leveraged_inverse_etfs = true
+exclude_binary_event_sectors = false      # Set true to block biotech, etc.
+binary_event_sectors = ["Biotechnology"]
+
+# Social and sentiment filters
+min_unique_authors = 5                    # Minimum distinct posters before a signal is actionable
+min_sentiment_confidence = 0.35           # Minimum classification confidence on social sentiment
+max_manipulation_risk = 0.60              # Block signs of pump-and-dump patterns
+
+# Technical filters
+max_annualised_volatility = 1.20          # 120% annual volatility cap
+min_atr_pct = 1.0                         # Minimum Average True Range as % of price
+max_atr_pct = 15.0                        # Maximum ATR (avoid illiquid or broken names)
+
+# Earnings guards
+min_days_to_earnings = 3                  # Minimum days after earnings to enter
+# max_days_to_earnings = 365             # (Comment out or set to null for no upper limit)
+block_entry_within_days_of_earnings = 3   # Block entries this close to next report
+
+[risk]
+# Account and position-level risk limits.
+account_size_usd = 100_000.0              # Portfolio size assumption
+max_risk_per_trade_pct = 0.75             # Max risk on a single trade (0.75% = 750 USD on 100k)
+max_portfolio_heat_pct = 6.0              # Total open risk across all positions
+max_position_size_pct = 15.0              # Max single position (% of account)
+max_sector_exposure_pct = 35.0            # Max sector concentration
+max_correlated_exposure_pct = 40.0        # Max combined correlation exposure
+correlation_threshold = 0.75              # Symbols above this correlation are grouped
+max_daily_loss_pct = 3.0                  # Stop all trading after daily loss exceeds this
+max_weekly_loss_pct = 6.0                 # Stop all trading after weekly loss exceeds this
+max_concurrent_positions = 8              # Maximum number of open trades
+max_pct_of_adv = 2.0                      # Max participation in a symbol's daily volume
+min_reward_risk_ratio = 1.6               # Reject signals with worse than 1.6:1 reward:risk (anti-gaming gate)
+kill_switch_engaged = false               # Emergency halt: blocks all new orders
+
+[costs]
+# Transaction-cost assumptions used by backtest and paper trading identically.
+commission_per_share = 0.0
+commission_per_trade = 0.0
+commission_min = 0.0
+sec_fee_rate = 0.0000278                  # SEC Section 31 fee rate (update to current)
+taf_per_share = 0.000166                  # FINRA Trading Activity Fee per share
+taf_max_per_trade = 8.30
+half_spread_bps = 3.0                     # Half-spread in basis points (paid on entry and exit)
+base_slippage_bps = 2.0                   # Baseline slippage
+impact_coefficient_bps = 25.0             # Market impact: scaled by order size vs ADV
+gap_slippage_bps = 10.0                   # Extra slippage if a stop gaps through its trigger
+max_participation_rate = 0.05             # Max fraction of bar volume an order consumes
+short_borrow_annual_pct = 3.0             # Annualised borrow cost for short positions
+enable_partial_fills = true               # Simulate partial execution on large orders
+
+[sentiment]
+# Sentiment aggregation and weighting.
+half_life_hours = 18.0                    # Exponential decay half-life for aging posts
+lookback_days = 14                        # How far back to aggregate sentiment
+min_ticker_confidence = 0.60              # Resolution confidence threshold
+min_posts_for_signal = 8                  # Minimum posts before aggregating
+min_unique_authors_for_signal = 4         # Minimum distinct authors
+engagement_weight = 0.35                  # Weight of engagement (score, comments) in aggregation
+credibility_weight = 0.35                 # Weight of author credibility signals
+fast_window_days = 2                      # Short-term acceleration window
+slow_window_days = 10                     # Long-term baseline window
+source_concentration_alert = 0.40         # Flag if one source dominates
+duplicate_ratio_alert = 0.35              # Flag if duplicate text is high
+use_ai_classifier = true                  # Use LLM for sentiment if available
+ai_sample_per_symbol = 20                 # Max posts to send to LLM per symbol
+
+[regime]
+# Market-regime classification.
+benchmark = "SPY"
+breadth_universe_max = 500                # Universe size for breadth calculations
+trend_fast_ma = 20                        # Fast moving average (days)
+trend_slow_ma = 50                        # Slow moving average
+trend_long_ma = 200                       # Long-term moving average
+high_vol_percentile = 0.80                # Percentile threshold for high volatility
+low_vol_percentile = 0.30
+vol_lookback_days = 252                   # 1-year lookback for volatility percentile
+breadth_bullish = 0.55                    # Breadth threshold for bullish regime
+breadth_bearish = 0.40                    # Breadth threshold for bearish regime
+risk_off_size_multiplier = 0.5            # Position sizing multiplier in bearish regimes
+high_vol_size_multiplier = 0.7            # Position sizing multiplier in high-volatility regimes
+
+[signals]
+# Signal generation and scoring.
+enabled_strategies = [
+  "sentiment_breakout",
+  "sentiment_pullback",
+  "capitulation_reversal",
+  "hype_failure_short",
+  "post_earnings_drift"
+]
+allow_shorts = true                       # Whether short signals are permitted
+min_overall_score = 55.0                  # Minimum score to consider for ranking
+min_confidence = 0.45                     # Minimum data-confidence threshold
+max_candidates = 40                       # Maximum ranked candidates to return per scan
+signal_expiry_days = 5                    # How long a signal remains actionable
+extended_threshold_atr = 0.75             # Price extension beyond entry zone triggers "extended" status
+max_holding_days = 20                     # Hard cap on holding period (anti-gambling)
+default_holding_days = 10                 # Default expected holding period for sizing
+
+# Component scoring weights (normalised at use)
+[signals.component_weights]
+technical_setup = 0.20
+price_momentum = 0.12
+volume_confirmation = 0.10
+reddit_sentiment = 0.08
+x_sentiment = 0.05
+sentiment_acceleration = 0.08
+attention_acceleration = 0.05
+catalyst_quality = 0.07
+earnings_risk = 0.08
+liquidity = 0.07
+market_regime = 0.06
+manipulation_risk = 0.04
+
+[backtest]
+# Backtest engine behaviour and validation gates.
+initial_capital_usd = 100_000.0
+execution_delay_bars = 1                  # Signals compute on bar close; execution starts next bar
+entry_reference = "next_open_limit"       # Options: next_open, next_open_limit, stop_trigger
+allow_shorts = true
+min_trades_for_validation = 30            # Minimum trades before strategy is considered validated
+min_trades_for_confidence = 50            # Minimum trades before a win/loss ratio is trusted
+walk_forward_train_days = 504             # Training window (2 years)
+walk_forward_test_days = 126              # Test window (6 months)
+walk_forward_step_days = 126              # Step size between windows
+holdout_fraction = 0.25                   # Final 25% reserved as untouched out-of-sample
+risk_free_rate_annual = 0.04              # For Sharpe ratio calculations
+trading_days_per_year = 252
+force_close_open_positions = true         # Force-close positions at end of backtest for classification
+include_delisted = true                   # Include delisted names (required for survivorship-bias avoidance)
+random_seed = 20240101                    # Seed for reproducibility
+
+[notifications]
+# Event alerts (optional; disabled by default).
+enabled = false
+channels = []                             # Options: windows, email, webhook
+webhook_url_credential = "notify_webhook_url"
+email_to = []
+smtp_host = ""
+smtp_port = 587
+smtp_user_credential = "smtp_user"
+smtp_password_credential = "smtp_password"
+smtp_starttls = true
+cooldown_minutes = 120                    # Suppress repeat (event, symbol) pairs within this window
+max_per_hour = 20                         # Maximum notifications per hour
+events = [
+  "signal_approaching_entry",
+  "entry_triggered",
+  "stop_hit",
+  "target_hit",
+  "earnings_approaching",
+  "sentiment_reversal",
+  "data_source_failure",
+  "risk_limit_breach"
+]
+
+[scheduler]
+# Scheduled background tasks (optional; disabled by default).
+enabled = false
+timezone = "America/New_York"
+market_data_refresh_cron = "30 16 * * mon-fri"  # 4:30 PM ET weekdays (after market close)
+social_refresh_cron = "0 */4 * * *"             # Every 4 hours
+scan_cron = "45 16 * * mon-fri"                 # 4:45 PM ET weekdays
+paper_mark_cron = "5 16 * * mon-fri"            # 4:05 PM ET weekdays
+misfire_grace_time_s = 3600                     # Grace period for missed scheduled tasks
+
+[trading]
+# Trading mode and broker configuration.
+mode = "paper"                            # Options: backtest (historical replay), paper (simulated live), live (requires separate opt-in)
+live_trading_authorised = false           # MUST be true in config *and* confirmed interactively to send real orders
+broker = ""                               # Broker adapter name (when mode = "live")
+broker_credential = ""                    # Credential lookup name for broker auth
+kill_switch_engaged = false               # Emergency halt: blocks new orders in paper and live modes
+
+[ui]
+# Streamlit UI behaviour.
+display_timezone = "America/New_York"
+theme = "dark"                            # Options: dark, light
+chart_lookback_days = 180                 # Historical depth for charts
+table_page_size = 50                      # Rows per page in tables
+port = 8501                               # Streamlit port
