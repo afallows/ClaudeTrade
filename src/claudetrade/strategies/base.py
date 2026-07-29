@@ -75,14 +75,22 @@ class StrategyContext:
     config: AppConfig | None = None
 
     def __post_init__(self) -> None:
-        # Defensive truncation: even if a caller passes too much, the strategy
-        # only ever sees history.
+        # Series inputs are *truncated* rather than rejected: passing a full
+        # history and having it clipped to the decision session is a normal,
+        # safe calling pattern, and clipping is what guarantees the strategy
+        # only ever sees the past.
         if self.bars and self.bars[-1].session > self.session:
             self.bars = [b for b in self.bars if b.session <= self.session]
         if self.sentiment_history:
             self.sentiment_history = [
                 s for s in self.sentiment_history if s.session <= self.session
             ]
+        # Everything that cannot be safely clipped -- a single sentiment
+        # snapshot, an earnings row's knowledge date, the regime -- is validated
+        # here, at construction. Leaving that to an explicit
+        # assert_no_lookahead() call meant a caller who forgot it could build
+        # and use a leaking context; now no such context can exist.
+        self.assert_no_lookahead()
 
     # --- accessors --------------------------------------------------------
 
@@ -175,7 +183,9 @@ class StrategyContext:
                     f"{self.symbol}: sentiment history dated {snapshot.session} "
                     f"exceeds session {self.session}"
                 )
-        if self.regime.session > self.session:
+        # The regime may legitimately be absent (unclassified session); only a
+        # regime dated in the future is a leak.
+        if self.regime is not None and self.regime.session > self.session:
             raise LookaheadError(
                 f"regime dated {self.regime.session} exceeds session {self.session}"
             )

@@ -331,7 +331,9 @@ def test_null_ai_provider_is_free_and_signals_fallback():
 
     provider = get_ai_provider(AppConfig())
     response = provider.complete(
-        AIRequest(task="sentiment", payload={"text": "hello"}, schema_name="SentimentClassification")
+        AIRequest(
+            task="sentiment", payload={"text": "hello"}, schema_name="SentimentClassification"
+        )
     )
     assert response.parsed_ok is False
     assert response.estimated_cost_usd == 0.0

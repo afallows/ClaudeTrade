@@ -21,12 +21,25 @@ log = logging.getLogger(__name__)
 BACKUP_SUFFIX = ".ctbak.db"
 
 
-def _sqlite_path(url: str) -> Path:
-    if not url.startswith("sqlite"):
-        raise ValueError(f"backup currently supports SQLite only (got {url.split(':')[0]})")
-    _, _, tail = url.partition(":///")
+def _sqlite_path(url: str | Path) -> Path:
+    """Resolve a SQLite target to a filesystem path.
+
+    Accepts either a SQLAlchemy URL or a plain path. Restore is the one
+    operation an operator reaches for under pressure, usually after losing
+    data, so it should not fail on the reasonable assumption that a path can be
+    passed where a database location is wanted.
+    """
+    if isinstance(url, Path):
+        return url
+    text = str(url)
+    if not text.startswith("sqlite"):
+        # A bare filesystem path is a legitimate way to name the target.
+        if "://" not in text:
+            return Path(text)
+        raise ValueError(f"backup currently supports SQLite only (got {text.split(':')[0]})")
+    _, _, tail = text.partition(":///")
     if not tail:
-        raise ValueError(f"could not parse SQLite path from URL: {url}")
+        raise ValueError(f"could not parse SQLite path from URL: {text}")
     return Path(tail)
 
 
@@ -68,7 +81,7 @@ def list_backups(destination_dir: Path) -> list[Path]:
     )
 
 
-def restore_backup(backup_path: Path, db_url: str, *, force: bool = False) -> Path:
+def restore_backup(backup_path: Path, db_url: str | Path, *, force: bool = False) -> Path:
     """Replace the live database with a backup.
 
     The database currently in place is first copied aside with a
