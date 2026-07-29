@@ -82,7 +82,8 @@ class PostEarningsDriftStrategy(Strategy):
     ATR_STOP_MULTIPLE = 2.0
 
     # --- score weights --------------------------------------------------------
-    BASELINE = 14.0
+    # See Strategy A's BASELINE comment.
+    BASELINE = 24.0
     W_DAYS_AFTER = 14.0
     W_SURPRISE_PCTL = 18.0
     W_EVENT_MOVE = 16.0

@@ -74,7 +74,11 @@ class CapitulationReversalStrategy(Strategy):
     SIZE_MULTIPLIER = 0.5
 
     # --- score weights --------------------------------------------------------
-    BASELINE = 8.0
+    # See Strategy A's BASELINE comment. Kept lower than the other four
+    # strategies' baseline (relatively speaking) because this is the riskiest
+    # setup in the set; SIZE_MULTIPLIER, not the score gate, is the primary
+    # control on that risk.
+    BASELINE = 16.0
     W_EXTENSION = 18.0
     W_OVERSOLD = 14.0
     W_CLIMAX_VOLUME = 16.0

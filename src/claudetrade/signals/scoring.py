@@ -203,7 +203,22 @@ def _data_confidence_score(
     sentiment: SymbolSentiment | None,
     config: AppConfig,
 ) -> float:
-    """How much the inputs behind this candidate can be trusted."""
+    """How much the inputs behind this candidate can be trusted.
+
+    This is a DATA-QUALITY metric -- sample adequacy, staleness, outstanding
+    warnings -- not a second manipulation assessment. ``duplicate_ratio`` and
+    ``source_concentration`` are already Herfindahl/duplicate-content inputs
+    to ``sentiment.manipulation_risk`` (see ``sentiment.manipulation.detect``),
+    which has its own dedicated scored component (``_manipulation_score``)
+    AND its own hard veto (``apply_hard_gates``'s ``max_manipulation_risk``
+    check). Subtracting them here too double-counts the identical
+    measurement under a different label: a single coordinated-posting signal
+    would otherwise both fail the manipulation gate/score *and* separately
+    crater the unrelated confidence metric for every candidate touched by
+    social data, drowning out what this score exists to measure. A single,
+    smaller pass-through of the already-aggregated ``manipulation_risk``
+    keeps confidence sensitive to promotion risk exactly once.
+    """
     score = 100.0
     if ctx.data_warnings:
         score -= 15.0 * len(ctx.data_warnings)
@@ -217,8 +232,7 @@ def _data_confidence_score(
             score -= 20.0
         if sentiment.unique_authors < config.sentiment.min_unique_authors_for_signal:
             score -= 15.0
-        score -= 25.0 * sentiment.duplicate_ratio
-        score -= 15.0 * sentiment.source_concentration
+        score -= 10.0 * sentiment.manipulation_risk
     return _clamp(score)
 
 

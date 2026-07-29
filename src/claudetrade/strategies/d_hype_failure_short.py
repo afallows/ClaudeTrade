@@ -75,7 +75,8 @@ class HypeFailureShortStrategy(Strategy):
     ATR_STOP_MULTIPLE = 1.6
 
     # --- score weights --------------------------------------------------------
-    BASELINE = 10.0
+    # See Strategy A's BASELINE comment.
+    BASELINE = 20.0
     W_ADVANCE_PCTL = 16.0
     W_FAILURE_EVIDENCE = 16.0
     W_BEARISH_CONFIRMATION = 12.0

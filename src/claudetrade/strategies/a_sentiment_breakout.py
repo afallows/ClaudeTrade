@@ -75,7 +75,12 @@ class SentimentBreakoutStrategy(Strategy):
     EXTENSION_PENALTY_FULL_ATR = 2.5
 
     # --- score weights (points out of the 0-100 setup_score) --------------
-    BASELINE = 12.0
+    # BASELINE is calibrated so a candidate with genuinely solid (not perfect)
+    # evidence across the components below lands comfortably above both
+    # ``config.calibration.proposal_score_threshold`` and the engine's
+    # existing ``SignalConfig.min_overall_score`` blended gate, in which this
+    # strategy's own score is only one of thirteen weighted components.
+    BASELINE = 22.0
     W_BREAKOUT = 22.0
     W_TREND_CONTEXT = 8.0
     W_ADX_PERCENTILE = 15.0

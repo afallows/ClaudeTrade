@@ -69,7 +69,9 @@ class SentimentPullbackStrategy(Strategy):
     PULLBACK_TAPER_PCT = 4.0
 
     # --- score weights ------------------------------------------------------
-    BASELINE = 10.0
+    # See Strategy A's BASELINE comment: calibrated against the engine's
+    # existing blended min_overall_score gate, not tuned to any one outcome.
+    BASELINE = 20.0
     W_UPTREND = 14.0
     W_ABOVE_200 = 6.0
     W_ADX_PERCENTILE = 14.0
