@@ -103,10 +103,18 @@ class SignalEngine:
         *,
         strategies: list[Strategy] | None = None,
         ai_provider: AIProvider | None = None,
+        generate_thesis: bool = True,
     ):
+        """
+        Args:
+            generate_thesis: Default for :meth:`scan`. Bulk backtests set this
+                False -- building prose for hundreds of thousands of candidate
+                evaluations is pure overhead and changes no decision.
+        """
         self.config = config
         self.strategies = strategies if strategies is not None else build_strategies(config)
         self.ai_provider = ai_provider
+        self.generate_thesis = generate_thesis
 
     # --- public API -------------------------------------------------------
 
@@ -118,7 +126,7 @@ class SignalEngine:
         regime: RegimeState,
         portfolio: PortfolioState | None = None,
         data_snapshot_hash: str = "",
-        generate_thesis: bool = True,
+        generate_thesis: bool | None = None,
     ) -> ScanResult:
         """Evaluate every context and return ranked signals.
 
@@ -130,11 +138,15 @@ class SignalEngine:
                 When omitted, an empty portfolio at the configured account size
                 is assumed -- appropriate for a research scan.
             data_snapshot_hash: Manifest digest, stamped for reproducibility.
-            generate_thesis: Set False in bulk backtests to skip prose building.
+            generate_thesis: Overrides the engine-level default; ``None`` uses
+                it. Set False in bulk backtests to skip prose building.
 
         Returns:
             A ``ScanResult`` whose ``signals`` are sorted best-first.
         """
+        build_thesis_text = (
+            self.generate_thesis if generate_thesis is None else generate_thesis
+        )
         state = portfolio or PortfolioState(
             equity=self.config.risk.account_size_usd,
             cash=self.config.risk.account_size_usd,
@@ -175,7 +187,7 @@ class SignalEngine:
                     state=state,
                     session=session,
                     data_snapshot_hash=data_snapshot_hash,
-                    generate_thesis=generate_thesis,
+                    generate_thesis=build_thesis_text,
                     rejected=result.rejected,
                 )
                 if signal is not None:
@@ -247,6 +259,7 @@ class SignalEngine:
             security=ctx.security,
             regime=regime,
             permits_earnings_risk=strategy.permits_earnings_risk,
+            requires_sentiment=strategy.requires_sentiment,
         )
         if not breakdown.passed:
             rejected.append(

@@ -12,7 +12,7 @@ three responsibilities that must not leak elsewhere:
 """
 
 from claudetrade.data.context import ContextBuilder, DatabaseContextProvider
-from claudetrade.data.ingest import IngestReport, DataIngestor
+from claudetrade.data.ingest import DataIngestor, IngestReport
 from claudetrade.data.quality import DataQualityChecker, QualityReport
 from claudetrade.data.snapshot import SnapshotManifest, build_snapshot
 from claudetrade.data.universe import UniverseSelector

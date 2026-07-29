@@ -520,7 +520,7 @@ def _generate_symbol_series(
     # per symbol, each an extra return shock independent of the daily process.
     earnings_days = _quarterly_offsets(rng, n_days)
     gap_shocks = rng.standard_t(df=3, size=len(earnings_days)) * 0.035
-    for day_idx, shock in zip(earnings_days, gap_shocks):
+    for day_idx, shock in zip(earnings_days, gap_shocks, strict=True):
         if 0 <= day_idx < n_days:
             log_returns[day_idx] += shock
 

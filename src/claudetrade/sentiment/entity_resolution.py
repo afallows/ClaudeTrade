@@ -143,10 +143,15 @@ class TickerResolver:
     directory: dict[str, SecurityInfo]
     extra_aliases: dict[str, str] = field(default_factory=dict)
     max_mentions_per_post: int = DEFAULT_MAX_MENTIONS_PER_POST
+    #: Derived lookup structures, built in __post_init__. They must be declared
+    #: as fields because this is a slots dataclass -- a slots class cannot gain
+    #: attributes that were never declared.
+    _symbols: set[str] = field(default_factory=set, init=False, repr=False)
+    _alias_index: dict[str, _AliasEntry] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._symbols = set(self.directory.keys())
-        self._alias_index: dict[str, _AliasEntry] = {}
+        self._alias_index = {}
         for symbol, info in self.directory.items():
             self._index_alias(normalise_company_name(symbol), symbol, "alias")
             if info.name:

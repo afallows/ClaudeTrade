@@ -115,9 +115,21 @@ class DataQualityChecker:
         *,
         expected_start: dt.date | None = None,
         expected_end: dt.date | None = None,
+        listed_date: dt.date | None = None,
+        delisted_date: dt.date | None = None,
         report: QualityReport | None = None,
     ) -> QualityReport:
-        """Validate a symbol's daily bar series."""
+        """Validate a symbol's daily bar series.
+
+        Args:
+            listed_date: First date the security traded. The expected range is
+                clipped to it, because a name that listed halfway through the
+                window is not missing the bars that precede its own IPO.
+            delisted_date: Last date the security traded, clipped likewise.
+                Without this, every delisted name -- exactly the names an
+                unbiased backtest depends on keeping -- reports as an error and
+                gets its signals suppressed.
+        """
         report = report or QualityReport()
         if not bars:
             report.add(
@@ -152,9 +164,17 @@ class DataQualityChecker:
         for bar in ordered:
             self._check_single_bar(symbol, bar, report)
 
-        # Gaps against the exchange calendar.
+        # Gaps against the exchange calendar, restricted to the window in which
+        # the security actually traded.
         start = expected_start or ordered[0].session
         end = expected_end or ordered[-1].session
+        if listed_date is not None:
+            start = max(start, listed_date)
+        if delisted_date is not None:
+            # Bars stop the day before the delisting takes effect.
+            end = min(end, delisted_date - dt.timedelta(days=1))
+        if end < start:
+            return report
         expected = set(trading_day_range(start, end))
         present = {b.session for b in ordered}
         missing = sorted(expected - present)
@@ -242,24 +262,45 @@ class DataQualityChecker:
     def _check_extreme_moves(
         self, symbol: str, bars: list[Bar], report: QualityReport
     ) -> None:
-        """Flag single-session moves large enough to suggest an unadjusted split."""
+        """Flag single-session moves large enough to suggest bad data.
+
+        The test runs on the **adjusted** series, because that is what the
+        indicators consume. A correctly-adjusted split shows a large jump in the
+        raw close and no jump at all in ``adj_close``; testing the raw print
+        would report every properly-handled split as a defect, and a checker
+        that cries wolf on routine corporate actions trains the operator to
+        ignore it.
+        """
         for prev, cur in zip(bars, bars[1:], strict=False):
-            if prev.close <= 0:
+            prev_adj = prev.effective_adj_close
+            cur_adj = cur.effective_adj_close
+            if prev_adj <= 0 or prev.close <= 0:
                 continue
-            change = 100.0 * (cur.close - prev.close) / prev.close
-            if abs(change) < EXTREME_MOVE_PCT:
+
+            adj_change = 100.0 * (cur_adj - prev_adj) / prev_adj
+            if abs(adj_change) < EXTREME_MOVE_PCT:
                 continue
-            # A ratio close to a common split factor is the giveaway.
-            ratio = prev.close / cur.close if cur.close > 0 else 0.0
+
+            raw_change = 100.0 * (cur.close - prev.close) / prev.close
+            # If the raw print moved but the adjusted series did not, the split
+            # was handled; the reverse means the adjustment itself is broken.
+            ratio = prev_adj / cur_adj if cur_adj > 0 else 0.0
             looks_like_split = any(abs(ratio - f) < 0.06 for f in (2.0, 3.0, 4.0, 5.0, 10.0, 0.5))
             report.add(
                 DataQualitySeverity.ERROR if looks_like_split else DataQualitySeverity.WARNING,
                 "abnormal_price",
-                f"{symbol} {cur.session}: {change:+.1f}% single-session move"
-                + (" -- consistent with an unadjusted split" if looks_like_split else ""),
+                f"{symbol} {cur.session}: {adj_change:+.1f}% single-session move in the adjusted "
+                f"series (raw {raw_change:+.1f}%)"
+                + (
+                    " -- ratio matches a common split factor, so the adjustment appears to be "
+                    "missing or wrong"
+                    if looks_like_split
+                    else ""
+                ),
                 symbol=symbol,
                 session=cur.session,
-                change_pct=round(change, 2),
+                change_pct=round(adj_change, 2),
+                raw_change_pct=round(raw_change, 2),
                 suspected_split=looks_like_split,
             )
 

@@ -234,6 +234,7 @@ def apply_hard_gates(
     config: AppConfig,
     security: SecurityInfo,
     sentiment: SymbolSentiment | None,
+    requires_sentiment: bool = True,
 ) -> list[str]:
     """Filters that no score can override.
 
@@ -291,26 +292,39 @@ def apply_hard_gates(
     ):
         failures.append(f"earnings {days} days away, beyond the configured window")
 
-    # Sentiment quality gates -- only applied when the strategy relies on it.
-    if sentiment is not None:
-        if sentiment.unique_authors < filters.min_unique_authors and proposal.strategy not in {
-            "post_earnings_drift"
-        }:
+    # Sentiment quality gates.
+    #
+    # These only *veto* a candidate when the strategy's thesis actually rests on
+    # sentiment. For a price-driven setup such as post-earnings drift, a thin or
+    # noisy social sample is missing evidence, not contrary evidence: it belongs
+    # in the confidence score, which already penalises it, rather than as a hard
+    # veto. Vetoing there would silently disable every price-based strategy
+    # whenever the social sources were quiet or unconfigured.
+    if sentiment is not None and requires_sentiment:
+        if sentiment.unique_authors < filters.min_unique_authors:
             failures.append(
                 f"only {sentiment.unique_authors} unique authors, below the "
                 f"{filters.min_unique_authors} minimum"
             )
         if sentiment.confidence < filters.min_sentiment_confidence:
-            failures.append(f"sentiment confidence {sentiment.confidence:.2f} below the minimum")
-        # The promotion-failure short deliberately trades high manipulation risk.
-        if (
-            proposal.strategy != "hype_failure_short"
-            and sentiment.manipulation_risk > filters.max_manipulation_risk
-        ):
             failures.append(
-                f"manipulation risk {sentiment.manipulation_risk:.2f} above the "
-                f"{filters.max_manipulation_risk:.2f} cap"
+                f"sentiment confidence {sentiment.confidence:.2f} below the "
+                f"{filters.min_sentiment_confidence:.2f} minimum"
             )
+
+    # Manipulation risk applies whether or not the strategy leans on sentiment:
+    # a coordinated promotion is a reason to avoid the name regardless of what
+    # produced the setup. The promotion-failure short is the sole exception,
+    # because that pattern *is* the trade.
+    if (
+        sentiment is not None
+        and proposal.strategy != "hype_failure_short"
+        and sentiment.manipulation_risk > filters.max_manipulation_risk
+    ):
+        failures.append(
+            f"manipulation risk {sentiment.manipulation_risk:.2f} above the "
+            f"{filters.max_manipulation_risk:.2f} cap"
+        )
 
     # Reward:risk floor. This is the structural guard against a strategy that
     # wins often by taking tiny profits against large losses.
@@ -336,6 +350,7 @@ def score_candidate(
     security: SecurityInfo,
     regime: RegimeState,
     permits_earnings_risk: bool = False,
+    requires_sentiment: bool = True,
 ) -> ScoreBreakdown:
     """Score one strategy proposal and apply the hard gates.
 
@@ -394,7 +409,12 @@ def score_candidate(
     confidence = _clamp(confidence * freshness_penalty, 0.0, 1.0)
 
     gate_failures = apply_hard_gates(
-        ctx=ctx, proposal=proposal, config=config, security=security, sentiment=sentiment
+        ctx=ctx,
+        proposal=proposal,
+        config=config,
+        security=security,
+        sentiment=sentiment,
+        requires_sentiment=requires_sentiment,
     )
 
     notes: list[str] = []
