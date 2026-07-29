@@ -7,4 +7,4 @@ explicitly authorises a supported brokerage connection.
 
 from claudetrade.version import CODE_VERSION, __version__
 
-__all__ = ["__version__", "CODE_VERSION"]
+__all__ = ["CODE_VERSION", "__version__"]

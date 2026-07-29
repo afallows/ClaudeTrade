@@ -19,7 +19,7 @@ import datetime as dt
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
-UTC = dt.timezone.utc
+UTC = dt.UTC
 MARKET_TZ = ZoneInfo("America/New_York")
 
 #: US regular trading hours in exchange-local time.

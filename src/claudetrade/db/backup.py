@@ -37,7 +37,7 @@ def create_backup(db: Database, destination_dir: Path, *, label: str = "") -> Pa
         Path of the created backup file.
     """
     destination_dir.mkdir(parents=True, exist_ok=True)
-    stamp = dt.datetime.now(tz=dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = dt.datetime.now(tz=dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     suffix = f"-{label}" if label else ""
     target = destination_dir / f"claudetrade-{stamp}{suffix}{BACKUP_SUFFIX}"
 
@@ -87,7 +87,7 @@ def restore_backup(backup_path: Path, db_url: str, *, force: bool = False) -> Pa
                 f"{target} already exists; pass force=True to replace it "
                 "(the existing file will be preserved with a .superseded suffix)"
             )
-        stamp = dt.datetime.now(tz=dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stamp = dt.datetime.now(tz=dt.UTC).strftime("%Y%m%dT%H%M%SZ")
         aside = target.with_suffix(target.suffix + f".superseded-{stamp}")
         shutil.copy2(target, aside)
         log.warning("existing database preserved at %s", aside)

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 # --------------------------------------------------------------------------
@@ -21,7 +21,7 @@ from typing import Any
 # --------------------------------------------------------------------------
 
 
-class Direction(str, Enum):
+class Direction(StrEnum):
     """Trade direction. ``FLAT`` means the engine explicitly declines to trade."""
 
     LONG = "long"
@@ -34,7 +34,7 @@ class Direction(str, Enum):
         return {Direction.LONG: 1, Direction.SHORT: -1, Direction.FLAT: 0}[self]
 
 
-class SignalStatus(str, Enum):
+class SignalStatus(StrEnum):
     """Lifecycle of a generated signal.
 
     ``EXPIRED`` exists so a missed entry cannot linger indefinitely and be
@@ -49,7 +49,7 @@ class SignalStatus(str, Enum):
     REJECTED = "rejected"  # failed a hard filter or risk control
 
 
-class ExitReason(str, Enum):
+class ExitReason(StrEnum):
     """Why a position was closed. Every closed trade carries exactly one."""
 
     STOP_LOSS = "stop_loss"
@@ -70,7 +70,7 @@ class ExitReason(str, Enum):
     MANUAL = "manual"
 
 
-class TradeOutcome(str, Enum):
+class TradeOutcome(StrEnum):
     """Classification used by the win/loss ratio.
 
     ``BREAKEVEN`` is reported separately and excluded from both numerator and
@@ -82,7 +82,7 @@ class TradeOutcome(str, Enum):
     BREAKEVEN = "breakeven"
 
 
-class MarketRegime(str, Enum):
+class MarketRegime(StrEnum):
     BULL_QUIET = "bull_quiet"
     BULL_VOLATILE = "bull_volatile"
     NEUTRAL = "neutral"
@@ -95,20 +95,20 @@ class MarketRegime(str, Enum):
         return self in {MarketRegime.BULL_QUIET, MarketRegime.BULL_VOLATILE}
 
 
-class EarningsSession(str, Enum):
+class EarningsSession(StrEnum):
     BEFORE_OPEN = "bmo"
     AFTER_CLOSE = "amc"
     DURING = "during"
     UNKNOWN = "unknown"
 
 
-class SocialSource(str, Enum):
+class SocialSource(StrEnum):
     REDDIT = "reddit"
     X = "x"
     OTHER = "other"
 
 
-class DataQualitySeverity(str, Enum):
+class DataQualitySeverity(StrEnum):
     INFO = "info"
     WARNING = "warning"
     ERROR = "error"
@@ -182,9 +182,7 @@ class SecurityInfo:
         """Whether the security was listed and trading on ``session``."""
         if self.listed_date and session < self.listed_date:
             return False
-        if self.delisted_date and session >= self.delisted_date:
-            return False
-        return True
+        return not (self.delisted_date and session >= self.delisted_date)
 
 
 @dataclass(frozen=True, slots=True)

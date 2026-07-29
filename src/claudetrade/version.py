@@ -28,7 +28,7 @@ def _git_revision() -> str | None:
     if not (repo_root / ".git").exists():
         return None
     try:
-        out = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        out = subprocess.run(
             ["git", "rev-parse", "--short=12", "HEAD"],
             cwd=repo_root,
             capture_output=True,
