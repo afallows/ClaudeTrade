@@ -303,3 +303,108 @@ class TestMedianAndExtremes:
         metrics = compute_metrics(trades, [], BacktestConfig())
         assert metrics.largest_win == pytest.approx(2000.0, abs=100.0)
         assert metrics.largest_loss < 0
+
+
+class TestDegenerateRatioMetricsAreUnavailableNotGarbage:
+    """ADR-0007 Decision 3(a): insufficient-sample ratios come out None with a
+    machine-readable reason, never a number like the historical Sharpe =
+    -9.2e16 -- and never float('nan') either, which would pass an `is None`
+    check but corrupt any downstream arithmetic that forgot to guard for it.
+    """
+
+    def test_zero_trades_zero_equity_points(self):
+        """No trades and no equity curve: every ratio is None with a reason."""
+        metrics = compute_metrics([], [], BacktestConfig())
+        assert metrics.trade_count == 0
+        assert metrics.sharpe is None
+        assert metrics.sortino is None
+        assert metrics.calmar is None
+        assert "sharpe" in metrics.unavailable_reasons
+        assert "sortino" in metrics.unavailable_reasons
+        assert "calmar" in metrics.unavailable_reasons
+        for reason in metrics.unavailable_reasons.values():
+            assert reason  # non-empty, machine-readable
+
+    def test_one_trade_no_equity_curve(self):
+        """A single trade cannot support a ratio estimate either."""
+        trades = [make_closed_trade("T1", "S1", 250.0)]
+        metrics = compute_metrics(trades, [], BacktestConfig())
+        assert metrics.trade_count == 1
+        assert metrics.sharpe is None
+        assert metrics.sortino is None
+        assert metrics.calmar is None
+        assert metrics.unavailable_reasons["sharpe"].startswith("no_equity_curve")
+
+    def test_short_equity_curve_below_observation_floor(self):
+        """Fewer return observations than the floor: insufficient_sample, not a number."""
+        equity = [MockEquityPoint(100_000.0), MockEquityPoint(100_500.0), MockEquityPoint(101_000.0)]
+        metrics = compute_metrics([], equity, BacktestConfig())
+        assert metrics.sharpe is None
+        assert metrics.sortino is None
+        assert metrics.calmar is None
+        assert metrics.unavailable_reasons["sharpe"].startswith("insufficient_sample")
+        assert metrics.unavailable_reasons["sortino"].startswith("insufficient_sample")
+
+    def test_zero_variance_equity_curve(self):
+        """A flat equity curve (enough points, zero return variance) is unavailable, not 0.0-as-a-measurement."""
+        equity = [MockEquityPoint(100_000.0, drawdown_pct=0.0) for _ in range(8)]
+        metrics = compute_metrics([], equity, BacktestConfig())
+        assert metrics.sharpe is None
+        assert metrics.sortino is None
+        assert metrics.calmar is None
+        assert metrics.unavailable_reasons["sharpe"].startswith("zero_variance")
+        # Calmar's own guard fires on zero measured drawdown, which is the
+        # accompanying symptom of a perfectly flat curve.
+        assert metrics.unavailable_reasons["calmar"].startswith("no_drawdown")
+
+    def test_healthy_sample_still_returns_real_numbers(self):
+        """Sanity check: a sample that clears every floor still produces plain floats."""
+        # drawdown_pct is supplied directly (mirroring what the real portfolio
+        # marks each session) rather than derived, so it must reflect the
+        # peak-to-date for max_dd_pct/calmar to see a real drawdown.
+        equity = [
+            MockEquityPoint(100_000.0, drawdown_pct=0.0),
+            MockEquityPoint(101_000.0, drawdown_pct=0.0),
+            MockEquityPoint(100_500.0, drawdown_pct=0.495),
+            MockEquityPoint(102_000.0, drawdown_pct=0.0),
+            MockEquityPoint(103_500.0, drawdown_pct=0.0),
+            MockEquityPoint(102_800.0, drawdown_pct=0.676),
+            MockEquityPoint(104_200.0, drawdown_pct=0.0),
+        ]
+        metrics = compute_metrics([], equity, BacktestConfig())
+        assert isinstance(metrics.sharpe, float)
+        assert isinstance(metrics.sortino, float)
+        assert isinstance(metrics.calmar, float)
+        assert not metrics.unavailable_reasons
+
+
+class TestSignificanceGate:
+    """ADR-0007 Decision 3(c): significance is computed inside compute_metrics,
+    not left for a caller to opt into, and carries both a structured field and
+    an explicit warning.
+    """
+
+    def test_below_trade_floor_is_not_significant(self):
+        config = BacktestConfig(min_trades_for_validation=30)
+        trades = [make_closed_trade(f"T{i}", f"S{i}", 100.0) for i in range(5)]
+        metrics = compute_metrics(trades, [], config)
+        assert metrics.is_statistically_significant is False
+        assert metrics.significance_reason is not None
+        assert "trade_count_below_floor" in metrics.significance_reason
+        assert any("NOT STATISTICALLY SIGNIFICANT" in w for w in metrics.warnings)
+
+    def test_zero_trades_is_not_significant(self):
+        metrics = compute_metrics([], [], BacktestConfig())
+        assert metrics.is_statistically_significant is False
+        assert metrics.significance_reason is not None
+        assert any("NOT STATISTICALLY SIGNIFICANT" in w for w in metrics.warnings)
+
+    def test_above_floor_with_clear_edge_is_significant(self):
+        """Enough trades, all winners of the same size: the CI cannot include zero."""
+        config = BacktestConfig(min_trades_for_validation=10)
+        trades = [make_closed_trade(f"T{i}", f"S{i}", 500.0) for i in range(20)]
+        metrics = compute_metrics(trades, [], config)
+        assert metrics.trade_count == 20
+        assert metrics.is_statistically_significant is True
+        assert metrics.significance_reason is None
+        assert not any("NOT STATISTICALLY SIGNIFICANT" in w for w in metrics.warnings)

@@ -42,6 +42,20 @@ log = logging.getLogger(__name__)
 _Z_95 = 1.959963985  # two-sided 95% normal quantile
 _BOOTSTRAP_RESAMPLES = 2000
 
+# ADR-0007 Decision 3(a): a ratio metric computed over too few return
+# observations, or over returns with ~zero variance, is not a number -- it is
+# noise wearing a number's clothes (the historical failure mode here was a
+# reported Sharpe of -9.2e16 from a two-point equity curve). Below these
+# floors, compute_metrics returns None with a machine-readable reason instead
+# of a numeric fallback (0.0, inf, or NaN all silently pass for "a result").
+# Guard shape adopted from ROT `src/rot/backtest/metrics.py:48-95`
+# (Mattbusel/Reddit-Options-Trader-ROT-, MIT licensed) -- that module returns
+# None below 5 daily-return observations or a return stdev under 1e-10; this
+# module reuses both thresholds against its own numpy/session-return
+# representation rather than ROT's plain-list implementation.
+_MIN_RETURN_OBSERVATIONS_FOR_RATIOS = 5
+_ZERO_VARIANCE_FLOOR = 1e-10
+
 
 class EquityPointLike(Protocol):
     """The subset of ``backtest.portfolio.EquityPoint`` metrics needs.
@@ -118,9 +132,13 @@ class PerformanceMetrics:
 
     max_drawdown_pct: float
     max_drawdown_duration_days: int
-    sharpe: float
-    sortino: float
-    calmar: float
+
+    #: None (never 0.0/inf/NaN as a stand-in) when the sample is too small or
+    #: has ~zero variance to support the ratio; see ``unavailable_reasons``
+    #: for the machine-readable "why". See ADR-0007 Decision 3(a).
+    sharpe: float | None
+    sortino: float | None
+    calmar: float | None
 
     largest_win: float
     largest_loss: float  # negative
@@ -140,6 +158,21 @@ class PerformanceMetrics:
     max_symbol_profit_share_pct: float
     max_sector_profit_share_pct: float
 
+    #: ADR-0007 Decision 3(c): a minimum-trade-count *and* statistical-test
+    #: gate, computed inside ``compute_metrics`` rather than left to a caller
+    #: to remember to apply. True only when the sample both clears
+    #: ``BacktestConfig.min_trades_for_validation`` and the bootstrap 95% CI
+    #: for expectancy excludes zero -- a count floor alone says "enough data
+    #: to ask the question", not "the answer is yes".
+    is_statistically_significant: bool
+    #: Machine-readable reason when the above is False; None when it's True.
+    significance_reason: str | None
+
+    #: Reasons a ratio metric above (``sharpe``/``sortino``/``calmar``) came
+    #: out None instead of a number, keyed by field name. Never populated for
+    #: a metric that has a real value. See ADR-0007 Decision 3(a).
+    unavailable_reasons: dict[str, str] = field(default_factory=dict)
+
     warnings: list[str] = field(default_factory=list)
 
 
@@ -154,6 +187,7 @@ def compute_metrics(
     config: BacktestConfig,
     *,
     breakeven_threshold_pct: float = 0.05,
+    min_return_observations_for_ratios: int = _MIN_RETURN_OBSERVATIONS_FOR_RATIOS,
 ) -> PerformanceMetrics:
     """Compute the full metric set for a batch of completed trades.
 
@@ -162,14 +196,26 @@ def compute_metrics(
             (``Trade.outcome`` raises), so this asserts none are open rather
             than silently filtering -- a dropped open trade is exactly the
             kind of quiet omission that inflates a win/loss ratio.
-        equity_curve: Session-by-session portfolio marks. Equity-curve-derived
-            figures (drawdown, Sharpe/Sortino, exposure, turnover) default to
-            0.0 when fewer than two points are supplied -- e.g. for a
-            per-segment slice with no dedicated equity series.
-        config: Supplies the risk-free rate and trading-day convention for
-            annualisation.
+        equity_curve: Session-by-session portfolio marks. Drawdown/exposure/
+            turnover default to 0.0 when fewer than two points are supplied
+            -- e.g. for a per-segment slice with no dedicated equity series.
+            Sharpe/Sortino/Calmar instead come out ``None`` in that case (see
+            ``min_return_observations_for_ratios`` below) rather than
+            defaulting to 0.0, because 0.0 reads as "measured and flat", not
+            "unmeasurable".
+        config: Supplies the risk-free rate, trading-day convention and the
+            ``min_trades_for_validation`` significance floor.
         breakeven_threshold_pct: Net returns inside +/- this percentage are
             excluded from both the win and loss counts.
+        min_return_observations_for_ratios: Floor on return observations (and,
+            for Calmar, on measurable drawdown) below which Sharpe/Sortino/
+            Calmar come out ``None`` with a reason in ``unavailable_reasons``
+            instead of a number. Mirrors the count-floor shape of
+            ``BacktestConfig.min_trades_for_validation`` but is exposed as a
+            keyword here (like ``breakeven_threshold_pct`` above) rather than
+            added to ``BacktestConfig``, since it governs a purely
+            statistical property of the equity curve, not a trading-account
+            policy. Default matches ROT's guard (see module-level constant).
     """
     assert all(not t.is_open for t in trades), (
         "compute_metrics received an open trade; force-close it first "
@@ -187,10 +233,7 @@ def compute_metrics(
     win_rate = n_wins / trade_count if trade_count else 0.0
 
     is_degenerate = n_losses == 0
-    if is_degenerate:
-        win_loss_ratio = math.inf if n_wins > 0 else 0.0
-    else:
-        win_loss_ratio = n_wins / n_losses
+    win_loss_ratio = (math.inf if n_wins > 0 else 0.0) if is_degenerate else n_wins / n_losses
 
     average_win = statistics.fmean(t.net_pnl for t in wins) if wins else 0.0
     average_loss = statistics.fmean(-t.net_pnl for t in losses) if losses else 0.0
@@ -218,11 +261,18 @@ def compute_metrics(
     largest_loss = min(largest_loss, 0.0)
     average_holding_days = statistics.fmean(t.holding_days for t in trades) if trades else 0.0
 
-    gross_vs_net = _gross_vs_net(trades, gross_profit, gross_loss, expectancy_dollars, profit_factor)
+    gross_vs_net = _gross_vs_net(trades, expectancy_dollars, profit_factor)
 
-    total_return_pct, annualised_return_pct, max_dd_pct, max_dd_days, sharpe, sortino, calmar = (
-        _equity_curve_metrics(equity_curve, config)
-    )
+    (
+        total_return_pct,
+        annualised_return_pct,
+        max_dd_pct,
+        max_dd_days,
+        sharpe,
+        sortino,
+        calmar,
+        unavailable_reasons,
+    ) = _equity_curve_metrics(equity_curve, config, min_return_observations_for_ratios)
     exposure_pct = (
         statistics.fmean(p.exposure_pct for p in equity_curve) if equity_curve else 0.0
     )
@@ -232,6 +282,30 @@ def compute_metrics(
     expectancy_se, expectancy_ci = _bootstrap_expectancy_ci(trades, config.random_seed)
 
     top3_share, max_symbol_share, max_sector_share = _concentration(trades)
+
+    # ADR-0007 Decision 3(c): significance is a count floor AND a statistical
+    # test, both evaluated here rather than left for a caller to opt into --
+    # the same "attach it inside compute_metrics, not on request" principle
+    # already used for `warnings` below. A trade count above the floor only
+    # proves there is enough data to ask whether the edge is real; the
+    # bootstrap CI on expectancy is what actually answers that question.
+    count_floor_met = trade_count >= config.min_trades_for_validation
+    edge_distinguishable_from_zero = bool(trades) and not (
+        expectancy_ci.low <= 0.0 <= expectancy_ci.high
+    )
+    is_statistically_significant = count_floor_met and edge_distinguishable_from_zero
+    if not count_floor_met:
+        significance_reason = (
+            f"trade_count_below_floor: {trade_count} completed trade(s), below the "
+            f"{config.min_trades_for_validation}-trade minimum"
+        )
+    elif not edge_distinguishable_from_zero:
+        significance_reason = (
+            "expectancy_ci_includes_zero: the 95% bootstrap interval for per-trade "
+            "expectancy spans zero, so this sample cannot yet rule out 'no edge at all'"
+        )
+    else:
+        significance_reason = None
 
     metrics = PerformanceMetrics(
         trade_count=trade_count,
@@ -270,6 +344,9 @@ def compute_metrics(
         top3_profit_share_pct=top3_share,
         max_symbol_profit_share_pct=max_symbol_share,
         max_sector_profit_share_pct=max_sector_share,
+        is_statistically_significant=is_statistically_significant,
+        significance_reason=significance_reason,
+        unavailable_reasons=unavailable_reasons,
     )
     # Attach the caveats here rather than leaving it to each caller. A warning
     # that depends on every consumer remembering to ask for it is a warning
@@ -281,8 +358,6 @@ def compute_metrics(
 
 def _gross_vs_net(
     trades: Sequence[Trade],
-    gross_profit: float,
-    gross_loss: float,
     net_expectancy: float,
     net_profit_factor: float,
 ) -> GrossNetMetrics:
@@ -321,11 +396,24 @@ def _gross_vs_net(
 
 
 def _equity_curve_metrics(
-    equity_curve: Sequence[EquityPointLike], config: BacktestConfig
-) -> tuple[float, float, float, int, float, float, float]:
-    """Return (total_return_pct, annualised_pct, max_dd_pct, max_dd_days, sharpe, sortino, calmar)."""
+    equity_curve: Sequence[EquityPointLike],
+    config: BacktestConfig,
+    min_return_observations: int,
+) -> tuple[float, float, float, int, float | None, float | None, float | None, dict[str, str]]:
+    """Return (total_return_pct, annualised_pct, max_dd_pct, max_dd_days, sharpe, sortino, calmar, unavailable_reasons).
+
+    ``sharpe``/``sortino``/``calmar`` are ``None`` -- never 0.0, ``inf`` or NaN
+    standing in for "unmeasurable" -- whenever the sample is too small or has
+    ~zero variance/drawdown to support the ratio; ``unavailable_reasons``
+    explains why, keyed by field name. See ADR-0007 Decision 3(a).
+    """
     if len(equity_curve) < 2:
-        return 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0
+        reason = "no_equity_curve: fewer than 2 marks to derive a return from"
+        return 0.0, 0.0, 0.0, 0, None, None, None, {
+            "sharpe": reason,
+            "sortino": reason,
+            "calmar": reason,
+        }
 
     equities = np.array([p.equity for p in equity_curve], dtype=float)
     initial, final = equities[0], equities[-1]
@@ -344,12 +432,46 @@ def _equity_curve_metrics(
     daily_returns = np.diff(equities) / np.where(equities[:-1] != 0, equities[:-1], np.nan)
     daily_returns = daily_returns[~np.isnan(daily_returns)]
     rf_daily = config.risk_free_rate_annual / trading_days
-    sharpe = _sharpe_ratio(daily_returns, rf_daily, trading_days)
-    sortino = _sortino_ratio(daily_returns, rf_daily, trading_days)
-    calmar = (
-        (annualised_return_pct / 100.0) / (max_dd_pct / 100.0) if max_dd_pct > 0 else math.inf
+
+    unavailable: dict[str, str] = {}
+    sharpe, sharpe_reason = _sharpe_ratio(daily_returns, rf_daily, trading_days, min_return_observations)
+    if sharpe_reason is not None:
+        unavailable["sharpe"] = sharpe_reason
+    sortino, sortino_reason = _sortino_ratio(
+        daily_returns, rf_daily, trading_days, min_return_observations
     )
-    return total_return_pct, annualised_return_pct, max_dd_pct, max_dd_days, sharpe, sortino, calmar
+    if sortino_reason is not None:
+        unavailable["sortino"] = sortino_reason
+
+    if daily_returns.size < min_return_observations:
+        calmar = None
+        unavailable["calmar"] = (
+            f"insufficient_sample: {daily_returns.size} return observation(s), below the "
+            f"{min_return_observations}-observation floor"
+        )
+    elif max_dd_pct < _ZERO_VARIANCE_FLOOR:
+        # No measurable drawdown to divide by. The old behaviour (math.inf)
+        # read as "infinitely good", which is exactly backwards for a ratio
+        # that is actually undefined here -- there is no evidence about how
+        # the strategy behaves in a drawdown at all.
+        calmar = None
+        unavailable["calmar"] = (
+            f"no_drawdown: max drawdown {max_dd_pct:.2e}% is ~zero, so annual-return / "
+            "drawdown is undefined rather than meaningfully infinite"
+        )
+    else:
+        calmar = (annualised_return_pct / 100.0) / (max_dd_pct / 100.0)
+
+    return (
+        total_return_pct,
+        annualised_return_pct,
+        max_dd_pct,
+        max_dd_days,
+        sharpe,
+        sortino,
+        calmar,
+        unavailable,
+    )
 
 
 def _max_drawdown_duration(equities: np.ndarray) -> int:
@@ -367,27 +489,65 @@ def _max_drawdown_duration(equities: np.ndarray) -> int:
     return longest
 
 
-def _sharpe_ratio(daily_returns: np.ndarray, rf_daily: float, trading_days: int) -> float:
-    if daily_returns.size < 2:
-        return 0.0
+def _sharpe_ratio(
+    daily_returns: np.ndarray, rf_daily: float, trading_days: int, min_observations: int
+) -> tuple[float | None, str | None]:
+    """Annualised Sharpe ratio, or ``(None, reason)`` if the sample can't support one.
+
+    Guard shape adopted from ROT `backtest/metrics.py::compute_sharpe_ratio`
+    (lines 48-68, MIT licensed): None below a return-observation floor or
+    below a near-zero-stdev floor, rather than a numeric fallback. The
+    formula itself (mean excess return / stdev, annualised by sqrt(trading
+    days)) is unchanged from this module's prior implementation.
+    """
+    n = daily_returns.size
+    if n < min_observations:
+        return None, (
+            f"insufficient_sample: {n} return observation(s), below the "
+            f"{min_observations}-observation floor"
+        )
     excess = daily_returns - rf_daily
     std = float(np.std(excess, ddof=1))
-    if std == 0:
-        return 0.0
-    return float(np.mean(excess) / std * math.sqrt(trading_days))
+    if std < _ZERO_VARIANCE_FLOOR:
+        return None, (
+            f"zero_variance: return stdev {std:.2e} is below the "
+            f"{_ZERO_VARIANCE_FLOOR:.0e} floor"
+        )
+    return float(np.mean(excess) / std * math.sqrt(trading_days)), None
 
 
-def _sortino_ratio(daily_returns: np.ndarray, rf_daily: float, trading_days: int) -> float:
-    if daily_returns.size < 2:
-        return 0.0
+def _sortino_ratio(
+    daily_returns: np.ndarray, rf_daily: float, trading_days: int, min_observations: int
+) -> tuple[float | None, str | None]:
+    """Annualised Sortino ratio (downside deviation only), or ``(None, reason)``.
+
+    Same guard shape as ``_sharpe_ratio`` (see ROT `backtest/metrics.py::
+    compute_sortino_ratio`, lines 71-95, MIT licensed). Previously a downside
+    sample too thin to estimate a deviation from returned 0.0 or ``math.inf``
+    depending on the sign of the mean excess return; both were numeric
+    fallbacks standing in for "cannot be estimated", which is exactly what
+    ADR-0007 Decision 3(a) rules out.
+    """
+    n = daily_returns.size
+    if n < min_observations:
+        return None, (
+            f"insufficient_sample: {n} return observation(s), below the "
+            f"{min_observations}-observation floor"
+        )
     excess = daily_returns - rf_daily
     downside = excess[excess < 0]
     if downside.size < 2:
-        return 0.0 if np.mean(excess) <= 0 else math.inf
+        return None, (
+            f"insufficient_downside_sample: only {downside.size} negative-return period(s), "
+            "too few to estimate a downside deviation"
+        )
     downside_dev = float(np.std(downside, ddof=1))
-    if downside_dev == 0:
-        return 0.0
-    return float(np.mean(excess) / downside_dev * math.sqrt(trading_days))
+    if downside_dev < _ZERO_VARIANCE_FLOOR:
+        return None, (
+            f"zero_variance: downside deviation {downside_dev:.2e} is below the "
+            f"{_ZERO_VARIANCE_FLOOR:.0e} floor"
+        )
+    return float(np.mean(excess) / downside_dev * math.sqrt(trading_days)), None
 
 
 def _turnover(trades: Sequence[Trade], initial_capital: float) -> float:
@@ -482,6 +642,16 @@ def _concentration(trades: Sequence[Trade]) -> tuple[float, float, float]:
 def validation_warnings(metrics: PerformanceMetrics, config: BacktestConfig) -> list[str]:
     """Plain-language warnings a reader must see before trusting the headline number."""
     warnings: list[str] = []
+
+    # ADR-0007 Decision 3(c): an explicit, greppable marker -- distinct from
+    # the softer "only N trades" wording below -- so a reader (or a test)
+    # never has to infer significance from the trade count alone.
+    if not metrics.is_statistically_significant:
+        warnings.append(
+            f"NOT STATISTICALLY SIGNIFICANT: {metrics.significance_reason}. Every ratio and "
+            "point estimate above should be read as directional only, not as evidence of a "
+            "durable edge."
+        )
 
     if metrics.trade_count < config.min_trades_for_validation:
         warnings.append(
@@ -627,7 +797,7 @@ SEGMENT_DIMENSIONS: tuple[str, ...] = (
 
 def segment_metrics(
     trades: Sequence[Trade],
-    equity_curve: Sequence[EquityPointLike],
+    equity_curve: Sequence[EquityPointLike],  # noqa: ARG001 -- kept for API symmetry; see docstring
     config: BacktestConfig,
     dimension: str,
     *,
