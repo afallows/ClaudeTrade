@@ -161,7 +161,12 @@ class RedditConfig(BaseModel):
     which case the pipeline continues without this source rather than failing.
     """
 
-    enabled: bool = False
+    #: On by default pointing at the *synthetic* generator, so a fresh install
+    #: exercises the whole sentiment pipeline with no credentials and no
+    #: network. Set ``provider = "reddit"`` and store credentials to go live;
+    #: if those credentials do not resolve the source disables itself cleanly
+    #: rather than failing the run.
+    enabled: bool = True
     provider: str = "synthetic"
     client_id_credential: str = "reddit_client_id"
     client_secret_credential: str = "reddit_client_secret"

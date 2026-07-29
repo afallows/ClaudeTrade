@@ -42,6 +42,7 @@ from claudetrade.domain import (
 )
 from claudetrade.logging_setup import get_logger
 from claudetrade.providers.base import ProviderError
+from claudetrade.sentiment.entity_resolution import TickerResolver
 from claudetrade.utils.timeutils import ensure_utc, utc_now
 
 log = get_logger(__name__)
@@ -471,6 +472,35 @@ class DataIngestor:
                     )
                     report.mentions_inserted += 1
 
+    def resolve_and_persist_mentions(
+        self,
+        posts: list[SocialPost],
+        directory: dict[str, SecurityInfo],
+        report: IngestReport,
+    ) -> None:
+        """Resolve ticker mentions for ``posts`` and store the confident ones.
+
+        Without this step posts land in the database with nothing linking them
+        to a symbol, so sentiment aggregation finds no rows and the whole
+        social half of the signal engine silently contributes nothing. Only
+        mentions at or above the configured confidence floor are stored --
+        below it, a "mention" is just a word that happens to look like a
+        ticker.
+        """
+        if not posts or not directory:
+            return
+
+        resolver = TickerResolver(directory)
+        floor = self.config.sentiment.min_ticker_confidence
+        mentions_by_post: dict[str, list] = {}
+        for post in posts:
+            mentions = resolver.resolve_filtered(post, floor)
+            if mentions:
+                mentions_by_post[post.external_id] = mentions
+
+        if mentions_by_post:
+            self.persist_mentions(mentions_by_post, report)
+
     # --- orchestration ---------------------------------------------------------
 
     def run_full_refresh(
@@ -501,7 +531,10 @@ class DataIngestor:
             else:
                 since = dt.datetime.combine(start, dt.time.min, tzinfo=dt.UTC)
                 until = dt.datetime.combine(end, dt.time.max, tzinfo=dt.UTC)
-            self.ingest_social(since=since, until=until, symbols=symbols, report=report)
+            posts = self.ingest_social(
+                since=since, until=until, symbols=symbols, report=report
+            )
+            self.resolve_and_persist_mentions(posts, reference, report)
 
         self.checker.persist(report.quality)
         report.finished_at = utc_now()
