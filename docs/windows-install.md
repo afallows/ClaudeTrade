@@ -9,7 +9,7 @@ that's a documentation bug; check [docs/troubleshooting.md](troubleshooting.md) 
 **Everything in this guide works fully offline, with zero credentials, on
 synthetic (fabricated) data.** That is the application's default configuration —
 nothing here talks to the internet or requires an account unless you deliberately
-turn on a live data source in [Step 7](#step-7-optional-turn-on-real-data-reddit-and-stooq).
+turn on a live data source in [Step 7](#step-7-optional-turn-on-real-data-with-reddit-and-stooq).
 
 ---
 
@@ -166,11 +166,11 @@ Reddit needs a free script app (client id + secret); X search needs a paid tier.
 On a machine behind a corporate firewall or proxy, some rows may say `BLOCKED`
 instead of `reachable` — that's expected and does not stop the rest of this
 guide from working, because the default configuration doesn't need any of these
-hosts (see [Step 7](#step-7-optional-turn-on-real-data-reddit-and-stooq)). If
+hosts (see [Step 7](#step-7-optional-turn-on-real-data-with-reddit-and-stooq)). If
 you do need one of them reachable, see
 [docs/troubleshooting.md](troubleshooting.md#corporate-proxy--tls-interception).
 
-## Step 7 (optional): Turn on real data — Reddit and Stooq
+## Step 7 (optional): Turn on real data with Reddit and Stooq
 
 Skip this section entirely for a first trial — everything downstream works on
 synthetic data with `provider = "synthetic"` (the default for market data,
