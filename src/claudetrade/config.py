@@ -1,0 +1,656 @@
+"""Typed application configuration.
+
+Configuration comes from three layers, later layers winning:
+
+1. Defaults defined here (safe, conservative, offline-capable).
+2. A TOML file -- ``config.toml`` in the app directory, or ``$CLAUDETRADE_CONFIG``.
+3. Environment variables, prefixed ``CLAUDETRADE_`` with ``__`` as the nesting
+   separator (e.g. ``CLAUDETRADE_RISK__MAX_RISK_PER_TRADE_PCT=0.5``).
+
+**Secrets never live here.** API keys are resolved at call time through
+``claudetrade.secrets``; the config only records *which* named credential to
+look up. That keeps ``config.toml`` safe to commit or share.
+
+``AppConfig.config_hash`` is a canonical digest of the effective configuration
+and is stamped onto every signal and backtest run so results are reproducible.
+"""
+
+from __future__ import annotations
+
+import os
+import tomllib
+from pathlib import Path
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from claudetrade.utils.hashing import content_hash
+
+ENV_PREFIX = "CLAUDETRADE_"
+DEFAULT_APP_DIRNAME = ".claudetrade"
+
+
+def default_app_dir() -> Path:
+    """Per-user application directory.
+
+    On Windows this resolves under ``%LOCALAPPDATA%``; elsewhere under
+    ``$XDG_DATA_HOME`` or ``~/.claudetrade``.
+    """
+    override = os.environ.get(f"{ENV_PREFIX}HOME")
+    if override:
+        return Path(override).expanduser()
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return Path(base) / "ClaudeTrade"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg) / "claudetrade"
+    return Path.home() / DEFAULT_APP_DIRNAME
+
+
+# --------------------------------------------------------------------------
+# Sub-configurations
+# --------------------------------------------------------------------------
+
+
+class PathsConfig(BaseModel):
+    """Filesystem locations. Relative paths resolve under ``app_dir``."""
+
+    app_dir: Path = Field(default_factory=default_app_dir)
+    data_dir: Path = Path("data")
+    logs_dir: Path = Path("logs")
+    exports_dir: Path = Path("exports")
+    backups_dir: Path = Path("backups")
+    cache_dir: Path = Path("cache")
+    snapshots_dir: Path = Path("snapshots")
+
+    def resolve(self, which: str) -> Path:
+        """Absolute path for a named directory, created on demand."""
+        value: Path = getattr(self, which)
+        path = value if value.is_absolute() else self.app_dir / value
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+
+class DatabaseConfig(BaseModel):
+    """Database location and engine behaviour.
+
+    SQLite is the default local store. The schema and all queries are written
+    through the SQLAlchemy ORM with no SQLite-specific SQL, so migrating to
+    PostgreSQL is a URL change plus a data copy (see ADR-0003).
+    """
+
+    url: str | None = None
+    filename: str = "claudetrade.db"
+    echo: bool = False
+    #: SQLite pragma: WAL improves concurrent read/write from the UI + scheduler.
+    sqlite_wal: bool = True
+    busy_timeout_ms: int = 10_000
+    pool_size: int = 5
+
+    def effective_url(self, paths: PathsConfig) -> str:
+        """Return the SQLAlchemy URL, defaulting to a file under ``data_dir``."""
+        if self.url:
+            return self.url
+        db_path = paths.resolve("data_dir") / self.filename
+        return f"sqlite+pysqlite:///{db_path}"
+
+
+class LoggingConfig(BaseModel):
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    json_format: bool = True
+    console: bool = True
+    rotate_max_bytes: int = 10 * 1024 * 1024
+    rotate_backup_count: int = 10
+    filename: str = "claudetrade.log"
+    audit_filename: str = "audit.log"
+
+
+class MarketDataConfig(BaseModel):
+    """Market-data provider selection.
+
+    ``provider`` names an adapter registered in
+    ``claudetrade.providers.registry``. ``fallbacks`` are tried in order when
+    the primary fails or lacks a symbol, which is what keeps the app running in
+    reduced-capability mode.
+    """
+
+    provider: str = "synthetic"
+    fallbacks: list[str] = Field(default_factory=lambda: ["csv"])
+    credential: str | None = None
+    csv_dir: Path | None = None
+    #: Bars older than this are flagged stale by the data-quality checks.
+    stale_after_hours: float = 30.0
+    max_symbols_per_request: int = 100
+    request_timeout_s: float = 20.0
+    rate_limit_per_minute: int = 60
+    benchmark_symbol: str = "SPY"
+    #: Sector ETF proxies used for relative-strength comparisons.
+    sector_etfs: dict[str, str] = Field(
+        default_factory=lambda: {
+            "Technology": "XLK",
+            "Health Care": "XLV",
+            "Financials": "XLF",
+            "Consumer Discretionary": "XLY",
+            "Consumer Staples": "XLP",
+            "Energy": "XLE",
+            "Industrials": "XLI",
+            "Materials": "XLB",
+            "Utilities": "XLU",
+            "Real Estate": "XLRE",
+            "Communication Services": "XLC",
+        }
+    )
+
+
+class EarningsConfig(BaseModel):
+    provider: str = "synthetic"
+    fallbacks: list[str] = Field(default_factory=lambda: ["csv"])
+    credential: str | None = None
+    csv_path: Path | None = None
+    #: Treat an unconfirmed (estimated) date as if it were N days wide.
+    estimated_date_uncertainty_days: int = 3
+    request_timeout_s: float = 20.0
+
+
+class RedditConfig(BaseModel):
+    """Authorised Reddit access.
+
+    Uses the official OAuth API only. Disabled unless credentials resolve, in
+    which case the pipeline continues without this source rather than failing.
+    """
+
+    enabled: bool = False
+    provider: str = "synthetic"
+    client_id_credential: str = "reddit_client_id"
+    client_secret_credential: str = "reddit_client_secret"
+    user_agent: str = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
+    subreddits: list[str] = Field(
+        default_factory=lambda: [
+            "stocks",
+            "investing",
+            "StockMarket",
+            "SecurityAnalysis",
+            "options",
+            "swingtrading",
+        ]
+    )
+    posts_per_subreddit: int = 100
+    comments_per_post: int = 50
+    lookback_hours: int = 72
+    #: Official API guidance for OAuth clients; kept conservative on purpose.
+    rate_limit_per_minute: int = 60
+    request_timeout_s: float = 20.0
+    #: Store only salted author digests, never usernames.
+    store_author_names: bool = False
+
+
+class XConfig(BaseModel):
+    """Authorised X (Twitter) access.
+
+    Requires a paid API tier for any meaningful search volume. When no
+    credential is configured the source is disabled cleanly and the remaining
+    sources continue to operate.
+    """
+
+    enabled: bool = False
+    provider: str = "synthetic"
+    bearer_credential: str = "x_bearer_token"
+    query_terms: list[str] = Field(default_factory=list)
+    max_results_per_query: int = 100
+    lookback_hours: int = 48
+    rate_limit_per_minute: int = 15
+    request_timeout_s: float = 20.0
+    store_author_names: bool = False
+
+
+class AIConfig(BaseModel):
+    """Optional LLM assistance.
+
+    The system is fully functional with ``provider = "null"``: sentiment falls
+    back to the deterministic rule ensemble and theses are template-generated.
+    AI output can never relax a risk control.
+    """
+
+    provider: Literal["null", "openai", "anthropic"] = "null"
+    model: str = "claude-sonnet-5"
+    api_key_credential: str = "anthropic_api_key"
+    base_url: str | None = None
+    max_output_tokens: int = 900
+    temperature: float = 0.0
+    request_timeout_s: float = 45.0
+    max_calls_per_run: int = 250
+    daily_cost_limit_usd: float = 5.0
+    cache_enabled: bool = True
+    cache_ttl_hours: int = 168
+    #: Posts scoring above this on the injection heuristic are never sent to AI.
+    injection_block_threshold: float = 0.4
+    #: Batch size for classification requests.
+    batch_size: int = 12
+    prompt_version: str = "v1"
+    #: Per-1M-token prices used only for local cost accounting; update to match
+    #: the provider's current published pricing.
+    input_cost_per_mtok_usd: float = 3.0
+    output_cost_per_mtok_usd: float = 15.0
+
+
+class UniverseConfig(BaseModel):
+    """Which securities are eligible to be scanned at all."""
+
+    source: Literal["database", "csv", "static"] = "database"
+    csv_path: Path | None = None
+    static_symbols: list[str] = Field(default_factory=list)
+    permitted_exchanges: list[str] = Field(default_factory=lambda: ["NYSE", "NASDAQ", "AMEX"])
+    max_symbols: int = 2000
+    include_etfs: bool = False
+
+
+class FilterConfig(BaseModel):
+    """Candidate filters. Defaults deliberately exclude illiquid and
+    pump-and-dump-prone names."""
+
+    min_price: float = 5.0
+    max_price: float = 1000.0
+    min_market_cap_usd: float = 500_000_000
+    min_avg_dollar_volume_usd: float = 10_000_000
+    max_bid_ask_spread_pct: float = 0.5
+    exclude_penny_stocks: bool = True
+    exclude_leveraged_inverse_etfs: bool = True
+    exclude_binary_event_sectors: bool = False
+    binary_event_sectors: list[str] = Field(default_factory=lambda: ["Biotechnology"])
+
+    min_unique_authors: int = 5
+    min_sentiment_confidence: float = 0.35
+    max_manipulation_risk: float = 0.60
+    max_annualised_volatility: float = 1.20
+    min_atr_pct: float = 1.0
+    max_atr_pct: float = 15.0
+
+    #: Earnings guard. The default strategy set does not hold through earnings.
+    min_days_to_earnings: int = 3
+    max_days_to_earnings: int | None = None
+    block_entry_within_days_of_earnings: int = 3
+
+    @field_validator("min_sentiment_confidence", "max_manipulation_risk")
+    @classmethod
+    def _unit_interval(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("must be within [0, 1]")
+        return v
+
+    @model_validator(mode="after")
+    def _price_order(self) -> FilterConfig:
+        if self.max_price <= self.min_price:
+            raise ValueError("max_price must exceed min_price")
+        return self
+
+
+class RiskConfig(BaseModel):
+    """Account and risk limits driving position sizing and portfolio heat."""
+
+    account_size_usd: float = 100_000.0
+    max_risk_per_trade_pct: float = 0.75
+    max_portfolio_heat_pct: float = 6.0
+    max_position_size_pct: float = 15.0
+    max_sector_exposure_pct: float = 35.0
+    max_correlated_exposure_pct: float = 40.0
+    correlation_threshold: float = 0.75
+    max_daily_loss_pct: float = 3.0
+    max_weekly_loss_pct: float = 6.0
+    max_concurrent_positions: int = 8
+    #: Cap participation in a name's average daily volume, to keep simulated
+    #: (and real) fills achievable.
+    max_pct_of_adv: float = 2.0
+    #: Reject a signal whose reward:risk falls below this. This is the primary
+    #: guard against "many tiny wins, few huge losses" win-rate gaming.
+    min_reward_risk_ratio: float = 1.6
+    kill_switch_engaged: bool = False
+
+    @field_validator(
+        "max_risk_per_trade_pct",
+        "max_portfolio_heat_pct",
+        "max_position_size_pct",
+        "max_sector_exposure_pct",
+        "max_correlated_exposure_pct",
+        "max_daily_loss_pct",
+        "max_weekly_loss_pct",
+    )
+    @classmethod
+    def _positive_pct(cls, v: float) -> float:
+        if not 0.0 < v <= 100.0:
+            raise ValueError("percentage must be in (0, 100]")
+        return v
+
+    @model_validator(mode="after")
+    def _heat_covers_trade(self) -> RiskConfig:
+        if self.max_portfolio_heat_pct < self.max_risk_per_trade_pct:
+            raise ValueError("max_portfolio_heat_pct must be >= max_risk_per_trade_pct")
+        return self
+
+
+class CostModelConfig(BaseModel):
+    """Transaction-cost assumptions used identically by backtest and paper trading."""
+
+    commission_per_share: float = 0.0
+    commission_per_trade: float = 0.0
+    commission_min: float = 0.0
+    #: SEC Section 31 fee on sales, per USD of principal (update to current rate).
+    sec_fee_rate: float = 0.0000278
+    #: FINRA Trading Activity Fee on sales, per share, capped per trade.
+    taf_per_share: float = 0.000166
+    taf_max_per_trade: float = 8.30
+    #: Half-spread paid on entry and exit, in basis points of price.
+    half_spread_bps: float = 3.0
+    #: Additional slippage in basis points, scaled by order size vs ADV.
+    base_slippage_bps: float = 2.0
+    impact_coefficient_bps: float = 25.0
+    #: Extra slippage applied when a stop gaps through its trigger.
+    gap_slippage_bps: float = 10.0
+    #: Fraction of a bar's volume that a single order may consume.
+    max_participation_rate: float = 0.05
+    #: Annualised borrow cost applied to short positions.
+    short_borrow_annual_pct: float = 3.0
+    enable_partial_fills: bool = True
+
+
+class SentimentConfig(BaseModel):
+    """Sentiment aggregation behaviour."""
+
+    #: Exponential time decay; a post loses half its weight after this long.
+    half_life_hours: float = 18.0
+    lookback_days: int = 14
+    #: Minimum resolution confidence before a mention is counted at all.
+    min_ticker_confidence: float = 0.60
+    min_posts_for_signal: int = 8
+    min_unique_authors_for_signal: int = 4
+    #: Weight applied to engagement (log-scaled) in weighted sentiment.
+    engagement_weight: float = 0.35
+    credibility_weight: float = 0.35
+    #: Windows (days) used for acceleration measures.
+    fast_window_days: int = 2
+    slow_window_days: int = 10
+    #: Above this share of posts from one author/community, flag concentration.
+    source_concentration_alert: float = 0.40
+    duplicate_ratio_alert: float = 0.35
+    use_ai_classifier: bool = True
+    ai_sample_per_symbol: int = 20
+
+
+class RegimeConfig(BaseModel):
+    """Market-regime classification thresholds."""
+
+    benchmark: str = "SPY"
+    breadth_universe_max: int = 500
+    trend_fast_ma: int = 20
+    trend_slow_ma: int = 50
+    trend_long_ma: int = 200
+    #: Realised-volatility percentile above which the regime is 'high volatility'.
+    high_vol_percentile: float = 0.80
+    low_vol_percentile: float = 0.30
+    vol_lookback_days: int = 252
+    breadth_bullish: float = 0.55
+    breadth_bearish: float = 0.40
+    #: Multipliers applied per regime to sizing and thresholds.
+    risk_off_size_multiplier: float = 0.5
+    high_vol_size_multiplier: float = 0.7
+
+
+class SignalConfig(BaseModel):
+    """Signal generation, scoring and lifecycle."""
+
+    enabled_strategies: list[str] = Field(
+        default_factory=lambda: [
+            "sentiment_breakout",
+            "sentiment_pullback",
+            "capitulation_reversal",
+            "hype_failure_short",
+            "post_earnings_drift",
+        ]
+    )
+    allow_shorts: bool = True
+    min_overall_score: float = 55.0
+    min_confidence: float = 0.45
+    max_candidates: int = 40
+    #: A signal that has not triggered within this many sessions expires.
+    signal_expiry_days: int = 5
+    #: An entry zone is 'extended' once price runs this far past the top of it.
+    extended_threshold_atr: float = 0.75
+    #: Hard cap on holding period. Prevents indefinitely-open losers inflating
+    #: the win/loss ratio by never being classified.
+    max_holding_days: int = 20
+    default_holding_days: int = 10
+    #: Component weights (normalised at use). Sum need not be 1.
+    component_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "technical_setup": 0.20,
+            "price_momentum": 0.12,
+            "volume_confirmation": 0.10,
+            "reddit_sentiment": 0.08,
+            "x_sentiment": 0.05,
+            "sentiment_acceleration": 0.08,
+            "attention_acceleration": 0.05,
+            "catalyst_quality": 0.07,
+            "earnings_risk": 0.08,
+            "liquidity": 0.07,
+            "market_regime": 0.06,
+            "manipulation_risk": 0.04,
+        }
+    )
+
+
+class BacktestConfig(BaseModel):
+    """Backtest engine behaviour and validation gates."""
+
+    initial_capital_usd: float = 100_000.0
+    #: Signals are computed on bar close and may only execute from the next bar.
+    execution_delay_bars: int = 1
+    #: Which price the next-bar order references.
+    entry_reference: Literal["next_open", "next_open_limit", "stop_trigger"] = "next_open_limit"
+    allow_shorts: bool = True
+    #: Minimum completed trades before a strategy is treated as validated.
+    min_trades_for_validation: int = 30
+    #: Warn when a win/loss ratio rests on fewer than this many trades.
+    min_trades_for_confidence: int = 50
+    walk_forward_train_days: int = 504
+    walk_forward_test_days: int = 126
+    walk_forward_step_days: int = 126
+    #: Fraction of the sample reserved as a final untouched out-of-sample block.
+    holdout_fraction: float = 0.25
+    risk_free_rate_annual: float = 0.04
+    trading_days_per_year: int = 252
+    #: Force-close any position still open at the end of the test window so it
+    #: is classified as a win or a loss rather than being quietly dropped.
+    force_close_open_positions: bool = True
+    include_delisted: bool = True
+    random_seed: int = 20240101
+
+
+class NotificationConfig(BaseModel):
+    enabled: bool = False
+    channels: list[Literal["windows", "email", "webhook"]] = Field(default_factory=list)
+    webhook_url_credential: str = "notify_webhook_url"
+    email_to: list[str] = Field(default_factory=list)
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user_credential: str = "smtp_user"
+    smtp_password_credential: str = "smtp_password"
+    smtp_starttls: bool = True
+    #: Suppress a repeat of the same (event, symbol) inside this window.
+    cooldown_minutes: int = 120
+    max_per_hour: int = 20
+    events: list[str] = Field(
+        default_factory=lambda: [
+            "signal_approaching_entry",
+            "entry_triggered",
+            "stop_hit",
+            "target_hit",
+            "earnings_approaching",
+            "sentiment_reversal",
+            "data_source_failure",
+            "risk_limit_breach",
+        ]
+    )
+
+
+class SchedulerConfig(BaseModel):
+    enabled: bool = False
+    timezone: str = "America/New_York"
+    #: Cron-ish schedules; the CLI can also run any job once, on demand.
+    market_data_refresh_cron: str = "30 16 * * mon-fri"
+    social_refresh_cron: str = "0 */4 * * *"
+    scan_cron: str = "45 16 * * mon-fri"
+    paper_mark_cron: str = "5 16 * * mon-fri"
+    misfire_grace_time_s: int = 3600
+
+
+class TradingModeConfig(BaseModel):
+    """Live trading is off by default and requires two explicit opt-ins."""
+
+    mode: Literal["backtest", "paper", "live"] = "paper"
+    #: Must be set to True in config *and* confirmed interactively before any
+    #: broker adapter is permitted to transmit an order.
+    live_trading_authorised: bool = False
+    broker: str | None = None
+    broker_credential: str | None = None
+    #: Immediate halt: blocks all new orders in paper and live modes.
+    kill_switch_engaged: bool = False
+
+    @model_validator(mode="after")
+    def _live_requires_authorisation(self) -> TradingModeConfig:
+        if self.mode == "live" and not self.live_trading_authorised:
+            raise ValueError(
+                "mode='live' requires live_trading_authorised=true and a configured broker. "
+                "Live trading is refused until you explicitly authorise it."
+            )
+        if self.mode == "live" and not self.broker:
+            raise ValueError("mode='live' requires a configured broker adapter")
+        return self
+
+
+class UIConfig(BaseModel):
+    display_timezone: str = "America/New_York"
+    theme: Literal["dark", "light"] = "dark"
+    chart_lookback_days: int = 180
+    table_page_size: int = 50
+    port: int = 8501
+
+
+# --------------------------------------------------------------------------
+# Root configuration
+# --------------------------------------------------------------------------
+
+
+class AppConfig(BaseSettings):
+    """Root configuration object passed explicitly through the application."""
+
+    model_config = SettingsConfigDict(
+        env_prefix=ENV_PREFIX,
+        env_nested_delimiter="__",
+        extra="ignore",
+        validate_assignment=True,
+    )
+
+    profile: str = "default"
+    paths: PathsConfig = Field(default_factory=PathsConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
+    earnings: EarningsConfig = Field(default_factory=EarningsConfig)
+    reddit: RedditConfig = Field(default_factory=RedditConfig)
+    x: XConfig = Field(default_factory=XConfig)
+    ai: AIConfig = Field(default_factory=AIConfig)
+    universe: UniverseConfig = Field(default_factory=UniverseConfig)
+    filters: FilterConfig = Field(default_factory=FilterConfig)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
+    costs: CostModelConfig = Field(default_factory=CostModelConfig)
+    sentiment: SentimentConfig = Field(default_factory=SentimentConfig)
+    regime: RegimeConfig = Field(default_factory=RegimeConfig)
+    signals: SignalConfig = Field(default_factory=SignalConfig)
+    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
+    notifications: NotificationConfig = Field(default_factory=NotificationConfig)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    trading: TradingModeConfig = Field(default_factory=TradingModeConfig)
+    ui: UIConfig = Field(default_factory=UIConfig)
+
+    # --- construction -----------------------------------------------------
+
+    @classmethod
+    def load(cls, path: str | Path | None = None) -> AppConfig:
+        """Load configuration from TOML plus environment overrides.
+
+        Args:
+            path: Explicit config file. Defaults to ``$CLAUDETRADE_CONFIG`` and
+                then ``<app_dir>/config.toml``. A missing file is not an error;
+                built-in defaults run fully offline.
+        """
+        candidate: Path | None = None
+        if path is not None:
+            candidate = Path(path).expanduser()
+        elif os.environ.get(f"{ENV_PREFIX}CONFIG"):
+            candidate = Path(os.environ[f"{ENV_PREFIX}CONFIG"]).expanduser()
+        else:
+            default = default_app_dir() / "config.toml"
+            if default.exists():
+                candidate = default
+
+        file_data: dict[str, Any] = {}
+        if candidate is not None:
+            if not candidate.exists():
+                raise FileNotFoundError(f"configuration file not found: {candidate}")
+            with candidate.open("rb") as fh:
+                file_data = tomllib.load(fh)
+            file_data.pop("secrets", None)  # defensive: never honour secrets in TOML
+
+        return cls(**file_data)
+
+    # --- derived ----------------------------------------------------------
+
+    def public_dict(self) -> dict[str, Any]:
+        """Configuration with no secret-bearing fields, safe to persist or log.
+
+        Credential *names* are retained (they are lookup keys, not secrets);
+        credential *values* are never held on this object in the first place.
+        """
+        return self.model_dump(mode="json", exclude={"paths"})
+
+    @property
+    def config_hash(self) -> str:
+        """Digest of the effective configuration, stamped onto every artefact."""
+        return content_hash(self.public_dict())
+
+    def database_url(self) -> str:
+        return self.database.effective_url(self.paths)
+
+    def describe_enabled_sources(self) -> dict[str, bool]:
+        """Which optional data sources are switched on, for status display."""
+        return {
+            "market_data": True,
+            "earnings": True,
+            "reddit": self.reddit.enabled,
+            "x": self.x.enabled,
+            "ai": self.ai.provider != "null",
+            "notifications": self.notifications.enabled,
+            "scheduler": self.scheduler.enabled,
+        }
+
+
+_CACHED: AppConfig | None = None
+
+
+def get_config(path: str | Path | None = None, *, reload: bool = False) -> AppConfig:
+    """Process-wide configuration accessor.
+
+    Prefer passing ``AppConfig`` explicitly into components (it keeps them
+    testable); this helper exists for entry points -- CLI, UI, scheduler.
+    """
+    global _CACHED
+    if _CACHED is None or reload or path is not None:
+        _CACHED = AppConfig.load(path)
+    return _CACHED
+
+
+def reset_config_cache() -> None:
+    """Clear the cached configuration (used by tests)."""
+    global _CACHED
+    _CACHED = None
