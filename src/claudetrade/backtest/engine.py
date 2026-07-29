@@ -490,9 +490,26 @@ class BacktestEngine:
             queued_orders = new_queued
 
             # --- Queue new entries from today's signals ---
+            # A symbol already has an order working (queued but not yet
+            # filled/expired) whenever it survived the execute-queued-orders
+            # step above into `queued_orders`. Without this check a strategy
+            # that re-proposes the same symbol on a later session (because its
+            # first order hasn't filled or expired yet) would get a *second*
+            # entry order queued for it; if both later filled, the second
+            # `portfolio.open_position()` call would silently overwrite the
+            # first position in `portfolio.positions`, orphaning the first
+            # position's entry cash debit forever (it is never closed, so its
+            # cost basis is never returned to cash) -- the exact defect that
+            # produced a ~$112k equity/trades divergence on a $100k account.
+            # `pending_symbols` is kept in sync as we queue below so two
+            # signals for the same symbol on the *same* session can't both
+            # queue either.
+            pending_symbols = {sym for sym, _ in queued_orders}
             for signal in scan_result.signals:
                 if signal.symbol in portfolio.positions:
                     continue  # Already holding this symbol
+                if signal.symbol in pending_symbols:
+                    continue  # Already have a working (unfilled) entry order
 
                 sizing, limit_check = portfolio.size_and_vet(
                     symbol=signal.symbol,
@@ -537,6 +554,7 @@ class BacktestEngine:
                     queued_session=session,
                 )
                 queued_orders.append((signal.symbol, order))
+                pending_symbols.add(signal.symbol)
                 funnel.orders_queued += 1
                 log.debug(f"  Queued {signal.symbol} {signal.direction.value} entry")
 
