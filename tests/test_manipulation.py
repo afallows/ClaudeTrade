@@ -15,6 +15,7 @@ def make_post(
     author_hash: str = "author1",
     created_at: dt.datetime | None = None,
     score: int = 10,
+    community: str = "stocks",
 ) -> SocialPost:
     """Helper to create posts."""
     if created_at is None:
@@ -27,6 +28,7 @@ def make_post(
         text=text,
         author_hash=author_hash,
         score=score,
+        community=community,
     )
 
 
@@ -83,7 +85,9 @@ class TestOrganicDiscussion:
             post = make_post(
                 f"Interesting analysis point {i}",
                 author_hash=f"author{i}",
-                created_at=dt.datetime(2023, 1, 15, 12, i * 30, tzinfo=dt.UTC),
+                community=["stocks", "investing", "wallstreetbets"][i % 3],
+                created_at=dt.datetime(2023, 1, 15, 12, 0, tzinfo=dt.UTC)
+                + dt.timedelta(minutes=i * 30),
             )
             posts.append(post)
 
@@ -269,6 +273,7 @@ class TestManipulationScoring:
             make_post(
                 f"$TEST analysis {i}: different angle",
                 author_hash=f"author{i}",
+                community=["stocks", "investing", "wallstreetbets"][i % 3],
                 created_at=base_time + dt.timedelta(hours=i),
             )
             for i in range(3)

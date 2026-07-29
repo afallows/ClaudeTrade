@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import replace
 
 import pytest
 
@@ -114,9 +115,7 @@ class TestDifferentSignalSameIdRaises:
         ledger.record(sample_signal)
 
         # Try to record a different signal with the same ID
-        different_signal = Signal(
-            **{**sample_signal.__dict__, "symbol": "OTHER", "direction": Direction.SHORT}
-        )
+        different_signal = replace(sample_signal, symbol="OTHER", direction=Direction.SHORT)
 
         with pytest.raises(LedgerIntegrityError):
             ledger.record(different_signal)
@@ -130,13 +129,11 @@ class TestExpireStale:
         ledger = SignalLedger(tmp_db)
 
         # Create an old signal with an expiry date
-        old_signal = Signal(
-            **{
-                **sample_signal.__dict__,
-                "signal_id": "OLD_SIG",
-                "created_at": dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
-                "expires_after": dt.date(2020, 1, 10),
-            }
+        old_signal = replace(
+            sample_signal,
+            signal_id="OLD_SIG",
+            created_at=dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
+            expires_after=dt.date(2020, 1, 10),
         )
         ledger.record(old_signal)
 

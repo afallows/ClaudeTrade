@@ -58,6 +58,20 @@ def memory_db() -> Database:
 
 
 @pytest.fixture
+def unmigrated_db() -> Database:
+    """In-memory SQLite database with **no** migrations applied.
+
+    Migration tests need a virgin database: they assert that version starts at
+    zero, that the first run reports applied migrations, and that a fresh
+    schema is detected as incomplete. ``memory_db`` has already been migrated,
+    which makes all three vacuously false.
+    """
+    db = Database("sqlite:///:memory:")
+    yield db
+    db.dispose()
+
+
+@pytest.fixture
 def sample_bars() -> list[Bar]:
     """Deterministic list of 100 trading bars.
 

@@ -21,36 +21,36 @@ from claudetrade.db.session import Database
 class TestMigrationsIdempotent:
     """Running migrations twice should be idempotent."""
 
-    def test_init_database_idempotent(self, memory_db: Database):
+    def test_init_database_idempotent(self, unmigrated_db: Database):
         """Applying init_database twice is safe (idempotent)."""
         # First run
-        applied1 = init_database(memory_db)
+        applied1 = init_database(unmigrated_db)
         assert len(applied1) > 0
 
         # Second run
-        applied2 = init_database(memory_db)
+        applied2 = init_database(unmigrated_db)
         assert len(applied2) == 0  # Nothing to apply
 
 
 class TestMigrationsVersioning:
     """Migrations are tracked and never re-applied."""
 
-    def test_current_version_increments(self, memory_db: Database):
+    def test_current_version_increments(self, unmigrated_db: Database):
         """current_version reflects applied migrations."""
-        version1 = current_version(memory_db)
+        version1 = current_version(unmigrated_db)
         assert version1 == 0  # Fresh DB
 
-        migrate(memory_db)
-        version2 = current_version(memory_db)
+        migrate(unmigrated_db)
+        version2 = current_version(unmigrated_db)
         assert version2 > version1
 
-    def test_migrate_to_target(self, memory_db: Database):
+    def test_migrate_to_target(self, unmigrated_db: Database):
         """migrate(target=N) applies up to version N."""
-        migrate(memory_db, target=1)
-        assert current_version(memory_db) == 1
+        migrate(unmigrated_db, target=1)
+        assert current_version(unmigrated_db) == 1
 
         # Requesting target=1 again does nothing
-        applied = migrate(memory_db, target=1)
+        applied = migrate(unmigrated_db, target=1)
         assert len(applied) == 0
 
 
@@ -63,9 +63,9 @@ class TestSchemaVerification:
         missing = verify_schema(memory_db)
         assert len(missing) == 0
 
-    def test_schema_incomplete_fresh_db(self, memory_db: Database):
+    def test_schema_incomplete_fresh_db(self, unmigrated_db: Database):
         """Fresh DB reports missing tables."""
-        missing = verify_schema(memory_db)
+        missing = verify_schema(unmigrated_db)
         # Should report tables that exist in the model but not the DB
         # (since we haven't migrated yet)
         assert len(missing) > 0

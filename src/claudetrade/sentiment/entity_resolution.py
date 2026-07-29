@@ -153,7 +153,16 @@ class TickerResolver:
         self._symbols = set(self.directory.keys())
         self._alias_index = {}
         for symbol, info in self.directory.items():
-            self._index_alias(normalise_company_name(symbol), symbol, "alias")
+            # Registering the symbol as its own alias lets "aapl looks good"
+            # resolve without a cashtag. For an ambiguous common word that is
+            # ruinous: the alias index matches case-insensitively and awards a
+            # flat _ALIAS_BASE, so "I use AI at work" would score 0.80 and
+            # sail past any threshold, completely bypassing the ambiguity
+            # scoring below. Those symbols must go through the bare-symbol
+            # path, which starts them at _BARE_BASE_AMBIGUOUS and makes them
+            # earn confidence from surrounding finance context.
+            if symbol.upper() not in AMBIGUOUS_TICKER_WORDS:
+                self._index_alias(normalise_company_name(symbol), symbol, "alias")
             if info.name:
                 self._index_alias(normalise_company_name(info.name), symbol, "company_name")
             for alias in info.aliases:

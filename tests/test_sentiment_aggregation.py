@@ -16,7 +16,7 @@ def _post(**overrides) -> SocialPost:
     fields = {
         "source": SocialSource.REDDIT,
         "external_id": "t3_test",
-        "created_at": dt.datetime(2024, 6, 3, 15, 0, tzinfo=dt.timezone.utc),
+        "created_at": dt.datetime(2024, 6, 3, 15, 0, tzinfo=dt.UTC),
         "text": "neutral placeholder text",
     }
     fields.update(overrides)

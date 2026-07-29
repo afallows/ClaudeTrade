@@ -185,7 +185,7 @@ class TestSanitizationRoundtrip:
         post = SocialPost(
             source=SocialSource.REDDIT,
             external_id="t3_injection",
-            created_at=dt.datetime(2024, 6, 3, 15, 0, tzinfo=dt.timezone.utc),
+            created_at=dt.datetime(2024, 6, 3, 15, 0, tzinfo=dt.UTC),
             text=dangerous,
         )
         provider = RecordingProvider()
@@ -225,7 +225,7 @@ class TestSanitizationRoundtrip:
         post = SocialPost(
             source=SocialSource.REDDIT,
             external_id="t3_benign",
-            created_at=dt.datetime(2024, 6, 3, 15, 0, tzinfo=dt.timezone.utc),
+            created_at=dt.datetime(2024, 6, 3, 15, 0, tzinfo=dt.UTC),
             text="$AAPL reclaimed the 50-day on strong volume, watching for follow-through",
         )
         provider = CountingProvider()
