@@ -46,6 +46,17 @@ class SizingResult:
     def is_tradable(self) -> bool:
         return self.shares > 0 and not self.rejected
 
+    def reason(self) -> str:
+        """Human-readable explanation of why the size is what it is.
+
+        Joins the rejection reason (when the request was structurally invalid or
+        every cap reduced it to zero) with each cap that reduced the position.
+        This is what the UI shows beneath a signal so a user is never left
+        guessing why a trade is smaller than the headline risk setting implies.
+        """
+        parts = [p for p in (self.rejection_reason, *self.constraints) if p]
+        return "; ".join(parts) if parts else f"sized by {self.binding_constraint}"
+
 
 def size_position(
     *,

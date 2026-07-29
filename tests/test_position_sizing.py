@@ -9,6 +9,21 @@ from claudetrade.domain import Direction
 from claudetrade.risk.sizing import size_position
 
 
+def _unconstrained(config: AppConfig) -> AppConfig:
+    """Set risk limits so the base sizing rule alone decides the size.
+
+    The shipped defaults (0.75% risk, 15% position cap) make the position-value
+    cap bind at exactly the same share count as the risk budget, which would
+    leave these tests unable to tell the two rules apart. Raising both limits
+    isolates the base rule: $100k x 1% = $1,000 risk budget, and a 25% position
+    cap ($25k) that is comfortably clear of the resulting $20k notional.
+    """
+    config.risk.account_size_usd = 100_000.0
+    config.risk.max_risk_per_trade_pct = 1.0
+    config.risk.max_position_size_pct = 25.0
+    return config
+
+
 class TestBaseSizing:
     """Base sizing rule: shares = risk_budget / risk_per_share."""
 
@@ -18,7 +33,7 @@ class TestBaseSizing:
         # Entry 100, stop 95 => risk_per_share = 5
         # Expected shares = floor(1000 / 5) = 200
         result = size_position(
-            config=tmp_app_config,
+            config=_unconstrained(tmp_app_config),
             direction=Direction.LONG,
             entry_price=100.0,
             stop_price=95.0,
@@ -31,7 +46,7 @@ class TestBaseSizing:
     def test_unconstrained_short(self, tmp_app_config: AppConfig):
         """Shares = floor(risk_budget / risk_per_share) for unconstrained short."""
         result = size_position(
-            config=tmp_app_config,
+            config=_unconstrained(tmp_app_config),
             direction=Direction.SHORT,
             entry_price=100.0,
             stop_price=105.0,  # Stop above entry for short
@@ -190,7 +205,7 @@ class TestRiskMultiplier:
     def test_multiplier_scales_down(self, tmp_app_config: AppConfig):
         """risk_multiplier < 1.0 reduces position size."""
         result = size_position(
-            config=tmp_app_config,
+            config=_unconstrained(tmp_app_config),
             direction=Direction.LONG,
             entry_price=100.0,
             stop_price=95.0,
@@ -199,11 +214,12 @@ class TestRiskMultiplier:
         # Base sizing: 200 shares
         # With 0.5 multiplier: 100 shares
         assert result.shares == 100
+        assert result.dollar_risk == 500.0
 
     def test_multiplier_above_one_is_clamped(self, tmp_app_config: AppConfig):
         """risk_multiplier > 1.0 is clamped to 1.0."""
         result = size_position(
-            config=tmp_app_config,
+            config=_unconstrained(tmp_app_config),
             direction=Direction.LONG,
             entry_price=100.0,
             stop_price=95.0,

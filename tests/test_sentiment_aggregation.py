@@ -7,7 +7,20 @@ import math
 
 import pytest
 
-from claudetrade.sentiment.aggregation import time_decay_weight
+from claudetrade.domain import SocialPost, SocialSource
+from claudetrade.sentiment.aggregation import _credibility_score, time_decay_weight
+
+
+def _post(**overrides) -> SocialPost:
+    """Minimal SocialPost for scoring helpers; overrides set the field under test."""
+    fields = {
+        "source": SocialSource.REDDIT,
+        "external_id": "t3_test",
+        "created_at": dt.datetime(2024, 6, 3, 15, 0, tzinfo=dt.timezone.utc),
+        "text": "neutral placeholder text",
+    }
+    fields.update(overrides)
+    return SocialPost(**fields)
 
 
 class TestTimeDecayWeight:
@@ -15,22 +28,22 @@ class TestTimeDecayWeight:
 
     def test_half_life_weight_is_half(self):
         """Weight at half-life hours is exactly 0.5."""
-        result = time_decay_weight(hours_old=18, half_life_hours=18)
+        result = time_decay_weight(age_hours=18, half_life_hours=18)
         assert result == pytest.approx(0.5, abs=1e-6)
 
     def test_recent_post_high_weight(self):
         """Recent posts have weight near 1.0."""
-        result = time_decay_weight(hours_old=1, half_life_hours=18)
+        result = time_decay_weight(age_hours=1, half_life_hours=18)
         assert result > 0.9
 
     def test_old_post_low_weight(self):
         """Old posts have weight near 0.0."""
-        result = time_decay_weight(hours_old=100, half_life_hours=18)
+        result = time_decay_weight(age_hours=100, half_life_hours=18)
         assert result < 0.1
 
     def test_zero_age_weight_is_one(self):
         """Post with zero age has weight 1.0."""
-        result = time_decay_weight(hours_old=0, half_life_hours=18)
+        result = time_decay_weight(age_hours=0, half_life_hours=18)
         assert result == pytest.approx(1.0, abs=1e-6)
 
     def test_decay_is_monotonic(self):
@@ -134,17 +147,24 @@ class TestEngagementWeighting:
         ratio = viral_weight / normal_weight
         assert ratio < 1000 / 10  # Much smaller than linear ratio
 
-    def test_log_scaling_preserves_order(self):
-        """Log scaling preserves ranking but narrows gaps."""
-        engagements = [1, 10, 100, 1000]
-        weights = [math.log1p(e) for e in engagements]
+    def test_log_scaling_compresses_extreme_accounts(self):
+        """Credibility rises with karma but a whale account cannot dominate.
 
-        # Ranking preserved
-        assert weights[0] < weights[1] < weights[2] < weights[3]
-        # But gaps narrowed
-        gaps = [weights[i + 1] - weights[i] for i in range(len(weights) - 1)]
-        # Gaps should decrease
-        assert gaps[0] > gaps[1]  # Gap from 1->10 bigger than 10->100
+        Ranking must be preserved, yet the score is log-scaled and clamped to
+        1.0 so that a 10,000,000-karma account is not 1,000x the weight of a
+        10,000-karma one -- that is what stops a single loud account setting
+        the aggregate sentiment for a symbol.
+        """
+        scores = [
+            _credibility_score(_post(author_karma=k))
+            for k in (0, 100, 10_000, 10_000_000)
+        ]
+
+        # Ranking preserved (non-decreasing), and every score stays in range.
+        assert scores[0] < scores[1] < scores[2]
+        assert all(0.0 <= s <= 1.0 for s in scores)
+        # The 1000x karma jump from 10k to 10M must not yield a 1000x score.
+        assert scores[3] < scores[2] * 1.5
 
 
 class TestUniqueAuthorSentiment:
