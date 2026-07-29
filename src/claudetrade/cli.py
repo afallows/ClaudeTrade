@@ -23,7 +23,7 @@ import datetime as dt
 import json
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 
@@ -31,6 +31,13 @@ from claudetrade.config import AppConfig, get_config
 from claudetrade.logging_setup import setup_logging
 from claudetrade.utils.timeutils import utc_now
 from claudetrade.version import CODE_VERSION, DISCLAIMER, __version__
+
+if TYPE_CHECKING:
+    # Import cost avoided at module load (the backtest package pulls in
+    # numpy/pandas); every command function already imports what it needs
+    # locally. This is annotation-only, erased by `from __future__ import
+    # annotations` above.
+    from claudetrade.backtest.engine import BacktestResult
 
 app = typer.Typer(
     name="claudetrade",
@@ -78,6 +85,30 @@ def _parse_date(value: str | None, default: dt.date) -> dt.date:
         return dt.date.fromisoformat(value)
     except ValueError:
         raise typer.BadParameter(f"expected an ISO date (YYYY-MM-DD), got {value!r}") from None
+
+
+def _render_funnel_report(result: BacktestResult) -> str:
+    """ADR-0007 Decision 3(b): the rejection funnel, as markdown.
+
+    ``backtest.reporting.render_markdown_report`` covers headline metrics and
+    segments; the funnel is rendered here rather than there so a 0-trade run
+    -- where the headline table is mostly zeros -- still has this section, and
+    so it isn't lost if the metrics reconstruction in that module ever
+    changes shape (``PerformanceMetrics(**result.metrics)``, unrelated to the
+    funnel entirely).
+    """
+    lines = ["## Rejection Funnel\n"]
+    if not result.trades:
+        lines.append(
+            "**0 completed trades.** The table below is why -- every "
+            "candidate this run considered is accounted for by exactly one "
+            "row.\n"
+        )
+    lines.append("```")
+    lines.extend(result.funnel.summary_lines())
+    lines.append("```")
+    lines.append("")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -351,12 +382,24 @@ def backtest(
     typer.echo(f"\n{DISCLAIMER}\n")
     typer.echo(render_markdown_report(result))
 
+    # ADR-0007 Decision 3(b): rendered unconditionally, not only on a 0-trade
+    # run -- a healthy run's funnel is what "healthy" looks like, and only
+    # ever showing this table when something went wrong would make it look
+    # like an error report instead of routine accounting.
+    funnel_report = _render_funnel_report(result)
+    typer.echo(funnel_report)
+    if not result.trades:
+        typer.secho(
+            "0 completed trades -- see the Rejection Funnel above for why.",
+            fg=typer.colors.YELLOW,
+        )
+
     if walk_forward:
         typer.echo("\nwalk-forward validation is available via the backtest.walkforward module")
 
     if report:
         report.parent.mkdir(parents=True, exist_ok=True)
-        report.write_text(render_markdown_report(result), encoding="utf-8")
+        report.write_text(render_markdown_report(result) + "\n" + funnel_report, encoding="utf-8")
         typer.echo(f"report written to {report}")
     if export:
         export.mkdir(parents=True, exist_ok=True)

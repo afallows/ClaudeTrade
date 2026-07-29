@@ -329,7 +329,7 @@ class BacktestEngine:
         symbols_with_context: set[str] = set()
 
         log.info(
-            f"Starting backtest {run_id}: {len(sessions)} sessions "
+            f"Starting backtest {run_id} ({label or 'unlabeled'}): {len(sessions)} sessions "
             f"from {sessions[0]} to {sessions[-1]}"
         )
 
@@ -368,14 +368,18 @@ class BacktestEngine:
             funnel.signals_generated += len(scan_result.signals)
 
             # Aggregate why the rest of this session's candidates fell out.
-            # `scan_result.rejected` is the signal engine's own pipeline
-            # (strategy error/invalid proposal, hard gates, score/confidence
-            # threshold, and its own sizing/limits check against the
-            # portfolio snapshot at scan time).
+            # `scan_result.rejected` is the signal engine's own pipeline:
+            # hard gates, the score/confidence threshold, its own sizing/
+            # limits check against the portfolio snapshot at scan time, and
+            # stage "strategy" -- which the signal engine uses for *both* an
+            # unhandled exception/invalid proposal (`SignalEngine.scan()`
+            # drains `Strategy.decline()` itself and folds the reasons in
+            # here, since a decline never produces a proposal to reject
+            # further downstream) *and* every recorded `Strategy.decline()`
+            # reason. The two are distinguished below by the "error: " prefix
+            # `SignalEngine._evaluate_one` puts only on the exception path.
             for rejected_candidate in scan_result.rejected:
-                if rejected_candidate.stage == "strategy":
-                    funnel.strategy_errors += 1
-                elif rejected_candidate.stage == "gates":
+                if rejected_candidate.stage == "gates":
                     funnel.gate_rejected += 1
                 elif rejected_candidate.stage == "score":
                     funnel.score_rejected += 1
@@ -383,12 +387,25 @@ class BacktestEngine:
                     funnel.sizing_zero += 1
                 elif rejected_candidate.stage == "limits":
                     funnel.limits_rejected += 1
+                elif rejected_candidate.stage == "strategy":
+                    for reason_text in rejected_candidate.reasons:
+                        if reason_text.startswith("error: "):
+                            funnel.strategy_errors += 1
+                        else:
+                            # "reason" or "reason: detail" (see
+                            # Strategy.decline) -- the reason code is
+                            # everything before the first ": ".
+                            reason_code = reason_text.split(": ", 1)[0]
+                            by_reason = funnel.strategy_declined.setdefault(
+                                rejected_candidate.strategy, {}
+                            )
+                            by_reason[reason_code] = by_reason.get(reason_code, 0) + 1
 
-            # Strategies record *why* they declined via Strategy.decline(),
-            # independent of the signal engine's own pipeline above (a
-            # decline never becomes a proposal at all, so it never appears in
-            # `scan_result.rejected`). Drained every session so counts don't
-            # accumulate unboundedly in the strategy instance.
+            # Defensive: drain any decline recorded outside a scan() call (a
+            # custom SignalEngine/Strategy wiring, or a future caller that
+            # invokes strategy.evaluate() directly) so nothing here leaks
+            # across sessions uncounted. Under the current SignalEngine this
+            # is always empty -- scan() already drained everything above.
             for strategy in self.signal_engine.strategies:
                 for rejection in strategy.drain_rejections():
                     by_reason = funnel.strategy_declined.setdefault(rejection.strategy, {})
@@ -487,7 +504,15 @@ class BacktestEngine:
                     sector=provider.security(signal.symbol).sector,
                 )
 
+                if not sizing.is_tradable:
+                    # Distinguished from a portfolio-limit breach below: this
+                    # is "the risk budget rounds down to zero shares", not
+                    # "there was room sized, but a limit vetoed it".
+                    funnel.sizing_zero += 1
+                    log.debug(f"  {signal.symbol}: sizing produced zero shares")
+                    continue
                 if not limit_check.allowed:
+                    funnel.limits_rejected += 1
                     log.debug(f"  {signal.symbol}: limit breach: {limit_check.breaches}")
                     continue
 
@@ -512,6 +537,7 @@ class BacktestEngine:
                     queued_session=session,
                 )
                 queued_orders.append((signal.symbol, order))
+                funnel.orders_queued += 1
                 log.debug(f"  Queued {signal.symbol} {signal.direction.value} entry")
 
             # --- Process existing positions: exits, mark-to-market ---
@@ -576,7 +602,17 @@ class BacktestEngine:
                         force_close_reason=ExitReason.END_OF_BACKTEST,
                     )
                     if trade is not None:
-                        portfolio.closed_trades.append(trade)
+                        # NOTE: process_bar_for_position -> _apply_exit_decision
+                        # already appends the completed Trade to
+                        # portfolio.closed_trades internally. A second
+                        # `portfolio.closed_trades.append(trade)` used to sit
+                        # here, silently double-counting every force-closed
+                        # trade (inflating trade_count and corrupting every
+                        # metric derived from it -- exactly the kind of
+                        # "garbage number" ADR-0007 Decision 3 exists to catch,
+                        # here on the input side rather than the metrics
+                        # formula). Caught by the rejection-funnel sanity test
+                        # (entries_filled must equal len(trades)).
                         log.debug(
                             f"  Force-closed {trade.symbol} at end-of-backtest "
                             f"P&L {trade.net_pnl:.0f}"
@@ -586,6 +622,13 @@ class BacktestEngine:
             f"backtest complete but {len(portfolio.positions)} position(s) still open; "
             "force_close_open_positions=true should have closed them"
         )
+
+        # --- Finalise the rejection funnel ---
+        # Anything still in queued_orders survived to the last session without
+        # filling *or* expiring -- distinct from `entries_expired_unfilled`,
+        # which is time-based and independent of when the run happens to end.
+        funnel.entries_carried_to_end += len(queued_orders)
+        funnel.universe_filtered_symbols = len(all_symbols_seen - symbols_with_context)
 
         # --- Compute metrics ---
         metrics_obj = compute_metrics(
@@ -628,10 +671,19 @@ class BacktestEngine:
             metrics=asdict(metrics_obj),
             segment_metrics=all_segment_metrics,
             warnings=warnings_list,
+            funnel=funnel,
             code_version=CODE_VERSION,
             config_hash=config_hash,
             data_snapshot_hash=data_snapshot_hash,
         )
+
+        if not portfolio.closed_trades:
+            # The canary this table exists for (ADR-0007 Decision 3(b)): a
+            # 0-trade run is never left to speak for itself.
+            log.warning(
+                "Backtest produced 0 trades. Rejection funnel: %s",
+                "; ".join(funnel.summary_lines()),
+            )
 
         log.info(
             f"Backtest complete: {len(portfolio.closed_trades)} trades, "
@@ -640,16 +692,15 @@ class BacktestEngine:
 
         return result
 
+    _ENTRY_ORDER_TYPES = {
+        "next_open": "market_on_open",
+        "next_open_limit": "limit",
+        "stop_trigger": "stop_entry",
+    }
+
     def _entry_order_type(self) -> str:
         """Map BacktestConfig.entry_reference to EntryOrderType."""
-        ref = self.backtest_config.entry_reference
-        if ref == "next_open":
-            return "market_on_open"
-        elif ref == "next_open_limit":
-            return "limit"
-        elif ref == "stop_trigger":
-            return "stop_entry"
-        return "market_on_open"
+        return self._ENTRY_ORDER_TYPES.get(self.backtest_config.entry_reference, "market_on_open")
 
 
 __all__ = [
@@ -657,4 +708,5 @@ __all__ = [
     "BacktestResult",
     "ContextProvider",
     "DictContextProvider",
+    "RejectionFunnel",
 ]
