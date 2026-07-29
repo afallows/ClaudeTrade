@@ -271,7 +271,7 @@ check for multiple `config.toml` files or a stray `CLAUDETRADE_CONFIG`/
 `reddit_client_id`, `reddit_client_secret`, `x_bearer_token`,
 `notify_webhook_url`), each showing `yes`/`no` for "configured" and a masked
 tail (`****ab12`) if set — never the real value. If you completed
-[docs/windows-install.md Step 7](windows-install.md#step-7-optional-turn-on-real-data-reddit-and-stooq),
+[docs/windows-install.md Step 7](windows-install.md#step-7-optional-turn-on-real-data-with-reddit-and-stooq),
 `reddit_client_id`/`reddit_client_secret` should show `yes`.
 
 **Fail looks like**: A traceback, or a credential you know you set showing `no`.
