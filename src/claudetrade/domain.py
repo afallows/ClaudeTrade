@@ -114,6 +114,43 @@ class DataQualitySeverity(StrEnum):
     ERROR = "error"
 
 
+class OrderStatus(StrEnum):
+    """Lifecycle of a broker order.
+
+    Closed on purpose: every ``claudetrade.brokers.base.BrokerProvider``
+    implementation -- paper today, a live adapter later -- must report one of
+    these values and nothing else, so callers can reason about "is this order
+    still live?" without knowing which broker placed it. Values match the
+    strings already persisted by the paper broker (``PaperOrderRow.status``:
+    ``"working"`` / ``"filled"``), so this enum documents behaviour that
+    already existed rather than migrating it.
+    """
+
+    NEW = "new"  # constructed, not yet sent to a venue
+    ACCEPTED = "accepted"  # acknowledged by the venue, not yet working
+    WORKING = "working"  # live and eligible to fill
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"  # never became live: risk guard, venue reject, bad request
+    EXPIRED = "expired"  # time in force lapsed unfilled
+    ERROR = "error"  # broker/transport failure; status is unknown, not "safe"
+
+
+#: Orders in one of these states can still fill, be cancelled, or be
+#: modified. Anything else is terminal. Kept as a frozenset (not a property
+#: on the enum) so a caller can test membership without importing the enum
+#: class itself -- ``status in ACTIVE_STATUSES`` reads the same everywhere.
+ACTIVE_STATUSES: frozenset[OrderStatus] = frozenset(
+    {
+        OrderStatus.NEW,
+        OrderStatus.ACCEPTED,
+        OrderStatus.WORKING,
+        OrderStatus.PARTIALLY_FILLED,
+    }
+)
+
+
 # --------------------------------------------------------------------------
 # Market data
 # --------------------------------------------------------------------------
