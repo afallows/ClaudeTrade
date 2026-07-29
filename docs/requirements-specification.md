@@ -58,10 +58,11 @@ This document maps functional and non-functional requirements to their implement
 
 | Requirement | Status | Implementation | Notes |
 |-------------|--------|----------------|-------|
-| Track open positions and fills | Implemented | `src/claudetrade/paper/tracker.py` | Simulated fills using configured cost model |
-| Mark positions to market daily | Implemented | `src/claudetrade/paper/tracker.py` | Equity curve, drawdown tracking |
-| Record trade exits and P&L | Implemented | `src/claudetrade/paper/tracker.py` | Exit reason tracking (stop, target, time, etc.) |
+| Track open positions and fills | Implemented | `src/claudetrade/paper/broker.py` (`PaperBroker.submit_signal`), `src/claudetrade/paper/portfolio.py` | Simulated fills using configured cost model |
+| Mark positions to market daily | Implemented | `src/claudetrade/paper/portfolio.py` | Equity curve, drawdown tracking |
+| Record trade exits and P&L | Implemented | `src/claudetrade/paper/portfolio.py` | Exit reason tracking (stop, target, time, etc.) |
 | Persist paper trading state to database | Implemented | `src/claudetrade/db/models.py` (`PaperTradeRow`) | Read-only historical view |
+| Open a new paper trade from the CLI or UI | **Not implemented** | — | `PaperBroker.submit_signal` exists and is exercised by tests, but no `claudetrade paper` subcommand and no UI screen calls it. `claudetrade paper status/positions/kill-switch` only *inspect* the account (which auto-creates itself with `risk.account_size_usd` on first use) and gate new entries — they cannot open one. |
 
 ### Database and Persistence
 
@@ -163,12 +164,12 @@ This document maps functional and non-functional requirements to their implement
 **`claudetrade.signals.engine`**: Signal ranking, lifecycle, expiry.  
 **`claudetrade.signals.ledger`**: Immutable signal store; append-only revisions.  
 **`claudetrade.sentiment.*.`**: Aggregation, classification, entity resolution, manipulation detection.  
-**`claudetrade.features.builder`**: Technical indicator computation.  
+**`claudetrade.features.feature_builder`**: Technical indicator computation.  
 **`claudetrade.regime.market_regime`**: Market regime classification and sizing multipliers.  
 **`claudetrade.backtest.engine`**: Walk-forward orchestration; strategy replay.  
 **`claudetrade.backtest.execution`**: Fill simulation; cost application.  
 **`claudetrade.backtest.metrics`**: Performance accounting; win/loss ratio; validation warnings.  
-**`claudetrade.paper.tracker`**: Simulated position tracking and P&L.  
+**`claudetrade.paper.portfolio`** / **`claudetrade.paper.broker`**: Simulated position tracking and P&L.  
 **`claudetrade.risk.sizing`**: Position sizing models.  
 **`claudetrade.risk.limits`**: Risk limit enforcement.  
 **`claudetrade.db.models`**: Schema; append-only enforcement.  
@@ -185,12 +186,20 @@ This document maps functional and non-functional requirements to their implement
 
 The following requirements are **not yet implemented** (see [docs/known-limitations.md](known-limitations.md) for details):
 
-- **Live trading**: No broker adapter is present. Live mode is rejected if `live_trading_authorised=true` but no broker is configured.
-- **CLI**: No command-line entry point yet (infrastructure exists; commands not yet defined).
-- **UI**: No Streamlit dashboard yet (optional `streamlit` dependency is listed; code not written).
-- **Scheduler**: APScheduler dependency is included but no background task runners are implemented.
+- **Live trading**: No real broker adapter is present (only the `BrokerProvider` interface
+  and a non-functional `NullLiveBroker` stub, in `src/claudetrade/brokers/`). Live mode is
+  rejected if `live_trading_authorised=true` but no broker is configured.
+- **Scheduler**: APScheduler dependency and `SchedulerConfig` are included but no background
+  task runners are implemented; the config settings are inert.
 - **Machine learning**: Optional `scikit-learn` dependency listed; ML-based signal fusion not implemented.
 - **Options support**: Only equity long/short is modelled.
 - **Intraday execution**: Only daily close prices and next-open fills; no intraday routing.
+- **UI backtest export buttons**: The Streamlit backtesting screen's "Export as CSV/Excel"
+  buttons are placeholders that show a message rather than writing a file. Use
+  `claudetrade backtest --export <dir>` (CLI) instead.
 
-These gaps are intentional: the core is complete and tested; optional features are listed for future development.
+The CLI (`claudetrade`) and the Streamlit UI (`claudetrade ui`) are both implemented —
+see `src/claudetrade/cli.py` and `src/claudetrade/ui/`.
+
+These remaining gaps are intentional: the core is complete and tested; optional features
+are listed for future development.

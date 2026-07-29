@@ -12,33 +12,33 @@ ClaudeTrade is under active development. This roadmap outlines planned features 
 - Market regime classification
 - Risk controls and position sizing
 - SQLite database with PostgreSQL path
+- Full CLI (`claudetrade`: init, status, probe, refresh, scan, backtest, ui,
+  secrets, paper, db, verify — see `src/claudetrade/cli.py`)
+- Streamlit dashboard (`claudetrade ui`; five screens: dashboard, scanner,
+  ticker detail, backtesting, settings)
 
-**Major gaps**: 
-- No CLI (API-only)
-- No UI/dashboard
-- No live trading
+**Major gaps**:
+- No live trading (a `BrokerProvider` interface and a non-functional stub
+  adapter exist in `src/claudetrade/brokers/`; no real venue is wired up)
 - No intraday execution
-- No scheduler integration
+- No scheduler integration (`SchedulerConfig` exists but is not wired to any job runner)
+- The UI's backtest "Export as CSV/Excel" buttons are placeholders (the CLI's
+  `claudetrade backtest --export` works)
+- No CLI/UI command opens a paper trade — `PaperBroker.submit_signal` is
+  implemented and tested but unreachable outside the Python API (see
+  [docs/known-limitations.md](known-limitations.md#opening-a-paper-trade))
 
-## Near-term (v0.2.0, Q2 2024)
+## Near-term
 
-**CLI commands**:
-- `claudetrade refresh` — Fetch latest market, earnings, and social data
-- `claudetrade scan` — Generate signals for today
-- `claudetrade backtest` — Run walk-forward validation on a date range
-- `claudetrade export` — Write signals and trades to CSV/Excel
-- `claudetrade secrets` — Manage credentials
-- `claudetrade validate-config` — Check configuration syntax
+**Remaining CLI/UI gaps**:
+- `claudetrade validate-config` — Check configuration syntax (not implemented)
+- Wire the UI's export buttons to the existing `backtest.reporting.export_csv`/`export_excel`
+- `claudetrade paper submit <symbol>` (or a UI "paper trade this" button) to
+  actually call `PaperBroker.submit_signal`
 
-**Streamlit dashboard** (basic):
-- Live signals table with filtering
-- Trade history view
-- Performance metrics summary
-- Settings panel for quick config changes
+**Effort**: Low (a few hours each)
 
-**Effort**: Medium (40–60 hours)
-
-## Mid-term (v0.3.0, Q4 2024)
+## Mid-term
 
 **Background scheduler**:
 - Scheduled data refreshes (market, social, earnings)
@@ -92,11 +92,11 @@ ClaudeTrade is under active development. This roadmap outlines planned features 
 
 Contributions are welcome. Priority areas:
 
-1. **CLI implementation** (immediate impact; moderate complexity)
-2. **Streamlit UI** (improves usability significantly)
-3. **Broker adapters** (enables live trading for motivated users)
-4. **Additional strategies** (low barrier; high research value)
-5. **Documentation** (always appreciated)
+1. **Broker adapters** (enables live trading for motivated users; the CLI, scan/backtest
+   pipeline and UI are already in place and do not need to change)
+2. **Additional strategies** (low barrier; high research value)
+3. **Background scheduler wiring** (moderate complexity; config already exists)
+4. **Documentation** (always appreciated)
 
 See the project repository for contribution guidelines.
 
@@ -125,10 +125,9 @@ See the project repository for contribution guidelines.
 
 ## Release Schedule
 
-- **v0.1.0**: Q1 2024 (current)
-- **v0.2.0**: Q2 2024 (CLI + basic UI)
-- **v0.3.0**: Q4 2024 (scheduler + live trading)
-- **v1.0.0**: 2025 (production-ready)
+- **v0.1.0**: current — core engine, CLI, and Streamlit UI
+- **v0.2.0**: scheduler wiring + live-trading broker adapter
+- **v1.0.0**: production-ready
 
 Dates are aspirational and may slip. The backlog is public; feature requests and bug reports drive priorities.
 

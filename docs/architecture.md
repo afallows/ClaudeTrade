@@ -266,11 +266,14 @@ The system is written to be portable to PostgreSQL:
 
 To migrate:
 
-```python
+```toml
 # config.toml
 [database]
 url = "postgresql://user:pass@localhost/claudetrade"
-# Then run: python -m claudetrade.db.migrations
+```
+```bash
+# Then run:
+claudetrade db migrate
 ```
 
 Data can be exported from SQLite and imported into PostgreSQL using standard tools.

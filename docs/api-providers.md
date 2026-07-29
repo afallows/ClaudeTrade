@@ -597,7 +597,7 @@ Market data is older than `market_data.stale_after_hours`.
 
 **Solution**:
 
-- Refresh data manually: `python -m claudetrade.pipeline refresh`
+- Refresh data manually: `claudetrade refresh`
 - Check if the provider is delayed
 - Increase `stale_after_hours` if you're okay with older data
 

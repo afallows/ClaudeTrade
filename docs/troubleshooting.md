@@ -20,18 +20,24 @@ Common issues and solutions.
 **Error**: Installing packages in the venv fails.
 
 **Solution**:
-1. Ensure venv is activated: `source .venv/bin/activate` (Linux/macOS) or `.venv\Scripts\activate` (Windows)
+1. Ensure venv is activated: `source .venv/bin/activate` (Linux/macOS) or `.venv\Scripts\activate` (Windows Command Prompt) or `.venv\Scripts\Activate.ps1` (Windows PowerShell)
 2. Verify: Prompt should show `(.venv)` prefix
-3. Retry: `pip install -e .`
+3. Retry: `pip install -r requirements.txt` and `pip install -e .`
 
-### "ModuleNotFoundError: No module named 'claudetrade'"
+### "ModuleNotFoundError: No module named 'claudetrade'" / "'claudetrade' is not recognized"
 
-**Error**: Python cannot find the package.
+**Error**: Python cannot find the package, or the `claudetrade` command doesn't exist.
+
+**Cause**: `pip install -r requirements.txt` installs only the third-party dependencies
+(pandas, streamlit, etc.) — it does **not** install the ClaudeTrade package itself or
+register the `claudetrade` console command. A separate install step is required.
 
 **Solution**:
 1. Ensure venv is activated
-2. Ensure you are in the ClaudeTrade root directory
-3. Reinstall: `pip install -e .`
+2. Ensure you are in the ClaudeTrade root directory (the one containing `pyproject.toml`)
+3. Install the package: `pip install -e .` (editable install; `pip install .` also works
+   for a non-development trial)
+4. Verify: `claudetrade version` should print a version string, not an error
 
 ---
 
@@ -42,9 +48,20 @@ Common issues and solutions.
 **Error**: Application fails to load configuration.
 
 **Solution**:
-1. Copy the example: `cp config.example.toml ~/.claudetrade/config.toml`
-2. Or set the path: `export CLAUDETRADE_CONFIG=/path/to/config.toml`
-3. Verify: `echo $CLAUDETRADE_CONFIG` (Linux/macOS) or `echo %CLAUDETRADE_CONFIG%` (Windows)
+1. A missing config file is not actually an error — `claudetrade` runs on built-in,
+   offline-safe defaults if no `config.toml` exists. This entry only applies if you
+   explicitly point `--config` or `CLAUDETRADE_CONFIG` at a file that isn't there.
+2. Copy the example to the app directory:
+   - macOS/Linux: `mkdir -p ~/.claudetrade && cp config.example.toml ~/.claudetrade/config.toml`
+   - Windows (PowerShell): `New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\ClaudeTrade" | Out-Null; Copy-Item config.example.toml "$env:LOCALAPPDATA\ClaudeTrade\config.toml"`
+3. Or set the path explicitly: `export CLAUDETRADE_CONFIG=/path/to/config.toml` (or `set CLAUDETRADE_CONFIG=...` on Windows)
+4. Verify: `echo $CLAUDETRADE_CONFIG` (Linux/macOS) or `echo %CLAUDETRADE_CONFIG%` (Windows)
+5. **If you copied `config.example.toml`**: delete or comment out the `app_dir = "~/.claudetrade"`
+   line under `[paths]` before saving it to Windows. That value is not `~`-expanded when it
+   comes from the config file, so on Windows it would be treated as a *relative* path (a
+   literal `~` folder under wherever you run the command from) instead of your real home
+   directory. Leaving `app_dir` out of the file lets it fall back to the correct per-OS
+   default (`%LOCALAPPDATA%\ClaudeTrade` on Windows, `~/.claudetrade` on macOS/Linux).
 
 ### "Invalid configuration: unknown section"
 
@@ -130,7 +147,7 @@ CLAUDETRADE_SECRET_ANTHROPIC_API_KEY, or store it with: claudetrade secrets set 
 **Solution**:
 1. Refresh data manually:
    ```bash
-   python -m claudetrade.pipeline refresh
+   claudetrade refresh
    ```
 2. Or increase the staleness threshold:
    ```toml
@@ -195,17 +212,22 @@ CLAUDETRADE_SECRET_ANTHROPIC_API_KEY, or store it with: claudetrade secrets set 
 2. Check the `schema_version` table:
    ```bash
    python -c "
-   from claudetrade.db.session import Database
+   from claudetrade.db.session import get_database
+   from claudetrade.db.models import SchemaVersion
    from claudetrade.config import AppConfig
-   db = Database(AppConfig.load())
-   with db.session() as s:
+   db = get_database(AppConfig.load())
+   with db.read_session() as s:
        print(s.query(SchemaVersion).all())
    "
    ```
-3. If migrations are incomplete, delete and re-init:
+3. If migrations are incomplete, back up, delete and re-init. The database file lives
+   at `<app_dir>/data/claudetrade.db` (`<app_dir>` is `%LOCALAPPDATA%\ClaudeTrade` on
+   Windows, `~/.claudetrade` on macOS/Linux, unless overridden):
    ```bash
-   rm ~/.claudetrade/claudetrade.db
-   python -m claudetrade.db.migrations  # Re-run migrations
+   claudetrade db backup           # keep a copy first
+   rm ~/.claudetrade/data/claudetrade.db      # macOS/Linux
+   # del "%LOCALAPPDATA%\ClaudeTrade\data\claudetrade.db"   # Windows
+   claudetrade init                 # re-create and re-run migrations
    ```
 
 ---
@@ -281,22 +303,126 @@ CLAUDETRADE_SECRET_ANTHROPIC_API_KEY, or store it with: claudetrade secrets set 
 
 ---
 
-## UI and Visualization (When Implemented)
+## UI and Visualization
 
-### "streamlit: port already in use"
+### "streamlit: port already in use" / "port 8501 is in use"
 
-**Error**: Port 8501 is already in use.
+**Error**: `claudetrade ui` fails to bind, or the browser tab shows a connection error.
 
 **Solution**:
 ```bash
-# Change port in config
+# Change the port for one run
+claudetrade ui --port 8502
+
+# Or change it permanently in config.toml
 [ui]
 port = 8502
-
-# Or kill the existing process
-lsof -i :8501  # Find PID
-kill -9 <PID>   # Kill it (macOS/Linux)
 ```
+To find and stop whatever is already using port 8501:
+```bash
+# macOS/Linux
+lsof -i :8501   # find the PID
+kill -9 <PID>
+
+# Windows (PowerShell)
+Get-NetTCPConnection -LocalPort 8501 | Select-Object -ExpandProperty OwningProcess
+Stop-Process -Id <PID> -Force
+```
+
+### UI backtest "Export as CSV/Excel" button does nothing
+
+**Not a bug you can fix locally** — the Streamlit backtesting screen's export buttons
+are placeholders that only show an informational message; they do not write a file
+(see `src/claudetrade/ui/screens/backtesting.py`). Use the CLI instead, which does
+write files:
+```bash
+claudetrade backtest --export ./exports --report ./exports/report.md
+```
+
+---
+
+## Windows-Specific Issues
+
+### "'python' is not recognized as an internal or external command"
+
+**Cause**: Python was installed without adding it to `PATH`, or the terminal was opened
+before the install finished.
+
+**Solution**:
+1. Re-run the Python installer from https://www.python.org/, choose "Modify", and tick
+   **"Add python.exe to PATH"** (or re-run the installer fresh and tick it on the first screen).
+2. Close and reopen the terminal (PATH changes do not apply to already-open windows).
+3. Verify: `py --version` or `python --version` should print 3.11 or higher. On Windows,
+   `py` (the Python launcher) is usually more reliable than `python` if multiple Pythons
+   are installed — use `py -m venv .venv` if plain `python` is not found.
+
+### "running scripts is disabled on this system" (PowerShell execution policy)
+
+**Error**: Activating the venv in PowerShell (`.venv\Scripts\Activate.ps1`) fails with
+`... cannot be loaded because running scripts is disabled on this system.`
+
+**Cause**: PowerShell's default execution policy blocks running local `.ps1` scripts,
+including the venv's own activation script.
+
+**Solution**: Allow locally-created scripts for the current user only (does not require
+admin rights and does not weaken security for scripts downloaded from the internet):
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+Then retry `.venv\Scripts\Activate.ps1`. Alternatively, use `.venv\Scripts\activate.bat`
+from Command Prompt (`cmd.exe`) instead of PowerShell — `.bat` files are not affected by
+this policy.
+
+### Where ClaudeTrade stores its data on Windows
+
+By default (no `app_dir` set in `config.toml` and no `CLAUDETRADE_HOME` set), ClaudeTrade
+stores everything under:
+```
+%LOCALAPPDATA%\ClaudeTrade\
+  data\        # claudetrade.db (SQLite), historical bars, universe cache
+  logs\        # claudetrade.log, audit.log
+  exports\     # CSV/Excel output from `claudetrade backtest --export`
+  backups\     # `claudetrade db backup` snapshots
+  cache\
+  snapshots\
+```
+This resolves via `default_app_dir()` in `src/claudetrade/config.py`, which checks
+`%LOCALAPPDATA%` (falling back to the user profile directory if unset). To see the exact
+paths for your machine, run `claudetrade init` — it prints `data dir:` and `logs dir:`.
+In File Explorer, paste `%LOCALAPPDATA%\ClaudeTrade` into the address bar to open it directly.
+
+**Caveat**: if your `config.toml` sets `app_dir` explicitly (as `config.example.toml`
+does, to `~/.claudetrade`), that value is used literally and is **not** `~`-expanded —
+see the "config.toml not found" entry above. Comment that line out to get the correct
+Windows default.
+
+### Corporate proxy / TLS interception
+
+**Symptoms**: `claudetrade probe` reports hosts as `BLOCKED` with a `proxy refused` or
+`connect failed` note; `claudetrade refresh` degrades with provider failures; `pip install`
+fails to reach PyPI.
+
+**Solution**:
+1. Set the standard proxy environment variables before running any command (PowerShell):
+   ```powershell
+   $env:HTTPS_PROXY = "http://proxy.example.corp:8080"
+   $env:HTTP_PROXY  = "http://proxy.example.corp:8080"
+   ```
+   or in Command Prompt: `set HTTPS_PROXY=http://proxy.example.corp:8080`
+2. If the network uses TLS-inspecting middleboxes, `httpx` (used for all outbound calls)
+   needs the corporate CA certificate trusted. Point Python's certificate bundle at a
+   combined PEM that includes your corporate CA, e.g. via the `SSL_CERT_FILE` environment
+   variable, or ask your IT administrator for the correct certificate bundle path.
+3. Run `claudetrade probe` after each change to confirm whether the fix worked — it
+   distinguishes a blocked network from a missing credential in its output.
+4. If you're in a managed environment where the proxy allow-list is administered
+   centrally, `probe`'s "Hosts to allow-list" line lists exactly which hostnames need
+   adding; this is something only an administrator can grant, not something the app can
+   work around.
+5. If live data sources are unreachable and can't be fixed quickly, the app still works
+   fully offline: leave `market_data.provider = "synthetic"`, `earnings.provider =
+   "synthetic"`, and `reddit.provider = "synthetic"` (the defaults) and continue the trial
+   without a network at all.
 
 ---
 
@@ -311,9 +437,10 @@ level = "DEBUG"
 console = true
 ```
 
-Then check the logs:
+Then check the logs (`<app_dir>/logs/claudetrade.log`):
 ```bash
-tail -f ~/.claudetrade/logs/claudetrade.log
+tail -f ~/.claudetrade/logs/claudetrade.log                        # macOS/Linux
+# Get-Content "$env:LOCALAPPDATA\ClaudeTrade\logs\claudetrade.log" -Wait   # Windows PowerShell
 ```
 
 ### "Check audit log"
@@ -321,13 +448,13 @@ tail -f ~/.claudetrade/logs/claudetrade.log
 **Solution**:
 ```bash
 python -c "
-from claudetrade.db.session import Database
+from claudetrade.db.session import get_database
 from claudetrade.config import AppConfig
 from claudetrade.db.models import AuditLog
 
-db = Database(AppConfig.load())
-with db.session() as s:
-    for row in s.query(AuditLog).order_by(-AuditLog.created_at).limit(10):
+db = get_database(AppConfig.load())
+with db.read_session() as s:
+    for row in s.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(10):
         print(row.action, row.detail, row.created_at)
 "
 ```
