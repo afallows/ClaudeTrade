@@ -345,6 +345,49 @@ class PaperPortfolio:
             if existing is None:
                 session.add(point)
 
+    # --- modification --------------------------------------------------------
+
+    def modify_stop(
+        self,
+        trade_id: str,
+        *,
+        stop_loss: float | None = None,
+        targets: list[float] | None = None,
+    ) -> PaperTradeRow:
+        """Adjust an open position's stop and/or targets.
+
+        Backs ``PaperBroker``'s ``BrokerProvider.modify_order``. Only open
+        trades may be touched -- migration 002's trigger already refuses to
+        rewrite a *closed* trade's outcome/exit fields, so the equivalent
+        guard for a still-open trade only needs to exist here in Python.
+
+        Raises:
+            PaperTradeError: if the trade is unknown or already closed.
+        """
+        with self.db.session() as session:
+            row = session.get(PaperTradeRow, trade_id)
+            if row is None:
+                raise PaperTradeError(f"unknown paper trade {trade_id}")
+            if row.exit_session is not None:
+                raise PaperTradeError(
+                    f"paper trade {trade_id} closed on {row.exit_session}; "
+                    "only open positions can be modified"
+                )
+            if stop_loss is not None:
+                row.stop_loss = stop_loss
+            if targets is not None:
+                row.targets = list(targets)
+            row.updated_at = utc_now()
+        audit_event(
+            "paper_trade_modified", trade_id=trade_id, stop_loss=stop_loss, targets=targets
+        )
+        log.info("modified paper trade %s: stop=%s targets=%s", trade_id, stop_loss, targets)
+        with self.db.read_session() as session:
+            row = session.get(PaperTradeRow, trade_id)
+            if row is None:  # pragma: no cover - just written above
+                raise PaperTradeError(f"unknown paper trade {trade_id}")
+            return row
+
     # --- closing -------------------------------------------------------------
 
     def close_trade(

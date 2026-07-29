@@ -10,6 +10,15 @@ is always False, and there is no code path that transmits an order anywhere. A
 live adapter would be a separate implementation of ``BrokerProvider`` and would
 additionally have to verify ``trading.mode == 'live'`` and
 ``live_trading_authorised`` before doing anything.
+
+``PaperBroker`` also implements ``claudetrade.brokers.base.BrokerProvider``
+(ADR-0007 Decision 4): the ``get_*``/``submit_order``/``cancel_order``/
+``modify_order`` methods below are a thin translation layer over
+``submit_signal``/``portfolio``/``ledger``, added without changing any of
+those methods' behaviour -- the DB-backed fills, MFE/MAE tracking and
+immutability guarantees they provide are pinned by the tests in
+``tests/test_ledger_immutability.py`` and friends and must stay exactly as
+they were.
 """
 
 from __future__ import annotations
@@ -17,11 +26,31 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 
+from sqlalchemy import select
+
 from claudetrade.backtest.costs import CostModel
+from claudetrade.brokers.base import (
+    Balances,
+    BrokerOrder,
+    BrokerOrderError,
+    BrokerProvider,
+    OrderRequest,
+)
 from claudetrade.config import AppConfig
 from claudetrade.db.models import PaperOrderRow, PaperTradeRow
 from claudetrade.db.session import Database
-from claudetrade.domain import Bar, Direction, Signal, SignalStatus
+from claudetrade.domain import (
+    ACTIVE_STATUSES,
+    Bar,
+    Direction,
+    ExitReason,
+    Fill,
+    MarketRegime,
+    OrderStatus,
+    Signal,
+    SignalStatus,
+    Trade,
+)
 from claudetrade.logging_setup import audit_event, get_logger
 from claudetrade.paper.portfolio import PaperPortfolio, PaperTradeError
 from claudetrade.risk.limits import check_new_position
@@ -50,7 +79,7 @@ class PaperOrderResult:
         return not self.accepted
 
 
-class PaperBroker:
+class PaperBroker(BrokerProvider):
     """Simulated execution against a persistent paper account."""
 
     name = "paper"
@@ -400,3 +429,234 @@ class PaperBroker:
             "kill switch engaged; %d positions remain open with their stops in force", open_count
         )
         return open_count
+
+    # --- BrokerProvider: identity --------------------------------------------
+
+    @property
+    def is_paper(self) -> bool:
+        return True
+
+    @property
+    def is_backtesting(self) -> bool:
+        # PaperBroker replays signals against real-time-shaped bars one at a
+        # time, persisting to the database as it goes -- it is not the bulk
+        # historical replay the backtester (claudetrade.backtest) performs.
+        return False
+
+    # --- BrokerProvider: guarded order-affecting surface ----------------------
+
+    def _submit_order(self, request: OrderRequest) -> BrokerOrder:
+        """Translate an ``OrderRequest`` into a ``submit_signal`` call.
+
+        Paper prices a fill against a bar, not against "the market right now",
+        so ``request.next_bar`` is required here even though the ABC leaves it
+        optional for adapters that do not need it.
+        """
+        if request.next_bar is None:
+            raise ValueError(
+                "PaperBroker.submit_order requires OrderRequest.next_bar: a simulated fill "
+                "has to be priced against a specific bar"
+            )
+        result = self.submit_signal(request.signal, next_bar=request.next_bar, marks=request.marks)
+        return self._order_result_to_broker_order(request.signal, request.next_bar, result)
+
+    def _cancel_order(self, order_id: str) -> BrokerOrder:
+        """Cancel an order, if it is still in an active state.
+
+        Paper fills a limit entry synchronously inside ``submit_order``, so in
+        practice every persisted ``PaperOrderRow`` is already terminal
+        (``filled``) by the time a caller could try to cancel it -- this path
+        exists so the contract is correct if a future paper mode ever queues
+        orders instead of filling them immediately.
+        """
+        row = self._get_order_row(order_id)
+        if row is None:
+            raise BrokerOrderError(f"no such paper order: {order_id}")
+        if OrderStatus(row.status) not in ACTIVE_STATUSES:
+            raise BrokerOrderError(
+                f"paper order {order_id} is already {row.status!r} and cannot be cancelled"
+            )
+        with self.db.session() as session:  # pragma: no cover - unreachable today, see above
+            live_row = session.get(PaperOrderRow, order_id)
+            live_row.status = OrderStatus.CANCELLED.value
+        return self._order_row_to_broker_order(self._get_order_row(order_id))
+
+    def _modify_order(
+        self, order_id: str, *, stop_loss: float | None, targets: list[float] | None
+    ) -> BrokerOrder:
+        """Adjust the stop/targets of the position an order opened.
+
+        The stop and targets that matter for risk live on the ``PaperTradeRow``
+        position, not the (already-filled) order row, so this looks up the
+        matching open trade via the order's ``signal_id`` and delegates to
+        ``PaperPortfolio.modify_stop``. The order row's own ``stop_price`` is
+        kept in sync for display purposes only.
+        """
+        order_row = self._get_order_row(order_id)
+        if order_row is None:
+            raise BrokerOrderError(f"no such paper order: {order_id}")
+        trade_row = self._open_trade_for_signal(order_row.signal_id)
+        if trade_row is None:
+            raise BrokerOrderError(
+                f"paper order {order_id} has no open position to modify "
+                "(already closed, or the order never filled)"
+            )
+        self.portfolio.modify_stop(trade_row.trade_id, stop_loss=stop_loss, targets=targets)
+        if stop_loss is not None:
+            with self.db.session() as session:
+                live_row = session.get(PaperOrderRow, order_id)
+                live_row.stop_price = stop_loss
+        return self._order_row_to_broker_order(self._get_order_row(order_id))
+
+    # --- BrokerProvider: read-only surface -------------------------------------
+
+    def get_balances(self) -> Balances:
+        account = self.portfolio.account()
+        state = self.portfolio.portfolio_state({})
+        return Balances(
+            cash=account.cash,
+            equity=account.equity,
+            buying_power=account.cash,
+            realised_pnl_today=state.realised_pnl_today,
+            realised_pnl_week=state.realised_pnl_week,
+            kill_switch_engaged=state.kill_switch_engaged,
+        )
+
+    def get_positions(self) -> list[Trade]:
+        return [self._trade_row_to_trade(row) for row in self.portfolio.open_trades()]
+
+    def get_position(self, symbol: str) -> Trade | None:
+        for row in self.portfolio.open_trades():
+            if row.symbol == symbol:
+                return self._trade_row_to_trade(row)
+        return None
+
+    def get_order(self, order_id: str) -> BrokerOrder | None:
+        row = self._get_order_row(order_id)
+        return self._order_row_to_broker_order(row) if row is not None else None
+
+    def get_open_orders(self) -> list[BrokerOrder]:
+        with self.db.read_session() as session:
+            rows = (
+                session.execute(
+                    select(PaperOrderRow).where(
+                        PaperOrderRow.account_id == self.portfolio.account_id,
+                        PaperOrderRow.status.in_([s.value for s in ACTIVE_STATUSES]),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [self._order_row_to_broker_order(row) for row in rows]
+
+    # --- BrokerProvider: row <-> domain-type translation -----------------------
+
+    def _get_order_row(self, order_id: str) -> PaperOrderRow | None:
+        with self.db.read_session() as session:
+            return session.get(PaperOrderRow, order_id)
+
+    def _open_trade_for_signal(self, signal_id: str | None) -> PaperTradeRow | None:
+        if not signal_id:
+            return None
+        with self.db.read_session() as session:
+            return session.execute(
+                select(PaperTradeRow).where(
+                    PaperTradeRow.account_id == self.portfolio.account_id,
+                    PaperTradeRow.signal_id == signal_id,
+                    PaperTradeRow.exit_session.is_(None),
+                )
+            ).scalar_one_or_none()
+
+    def _order_result_to_broker_order(
+        self, signal: Signal, bar: Bar, result: PaperOrderResult
+    ) -> BrokerOrder:
+        status = OrderStatus.FILLED if result.accepted else OrderStatus.REJECTED
+        fills: list[Fill] = []
+        if result.accepted and result.fill_price is not None:
+            fills.append(Fill(session=bar.session, price=result.fill_price, shares=result.shares))
+        return BrokerOrder(
+            order_id=result.order_id or f"rejected-{signal.signal_id}",
+            symbol=result.symbol or signal.symbol,
+            direction=signal.direction,
+            status=status,
+            requested_shares=signal.plan.shares,
+            filled_shares=result.shares if result.accepted else 0,
+            average_fill_price=result.fill_price,
+            fills=fills,
+            reasons=result.reasons,
+        )
+
+    @staticmethod
+    def _order_row_to_broker_order(row: PaperOrderRow) -> BrokerOrder:
+        direction = Direction.LONG if row.side == "buy" else Direction.SHORT
+        fills: list[Fill] = []
+        if row.filled_quantity:
+            fill_session = (row.filled_at or row.created_at).date()
+            fills.append(
+                Fill(
+                    session=fill_session,
+                    price=row.average_fill_price or 0.0,
+                    shares=row.filled_quantity,
+                    commission=row.commission,
+                    fees=row.fees,
+                    slippage=row.slippage,
+                )
+            )
+        return BrokerOrder(
+            order_id=row.order_id,
+            symbol=row.symbol,
+            direction=direction,
+            status=OrderStatus(row.status),
+            requested_shares=row.quantity,
+            filled_shares=row.filled_quantity,
+            average_fill_price=row.average_fill_price,
+            fills=fills,
+            submitted_at=row.created_at,
+            updated_at=row.filled_at or row.created_at,
+            reasons=[row.reject_reason] if row.reject_reason else [],
+        )
+
+    @staticmethod
+    def _trade_row_to_trade(row: PaperTradeRow) -> Trade:
+        fills = [
+            Fill(
+                session=row.entry_session,
+                price=row.entry_price,
+                shares=row.shares,
+                commission=row.commission_total,
+                fees=row.fees_total,
+            )
+        ]
+        return Trade(
+            trade_id=row.trade_id,
+            signal_id=row.signal_id,
+            symbol=row.symbol,
+            strategy=row.strategy,
+            direction=Direction(row.direction),
+            entry_session=row.entry_session,
+            entry_price=row.entry_price,
+            shares=row.shares,
+            stop_loss=row.stop_loss,
+            targets=list(row.targets or []),
+            exit_session=row.exit_session,
+            exit_price=row.exit_price,
+            exit_reason=ExitReason(row.exit_reason) if row.exit_reason else None,
+            fills=fills,
+            commission_total=row.commission_total,
+            fees_total=row.fees_total,
+            slippage_total=row.slippage_total,
+            borrow_cost_total=row.borrow_cost_total,
+            mfe_pct=row.mfe_pct,
+            mae_pct=row.mae_pct,
+            mfe_r=row.mfe_r,
+            mae_r=row.mae_r,
+            initial_risk_per_share=row.initial_risk_per_share,
+            thesis_intact_at_exit=row.thesis_intact_at_exit,
+            regime_at_entry=MarketRegime(row.regime_at_entry),
+            sector=row.sector,
+            market_cap_bucket=row.market_cap_bucket,
+            days_to_earnings_at_entry=row.days_to_earnings_at_entry,
+            confidence_at_entry=row.confidence_at_entry,
+            sentiment_source=row.sentiment_source,
+            notes=list(row.notes or []),
+        )
