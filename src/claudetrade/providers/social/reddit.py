@@ -154,87 +154,15 @@ class RedditProvider:
                 continue
 
             try:
-                with httpx.Client(timeout=self.config.request_timeout_s) as client:
-                    response = client.get(
-                        f"https://oauth.reddit.com/r/{subreddit}/new",
-                        headers={
-                            "Authorization": f"bearer {self._access_token}",
-                            "User-Agent": self.config.user_agent,
-                        },
-                        params={
-                            "limit": self.config.posts_per_subreddit,
-                            "t": "day",  # Last 24 hours
-                        },
+                posts.extend(
+                    self._fetch_subreddit(
+                        subreddit,
+                        since=since,
+                        remaining=None if limit is None else limit - len(posts),
                     )
-
-                    if response.status_code == 429:
-                        # Respect Retry-After header
-                        retry_after = response.headers.get("Retry-After", "60")
-                        try:
-                            wait_s = float(retry_after)
-                        except (ValueError, TypeError):
-                            wait_s = 60.0
-                        raise RateLimitError(
-                            f"Reddit rate limit for r/{subreddit}",
-                            provider="reddit",
-                            retry_after_s=wait_s,
-                        )
-
-                    response.raise_for_status()
-                    payload = response.json()
-
-                    for item in payload.get("data", {}).get("children", []):
-                        data = item.get("data", {})
-                        post_created_ts = data.get("created_utc", 0)
-                        post_created_at = dt.datetime.fromtimestamp(
-                            post_created_ts, tz=dt.UTC
-                        )
-
-                        # Filter by time window
-                        if post_created_at < since:
-                            continue
-
-                        text = data.get("title", "") + "\n" + data.get("selftext", "")
-                        sanitised = sanitize_social_text(text)
-
-                        author = data.get("author", "")
-                        author_hash = (
-                            pseudonymise(author, salt="reddit") if author and author != "[deleted]"
-                            else ""
-                        )
-
-                        post = SocialPost(
-                            source=SocialSource.REDDIT,
-                            external_id=data.get("id", ""),
-                            created_at=post_created_at,
-                            text=sanitised,
-                            community=f"r/{subreddit}",
-                            score=data.get("score", 0),
-                            num_comments=data.get("num_comments", 0),
-                            num_reposts=0,
-                            num_replies=0,
-                            author_hash=author_hash,
-                            author_age_days=None,
-                            author_karma=None,
-                            author_followers=None,
-                            is_comment=False,
-                            parent_id=None,
-                            is_removed=data.get("removed_by_category") is not None,
-                            is_crosspost=data.get("is_crosspostable", False),
-                            crosspost_parent=data.get("crosspost_parent", None),
-                            text_hash=text_hash(sanitised),
-                            duplicate_group=None,
-                            injection_risk=injection_risk_score(sanitised),
-                            fetched_at=dt.datetime.now(tz=dt.UTC),
-                        )
-                        posts.append(post)
-
-                        if limit is not None and len(posts) >= limit:
-                            break
-
-                    if limit is not None and len(posts) >= limit:
-                        break
-
+                )
+                if limit is not None and len(posts) >= limit:
+                    break
             except RateLimitError:
                 raise
             except Exception as exc:
@@ -246,3 +174,133 @@ class RedditProvider:
             posts = posts[:limit]
 
         return posts
+
+    def _fetch_subreddit(
+        self, subreddit: str, *, since: dt.datetime, remaining: int | None
+    ) -> list[SocialPost]:
+        """Page through ``/r/<sub>/new`` until posts predate ``since``.
+
+        ``/new`` is strictly reverse-chronological, so the first post older
+        than ``since`` means every later one is older too and paging can stop.
+        Without paging, a listing call returns at most 100 items and a busy
+        subreddit would silently drop everything beyond that -- an
+        under-fetch that looks like "quiet day" rather than a data gap.
+        """
+        collected: list[SocialPost] = []
+        after: str | None = None
+        page_size = max(1, min(100, self.config.posts_per_subreddit))
+
+        for _ in range(self.config.max_pages_per_subreddit):
+            if remaining is not None and len(collected) >= remaining:
+                break
+
+            params: dict[str, object] = {"limit": page_size}
+            if after:
+                params["after"] = after
+
+            with httpx.Client(timeout=self.config.request_timeout_s) as client:
+                response = client.get(
+                    f"https://oauth.reddit.com/r/{subreddit}/new",
+                    headers={
+                        "Authorization": f"bearer {self._access_token}",
+                        "User-Agent": self.config.user_agent,
+                    },
+                    params=params,
+                )
+
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After", "60")
+                    try:
+                        wait_s = float(retry_after)
+                    except (ValueError, TypeError):
+                        wait_s = 60.0
+                    raise RateLimitError(
+                        f"Reddit rate limit for r/{subreddit}",
+                        provider="reddit",
+                        retry_after_s=wait_s,
+                    )
+
+                response.raise_for_status()
+                payload = response.json()
+
+            children = payload.get("data", {}).get("children", [])
+            if not children:
+                break
+
+            reached_window_start = False
+            for item in children:
+                data = item.get("data", {})
+                post_created_at = dt.datetime.fromtimestamp(
+                    data.get("created_utc", 0), tz=dt.UTC
+                )
+                if post_created_at < since:
+                    reached_window_start = True
+                    break
+
+                collected.append(self._to_post(data, subreddit, post_created_at))
+                if remaining is not None and len(collected) >= remaining:
+                    break
+
+            if reached_window_start:
+                break
+            after = payload.get("data", {}).get("after")
+            if not after:
+                break
+            self._rate_limiter.acquire()
+
+        return collected
+
+    def _to_post(
+        self, data: dict, subreddit: str, created_at: dt.datetime
+    ) -> SocialPost:
+        """Map one Reddit listing child onto a sanitised ``SocialPost``."""
+        text = data.get("title", "") + "\n" + data.get("selftext", "")
+        sanitised = sanitize_social_text(text)
+        # Score the RAW text. Sanitisation has already rewritten any injection
+        # phrase to "[filtered]", so scoring the sanitised copy always returns
+        # ~0 and the stored risk flag would be permanently blind -- both for
+        # data-quality reporting and for the AI classifier's block, which
+        # consults this value.
+        injection_risk = injection_risk_score(text)
+
+        author = data.get("author", "")
+        author_hash = (
+            pseudonymise(author, salt="reddit") if author and author != "[deleted]" else ""
+        )
+
+        # A crosspost is identified by carrying a parent, NOT by
+        # ``is_crosspostable`` -- that flag means "others are permitted to
+        # crosspost this", which is true of most ordinary posts and would
+        # mislabel nearly the whole corpus as duplicated content.
+        parent_list = data.get("crosspost_parent_list") or []
+        crosspost_parent = data.get("crosspost_parent") or (
+            parent_list[0].get("name") if parent_list else None
+        )
+
+        return SocialPost(
+            source=SocialSource.REDDIT,
+            # Reddit's ``name`` is the fullname ("t3_abc123"), unique across
+            # object types; the bare ``id`` can collide between a post and a
+            # comment, which would silently deduplicate distinct content.
+            external_id=data.get("name") or f"t3_{data.get('id', '')}",
+            created_at=created_at,
+            text=sanitised,
+            community=f"r/{subreddit}",
+            score=data.get("score", 0),
+            num_comments=data.get("num_comments", 0),
+            num_reposts=0,
+            num_replies=0,
+            author_hash=author_hash,
+            author_age_days=None,
+            author_karma=None,
+            author_followers=None,
+            is_comment=False,
+            parent_id=None,
+            is_removed=data.get("removed_by_category") is not None,
+            is_crosspost=crosspost_parent is not None,
+            crosspost_parent=crosspost_parent,
+            text_hash=text_hash(sanitised),
+            duplicate_group=None,
+            injection_risk=injection_risk,
+            fetched_at=dt.datetime.now(tz=dt.UTC),
+        )

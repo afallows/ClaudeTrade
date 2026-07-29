@@ -169,6 +169,11 @@ class XProvider:
 
                         text = tweet.get("text", "")
                         sanitised = sanitize_social_text(text)
+                        # Score the RAW text: sanitisation rewrites injection
+                        # phrases to "[filtered]", so scoring the sanitised
+                        # copy would always return ~0 and leave the stored
+                        # risk flag permanently blind.
+                        injection_risk = injection_risk_score(text)
 
                         author_id = tweet.get("author_id", "")
                         author_user = users_by_id.get(author_id, {})
@@ -201,7 +206,7 @@ class XProvider:
                             crosspost_parent=None,
                             text_hash=text_hash(sanitised),
                             duplicate_group=None,
-                            injection_risk=injection_risk_score(sanitised),
+                            injection_risk=injection_risk,
                             fetched_at=dt.datetime.now(tz=dt.UTC),
                         )
                         posts.append(post)

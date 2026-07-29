@@ -176,7 +176,12 @@ class RedditConfig(BaseModel):
             "swingtrading",
         ]
     )
+    #: Reddit caps a listing page at 100 items, so a busy subreddit needs
+    #: several pages to cover a full lookback window. This bounds how many
+    #: pages one refresh will walk before giving up, keeping a runaway loop
+    #: from burning the whole rate-limit budget on one community.
     posts_per_subreddit: int = 100
+    max_pages_per_subreddit: int = 10
     comments_per_post: int = 50
     lookback_hours: int = 72
     #: Official API guidance for OAuth clients; kept conservative on purpose.
