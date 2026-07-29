@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import datetime as dt
 
-import pytest
-
 from claudetrade.backtest.engine import BacktestEngine, DictContextProvider, RejectionFunnel
 from claudetrade.config import AppConfig, BacktestConfig
 from claudetrade.domain import Bar, Direction, MarketRegime, RegimeState, SecurityInfo
