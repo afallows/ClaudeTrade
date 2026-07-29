@@ -449,6 +449,77 @@ class SignalConfig(BaseModel):
     )
 
 
+class StrategyCalibrationConfig(BaseModel):
+    """Score-accumulation calibration for the five strategies (ADR-0007 Decision 2).
+
+    Strategies in ``src/claudetrade/strategies/`` no longer decline at the
+    first unmet absolute threshold. Each non-veto condition contributes a
+    weighted score component (see ``strategies.scoring_utils.ScoreAccumulator``)
+    and a strategy emits a proposal once its accumulated score clears
+    ``proposal_score_threshold``. A short, strategy-documented list of
+    conditions remain hard vetoes -- earnings window, insufficient history,
+    liquidity, manipulation risk -- because a weighted average is the wrong
+    tool for a disqualifying fact.
+
+    The values below are PERCENTILE LEVELS (0-1) against a symbol's OWN
+    trailing distribution, not bare absolute price/volume/indicator
+    constants: e.g. ``breakout_volume_percentile`` asks "is today's relative
+    volume in the top 30% of this symbol's own trailing 120 sessions?", never
+    "is relative volume above 1.5x". A percentile is comparable across a
+    quiet utility and a volatile small-cap in a way an absolute number is
+    not, and it is what lets the same threshold serve every regime.
+
+    Reversal: raising ``proposal_score_threshold`` toward 100 restores
+    near-AND-gate strictness; a percentile level set to 0.0 or 1.0 removes
+    that condition's ability to move the score.
+    """
+
+    #: Trailing sessions of sentiment history used by the on-the-fly
+    #: ``strategies.scoring_utils.percentile_rank`` helper (sentiment has no
+    #: precomputed feature column, unlike price/volume series -- see
+    #: ``features.feature_builder``'s fixed 120-session window for those).
+    sentiment_percentile_window: int = 90
+
+    #: Minimum accumulated score (0-100, before the engine's 13-component
+    #: blend in ``signals.scoring.score_candidate``) for a strategy to emit a
+    #: proposal at all. This is deliberately a separate, lower-friction gate
+    #: from ``SignalConfig.min_overall_score`` -- that gate applies to the
+    #: engine's blended score across all candidates; this one only decides
+    #: whether the strategy's OWN thesis is worth proposing in the first place.
+    proposal_score_threshold: float = 48.0
+
+    # --- Strategy A: sentiment_breakout -------------------------------------
+    breakout_volume_percentile: float = 0.70
+    breakout_trend_percentile: float = 0.55
+    breakout_sentiment_accel_percentile: float = 0.65
+    breakout_mention_accel_percentile: float = 0.60
+
+    # --- Strategy B: sentiment_pullback --------------------------------------
+    pullback_trend_percentile: float = 0.55
+    #: Down-volume during the pullback should rank LOW among its own history.
+    pullback_quiet_volume_percentile: float = 0.45
+    pullback_rsi_low_percentile: float = 0.25
+    pullback_rsi_high_percentile: float = 0.65
+
+    # --- Strategy C: capitulation_reversal -----------------------------------
+    #: How far below the symbol's own trailing distribution of
+    #: dist_from_sma50_pct today's reading must rank (LOW percentile = most
+    #: stretched below average in its own history).
+    capitulation_extension_percentile: float = 0.20
+    capitulation_oversold_percentile: float = 0.20
+    capitulation_climax_volume_percentile: float = 0.80
+
+    # --- Strategy D: hype_failure_short ---------------------------------------
+    hype_advance_percentile: float = 0.85
+    hype_sentiment_spike_percentile: float = 0.75
+
+    # --- Strategy E: post_earnings_drift ---------------------------------------
+    #: Event-day reaction magnitude percentile against the symbol's own
+    #: trailing |ROC-20| distribution -- a 3% move is a repricing for a
+    #: sleepy utility and noise for a volatile small-cap.
+    drift_reaction_percentile: float = 0.55
+
+
 class BacktestConfig(BaseModel):
     """Backtest engine behaviour and validation gates."""
 
@@ -577,6 +648,7 @@ class AppConfig(BaseSettings):
     sentiment: SentimentConfig = Field(default_factory=SentimentConfig)
     regime: RegimeConfig = Field(default_factory=RegimeConfig)
     signals: SignalConfig = Field(default_factory=SignalConfig)
+    calibration: StrategyCalibrationConfig = Field(default_factory=StrategyCalibrationConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)

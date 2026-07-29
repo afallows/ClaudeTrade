@@ -239,8 +239,27 @@ class SignalEngine:
             rejected.append(
                 RejectedCandidate(ctx.symbol, strategy.name, "strategy", [f"error: {exc}"])
             )
+            strategy.drain_rejections()  # discard: already reported as an error above
             return None
+
+        # Surface every ``decline()`` the strategy recorded -- hard vetoes and,
+        # since ADR-0007 Decision 2, near-miss score shortfalls with their full
+        # component breakdown. This is what makes "why didn't X show up?"
+        # answerable from the scan's rejected list instead of only from logs.
+        strategy_declines = strategy.drain_rejections()
         if proposal is None:
+            if strategy_declines:
+                rejected.append(
+                    RejectedCandidate(
+                        ctx.symbol,
+                        strategy.name,
+                        "strategy",
+                        [
+                            f"{r.reason}: {r.detail}" if r.detail else r.reason
+                            for r in strategy_declines
+                        ],
+                    )
+                )
             return None
 
         try:
