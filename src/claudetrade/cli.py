@@ -145,6 +145,101 @@ def status(config: ConfigOption = None) -> None:
         typer.echo(f"  {key:14s} {value:,}")
 
 
+#: Hosts each live source needs, with why and whether a credential is required.
+#: Used by `claudetrade providers probe` so an operator can confirm egress and
+#: credentials separately -- they fail in different ways and need different fixes.
+LIVE_ENDPOINTS: tuple[tuple[str, str, str, bool], ...] = (
+    ("market", "stooq.com", "https://stooq.com/q/d/l/?s=aapl.us&i=d", False),
+    (
+        "market",
+        "query1.finance.yahoo.com",
+        "https://query1.finance.yahoo.com/v8/finance/chart/AAPL?range=5d&interval=1d",
+        False,
+    ),
+    ("reddit", "www.reddit.com", "https://www.reddit.com/api/v1/access_token", True),
+    ("reddit", "oauth.reddit.com", "https://oauth.reddit.com/api/v1/me", True),
+    ("x", "api.x.com", "https://api.x.com/2/tweets/search/recent?query=test", True),
+    ("ai", "api.anthropic.com", "https://api.anthropic.com/v1/models", True),
+    ("ai", "api.openai.com", "https://api.openai.com/v1/models", True),
+)
+
+
+@app.command("probe")
+def probe(
+    config: ConfigOption = None,
+    timeout: Annotated[float, typer.Option(help="Per-host timeout in seconds.")] = 15.0,
+) -> None:
+    """Test whether the live data endpoints are reachable from this machine.
+
+    Distinguishes the two failure modes that look alike but need different
+    fixes: a blocked network (the host cannot be reached at all, typically a
+    proxy or firewall policy) and a missing credential (the host answers but
+    rejects the request). Run this after changing an egress policy to confirm
+    the change took effect.
+    """
+    cfg = _load(config)
+    import httpx
+
+    from claudetrade.secrets import has_secret
+
+    typer.echo("Probing live data endpoints...\n")
+    typer.echo(f"{'SOURCE':8s}{'HOST':34s}{'NETWORK':12s}{'CREDENTIAL':12s}NOTE")
+    blocked: list[str] = []
+
+    for source, host, url, needs_key in LIVE_ENDPOINTS:
+        note = ""
+        try:
+            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                response = client.get(url)
+            # Any HTTP answer -- including 401/403 from the service itself --
+            # proves the network path is open.
+            network = "reachable"
+            if response.status_code in (401, 403):
+                note = f"HTTP {response.status_code}: needs credentials"
+            else:
+                note = f"HTTP {response.status_code}"
+        except httpx.ProxyError as exc:
+            network = "BLOCKED"
+            note = f"proxy refused: {str(exc)[:48]}"
+            blocked.append(host)
+        except httpx.ConnectError as exc:
+            network = "BLOCKED"
+            note = f"connect failed: {str(exc)[:48]}"
+            blocked.append(host)
+        except Exception as exc:  # timeouts and anything else
+            network = "BLOCKED"
+            note = f"{type(exc).__name__}: {str(exc)[:40]}"
+            blocked.append(host)
+
+        if not needs_key:
+            credential = "not needed"
+        else:
+            name = {
+                "reddit": cfg.reddit.client_id_credential,
+                "x": cfg.x.bearer_credential,
+                "ai": cfg.ai.api_key_credential,
+            }.get(source, "")
+            credential = "configured" if (name and has_secret(name)) else "MISSING"
+
+        typer.echo(f"{source:8s}{host:34s}{network:12s}{credential:12s}{note}")
+
+    typer.echo("")
+    if blocked:
+        typer.secho(
+            f"{len(blocked)} host(s) unreachable from this machine. If you are running inside a "
+            "managed environment, these must be added to its egress allow-list by an "
+            "administrator; the application cannot and must not work around that control.",
+            fg=typer.colors.YELLOW,
+        )
+        typer.echo("Hosts to allow-list: " + ", ".join(sorted(set(blocked))))
+    else:
+        typer.secho("All probed hosts are reachable.", fg=typer.colors.GREEN)
+    typer.echo(
+        "\nCredentials are stored with:  claudetrade secrets set <name>\n"
+        "Reddit needs a free script app (client id + secret); X search needs a paid tier."
+    )
+
+
 @app.command()
 def refresh(
     config: ConfigOption = None,
