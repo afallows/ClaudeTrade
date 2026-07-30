@@ -348,6 +348,19 @@ def _build_x_provider(config: AppConfig) -> SocialProvider | None:
     return XProvider(config.x)
 
 
+def _build_stocktwits_provider(config: AppConfig) -> SocialProvider | None:
+    """Instantiate the Stocktwits adapter, or ``None`` when unavailable.
+
+    No credentials are required (keyless public reads), so there is no
+    synthetic/live selector like Reddit/X/News have -- ``enabled`` alone
+    gates this source, consistent with its ADR-0008 Decision 1 "official
+    API, opt-in due to rate budget" posture.
+    """
+    from claudetrade.providers.social.stocktwits import StocktwitsProvider
+
+    return StocktwitsProvider(config.stocktwits)
+
+
 def _build_news_provider(config: AppConfig) -> SocialProvider | None:
     """Instantiate the configured news adapter, or ``None`` when unavailable.
 
@@ -390,6 +403,7 @@ def get_social_providers(config: AppConfig) -> list[SocialProvider]:
     for enabled, name, builder in (
         (config.reddit.enabled, "reddit", _build_reddit_provider),
         (config.x.enabled, "x", _build_x_provider),
+        (config.stocktwits.enabled, "stocktwits", _build_stocktwits_provider),
         (config.news.enabled, "news", _build_news_provider),
     ):
         if not enabled:

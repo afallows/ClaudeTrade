@@ -61,6 +61,28 @@ class NotConfiguredError(ProviderError):
     """The provider has no credentials configured and is cleanly disabled."""
 
 
+class SourceBlockedError(ProviderError):
+    """The source signalled a block, challenge, CAPTCHA, or an otherwise
+    unexpected response (ADR-0008 Decision 1's fail-closed constraint).
+
+    Distinct from ``RateLimitError`` (a *quantity* signal -- "come back
+    later" is meaningful) and ``AuthenticationError`` (credentials are simply
+    wrong or missing). This is a *behavioural* signal: the vendor's
+    anti-automation system, or a response shape that could be one, has been
+    hit. The only permitted response is to stop calling that source for the
+    rest of the current cycle -- never retry in a loop, never rotate a
+    fingerprint or proxy, never attempt to solve a challenge. ``retryable``
+    stays at the base default of ``False``: "retry" is exactly the behaviour
+    this exception exists to prevent within a cycle; a *later, scheduled*
+    cycle may naturally try again.
+
+    Raised by the personal-use scraping/session adapters added under
+    ADR-0008 Decision 1 (Reddit's unauthenticated public-JSON fallback, the
+    X cookie-session mode) whenever the source's response cannot be trusted
+    as ordinary service.
+    """
+
+
 @dataclass(slots=True)
 class ProviderStatus:
     """Health and capability report shown on the dashboard.

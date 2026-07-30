@@ -13,12 +13,17 @@ whose ``data.children`` are ``{"kind": "t3", "data": {...}}`` objects, with
 from __future__ import annotations
 
 import datetime as dt
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
 
 from claudetrade.config import RedditConfig
-from claudetrade.providers.base import NotConfiguredError, RateLimitError
+from claudetrade.providers.base import (
+    NotConfiguredError,
+    RateLimitError,
+    SourceBlockedError,
+)
 from claudetrade.providers.social.reddit import RedditProvider
 
 NOW = dt.datetime(2024, 6, 3, 18, 0, tzinfo=dt.UTC)
@@ -68,6 +73,10 @@ class _RedditStub:
         self.requests: list[httpx.Request] = []
         self.token_calls = 0
         self.rate_limit_next = False
+        #: When set, every /r/<sub>/new(.json) request gets this response
+        #: instead of a listing -- used to simulate a block/challenge.
+        self.blocked_response: httpx.Response | None = None
+        self.last_grant_type: str | None = None
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -76,14 +85,19 @@ class _RedditStub:
             self.token_calls += 1
             # Reddit requires HTTP Basic auth with the app credentials.
             assert request.headers.get("authorization", "").startswith("Basic ")
+            body = parse_qs(request.content.decode())
+            self.last_grant_type = body.get("grant_type", [None])[0]
             return httpx.Response(
                 200, json={"access_token": "tok-123", "expires_in": 3600}
             )
 
+        if self.blocked_response is not None:
+            return self.blocked_response
+
         if self.rate_limit_next:
             return httpx.Response(429, headers={"Retry-After": "17"}, json={})
 
-        # /r/<sub>/new
+        # /r/<sub>/new or /r/<sub>/new.json
         parts = request.url.path.strip("/").split("/")
         subreddit = parts[1] if len(parts) > 1 else ""
         queue = self.pages.get(subreddit, [])
@@ -298,6 +312,134 @@ class TestTokenReuse:
         posts = RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
         assert len(posts) == 3
         assert stub.token_calls == 1
+
+
+@pytest.fixture
+def password_credentials(monkeypatch):
+    """Full owner-credential set: client id/secret AND username/password."""
+    monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", "test-client-secret")
+    monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_USERNAME", "owner-username")
+    monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_PASSWORD", "owner-password")
+
+
+class TestModeSelectionAndFallbackOrder:
+    """ADR-0008 Decision 1: password grant preferred, then client-credentials,
+    then the opt-in public-JSON fallback, then a clean refusal."""
+
+    def test_password_grant_preferred_when_all_four_credentials_resolve(
+        self, reddit_config, password_credentials, monkeypatch
+    ):
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        provider = RedditProvider(reddit_config)
+        assert provider.mode == "password"
+
+        provider.fetch_posts(since=NOW - dt.timedelta(days=1))
+        assert stub.last_grant_type == "password"
+
+    def test_client_credentials_used_when_only_app_credentials_resolve(
+        self, reddit_config, credentials, monkeypatch
+    ):
+        """``credentials`` sets only client id/secret -- no user login present."""
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        provider = RedditProvider(reddit_config)
+        assert provider.mode == "client_credentials"
+
+        provider.fetch_posts(since=NOW - dt.timedelta(days=1))
+        assert stub.last_grant_type == "client_credentials"
+
+    def test_falls_back_to_public_json_when_no_oauth_credentials_resolve(
+        self, reddit_config, monkeypatch
+    ):
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", raising=False)
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", raising=False)
+        reddit_config.public_json_fallback = True
+
+        provider = RedditProvider(reddit_config)
+        assert provider.mode == "public_json"
+
+    def test_public_json_fallback_off_by_default_still_raises(
+        self, reddit_config, monkeypatch
+    ):
+        """No credentials and the opt-in flag left at its default (False)."""
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", raising=False)
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", raising=False)
+        assert reddit_config.public_json_fallback is False
+        with pytest.raises(NotConfiguredError):
+            RedditProvider(reddit_config)
+
+    def test_public_json_rate_limit_is_hard_capped_at_30(self):
+        """A configured value above 30 is clamped at construction time, never
+        honoured as-is -- ADR-0008 Decision 1's rate ceiling is not something
+        an operator can configure their way past."""
+        config = RedditConfig(public_json_fallback=True, public_json_rate_limit_per_minute=999)
+        assert config.public_json_rate_limit_per_minute == 30
+
+
+class TestPublicJsonFallback:
+    """Unauthenticated public-JSON mode: happy path and fail-closed behaviour."""
+
+    def test_fetches_without_authorization_header(self, reddit_config, monkeypatch):
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", raising=False)
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", raising=False)
+        reddit_config.public_json_fallback = True
+        stub = _RedditStub({"stocks": [_listing([_child("pub1", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        posts = RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+
+        assert len(posts) == 1
+        listing_calls = [r for r in stub.requests if "new.json" in r.url.path]
+        assert len(listing_calls) == 1
+        assert "authorization" not in listing_calls[0].headers
+
+    def test_403_fails_closed_and_aborts_the_whole_cycle(self, reddit_config, monkeypatch):
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", raising=False)
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", raising=False)
+        reddit_config.public_json_fallback = True
+        reddit_config.subreddits = ["stocks", "investing"]
+        stub = _RedditStub(
+            {
+                "stocks": [_listing([_child("a", created=NOW)])],
+                "investing": [_listing([_child("b", created=NOW)])],
+            }
+        )
+        stub.blocked_response = httpx.Response(403, json={"error": "blocked"})
+        _install(monkeypatch, stub)
+
+        with pytest.raises(SourceBlockedError):
+            RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+
+    def test_429_fails_closed_as_rate_limit_error(self, reddit_config, monkeypatch):
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", raising=False)
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", raising=False)
+        reddit_config.public_json_fallback = True
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        stub.blocked_response = httpx.Response(429, headers={"Retry-After": "42"}, json={})
+        _install(monkeypatch, stub)
+
+        with pytest.raises(RateLimitError) as exc:
+            RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+        assert exc.value.retry_after_s == 42.0
+
+    def test_unexpected_content_type_fails_closed(self, reddit_config, monkeypatch):
+        """A challenge/interstitial page served as HTML with a 200 must not be
+        mistaken for a valid (empty) listing."""
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", raising=False)
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", raising=False)
+        reddit_config.public_json_fallback = True
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        stub.blocked_response = httpx.Response(
+            200, headers={"content-type": "text/html"}, text="<html>are you a robot?</html>"
+        )
+        _install(monkeypatch, stub)
+
+        with pytest.raises(SourceBlockedError):
+            RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
 
 
 def _install(monkeypatch, stub: _RedditStub) -> None:

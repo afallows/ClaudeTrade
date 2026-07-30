@@ -1,11 +1,35 @@
-"""Reddit OAuth provider: real adapter to official Reddit API.
+"""Reddit provider: real adapter to the official Reddit API, with a
+last-resort unauthenticated fallback (ADR-0008 Decision 1).
 
-Uses client-credentials OAuth only (no user login). Requires reddit_client_id
-and reddit_client_secret credentials. If credentials are absent, raises
-NotConfiguredError so the source is cleanly disabled.
+Three modes, tried in this preference order at construction time:
 
-All text is sanitised via sanitize_social_text() and authors are salted
-hashes (never stored as usernames).
+1. **Password grant** (``grant_type=password``) -- a script app's client
+   id/secret *plus* the owner's own Reddit username/password. An official
+   OAuth flow against the same endpoints as (2); preferred whenever all four
+   credentials resolve, per the owner's explicit request ("use my reddit
+   credentials ... retain the fallback to the standard API").
+2. **Client-credentials grant** -- a script app's client id/secret alone.
+   Reddit's app-only OAuth flow; no user login. Used when the password-grant
+   credentials are not both configured but the client id/secret are.
+3. **Public JSON fallback** -- reads ``www.reddit.com/r/<sub>/new.json``
+   completely unauthenticated. Only used when *neither* OAuth combination
+   above resolves AND ``config.public_json_fallback`` is explicitly set. This
+   path is ToS-gray for automated use (see the module/class docstrings) and
+   is capped at a conservative, human-scale rate.
+
+If none of the three resolves, ``NotConfiguredError`` is raised so the source
+is cleanly disabled -- the pipeline continues without it.
+
+Every mode's output goes through the same ``sanitize_social_text()`` /
+author-hash / injection-score pipeline; only the transport and
+authentication differ.
+
+**Fail-closed (ADR-0008 Decision 1)**: in public-JSON mode, any block,
+challenge, CAPTCHA, or unexpected response (HTTP 401/403, a non-JSON body,
+or any other non-2xx status) raises ``SourceBlockedError``, which is *not*
+caught by this module -- it propagates out of ``fetch_posts`` and terminates
+the whole fetch for this cycle. There is no retry loop, no fingerprint/proxy
+rotation, and no CAPTCHA handling anywhere in this file.
 """
 
 from __future__ import annotations
@@ -23,6 +47,7 @@ from claudetrade.providers.base import (
     ProviderStatus,
     RateLimiter,
     RateLimitError,
+    SourceBlockedError,
 )
 from claudetrade.secrets import get_secret
 from claudetrade.utils.hashing import pseudonymise, text_hash
@@ -30,82 +55,160 @@ from claudetrade.utils.text import injection_risk_score, sanitize_social_text
 
 log = logging.getLogger(__name__)
 
+_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+
 
 class RedditProvider:
-    """Official Reddit OAuth API adapter for social posts.
+    """Reddit adapter for social posts: OAuth (password or client-credentials
+    grant), with an opt-in unauthenticated public-JSON fallback.
 
-    Fetches recent posts from configured subreddits using client-credentials
-    flow. Respects rate limits and Reddit's API contract.
+    Fetches recent posts from configured subreddits, paging until the
+    requested time window is covered. Respects rate limits and Reddit's API
+    contract for the OAuth modes; fails closed immediately in public-JSON
+    mode on any sign of a block (see the module docstring).
     """
 
     name: str = "reddit"
     source: SocialSource = SocialSource.REDDIT
 
     def __init__(self, config: RedditConfig):
-        """Initialize the Reddit provider.
+        """Initialize the Reddit provider, selecting the best available mode.
 
         Args:
             config: RedditConfig with credentials, subreddits, rate limits.
 
         Raises:
-            NotConfiguredError: if credentials are not available.
+            NotConfiguredError: if no OAuth credentials resolve and
+                ``config.public_json_fallback`` is not set.
         """
         self.config = config
 
-        # Resolve credentials
         client_id_secret = get_secret(config.client_id_credential)
         client_secret_secret = get_secret(config.client_secret_credential)
+        username_secret = get_secret(config.username_credential)
+        password_secret = get_secret(config.password_credential)
 
-        if client_id_secret is None or client_secret_secret is None:
+        has_client_creds = client_id_secret is not None and client_secret_secret is not None
+        has_user_creds = username_secret is not None and password_secret is not None
+
+        self._client_id: str | None = None
+        self._client_secret: str | None = None
+        self._username: str | None = None
+        self._password: str | None = None
+
+        if has_client_creds and has_user_creds:
+            self.mode = "password"
+        elif has_client_creds:
+            self.mode = "client_credentials"
+        elif config.public_json_fallback:
+            self.mode = "public_json"
+            log.warning(
+                "Reddit OAuth credentials not configured; falling back to the "
+                "unauthenticated public JSON listing endpoint. This path is "
+                "ToS-gray for automated use (ADR-0008 Decision 1) -- configure "
+                "%s/%s (or %s/%s) to prefer the official API.",
+                config.client_id_credential,
+                config.client_secret_credential,
+                config.username_credential,
+                config.password_credential,
+            )
+        else:
             raise NotConfiguredError(
                 f"Reddit credentials not found: {config.client_id_credential}, "
-                f"{config.client_secret_credential}",
+                f"{config.client_secret_credential} (or {config.username_credential}, "
+                f"{config.password_credential} for the password grant). Set "
+                "reddit.public_json_fallback = true to allow the unauthenticated "
+                "fallback instead.",
                 provider="reddit",
             )
 
-        self._client_id = client_id_secret.reveal()
-        self._client_secret = client_secret_secret.reveal()
+        if self.mode in ("password", "client_credentials"):
+            self._client_id = client_id_secret.reveal()  # type: ignore[union-attr]
+            self._client_secret = client_secret_secret.reveal()  # type: ignore[union-attr]
+            if self.mode == "password":
+                self._username = username_secret.reveal()  # type: ignore[union-attr]
+                self._password = password_secret.reveal()  # type: ignore[union-attr]
+
         self._access_token: str | None = None
         self._token_expires_at = 0.0
 
+        rate_limit = (
+            config.public_json_rate_limit_per_minute
+            if self.mode == "public_json"
+            else config.rate_limit_per_minute
+        )
         self._rate_limiter = RateLimiter(
-            config.rate_limit_per_minute,
+            rate_limit,
             name="reddit",
             max_wait_s=config.request_timeout_s,
         )
 
-        log.info("Reddit provider configured for subreddits: %s", config.subreddits)
+        log.info(
+            "Reddit provider configured (mode=%s) for subreddits: %s",
+            self.mode,
+            config.subreddits,
+        )
 
     def status(self) -> ProviderStatus:
-        """Report provider status."""
+        """Report provider status, honest about which mode is in effect."""
+        if self.mode == "password":
+            message = f"Reddit OAuth, password grant ({len(self.config.subreddits)} subreddits)"
+            licence_note = (
+                "Official Reddit API, password grant (owner's own account credentials, "
+                "ADR-0008 Decision 1)."
+            )
+        elif self.mode == "client_credentials":
+            message = (
+                f"Reddit OAuth, client-credentials grant ({len(self.config.subreddits)} "
+                "subreddits)"
+            )
+            licence_note = "Official Reddit API, app-only client-credentials grant."
+        else:
+            message = (
+                f"Reddit public JSON fallback, UNAUTHENTICATED "
+                f"({len(self.config.subreddits)} subreddits)"
+            )
+            licence_note = (
+                "Unauthenticated read of www.reddit.com/r/<sub>/new.json. This is "
+                "ToS-gray for automated/scheduled use, not a sanctioned API "
+                "integration -- an opt-in last resort only (ADR-0008 Decision 1), "
+                "rate-capped and fail-closed on any block/challenge signal."
+            )
         return ProviderStatus(
             name=self.name,
             kind="social",
             available=True,
             configured=True,
-            message=f"Reddit OAuth ({len(self.config.subreddits)} subreddits)",
+            message=message,
             supports_point_in_time=False,
-            rate_limit_per_minute=self.config.rate_limit_per_minute,
-            licence_note="Official Reddit API; requires OAuth credentials",
+            rate_limit_per_minute=self._rate_limiter.calls_per_minute,
+            licence_note=licence_note,
         )
 
     def _ensure_token(self) -> None:
-        """Refresh the OAuth access token if expired."""
+        """Refresh the OAuth access token if expired (OAuth modes only)."""
         now = time.time()
         if self._access_token is not None and now < self._token_expires_at:
             return
 
-        try:
-            self._rate_limiter.acquire()
-        except RateLimitError:
-            raise
+        self._rate_limiter.acquire()
+
+        grant_data: dict[str, str] = (
+            {
+                "grant_type": "password",
+                "username": self._username or "",
+                "password": self._password or "",
+            }
+            if self.mode == "password"
+            else {"grant_type": "client_credentials"}
+        )
 
         try:
             with httpx.Client(timeout=self.config.request_timeout_s) as client:
                 response = client.post(
-                    "https://www.reddit.com/api/v1/access_token",
+                    _TOKEN_URL,
                     auth=(self._client_id, self._client_secret),
-                    data={"grant_type": "client_credentials"},
+                    data=grant_data,
                     headers={"User-Agent": self.config.user_agent},
                 )
                 response.raise_for_status()
@@ -113,7 +216,7 @@ class RedditProvider:
                 self._access_token = payload["access_token"]
                 self._token_expires_at = now + payload.get("expires_in", 3600) - 60
         except Exception as exc:
-            log.error("Reddit token refresh failed: %s", exc)
+            log.error("Reddit token refresh failed (mode=%s): %s", self.mode, exc)
             raise RateLimitError(
                 f"Reddit token refresh failed: {exc}",
                 provider="reddit",
@@ -138,11 +241,18 @@ class RedditProvider:
 
         Returns:
             List of SocialPost, newest first, all sanitised and author-hashed.
+
+        Raises:
+            SourceBlockedError: (public-JSON mode only) on any block,
+                challenge, or unexpected response -- this terminates the
+                fetch for the whole cycle rather than degrading per-subreddit,
+                per ADR-0008 Decision 1's fail-closed constraint.
         """
         if until is None:
             until = dt.datetime.now(tz=dt.UTC)
 
-        self._ensure_token()
+        if self.mode != "public_json":
+            self._ensure_token()
 
         posts: list[SocialPost] = []
 
@@ -163,7 +273,10 @@ class RedditProvider:
                 )
                 if limit is not None and len(posts) >= limit:
                     break
-            except RateLimitError:
+            except (RateLimitError, SourceBlockedError):
+                # Both are fail-closed signals that must propagate: a vendor
+                # rate limit or block/challenge terminates the fetch for the
+                # whole cycle, never just this one subreddit.
                 raise
             except Exception as exc:
                 log.warning("Failed to fetch r/%s: %s", subreddit, exc)
@@ -178,7 +291,8 @@ class RedditProvider:
     def _fetch_subreddit(
         self, subreddit: str, *, since: dt.datetime, remaining: int | None
     ) -> list[SocialPost]:
-        """Page through ``/r/<sub>/new`` until posts predate ``since``.
+        """Page through ``/r/<sub>/new`` (or its public-JSON twin) until posts
+        predate ``since``.
 
         ``/new`` is strictly reverse-chronological, so the first post older
         than ``since`` means every later one is older too and paging can stop.
@@ -198,16 +312,23 @@ class RedditProvider:
             if after:
                 params["after"] = after
 
-            with httpx.Client(timeout=self.config.request_timeout_s) as client:
-                response = client.get(
-                    f"https://oauth.reddit.com/r/{subreddit}/new",
-                    headers={
-                        "Authorization": f"bearer {self._access_token}",
-                        "User-Agent": self.config.user_agent,
-                    },
-                    params=params,
-                )
+            if self.mode == "public_json":
+                url = f"https://www.reddit.com/r/{subreddit}/new.json"
+                headers = {"User-Agent": self.config.user_agent}
+            else:
+                url = f"https://oauth.reddit.com/r/{subreddit}/new"
+                headers = {
+                    "Authorization": f"bearer {self._access_token}",
+                    "User-Agent": self.config.user_agent,
+                }
 
+            with httpx.Client(timeout=self.config.request_timeout_s) as client:
+                response = client.get(url, headers=headers, params=params)
+
+            if self.mode == "public_json":
+                self._fail_closed_if_blocked(response, subreddit)
+                payload = response.json()
+            else:
                 if response.status_code == 429:
                     retry_after = response.headers.get("Retry-After", "60")
                     try:
@@ -219,7 +340,6 @@ class RedditProvider:
                         provider="reddit",
                         retry_after_s=wait_s,
                     )
-
                 response.raise_for_status()
                 payload = response.json()
 
@@ -249,6 +369,55 @@ class RedditProvider:
             self._rate_limiter.acquire()
 
         return collected
+
+    def _fail_closed_if_blocked(self, response: httpx.Response, subreddit: str) -> None:
+        """Public-JSON mode only: raise on any block/challenge/unexpected response.
+
+        ADR-0008 Decision 1 is explicit that this terminates the fetch for
+        the cycle rather than being retried, evaded, or worked around. A 429
+        raises ``RateLimitError`` (a quantity signal, same shape as the OAuth
+        path); everything else that isn't a clean 2xx JSON response raises
+        ``SourceBlockedError``, which is not caught anywhere in this module.
+        """
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "60")
+            try:
+                wait_s = float(retry_after)
+            except (ValueError, TypeError):
+                wait_s = 60.0
+            raise RateLimitError(
+                f"Reddit public-JSON rate limit for r/{subreddit}",
+                provider="reddit",
+                retry_after_s=wait_s,
+            )
+
+        if response.status_code in (401, 403):
+            raise SourceBlockedError(
+                f"Reddit public JSON endpoint denied access for r/{subreddit} "
+                f"(HTTP {response.status_code}) -- fail-closed per ADR-0008 "
+                "Decision 1: no retry, no fingerprint/proxy rotation, no "
+                "CAPTCHA handling.",
+                provider="reddit",
+            )
+
+        content_type = response.headers.get("content-type", "")
+        if "json" not in content_type.lower():
+            # A block/challenge page is typically served as HTML with a 200,
+            # not a clean error status -- this is the "unexpected response"
+            # case ADR-0008 Decision 1 also requires failing closed on.
+            raise SourceBlockedError(
+                f"Reddit public JSON endpoint returned unexpected content-type "
+                f"'{content_type}' for r/{subreddit} (possible block/challenge "
+                "page) -- fail-closed per ADR-0008 Decision 1.",
+                provider="reddit",
+            )
+
+        if response.status_code >= 400:
+            raise SourceBlockedError(
+                f"Reddit public JSON endpoint returned HTTP {response.status_code} "
+                f"for r/{subreddit} -- fail-closed per ADR-0008 Decision 1.",
+                provider="reddit",
+            )
 
     def _to_post(
         self, data: dict, subreddit: str, created_at: dt.datetime

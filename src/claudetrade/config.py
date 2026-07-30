@@ -887,6 +887,7 @@ class AppConfig(BaseSettings):
     earnings: EarningsConfig = Field(default_factory=EarningsConfig)
     reddit: RedditConfig = Field(default_factory=RedditConfig)
     x: XConfig = Field(default_factory=XConfig)
+    stocktwits: StocktwitsConfig = Field(default_factory=StocktwitsConfig)
     news: NewsConfig = Field(default_factory=NewsConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
@@ -959,6 +960,7 @@ class AppConfig(BaseSettings):
             "earnings": True,
             "reddit": self.reddit.enabled,
             "x": self.x.enabled,
+            "stocktwits": self.stocktwits.enabled,
             "news": self.news.enabled,
             "ai": self.ai.provider != "null",
             "notifications": self.notifications.enabled,

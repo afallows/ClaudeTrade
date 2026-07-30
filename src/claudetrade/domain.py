@@ -106,6 +106,9 @@ class SocialSource(StrEnum):
     REDDIT = "reddit"
     X = "x"
     NEWS = "news"
+    #: Stocktwits public symbol-stream API (ADR-0008 Decision 1 source
+    #: expansion). Additive member; existing values are unchanged.
+    STOCKTWITS = "stocktwits"
     OTHER = "other"
 
 
@@ -307,6 +310,15 @@ class SocialPost:
     injection_risk: float = 0.0
     fetched_at: dt.datetime | None = None
     raw_ref: str | None = None
+    #: Self-declared sentiment label the *source itself* attaches to a post
+    #: (currently only Stocktwits, whose authors may tag a message "Bullish"
+    #: / "Bearish"), normalised to ``"bullish"``/``"bearish"``/``None``.
+    #: This is a PRIOR HINT, never a substitute for classification: a
+    #: self-declared label is evidence a human asserted it, not truth about
+    #: the post's actual sentiment, so the ensemble classifier still runs on
+    #: ``text`` unconditionally. Sources with no such concept (Reddit, X,
+    #: news) always leave this ``None``.
+    sentiment_prior: str | None = None
 
     @property
     def engagement(self) -> float:

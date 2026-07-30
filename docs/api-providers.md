@@ -482,17 +482,36 @@ enabled = false
 - Posts are generated, not scraped
 - Cannot research real discussion
 
-### Reddit (Live OAuth)
+### Reddit (Live OAuth, with an opt-in unauthenticated fallback)
 
 **Module**: `src/claudetrade/providers/social/reddit.py`
 
-Official Reddit OAuth API. Requires credentials.
+Three modes, tried in this order at construction time (ADR-0008 Decision 1):
 
-**Setup**:
+1. **Password grant** -- a script app's client id/secret *plus* the owner's
+   own Reddit username/password. An official OAuth flow, preferred whenever
+   all four credentials resolve.
+2. **Client-credentials grant** -- a script app's client id/secret alone
+   (app-only, no user login). Used when the password-grant credentials
+   aren't both configured but the client id/secret are.
+3. **Public JSON fallback** (`reddit.public_json_fallback = true`) --
+   unauthenticated reads of `www.reddit.com/r/<sub>/new.json`. Only used when
+   *neither* OAuth combination above resolves. **Honest ToS status**: this is
+   not a sanctioned integration path the way OAuth is -- reading Reddit's
+   public listing JSON without authentication is ToS-gray for
+   automated/scheduled use, tolerated in practice for casual, low-volume,
+   identifying-UA traffic. It exists only as a last resort, is off by
+   default, and is hard-capped at 30 requests/minute regardless of config.
+   The moment OAuth credentials work, this class prefers them automatically.
+
+**Setup (OAuth, either grant)**:
 
 1. Go to https://www.reddit.com/prefs/apps
 2. Create an app (choose "script" type)
 3. Note the **client ID** and **client secret**
+4. For the password grant, also use the owner's own Reddit account username
+   and password (never a shared or default account -- ADR-0008 Decision 1's
+   "own credentials only" constraint)
 
 **Configuration**:
 
@@ -502,6 +521,8 @@ enabled = true
 provider = "reddit"
 client_id_credential = "reddit_client_id"
 client_secret_credential = "reddit_client_secret"
+username_credential = "reddit_username"      # only used by the password grant
+password_credential = "reddit_password"      # only used by the password grant
 subreddits = ["stocks", "investing", "StockMarket", "SecurityAnalysis", "options", "swingtrading"]
 posts_per_subreddit = 100
 comments_per_post = 50
@@ -509,6 +530,10 @@ lookback_hours = 72
 rate_limit_per_minute = 60
 user_agent = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
 store_author_names = false
+
+# Opt-in, last-resort fallback -- see the ToS caveat above before enabling.
+public_json_fallback = false
+public_json_rate_limit_per_minute = 30       # hard-capped at 30 regardless of this value
 ```
 
 **Store credentials**:
@@ -517,29 +542,50 @@ store_author_names = false
 # Environment variables
 export CLAUDETRADE_SECRET_REDDIT_CLIENT_ID="your_client_id"
 export CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET="your_client_secret"
+export CLAUDETRADE_SECRET_REDDIT_USERNAME="your_reddit_username"       # password grant only
+export CLAUDETRADE_SECRET_REDDIT_PASSWORD="your_reddit_password"       # password grant only
 
 # Or OS credential store
 claudetrade secrets set reddit_client_id
 claudetrade secrets set reddit_client_secret
+claudetrade secrets set reddit_username
+claudetrade secrets set reddit_password
 ```
+
+**Fail-closed behaviour (public-JSON mode only, ADR-0008 Decision 1)**: any
+HTTP 401/403, a non-JSON response body, or any other unexpected/non-2xx
+response immediately disables the source **for the rest of that fetch
+cycle** -- no retry loop, no fingerprint or proxy rotation, no CAPTCHA
+handling. The next scheduled cycle tries again from scratch. A 429 is
+handled the same way as the OAuth path (a `RateLimitError` carrying
+`Retry-After`, also ending the cycle). This is exercised in
+`tests/test_reddit_provider.py`.
 
 **Limitations**:
 
-- OAuth required; no API key fallback
-- Rate limited to 60 calls/minute (public tier)
+- OAuth grants are rate limited to 60 calls/minute (public tier); the
+  public-JSON fallback is capped at 30/minute regardless of configuration
 - Posts are searchable only in the last 6 months (API limitation)
 - Engagement counts (score, num_comments) are mutable at the source; historical sentiment cannot be perfectly reconstructed
 - Author names are stored as salted hashes only (never plaintext), per config `store_author_names = false`
+- The public-JSON fallback carries no delivery guarantee at all -- it can be
+  throttled or blocked by Reddit at any time with no notice, by design
 
-**Licence**: Reddit data is subject to Reddit's API terms and user agreement. Commercial use of aggregated social data may require permission.
+**Licence**: Reddit data is subject to Reddit's API terms and user agreement. Commercial use of aggregated social data may require permission. The public-JSON fallback is additionally ToS-gray for automated use -- see above.
 
-### X/Twitter (Paid API v2)
+### X/Twitter (Paid API v2, or an opt-in cookie-session mode)
 
 **Module**: `src/claudetrade/providers/social/x_provider.py`
 
-X API v2. Requires a **paid tier** (free tier has no search capability).
+Two independent live paths, tried in this order at construction time:
 
-**Setup**:
+1. **Official API v2** (`bearer_credential`). Requires a paid tier for
+   meaningful search volume. Always preferred when configured -- ADR-0008
+   Decision 1 requires the official API remain first-choice.
+2. **Cookie-session mode** (`x.session_enabled = true`), only reached when
+   no bearer token is configured. See below.
+
+**Setup (official API)**:
 
 1. Go to https://developer.twitter.com/en/portal/dashboard
 2. Create an app and apply for elevated access
@@ -578,6 +624,151 @@ claudetrade secrets set x_bearer_token
 
 **Licence**: X/Twitter data is subject to X's API terms. Redistribution restrictions apply.
 
+#### X cookie-session mode (opt-in, off by default -- ADR-0008 Decision 1)
+
+**PLAIN ACCOUNT-RISK STATEMENT**: this mode automates the owner's own
+logged-in x.com session against the internal, unversioned GraphQL endpoints
+the web client itself uses. **Doing this violates X's Terms of Service and
+can lead to suspension of that X account.** This application never bundles
+or defaults these credentials, never solves a CAPTCHA or challenge, and
+never rotates a fingerprint or proxy to work around a block -- it disables
+the source for the rest of the cycle instead. The owner accepts this risk
+for their own account; this mode is off by default
+(`x.session_enabled = false`) and must be explicitly turned on.
+
+**How to export your session cookies** (Chrome/Edge/Firefox devtools):
+
+1. Log in to x.com in your browser as normal.
+2. Open devtools (F12) -> **Application** tab (Chrome/Edge) or **Storage**
+   tab (Firefox) -> **Cookies** -> `https://x.com`.
+3. Find the cookie named `auth_token`; copy its **Value**.
+4. Find the cookie named `ct0` (the CSRF token cookie); copy its **Value**.
+5. Store both via the credential store, never in `config.toml`:
+
+```bash
+claudetrade secrets set x_auth_token
+claudetrade secrets set x_ct0
+# or, environment variables:
+export CLAUDETRADE_SECRET_X_AUTH_TOKEN="..."
+export CLAUDETRADE_SECRET_X_CT0="..."
+```
+
+**Configuration**:
+
+```toml
+[x]
+session_enabled = true
+auth_token_credential = "x_auth_token"
+ct0_credential = "x_ct0"
+session_symbols = ["AAPL", "MSFT"]     # cashtag-searched; leading $ added automatically
+session_max_results_per_query = 40
+session_rate_limit_per_minute = 6      # deliberately stricter than the official API default
+session_request_timeout_s = 20.0
+```
+
+**Endpoint stability (read before relying on this mode)**: the GraphQL
+endpoint path and query ID this adapter calls are internal to x.com's web
+client and change without notice or a deprecation window -- see the
+clearly-marked constants block at the top of `x_provider.py`
+(`_SEARCH_GRAPHQL_QUERY_ID` etc.). **This sandbox has no network egress and
+could not capture a live, current query ID while building this adapter**;
+the shipped constant is illustrative/unverified and will need to be replaced
+with a fresh capture from your own browser's devtools (Network tab, filter
+`graphql`, log in, run a search, copy the request the client itself makes)
+before this mode returns real data. Until then, or whenever x.com changes
+its internal API again, session-mode requests fail closed (typically a
+404/400 on the stale path, or an unparseable response shape) rather than
+guessing -- see the fail-closed behaviour below. Updating the constant is
+expected, ordinary maintenance, not a bug fix.
+
+**Fail-closed behaviour (ADR-0008 Decision 1)**: any HTTP 401/403 (expired,
+logged-out, or challenged cookies), any non-JSON response, any response that
+doesn't match the expected timeline shape (including a changed internal API,
+see above), or a 429 immediately disables the source **for the rest of that
+fetch cycle** -- no retry loop, no fingerprint/proxy rotation, no CAPTCHA
+handling. Re-export fresh cookies (401/403) or wait for the next scheduled
+cycle (429) to resume. This is exercised in `tests/test_x_provider.py`.
+
+**Limitations**:
+
+- Off by default; must be explicitly enabled and configured
+- Unofficial, unsupported, and can stop working at any time without notice
+- No engagement-metrics parity guarantee with the official API's `public_metrics`
+- The official API path above remains intact and is always preferred the
+  moment a bearer token is configured
+
+### Stocktwits (Live, Keyless, Opt-in)
+
+**Module**: `src/claudetrade/providers/social/stocktwits.py`
+
+Stocktwits' own documented, **keyless** public symbol-stream API
+(`api.stocktwits.com/api/2/streams/symbol/{SYMBOL}.json`) -- ADR-0008
+Decision 1's "official API first-choice" applies in the fullest sense here:
+this is not scraping at all, no authentication is bypassed, and no ToS
+boundary is tested. Off by default only because the vendor's published
+unauthenticated budget (200 requests/hour) is easy to exhaust across a large
+universe, not because of any risk to the account or credentials (there are
+none).
+
+**Sentiment tags are a prior hint, not ground truth**: a message may carry a
+self-declared `entities.sentiment.basic` tag ("Bullish"/"Bearish") the
+*author* attached to their own post. This is mapped onto
+`SocialPost.sentiment_prior` (`"bullish"` / `"bearish"` / `None`) as a prior
+hint only -- the ensemble sentiment classifier still runs on the post's text
+unconditionally for every post, Stocktwits included. Treating a self-declared
+label as truth would let anyone paint their own post's sentiment without the
+classifier ever checking it against the actual content.
+
+**Configuration**:
+
+```toml
+[stocktwits]
+enabled = true
+watchlist_symbols = ["AAPL", "MSFT", "TSLA"]
+max_symbols_per_cycle = 20      # hard budget guard, see below
+rate_limit_per_minute = 3       # 180/hour -- a margin below the 200/hour vendor cap
+request_timeout_s = 20.0
+```
+
+**Rate budget**: Stocktwits documents 200 requests/hour for unauthenticated
+reads. The default `rate_limit_per_minute = 3` (180/hour) keeps a working
+margin. `max_symbols_per_cycle` bounds how many symbols one refresh will
+fetch regardless of universe size -- one request per symbol, no deep
+pagination -- and the symbols actually fetched are prioritised by the order
+of the `symbols` hint the caller passes to `fetch_posts()` (the pipeline
+passes recent-signal / watchlist symbols first), falling back to
+`watchlist_symbols` when no hint is supplied. A broad universe therefore
+degrades to "covered the names that mattered this cycle", never a silent,
+even rationing across everything.
+
+**Fail-closed behaviour (ADR-0008 Decision 1)**: any HTTP 401/403, a
+non-JSON response, or a response missing the expected `messages` field
+immediately disables the source **for the rest of that fetch cycle** -- no
+retry loop, no fingerprint/proxy rotation. A 404 for a single symbol (unknown
+ticker, or a real symbol with no chatter) is treated as ordinary "nothing
+here" and only skips that one symbol, matching this codebase's existing
+precedent for per-symbol gaps (see `providers.market.stooq`'s unknown-symbol
+handling). A 429 raises the same `RateLimitError` shape as every other
+source and also ends the cycle. This is exercised in
+`tests/test_stocktwits_provider.py`.
+
+**Credentials**: None required.
+
+**Limitations**:
+
+- No historical backfill beyond whatever the stream endpoint currently
+  returns (typically the most recent ~20-30 messages per symbol) -- this is
+  not an archive
+- Engagement counts (`likes.total`, `conversation.replies`) are mutable at
+  the source, same caveat as Reddit/X
+- Author handles are stored as salted hashes only, never plaintext
+- The self-declared sentiment tag is optional per-message; most messages
+  carry no tag at all, in which case `sentiment_prior` is `None`
+
+**Licence**: Stocktwits' public stream is documented for keyless basic
+reads; this adapter performs only that. Commercial or high-volume use may
+require Stocktwits' paid API tier and is out of scope here.
+
 ### News RSS/Atom (Default, Live, No Credentials)
 
 **Module**: `src/claudetrade/providers/social/news_rss.py`
@@ -614,6 +805,34 @@ should confirm each feed still resolves and still serves the expected
 format (`claudetrade probe`, or simply fetching the URL) before relying on it,
 and are free to edit `feed_urls` to any other feed their organisation is
 comfortable treating as a syndication channel.
+
+**Candidate feeds considered for this expansion but NOT added (unverifiable
+from this sandbox)**: ADR-0008's source expansion asked for MarketWatch,
+Yahoo Finance and Nasdaq feeds to be added *if* each could be confirmed to
+publish a documented public RSS feed. This sandbox's egress is fully blocked
+at the proxy layer (every `WebFetch` attempt returned HTTP 403, including
+against `example.com` as a control and against `ir.nasdaq.com`, ruling out a
+per-host block rather than a general outage; `curl` through the configured
+proxy failed identically with `CONNECT tunnel failed, response 403` for
+every host tried, including hosts already in the default list above). Web
+search (a separate path, not subject to the same block) surfaced plausible
+candidate URLs, but none from the publisher's own first-party documentation
+page reachable from here, and search results even flagged uncertainty about
+whether MarketWatch's own classic feed still functions
+([Feedspot's MarketWatch feed roundup](https://rss.feedspot.com/marketwatch_rss_feeds/)
+pointed to a Dow Jones-hosted redirect rather than a stable, documented
+first-party URL). Per the instruction to omit anything unverifiable rather
+than assert it, none of the three were added:
+
+| Candidate | Why it was considered | Why it was not added |
+| --- | --- | --- |
+| MarketWatch top stories | Historically published via a Dow Jones-hosted RSS feed | Current, stable first-party URL not confirmable from this sandbox; third-party aggregators disagree on the live URL |
+| Yahoo Finance news | `feeds.finance.yahoo.com/rss/2.0/headline` is a commonly cited endpoint | Could not confirm it is still live/first-party-documented, and it also appears to require a stock-symbol query parameter rather than serving a general news feed, which doesn't fit this list's "top stories" shape |
+| Nasdaq original content | `nasdaq.com/feed/rssoutbound?category=Original` is a commonly cited endpoint; Nasdaq's own IR site (`ir.nasdaq.com/tools/rss-feeds`) documents *some* RSS feeds | Could not reach either page to confirm the `Original`-category endpoint specifically still resolves and serves the expected format |
+
+An operator with real network access can verify any of these (or any other
+feed) and add it to `feed_urls` directly -- this list remains fully
+operator-editable; nothing here requires a code change to extend.
 
 **Configuration**:
 

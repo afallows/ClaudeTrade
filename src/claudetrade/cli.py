@@ -247,7 +247,36 @@ LIVE_ENDPOINTS: tuple[tuple[str, str, str, bool], ...] = (
     ),
     ("reddit", "www.reddit.com", "https://www.reddit.com/api/v1/access_token", True),
     ("reddit", "oauth.reddit.com", "https://oauth.reddit.com/api/v1/me", True),
+    # Public JSON fallback (ADR-0008 Decision 1): genuinely credential-free,
+    # so needs_key=False here is fully accurate, unlike the x_session row below.
+    (
+        "reddit",
+        "www.reddit.com",
+        "https://www.reddit.com/r/stocks/new.json?limit=1",
+        False,
+    ),
     ("x", "api.x.com", "https://api.x.com/2/tweets/search/recent?query=test", True),
+    # X cookie-session mode (ADR-0008 Decision 1 / Decision 5). Real reachability
+    # check only -- the CREDENTIAL column below cannot reflect this row
+    # accurately: it is wired to look up cfg.x.bearer_credential (the official
+    # API token) keyed by the "x" source name, and extending that lookup to
+    # also check x_auth_token/x_ct0 is out of scope for this change (probe's
+    # credential-name mapping lives further down in this function, which is
+    # outside the host-list-only boundary this change was scoped to). Using a
+    # distinct, unmapped source name here means the CREDENTIAL column always
+    # reads "MISSING" for this row regardless of whether the session cookies
+    # are actually configured -- an honest "not wired up yet" placeholder
+    # rather than a false "configured"/"not needed". Verify session cookies
+    # separately with `claudetrade secrets list`.
+    ("x_session", "x.com", "https://x.com/i/api/graphql/placeholder/SearchTimeline", True),
+    # Stocktwits public symbol-stream API (ADR-0008 Decision 1): keyless by
+    # design, so needs_key=False is fully accurate.
+    (
+        "stocktwits",
+        "api.stocktwits.com",
+        "https://api.stocktwits.com/api/2/streams/symbol/AAPL.json",
+        False,
+    ),
     ("ai", "api.anthropic.com", "https://api.anthropic.com/v1/models", True),
     ("ai", "api.openai.com", "https://api.openai.com/v1/models", True),
 )
