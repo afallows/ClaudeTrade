@@ -13,6 +13,37 @@ turn on a live data source in [Step 7](#step-7-optional-turn-on-real-data-with-r
 
 ---
 
+## Fastest path: one script
+
+If you just want the app running and don't need to understand each step, this
+is the whole install:
+
+1. Get the source onto the machine — either download and extract the `.zip`
+   from the repository, or, if you have `git`:
+   ```
+   git clone https://github.com/afallows/claudetrade.git
+   ```
+2. Open the extracted/cloned `ClaudeTrade` folder in File Explorer and
+   **double-click `scripts\setup.bat`**.
+3. Done. The script checks for Python 3.11+ (installing it via `winget` if
+   it's missing), creates the virtual environment, installs everything,
+   creates the database, loads the last 90 days of data, and opens the app —
+   all in one run. A console window stays open showing progress; leave it
+   open while you use the app, and press a key in it (or close the app
+   window) when you're done.
+
+Re-running `scripts\setup.bat` later is safe and fast — every step skips or
+repeats cleanly if it's already done. See `scripts\setup.ps1 -?` (or its
+header comment) for optional flags: `-SkipData` (skip the data load on a
+re-run), `-Classic` (open the legacy Streamlit UI instead of the desktop
+app), and `-NoLaunch` (set up everything but don't open the UI).
+
+If `scripts\setup.bat` doesn't work for you, or you want to understand or
+control each step yourself, the rest of this guide walks through exactly
+what it automates, one command at a time, starting from Step 1 below.
+
+---
+
 ## Step 1: Install Python 3.11 or newer
 
 1. Go to https://www.python.org/downloads/ and download the latest Python 3.11.x

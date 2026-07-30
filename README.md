@@ -18,6 +18,21 @@ All computation is deterministic, reproducible, and auditable. Every signal carr
 
 ## Quick Start
 
+### Windows: one-script setup (fastest path)
+
+If you're on Windows, this is the whole install:
+
+1. Download/clone the source, then open the `ClaudeTrade` folder.
+2. Double-click **`scripts\setup.bat`**.
+
+That checks for Python 3.11+ (installing it via `winget` if it's missing),
+creates the virtual environment, installs everything, creates the database,
+loads the last 90 days of data, and launches the app — one script, start to
+finish. Re-running it later is safe and fast. See
+[docs/windows-install.md](docs/windows-install.md#fastest-path-one-script)
+for details and optional flags (`-SkipData`, `-Classic`, `-NoLaunch`); the
+rest of this section covers the manual, cross-platform install.
+
 ### Prerequisites
 
 - Python 3.11+
@@ -66,7 +81,7 @@ claudetrade refresh
 # Generate ranked signals for today and print them
 claudetrade scan
 
-# Launch the Streamlit dashboard
+# Launch the desktop UI (React/FastAPI app; use `claudetrade ui --classic` for the legacy Streamlit dashboard)
 claudetrade ui
 ```
 

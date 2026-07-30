@@ -14,7 +14,42 @@ generally depend on earlier ones).
 
 ## 1. [ ] Fresh install
 
-**Command**:
+**Command**: from a fresh Command Prompt or File Explorer, with `.venv` not
+yet created:
+```
+scripts\setup.bat -NoLaunch
+```
+(`-NoLaunch` here so this step only exercises install/init/data-load —
+Step 6 below exercises the UI launch itself, deliberately, as its own check.
+For a real first-time end user, double-clicking `scripts\setup.bat` with no
+flags is the intended path and folds Steps 1, 2, and 4 into one double-click,
+then launches the UI directly into Step 6.)
+
+**Pass looks like**: A console window opens showing five numbered steps
+(`[1/5]` .. `[5/5]`, or fewer with `-NoLaunch`); each prints `OK` lines as it
+completes Python detection, virtual environment creation, dependency
+install, and `claudetrade init`; it ends with "Setup finished (exit code
+0)." and no traceback. A transcript log appears next to the script
+(`scripts\setup-log-<timestamp>.txt`).
+
+Then confirm the install directly:
+```
+.venv\Scripts\claudetrade.exe version
+```
+should print `claudetrade 0.1.0 (code_version=...)` followed by the
+research-only disclaimer, with no traceback.
+
+**Fail looks like**: The script prints `ERROR` and exits with a non-zero
+code before finishing; `'claudetrade' is not recognized`; a `pip` error
+partway through the install (visible in the console and the transcript log).
+
+**Troubleshooting**: [Python 3.11 not found](troubleshooting.md#python-311-not-found),
+["'python' is not recognized..."](troubleshooting.md#python-is-not-recognized-as-an-internal-or-external-command),
+[ModuleNotFoundError: No module named 'claudetrade'](troubleshooting.md#modulenotfounderror-no-module-named-claudetrade--claudetrade-is-not-recognized).
+
+If you'd rather run the manual steps this script automates (e.g. to isolate
+which one is failing), see [docs/windows-install.md](windows-install.md#step-1-install-python-311-or-newer)
+Steps 1–4:
 ```
 py -m venv .venv
 .venv\Scripts\activate
@@ -23,17 +58,6 @@ pip install -r requirements.txt
 pip install -e .
 claudetrade version
 ```
-
-**Pass looks like**: `claudetrade version` prints `claudetrade 0.1.0
-(code_version=...)` followed by the research-only disclaimer, with no
-traceback.
-
-**Fail looks like**: `'python'`/`'py'` not recognized; `'claudetrade' is not
-recognized`; a `pip` error partway through the install.
-
-**Troubleshooting**: [Python 3.11 not found](troubleshooting.md#python-311-not-found),
-["'python' is not recognized..."](troubleshooting.md#python-is-not-recognized-as-an-internal-or-external-command),
-[ModuleNotFoundError: No module named 'claudetrade'](troubleshooting.md#modulenotfounderror-no-module-named-claudetrade--claudetrade-is-not-recognized).
 
 ---
 
