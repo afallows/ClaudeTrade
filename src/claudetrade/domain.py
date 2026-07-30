@@ -105,6 +105,7 @@ class EarningsSession(StrEnum):
 class SocialSource(StrEnum):
     REDDIT = "reddit"
     X = "x"
+    NEWS = "news"
     OTHER = "other"
 
 

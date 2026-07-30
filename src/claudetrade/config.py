@@ -235,6 +235,62 @@ class XConfig(BaseModel):
     store_author_names: bool = False
 
 
+class NewsConfig(BaseModel):
+    """Publisher-syndicated RSS/Atom news feeds: a lawful, credential-free
+    social-sentiment source.
+
+    This exists to reduce the application's reliance on Reddit's official API
+    (rate-limited, OAuth-gated, and subject to Reddit's own availability).
+    RSS/Atom feeds that a publisher explicitly serves for syndication are a
+    different kind of source entirely: there is no authentication to fail,
+    no scraping, no ToS boundary to test -- the operator publishes the feed
+    for exactly this purpose. That is also why, unlike Reddit/X, this source
+    defaults to its *live* adapter (``provider = "news_rss"``) rather than the
+    offline synthetic generator: there are no credentials to be missing and
+    no paid tier to gate behind an opt-in.
+
+    ``feed_urls`` ships a small default list of major exchange/regulator,
+    wire-service and public-broadcaster feeds chosen because their owners
+    document them as public syndication feeds (see ``docs/api-providers.md``
+    for the rationale on each). This package cannot verify the URLs are still
+    live from a sandboxed, egress-blocked build -- operators should confirm
+    reachability with ``claudetrade probe`` after deploying and are free to
+    replace the list with feeds of their own choosing.
+    """
+
+    enabled: bool = True
+    provider: str = "news_rss"
+    feed_urls: list[str] = Field(
+        default_factory=lambda: [
+            # US securities regulator: official press-release feed.
+            "https://www.sec.gov/news/pressreleases.rss",
+            # US central bank: official press-release feed.
+            "https://www.federalreserve.gov/feeds/press_all.xml",
+            # Wire service: publishes per-category RSS for syndication.
+            "https://www.prnewswire.com/rss/financial-services-latest-news.rss",
+            # Public broadcaster: publishes per-section RSS, including business.
+            "https://feeds.npr.org/1006/rss.xml",
+        ]
+    )
+    user_agent: str = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
+    rate_limit_per_minute: int = 30
+    request_timeout_s: float = 20.0
+    lookback_hours: int = 72
+    #: Salt for the publisher-level author hash (see ``NewsRssProvider``:
+    #: there is no personal author to pseudonymise, only the feed's domain).
+    author_salt: str = "news_rss"
+
+    # --- Hosted (paid) sentiment aggregator seam ---------------------------
+    # See providers/social/hosted_api.py::HostedSentimentProvider. Disabled
+    # by default: this is a documented adapter seam, not a working
+    # integration, so all three of these must be explicitly set before the
+    # constructor even attempts to proceed (and even then it raises -- see
+    # that module's docstring for what a real implementation must add).
+    hosted_base_url: str | None = None
+    hosted_credential: str | None = None
+    hosted_enabled: bool = False
+
+
 class AIConfig(BaseModel):
     """Optional LLM assistance.
 
@@ -674,6 +730,7 @@ class AppConfig(BaseSettings):
     earnings: EarningsConfig = Field(default_factory=EarningsConfig)
     reddit: RedditConfig = Field(default_factory=RedditConfig)
     x: XConfig = Field(default_factory=XConfig)
+    news: NewsConfig = Field(default_factory=NewsConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     filters: FilterConfig = Field(default_factory=FilterConfig)
@@ -745,6 +802,7 @@ class AppConfig(BaseSettings):
             "earnings": True,
             "reddit": self.reddit.enabled,
             "x": self.x.enabled,
+            "news": self.news.enabled,
             "ai": self.ai.provider != "null",
             "notifications": self.notifications.enabled,
             "scheduler": self.scheduler.enabled,

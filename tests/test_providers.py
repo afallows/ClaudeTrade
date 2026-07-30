@@ -335,6 +335,7 @@ def test_reddit_registry_skips_unconfigured_source_without_raising():
     config.reddit.enabled = True
     config.reddit.provider = "reddit"  # the live adapter, with no credentials
     config.x.enabled = False
+    config.news.enabled = False  # news_rss is on by default; isolate reddit here
     assert get_social_providers(config) == []
 
 
@@ -346,6 +347,7 @@ def test_synthetic_reddit_provider_is_reachable_without_credentials():
     config = AppConfig()
     config.reddit.enabled = True
     config.reddit.provider = "synthetic"
+    config.news.enabled = False  # news_rss is on by default; isolate reddit here
     providers = get_social_providers(config)
     assert len(providers) == 1
     assert providers[0].source is SocialSource.REDDIT

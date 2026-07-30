@@ -398,6 +398,149 @@ claudetrade secrets set x_bearer_token
 
 **Licence**: X/Twitter data is subject to X's API terms. Redistribution restrictions apply.
 
+### News RSS/Atom (Default, Live, No Credentials)
+
+**Module**: `src/claudetrade/providers/social/news_rss.py`
+
+Reads a configurable list of RSS/Atom feeds that publishers explicitly serve
+for syndication -- this is the source this package adds to broaden sentiment
+beyond Reddit's official API, which trial feedback flagged as flaky
+(rate-limited, OAuth-gated, occasionally unavailable). It is **not** scraping:
+no authentication is bypassed, no paywall is defeated, and no vendor rate
+limit or terms-of-service boundary is tested. A feed exists because its
+owner published it for exactly this purpose.
+
+Unlike Reddit and X, this source defaults to its live adapter
+(`provider = "news_rss"`), not the offline synthetic generator, because there
+are no credentials to be missing and no paid tier to gate behind an opt-in --
+the same reasoning that makes Stooq market data usable with `enabled = true`
+out of the box.
+
+**Default feeds** (chosen because their owners document them as public
+syndication feeds -- an exchange/regulator, a central bank, a wire service,
+and a public broadcaster):
+
+| Feed | Why it's a lawful default |
+| --- | --- |
+| `https://www.sec.gov/news/pressreleases.rss` | US securities regulator; official press-release RSS, published for public syndication. |
+| `https://www.federalreserve.gov/feeds/press_all.xml` | US central bank; official press-release RSS. |
+| `https://www.prnewswire.com/rss/financial-services-latest-news.rss` | Wire service; publishes per-category RSS specifically for syndication -- this is its own advertised distribution channel, not a side effect of its website. |
+| `https://feeds.npr.org/1006/rss.xml` | Public broadcaster; publishes per-section RSS (this one is the Business section) via a documented feeds directory. |
+
+**Honest limitation**: this package was built and tested against recorded
+fixture XML (`tests/fixtures/news_rss/`) in an egress-blocked environment --
+none of the above URLs were reached at runtime while writing it. Operators
+should confirm each feed still resolves and still serves the expected
+format (`claudetrade probe`, or simply fetching the URL) before relying on it,
+and are free to edit `feed_urls` to any other feed their organisation is
+comfortable treating as a syndication channel.
+
+**Configuration**:
+
+```toml
+[news]
+enabled = true
+provider = "news_rss"
+feed_urls = [
+    "https://www.sec.gov/news/pressreleases.rss",
+    "https://www.federalreserve.gov/feeds/press_all.xml",
+]
+rate_limit_per_minute = 30
+request_timeout_s = 20.0
+lookback_hours = 72
+```
+
+**Credentials**: None required.
+
+**Ticker relevance**: headlines rarely carry cashtags (`$AAPL`), so this
+adapter does not attempt ticker resolution itself -- it hands sanitised text
+to the same `sentiment.entity_resolution.TickerResolver` every other source
+runs through. The resolver's company-name/alias path is what makes a headline
+like "Shopify beats earnings expectations" resolve to `SHOP` (a directory
+entry with `name = "Shopify"` is enough); the bare-symbol path is what would
+be needed for a headline that used the ticker itself instead of the company
+name, and is scored much more cautiously (see
+`sentiment/entity_resolution.py`'s module docstring). Company/product names
+that do not match a directory entry's `name`/`aliases` will simply not
+resolve -- this is the resolver's existing, documented limitation, not
+something added by this provider.
+
+**Deduplication**: wire stories are routinely syndicated verbatim across
+multiple of the configured feeds with different `guid`/`link` values. Items
+are deduplicated first by `external_id` (per item, within a single fetch)
+and then by the sanitised text's `text_hash` (across feeds) -- the first copy
+seen is kept, its `duplicate_group` is set to that hash, and later copies are
+dropped rather than passed on to double-count the same story in sentiment
+aggregation.
+
+**A note on credibility weighting**: `SocialPost` engagement fields
+(`score`/`num_comments`/`num_reposts`/`num_replies`) and author metrics
+(`author_age_days`/`author_karma`/`author_followers`) are structurally absent
+for a wire story -- there is no vote count or account history to report, so
+all of these are `0`/`None`. `sentiment.aggregation._credibility_score` scores
+absent metrics as their zero-value floor (age/karma/followers component all
+`0.0`), and `engagement_weighted` scales by `log1p(engagement)` which is also
+`0` for a post with no engagement counts at all. The practical effect: a news
+post contributes normally to `raw_sentiment`, `unique_author_sentiment`,
+`sentiment_acceleration` and the label averages (all of which use only the
+time-decay weight), but contributes **zero** weight to `engagement_weighted`
+and `credibility_weighted` -- an authoritative wire story is treated
+identically to a brand-new, karma-less throwaway account for those two
+measures specifically, not because it is *distrusted* but because "no
+metrics reported" and "worst possible metrics" are not currently
+distinguished by that scoring function. This is an existing characteristic of
+`sentiment/aggregation.py` (out of scope for this provider package to
+change) rather than a defect introduced here; it is worth knowing if
+`engagement_weighted`/`credibility_weighted` specifically are used to
+evaluate how much news content is influencing a symbol's sentiment.
+
+**Limitations**:
+
+- No engagement signal exists for a wire story (see credibility note above)
+- No author to pseudonymise; the "author" hash is a salted digest of the
+  feed's own domain, not a person
+- Feeds serve only recent items (typically the last few dozen stories per
+  feed); this is not a historical archive
+- No guaranteed uptime or format stability -- a publisher can change its feed
+  format or retire it at any time, same as any other free, unauthenticated
+  endpoint
+
+**Licence**: Feeds are read only from URLs their owners publish for
+syndication. Content is standard news-article text; no redistribution beyond
+this application's own sentiment pipeline is performed. Operators remain
+responsible for confirming any additional feed they add is genuinely
+published for syndication by its owner.
+
+### Hosted Sentiment Aggregator (Stub, Not Implemented)
+
+**Module**: `src/claudetrade/providers/social/hosted_api.py`
+
+`HostedSentimentProvider` is a documented adapter **seam**, not a working
+integration -- its constructor always raises `NotConfiguredError`, even when
+fully configured. It exists so a future paid aggregator (broader outlet
+coverage, deeper history) has an obvious place to be wired in, without a fake
+implementation standing in for it in the meantime. See the module's
+docstring for what a real implementation must provide: stated historical
+depth (ADR-0007's rejection of `openbb-adanos`'s 90-day cap is the
+cautionary example), a clear statement of whether the vendor returns
+per-post data (which must go through the same sanitisation/hashing pipeline
+as every other adapter) or pre-aggregated scores (which must not be forced
+into fabricated per-post rows), and the vendor's licensing terms per
+ADR-0007 Decision 5.
+
+**Configuration** (present on `NewsConfig` but inert until a real
+implementation replaces the stub):
+
+```toml
+[news]
+hosted_base_url = "https://example-vendor.invalid/api"
+hosted_credential = "hosted_sentiment_api_key"
+hosted_enabled = true
+```
+
+Setting all three still raises `NotConfiguredError` today -- that is the
+point of a stub.
+
 ---
 
 ## AI Providers
@@ -691,6 +834,7 @@ Market data is older than `market_data.stale_after_hours`.
 ## Data Retention and Privacy
 
 - **Social media**: Posts are sanitised; usernames are hashed. Raw text is not logged.
+- **News**: Item text is sanitised the same way; there is no username to hash, so the author hash is a salted digest of the feed's own domain (publisher-level, not personal data).
 - **Sentiment**: Aggregated; individual posts are not visible in output.
 - **Audit log**: Credential access is logged but not the value.
 - **Database**: Market and earnings data is retained indefinitely for backtesting.

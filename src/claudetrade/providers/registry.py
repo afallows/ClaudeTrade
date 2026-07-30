@@ -12,7 +12,7 @@ import datetime as dt
 import logging
 
 from claudetrade.config import AppConfig
-from claudetrade.domain import Bar, CorporateAction, SecurityInfo
+from claudetrade.domain import Bar, CorporateAction, SecurityInfo, SocialSource
 from claudetrade.providers.base import (
     AIProvider,
     AIRequest,
@@ -343,6 +343,30 @@ def _build_x_provider(config: AppConfig) -> SocialProvider | None:
     return XProvider(config.x)
 
 
+def _build_news_provider(config: AppConfig) -> SocialProvider | None:
+    """Instantiate the configured news adapter, or ``None`` when unavailable.
+
+    Unlike Reddit/X, ``news_rss`` (not ``synthetic``) is the default: RSS
+    needs no credentials and no paid tier, so there is nothing to gate behind
+    an opt-in the way Reddit's OAuth app or X's paid API tier are gated.
+    """
+    if config.news.provider == "synthetic":
+        from claudetrade.providers.social.synthetic import SyntheticSocialProvider
+
+        # Offset the seed so this doesn't emit an identical corpus to the
+        # other synthetic sources, which would make source-concentration
+        # metrics meaningless.
+        return SyntheticSocialProvider(
+            source=SocialSource.NEWS,
+            seed=config.backtest.random_seed + 2,
+            base_author_salt="news_synthetic",
+        )
+
+    from claudetrade.providers.social.news_rss import NewsRssProvider
+
+    return NewsRssProvider(config.news)
+
+
 def get_social_providers(config: AppConfig) -> list[SocialProvider]:
     """Construct the enabled social providers.
 
@@ -361,6 +385,7 @@ def get_social_providers(config: AppConfig) -> list[SocialProvider]:
     for enabled, name, builder in (
         (config.reddit.enabled, "reddit", _build_reddit_provider),
         (config.x.enabled, "x", _build_x_provider),
+        (config.news.enabled, "news", _build_news_provider),
     ):
         if not enabled:
             continue

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Example Broadcaster - Business</title>
+  <link href="https://broadcaster.example.org/business" rel="self" />
+  <updated>2024-06-03T19:00:00Z</updated>
+  <entry>
+    <title>Regional bank shares rally on stress test results</title>
+    <link href="https://broadcaster.example.org/2024/06/03/bank-stress-test" />
+    <id>broadcaster-example-id-bank-1</id>
+    <updated>2024-06-03T09:30:00-05:00</updated>
+    <summary>Shares of several regional lenders rose after the latest round of stress test results was published.</summary>
+  </entry>
+  <entry>
+    <title>Oil prices slip on demand concerns</title>
+    <link href="https://broadcaster.example.org/2024/06/03/oil-prices-slip" />
+    <id>broadcaster-example-id-oil-1</id>
+    <published>2024-06-03T12:00:00Z</published>
+    <content>Crude futures fell for a third straight session amid signs of softening global demand.</content>
+  </entry>
+</feed>
