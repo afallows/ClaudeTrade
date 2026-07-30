@@ -347,7 +347,15 @@ class Pipeline:
 
         if record:
             for signal in scan_result.signals:
-                self.ledger.record(signal)
+                # One unrecordable signal (a true same-id/different-content
+                # collision now indicates corruption, not a routine rescan)
+                # must not abort recording the rest of the batch.
+                outcome = self.ledger.record_or_report(signal)
+                if not outcome.ok:
+                    scan_result.record_errors[signal.signal_id] = outcome.error or "unknown"
+                    result.warnings.append(
+                        f"signal {signal.signal_id} could not be recorded: {outcome.error}"
+                    )
             # Anything that never triggered inside its window is closed off, so
             # a stale idea cannot be resurrected at a convenient price later.
             self.ledger.expire_stale(session)

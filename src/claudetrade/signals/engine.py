@@ -81,6 +81,13 @@ class ScanResult:
     evaluated_symbols: int = 0
     data_snapshot_hash: str = ""
     warnings: list[str] = field(default_factory=list)
+    #: signal_id -> error message, for signals the caller tried to persist
+    #: (via ``SignalLedger.record_or_report``) but that collided under an id
+    #: already claimed by different content. Left empty by ``scan()`` itself,
+    #: which only builds signals -- populated by the recording caller (see
+    #: ``pipeline.scan``) so a genuine collision shows up as one signal
+    #: missing from the ledger rather than aborting the whole scan.
+    record_errors: dict[str, str] = field(default_factory=dict)
 
     @property
     def longs(self) -> list[Signal]:
@@ -354,7 +361,9 @@ class SignalEngine:
                 )
 
         event = ctx.next_earnings()
-        signal_id = make_signal_id(ctx.symbol, strategy.name, session, self.config.config_hash)
+        signal_id = make_signal_id(
+            ctx.symbol, strategy.name, session, self.config.config_hash, CODE_VERSION
+        )
         freshness = self._freshness_hours(ctx, session)
 
         risks = list(proposal.risks)

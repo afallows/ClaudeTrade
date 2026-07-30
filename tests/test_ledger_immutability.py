@@ -6,7 +6,10 @@ import datetime as dt
 from dataclasses import replace
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
+from claudetrade.db.models import SignalRow
 from claudetrade.db.session import Database
 from claudetrade.domain import (
     ComponentScores,
@@ -18,7 +21,10 @@ from claudetrade.domain import (
 from claudetrade.signals.ledger import (
     LedgerIntegrityError,
     SignalLedger,
+    make_signal_id,
+    signal_integrity_payload,
 )
+from claudetrade.utils.hashing import content_hash
 
 
 @pytest.fixture
@@ -145,3 +151,213 @@ class TestExpireStale:
         # Check the status
         status = ledger.current_status("OLD_SIG")
         assert status == SignalStatus.EXPIRED
+
+
+class TestVerifyOnReadRoundTrip:
+    """Defect 1: every datetime deserialized from the DB must come back
+    timezone-aware UTC, so a legitimately-stored signal's hash re-verifies.
+    """
+
+    def test_record_then_get_verify_succeeds(self, tmp_db: Database, sample_signal: Signal):
+        """A signal recorded through the normal write path must pass
+        ``get(..., verify=True)`` -- the whole point of the integrity hash is
+        to catch tampering, not to fail on every read.
+        """
+        ledger = SignalLedger(tmp_db)
+        ledger.record(sample_signal)
+
+        loaded = ledger.get("SIG001", verify=True)
+
+        assert loaded is not None
+        assert loaded.signal_id == "SIG001"
+
+    def test_round_tripped_datetimes_are_utc_aware(
+        self, tmp_db: Database, sample_signal: Signal
+    ):
+        """``created_at`` and ``price_as_of`` come back timezone-aware UTC,
+        not naive -- the root cause of defect 1.
+        """
+        ledger = SignalLedger(tmp_db)
+        ledger.record(sample_signal)
+
+        loaded = ledger.get("SIG001", verify=False)
+
+        assert loaded is not None
+        assert loaded.created_at.tzinfo is not None
+        assert loaded.created_at.utcoffset() == dt.timedelta(0)
+        assert loaded.price_as_of.tzinfo is not None
+        assert loaded.price_as_of.utcoffset() == dt.timedelta(0)
+
+    def test_verify_all_reports_no_failures_for_untampered_signals(
+        self, tmp_db: Database, sample_signal: Signal
+    ):
+        """``verify_all`` must not flag freshly recorded, untampered signals."""
+        ledger = SignalLedger(tmp_db)
+        ledger.record(sample_signal)
+
+        assert ledger.verify_all() == []
+
+
+class TestTamperDetection:
+    """A row that diverges from its recorded hash is detected, not trusted."""
+
+    def test_raw_sql_update_is_rejected_by_immutability_trigger(
+        self, tmp_db: Database, sample_signal: Signal
+    ):
+        """Migration 002's trigger blocks ``UPDATE`` outright -- tampering via
+        a SQL client never gets far enough to need the hash check at all.
+        """
+        ledger = SignalLedger(tmp_db)
+        ledger.record(sample_signal)
+
+        with pytest.raises(IntegrityError), tmp_db.engine.begin() as conn:
+            conn.execute(text("UPDATE signals SET symbol = 'HACKED' WHERE signal_id = 'SIG001'"))
+
+        # The row is untouched -- verify still succeeds on the original content.
+        assert ledger.get("SIG001", verify=True).symbol == "TEST"
+
+    def test_mismatched_row_fails_verification(
+        self, tmp_db: Database, sample_signal: Signal
+    ):
+        """Simulated tampering: a row inserted directly (bypassing
+        ``record()``, which is the only thing the trigger cannot stop since
+        ``INSERT`` is permitted) whose stored ``integrity_hash`` does not
+        match its content. ``get(..., verify=True)`` must raise rather than
+        hand back an unverified signal.
+        """
+        tampered_id = "SIG_TAMPERED"
+        tampered_signal = replace(sample_signal, signal_id=tampered_id)
+        # A hash computed over content that does not match what's inserted --
+        # standing in for a row edited outside the application.
+        wrong_hash = content_hash(
+            signal_integrity_payload(replace(tampered_signal, symbol="SOMETHING_ELSE"))
+        )
+        with tmp_db.session() as session:
+            session.add(
+                SignalRow(
+                    signal_id=tampered_id,
+                    created_at=tampered_signal.created_at,
+                    session=tampered_signal.session,
+                    symbol=tampered_signal.symbol,
+                    company_name=tampered_signal.company_name,
+                    strategy=tampered_signal.strategy,
+                    strategy_version=tampered_signal.strategy_version,
+                    direction=tampered_signal.direction.value,
+                    initial_status=tampered_signal.status.value,
+                    reference_price=tampered_signal.reference_price,
+                    price_as_of=tampered_signal.price_as_of,
+                    overall_score=tampered_signal.overall_score,
+                    confidence=tampered_signal.confidence,
+                    components=tampered_signal.components.as_dict(),
+                    plan={
+                        "entry_low": tampered_signal.plan.entry_low,
+                        "entry_high": tampered_signal.plan.entry_high,
+                        "stop_loss": tampered_signal.plan.stop_loss,
+                        "targets": tampered_signal.plan.targets,
+                        "shares": tampered_signal.plan.shares,
+                    },
+                    regime=tampered_signal.regime.value,
+                    code_version=tampered_signal.code_version,
+                    config_hash=tampered_signal.config_hash,
+                    data_snapshot_hash=tampered_signal.data_snapshot_hash,
+                    integrity_hash=wrong_hash,
+                )
+            )
+
+        ledger = SignalLedger(tmp_db)
+        with pytest.raises(LedgerIntegrityError):
+            ledger.get(tampered_id, verify=True)
+
+
+class TestSignalIdReproducibility:
+    """Defect 2: the id's hash suffix covers ``config_hash`` and
+    ``code_version`` so a config or code change mints a different id
+    instead of colliding with a prior scan's id under different content.
+    """
+
+    def test_same_inputs_produce_same_id(self):
+        """Re-scanning with identical inputs still dedupes silently."""
+        session = dt.date(2024, 1, 2)
+        id1 = make_signal_id("AAPL", "breakout", session, "cfg-abc", "0.1.0+gdead")
+        id2 = make_signal_id("AAPL", "breakout", session, "cfg-abc", "0.1.0+gdead")
+        assert id1 == id2
+
+    def test_changed_config_hash_changes_id(self):
+        """A configuration change mints a different id."""
+        session = dt.date(2024, 1, 2)
+        id1 = make_signal_id("AAPL", "breakout", session, "cfg-abc", "0.1.0+gdead")
+        id2 = make_signal_id("AAPL", "breakout", session, "cfg-xyz", "0.1.0+gdead")
+        assert id1 != id2
+
+    def test_changed_code_version_changes_id(self):
+        """A code deploy mints a different id, even with unchanged config."""
+        session = dt.date(2024, 1, 2)
+        id1 = make_signal_id("AAPL", "breakout", session, "cfg-abc", "0.1.0+gdead")
+        id2 = make_signal_id("AAPL", "breakout", session, "cfg-abc", "0.1.0+gbeef")
+        assert id1 != id2
+
+    def test_rescanning_after_config_change_records_both(
+        self, tmp_db: Database, sample_signal: Signal
+    ):
+        """The whole point: re-scanning a session after a config change must
+        not raise ``LedgerIntegrityError`` -- it mints a fresh id and records
+        alongside the original rather than colliding with it.
+        """
+        ledger = SignalLedger(tmp_db)
+        session = dt.date(2024, 1, 2)
+        id_before = make_signal_id("AAPL", "breakout", session, "cfg-abc", "0.1.0+gdead")
+        id_after = make_signal_id("AAPL", "breakout", session, "cfg-xyz", "0.1.0+gdead")
+
+        first = replace(
+            sample_signal, signal_id=id_before, config_hash="cfg-abc", code_version="0.1.0+gdead"
+        )
+        second = replace(
+            sample_signal,
+            signal_id=id_after,
+            symbol=first.symbol,
+            overall_score=first.overall_score + 1,  # the config change altered scoring
+            config_hash="cfg-xyz",
+            code_version="0.1.0+gdead",
+        )
+
+        ledger.record(first)
+        ledger.record(second)  # must not raise
+
+        assert ledger.get(id_before, verify=True) is not None
+        assert ledger.get(id_after, verify=True) is not None
+
+
+class TestRecordOrReport:
+    """``record_or_report`` turns a true collision into a structured outcome
+    instead of raising, so a batch of many signals can surface one failure
+    without aborting the rest.
+    """
+
+    def test_fresh_signal_reports_ok(self, tmp_db: Database, sample_signal: Signal):
+        ledger = SignalLedger(tmp_db)
+        outcome = ledger.record_or_report(sample_signal)
+        assert outcome.ok
+        assert not outcome.duplicate
+        assert outcome.error is None
+
+    def test_identical_rerecord_reports_ok_duplicate(
+        self, tmp_db: Database, sample_signal: Signal
+    ):
+        ledger = SignalLedger(tmp_db)
+        ledger.record(sample_signal)
+        outcome = ledger.record_or_report(sample_signal)
+        assert outcome.ok
+        assert outcome.duplicate
+
+    def test_true_collision_reports_failure_without_raising(
+        self, tmp_db: Database, sample_signal: Signal
+    ):
+        ledger = SignalLedger(tmp_db)
+        ledger.record(sample_signal)
+        different_signal = replace(sample_signal, symbol="OTHER", direction=Direction.SHORT)
+
+        outcome = ledger.record_or_report(different_signal)
+
+        assert not outcome.ok
+        assert outcome.error is not None
+        assert "SIG001" in outcome.error
