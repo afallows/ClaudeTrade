@@ -183,17 +183,17 @@ def init(config: ConfigOption = None) -> None:
     typer.echo(
         f"market data: provider={cfg.market_data.provider} "
         + (
-            "(offline synthetic data -- zero API keys, zero network, the default)"
+            "(offline synthetic demo data -- fabricated tickers)"
             if cfg.market_data.provider == "synthetic"
-            else "(live)"
+            else "(live; Stooq is the default)"
         )
     )
     if cfg.market_data.provider == "synthetic":
         typer.echo(
-            "  to switch on real US + Canadian daily bars: set "
+            "  WARNING: synthetic mode creates fabricated tickers. To restore real "
+            "US + Canadian daily bars, set "
             'market_data.provider = "stooq" in config.toml, run `claudetrade probe` '
-            "to confirm this machine can reach stooq.com, then `claudetrade refresh`. "
-            "The default stays synthetic/offline; this is opt-in."
+            "to confirm this machine can reach stooq.com, then `claudetrade refresh`."
         )
 
 

@@ -275,3 +275,23 @@ export interface SignalFilters {
   max_days_to_earnings?: number;
   limit?: number;
 }
+
+export interface CredentialStatus {
+  name: string;
+  label: string;
+  pipeline: 'sentiment' | 'stock_price';
+  configured: boolean;
+  source: string | null;
+  masked: string | null;
+}
+export interface CredentialsResponse { credentials: CredentialStatus[]; storage: string; }
+export interface PipelineDiagnostic {
+  name: string;
+  kind: 'sentiment' | 'stock_price';
+  provider: string;
+  status: 'reachable' | 'configured' | 'not_configured';
+  configured: boolean;
+  reachable: boolean | null;
+  detail: string;
+}
+export interface DiagnosticsResponse { pipelines: PipelineDiagnostic[]; probe_note: string; }

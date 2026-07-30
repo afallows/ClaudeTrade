@@ -9,6 +9,8 @@ import { SkeletonCard, SkeletonRows } from './components/Skeleton';
 // bundle, and only one of the three screens needs AG Grid at all -- lazy
 // imports keep them out of the entry chunk instead of paying for all three
 // screens' dependencies on first paint.
+const Configuration = lazy(() => import('./screens/Configuration').then((m) => ({ default: m.Configuration })));
+const Diagnostics = lazy(() => import('./screens/Diagnostics').then((m) => ({ default: m.Diagnostics })));
 const Dashboard = lazy(() => import('./screens/Dashboard').then((m) => ({ default: m.Dashboard })));
 const Screener = lazy(() => import('./screens/Screener').then((m) => ({ default: m.Screener })));
 const TickerDetailScreen = lazy(() =>
@@ -48,6 +50,8 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Dashboard /> },
       { path: 'screener', element: <Screener /> },
+      { path: 'configuration', element: <Configuration /> },
+      { path: 'diagnostics', element: <Diagnostics /> },
       { path: 'tickers/:symbol', element: <TickerDetailScreen /> },
     ],
   },

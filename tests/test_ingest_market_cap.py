@@ -191,3 +191,27 @@ class TestIngestSecuritiesStoresResolvedCap:
             row = session.get(Security, "AAPL")
             assert row is not None
             assert row.market_cap_usd == 2_800_000_000_000.0
+
+
+class TestHistoricalRequestMarketCapFloor:
+    def test_current_cap_filters_history_request_universe(self, memory_db):
+        config = AppConfig()
+        provider = _CapProvider({"BIG": 2_000_000_000.0, "SMALL": 900_000_000.0})
+        ingestor = _ingestor(config, memory_db, provider)
+        report = IngestReport()
+        enriched = ingestor.ingest_securities(
+            [SecurityInfo(symbol="BIG"), SecurityInfo(symbol="SMALL")], report
+        )
+
+        assert ingestor.symbols_passing_market_cap_floor(
+            ["BIG", "SMALL", config.market_data.benchmark_symbol], enriched
+        ) == ["BIG", config.market_data.benchmark_symbol]
+
+    def test_strict_unknown_policy_does_not_request_unresolved_symbol(self, memory_db):
+        config = AppConfig()
+        config.universe.unknown_cap_policy = "exclude"
+        ingestor = _ingestor(config, memory_db, _CapProvider({}))
+
+        assert ingestor.symbols_passing_market_cap_floor(
+            ["UNKNOWN"], [SecurityInfo(symbol="UNKNOWN")]
+        ) == []

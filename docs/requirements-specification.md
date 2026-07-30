@@ -103,7 +103,7 @@ This document maps functional and non-functional requirements to their implement
 
 | Requirement | Status | Implementation | Notes |
 |-------------|--------|----------------|-------|
-| Scan and generate signals for up to 2000 symbols daily | Implemented | `src/claudetrade/config.py` (`UniverseConfig.max_symbols`) | Batch processing; configurable |
+| Scan and generate signals for the complete packaged >=$1B US + TSX universe (up to 3000 symbols by default) | Implemented | `src/claudetrade/config.py` (`UniverseConfig.max_symbols`) | Batch processing; configurable |
 | Backtest 10 years of daily data in reasonable time | Partial | `src/claudetrade/backtest/engine.py` | Walk-forward reduces per-window cost; full 10-year test may take hours |
 | Support up to 250 LLM calls per run | Implemented | `src/claudetrade/config.py` (`AIConfig.max_calls_per_run`) | Batch requests; caching |
 

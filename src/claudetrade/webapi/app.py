@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from claudetrade.config import AppConfig
 from claudetrade.pipeline import Pipeline
 from claudetrade.version import CODE_VERSION, DISCLAIMER
-from claudetrade.webapi.routers import dashboard, paper, signals, tickers
+from claudetrade.webapi.routers import dashboard, paper, signals, system, tickers
 
 #: Built frontend assets (``npm run build`` output), committed to the repo so
 #: end users never need Node -- see ``frontend/DESIGN.md``.
@@ -53,6 +53,7 @@ def create_app(config: AppConfig, pipeline: Pipeline | None = None) -> FastAPI:
     app.include_router(tickers.router)
     app.include_router(dashboard.router)
     app.include_router(paper.router)
+    app.include_router(system.router)
 
     @app.get("/api/meta", tags=["meta"])
     def meta() -> dict[str, object]:

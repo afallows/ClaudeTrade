@@ -6,8 +6,8 @@ Covers two of the out-of-box-experience fixes:
   days ending today, not a multi-year window -- a fresh install pointed at a
   real provider should not have to pull years of history for hundreds of
   symbols before it shows anything.
-* ``init`` must say which universe is active and how to switch on real data,
-  without flipping the default provider away from synthetic/offline.
+* ``init`` must say which universe is active and confirm that live Stooq data
+  is enabled by default rather than fabricated synthetic tickers.
 """
 
 from __future__ import annotations
@@ -84,22 +84,22 @@ def test_refresh_explicit_dates_are_not_overridden(cli_env, monkeypatch):
     assert captured["end"] == dt.date(2024, 12, 31)
 
 
-def test_init_reports_active_universe_and_how_to_go_live(cli_env):
+def test_init_reports_active_universe_and_live_provider(cli_env):
     result = runner.invoke(app, ["init"])
 
     assert result.exit_code == 0, result.output
     assert "universe:" in result.output
     assert "us_default" in result.output
     assert "ca_default" in result.output
-    assert "market_data.provider" in result.output
-    assert 'provider = "stooq"' in result.output
+    assert "provider=stooq" in result.output
+    assert "live; Stooq is the default" in result.output
 
 
-def test_init_does_not_flip_the_default_provider(cli_env):
-    """Telling the user how to switch to stooq must not itself switch it --
-    zero-key offline behaviour stays the default."""
+def test_stooq_is_the_default_market_provider(cli_env):
+    """A fresh install must not silently populate fabricated market tickers."""
     from claudetrade.config import get_config
 
     runner.invoke(app, ["init"])
     config = get_config(reload=True)
-    assert config.market_data.provider == "synthetic"
+    assert config.market_data.provider == "stooq"
+    assert config.market_data.fallbacks == ["yahoo", "csv"]

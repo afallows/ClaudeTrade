@@ -33,6 +33,10 @@ def tmp_app_config(tmp_path: Path, monkeypatch) -> AppConfig:
     reset_config_cache()
 
     config = AppConfig()
+    # Production defaults to live Stooq data. Unit tests must remain
+    # deterministic and must never make outbound provider requests implicitly.
+    config.market_data.provider = "synthetic"
+    config.market_data.fallbacks = []
     config.logging.console = False
     config.paths.app_dir = tmp_path
 
@@ -139,7 +143,7 @@ def make_bar():
         counter[0] += 1
         date = session or dt.date(2023, 1, 3) + dt.timedelta(days=counter[0])
         h = high if high is not None else open_ * 1.02
-        l = low if low is not None else open_ * 0.98
+        low_value = low if low is not None else open_ * 0.98
         c = close if close is not None else open_ * 1.01
         ac = adj_close if adj_close is not None else c
 
@@ -148,7 +152,7 @@ def make_bar():
             session=date,
             open=open_,
             high=h,
-            low=l,
+            low=low_value,
             close=c,
             volume=volume,
             adj_close=ac,

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AgGridReact } from 'ag-grid-react';
 import type { ColDef, ICellRendererParams, RowClickedEvent } from 'ag-grid-community';
-import { ChevronDown, RefreshCw, ScanSearch } from 'lucide-react';
+import { ChevronDown, RefreshCw, ScanSearch, Search } from 'lucide-react';
 import '../grid/register';
 import { claudeTradeGridTheme } from '../grid/theme';
 import { api, ApiError } from '../api/client';
@@ -71,6 +71,44 @@ const columnDefs: ColDef<SignalRow>[] = [
 ];
 
 const DIRECTIONS: Array<'long' | 'short'> = ['long', 'short'];
+const FILTER_STORAGE_KEY = 'claudetrade.screener.filters';
+
+type PersistedFilters = {
+  minScore: number;
+  minConfidence: number;
+  maxDaysToEarnings: number | null;
+};
+
+const DEFAULT_FILTERS: PersistedFilters = {
+  minScore: 0,
+  minConfidence: 0,
+  maxDaysToEarnings: null,
+};
+
+function loadPersistedFilters(): PersistedFilters {
+  try {
+    const stored = JSON.parse(localStorage.getItem(FILTER_STORAGE_KEY) ?? '{}') as Partial<PersistedFilters>;
+    return {
+      minScore:
+        typeof stored.minScore === 'number' && stored.minScore >= 0 && stored.minScore <= 100
+          ? stored.minScore
+          : DEFAULT_FILTERS.minScore,
+      minConfidence:
+        typeof stored.minConfidence === 'number' &&
+        stored.minConfidence >= 0 &&
+        stored.minConfidence <= 1
+          ? stored.minConfidence
+          : DEFAULT_FILTERS.minConfidence,
+      maxDaysToEarnings:
+        stored.maxDaysToEarnings === null ||
+        (typeof stored.maxDaysToEarnings === 'number' && stored.maxDaysToEarnings >= 0)
+          ? stored.maxDaysToEarnings
+          : DEFAULT_FILTERS.maxDaysToEarnings,
+    };
+  } catch {
+    return DEFAULT_FILTERS;
+  }
+}
 
 /** The Screener: the owner's original complaint ("I can't click and go on
  * the screener to show the details of the setups") is fixed entirely by
@@ -79,13 +117,17 @@ const DIRECTIONS: Array<'long' | 'short'> = ['long', 'short'];
  * dropdown" step the old Streamlit table needed. */
 export function Screener() {
   const navigate = useNavigate();
+  const [tickerSearch, setTickerSearch] = useState('');
   const [allSignals, setAllSignals] = useState<SignalRow[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [directions, setDirections] = useState<Set<string>>(new Set(DIRECTIONS));
-  const [minScore, setMinScore] = useState(0);
-  const [minConfidence, setMinConfidence] = useState(0);
-  const [maxDaysToEarnings, setMaxDaysToEarnings] = useState<number | null>(null);
+  const [persistedFilters] = useState(loadPersistedFilters);
+  const [minScore, setMinScore] = useState(persistedFilters.minScore);
+  const [minConfidence, setMinConfidence] = useState(persistedFilters.minConfidence);
+  const [maxDaysToEarnings, setMaxDaysToEarnings] = useState<number | null>(
+    persistedFilters.maxDaysToEarnings,
+  );
   const [strategies, setStrategies] = useState<Set<string> | null>(null);
 
   const [rejected, setRejected] = useState<{
@@ -120,6 +162,13 @@ export function Screener() {
     loadSignals();
     loadRejected();
   }, [loadSignals, loadRejected]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      FILTER_STORAGE_KEY,
+      JSON.stringify({ minScore, minConfidence, maxDaysToEarnings }),
+    );
+  }, [minScore, minConfidence, maxDaysToEarnings]);
 
   const strategyOptions = useMemo(
     () => Array.from(new Set((allSignals ?? []).map((s) => s.strategy))).sort(),
@@ -183,6 +232,12 @@ export function Screener() {
     if (event.data) navigate(`/tickers/${encodeURIComponent(event.data.symbol)}`);
   };
 
+  function searchTicker(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const symbol = tickerSearch.trim().toUpperCase();
+    if (symbol) navigate(`/tickers/${encodeURIComponent(symbol)}`);
+  }
+
   return (
     <div className="flex flex-col gap-4 p-6">
       <div className="flex items-center justify-between gap-4">
@@ -192,15 +247,39 @@ export function Screener() {
             Click a row to open its full ticker detail. Sort or filter any column.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={runScan}
-          disabled={scanning}
-          className="flex items-center gap-2 rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white hover:bg-accent-strong disabled:opacity-60"
-        >
-          <ScanSearch className={`h-4 w-4 ${scanning ? 'animate-pulse' : ''}`} strokeWidth={2} aria-hidden="true" />
-          {scanning ? 'Scanning…' : 'Run Scan'}
-        </button>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <form onSubmit={searchTicker} className="flex items-center gap-2" role="search">
+            <label htmlFor="ticker-sentiment-search" className="sr-only">
+              Search ticker sentiment
+            </label>
+            <input
+              id="ticker-sentiment-search"
+              type="search"
+              value={tickerSearch}
+              onChange={(event) => setTickerSearch(event.target.value)}
+              placeholder="Ticker (e.g. AAPL)"
+              autoComplete="off"
+              className="w-40 rounded-lg border border-gridline bg-surface px-3 py-2 text-sm uppercase text-ink placeholder:normal-case"
+            />
+            <button
+              type="submit"
+              disabled={!tickerSearch.trim()}
+              className="flex items-center gap-2 rounded-lg border border-gridline bg-surface px-3 py-2 text-sm font-semibold text-ink hover:bg-surface-2 disabled:opacity-50"
+            >
+              <Search className="h-4 w-4" strokeWidth={2} aria-hidden="true" />
+              View sentiment
+            </button>
+          </form>
+          <button
+            type="button"
+            onClick={runScan}
+            disabled={scanning}
+            className="flex items-center gap-2 rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white hover:bg-accent-strong disabled:opacity-60"
+          >
+            <ScanSearch className={`h-4 w-4 ${scanning ? 'animate-pulse' : ''}`} strokeWidth={2} aria-hidden="true" />
+            {scanning ? 'Scanning…' : 'Run Scan'}
+          </button>
+        </div>
       </div>
 
       {scanMessage && <p className="text-xs text-ink-secondary">{scanMessage}</p>}

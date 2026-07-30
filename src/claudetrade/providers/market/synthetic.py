@@ -184,7 +184,10 @@ class SyntheticMarketProvider(MarketDataProvider):
             kind="market",
             available=True,
             configured=True,
-            message="synthetic offline generator; always available",
+            message=(
+                "SYNTHETIC/FABRICATED offline generator; ticker names and prices "
+                "are not real market data"
+            ),
             supports_point_in_time=True,
             supports_delisted=True,
             rate_limit_per_minute=None,
@@ -195,7 +198,12 @@ class SyntheticMarketProvider(MarketDataProvider):
                 "against it say nothing about real-market performance. Safe to redistribute; "
                 "unsuitable as evidence of strategy edge."
             ),
-            capabilities={"intraday": True, "corporate_actions": True, "point_in_time_universe": True},
+            capabilities={
+                "intraday": True,
+                "corporate_actions": True,
+                "point_in_time_universe": True,
+                "synthetic_data": True,
+            },
         )
 
     def get_daily_bars(
