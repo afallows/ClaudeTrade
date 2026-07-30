@@ -1,12 +1,11 @@
-"""Tests for `claudetrade ui`'s subprocess vs in-process launch decision.
+"""Tests for `claudetrade ui`'s launch decision matrix.
 
-Under a normal install, ``sys.executable`` is a real Python interpreter and
-Streamlit is spawned as a subprocess. Under a PyInstaller-frozen build,
-``sys.executable`` is the bootloader binary itself, so `-m streamlit` would
-try to re-exec the frozen program as if it were `python -m streamlit`.
-``claudetrade.cli.ui`` must detect ``sys.frozen`` and launch Streamlit
-in-process instead -- these tests cannot start a real Streamlit server, so
-both branches are exercised by mocking the call each one makes.
+Two axes: which interface (the ADR-0008 React/FastAPI desktop app by
+default, the legacy Streamlit app under ``--classic``) and how it is started
+(subprocess under a normal install; in-process under a PyInstaller-frozen
+build, where ``sys.executable`` is the bootloader binary and ``-m anything``
+would re-exec the frozen program). These tests cannot start real servers, so
+every branch is exercised by mocking the exact call it makes.
 """
 
 from __future__ import annotations
@@ -34,8 +33,68 @@ def ui_env(tmp_path, monkeypatch):
     reset_database_cache()
 
 
-def test_ui_launches_subprocess_when_not_frozen(ui_env, monkeypatch):
-    """The ordinary (non-frozen) install path spawns `python -m streamlit`."""
+# ---------------------------------------------------------------------------
+# Default: the web/desktop app
+# ---------------------------------------------------------------------------
+
+
+def test_ui_default_spawns_webapi_subprocess(ui_env, monkeypatch):
+    """Without --classic, a normal install spawns `python -m claudetrade.webapi`."""
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    calls: list[list[str]] = []
+
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "call", lambda command: calls.append(command) or 0)
+
+    result = runner.invoke(app, ["ui", "--port", "9999"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    command = calls[0]
+    assert command[0] == sys.executable
+    assert "claudetrade.webapi" in command
+    assert "streamlit" not in command
+    assert "9999" in command
+
+
+def test_ui_default_frozen_runs_webapi_in_process(ui_env, monkeypatch):
+    """Under a frozen build, the web app's main() runs in this process.
+
+    Re-executing the bootloader via subprocess would relaunch claudetrade
+    itself, and actually calling the real main() here would start a live
+    uvicorn server and hang the suite -- so the entry point is mocked and
+    the test asserts it was chosen, with subprocess forbidden.
+    """
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    import subprocess
+
+    def _fail_if_called(*_args, **_kwargs):
+        raise AssertionError("subprocess must not run when sys.frozen is set")
+
+    monkeypatch.setattr(subprocess, "call", _fail_if_called)
+
+    import claudetrade.webapi.__main__ as webapi_main_module
+
+    main_calls: list[list[str] | None] = []
+    monkeypatch.setattr(
+        webapi_main_module, "main", lambda argv=None: main_calls.append(argv)
+    )
+
+    result = runner.invoke(app, ["ui", "--port", "9999"])
+
+    assert result.exit_code == 0, result.output
+    assert main_calls == [["--port", "9999"]]
+
+
+# ---------------------------------------------------------------------------
+# --classic: the legacy Streamlit app
+# ---------------------------------------------------------------------------
+
+
+def test_ui_classic_spawns_streamlit_subprocess(ui_env, monkeypatch):
+    """--classic on a normal install spawns `python -m streamlit run ...`."""
     monkeypatch.delattr(sys, "frozen", raising=False)
     calls: list[list[str]] = []
 
@@ -48,7 +107,7 @@ def test_ui_launches_subprocess_when_not_frozen(ui_env, monkeypatch):
         cli, "_run_streamlit_in_process", lambda *a, **k: in_process_calls.append((a, k))
     )
 
-    result = runner.invoke(app, ["ui", "--port", "9999"])
+    result = runner.invoke(app, ["ui", "--classic", "--port", "9999"])
 
     assert result.exit_code == 0, result.output
     assert not in_process_calls, "frozen in-process path must not run when sys.frozen is unset"
@@ -59,8 +118,8 @@ def test_ui_launches_subprocess_when_not_frozen(ui_env, monkeypatch):
     assert "9999" in command
 
 
-def test_ui_launches_in_process_when_frozen(ui_env, monkeypatch):
-    """Under a PyInstaller build (sys.frozen=True), Streamlit runs in-process."""
+def test_ui_classic_frozen_runs_streamlit_in_process(ui_env, monkeypatch):
+    """--classic under a frozen build uses Streamlit's bootstrap API in-process."""
     monkeypatch.setattr(sys, "frozen", True, raising=False)
 
     import subprocess
@@ -77,7 +136,7 @@ def test_ui_launches_in_process_when_frozen(ui_env, monkeypatch):
         lambda app_path, port: in_process_calls.append((app_path, port)),
     )
 
-    result = runner.invoke(app, ["ui", "--port", "9999"])
+    result = runner.invoke(app, ["ui", "--classic", "--port", "9999"])
 
     assert result.exit_code == 0, result.output
     assert len(in_process_calls) == 1

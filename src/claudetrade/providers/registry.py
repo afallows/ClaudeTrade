@@ -29,6 +29,7 @@ from claudetrade.providers.earnings.synthetic import SyntheticEarningsProvider
 from claudetrade.providers.market.csv_provider import CSVMarketProvider
 from claudetrade.providers.market.stooq import StooqMarketProvider
 from claudetrade.providers.market.synthetic import SyntheticMarketProvider
+from claudetrade.providers.market.yahoo import YahooMarketProvider
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +42,10 @@ _MARKET_PROVIDERS: dict[str, type[MarketDataProvider]] = {
     "synthetic": SyntheticMarketProvider,
     "csv": CSVMarketProvider,
     "stooq": StooqMarketProvider,
+    # Yahoo is the one adapter with get_market_caps support, which the
+    # runtime >= $1B universe filter (ADR-0008 Decision 3) depends on for
+    # real-data runs; typical live config is stooq primary + yahoo fallback.
+    "yahoo": YahooMarketProvider,
 }
 
 #: Earnings adapters. Add new providers here.

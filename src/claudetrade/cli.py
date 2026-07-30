@@ -827,9 +827,33 @@ def verify_survivorship(
 
 
 @app.command()
-def ui(config: ConfigOption = None, port: int | None = None) -> None:
-    """Launch the desktop interface (Streamlit)."""
+def ui(
+    config: ConfigOption = None,
+    port: int | None = None,
+    classic: bool = typer.Option(
+        False,
+        "--classic",
+        help="Launch the legacy Streamlit interface instead of the desktop app.",
+    ),
+) -> None:
+    """Launch the desktop interface (React app; --classic for Streamlit)."""
     cfg = _load(config)
+
+    if not classic:
+        # The ADR-0008 web UI: FastAPI + built React SPA in a native window
+        # (browser fallback). It is its own module entry point so a frozen
+        # build can also launch it without re-executing the bootloader.
+        import subprocess
+
+        command = [sys.executable, "-m", "claudetrade.webapi"]
+        if port:
+            command += ["--port", str(port)]
+        if getattr(sys, "frozen", False):
+            from claudetrade.webapi.__main__ import main as webapi_main
+
+            raise typer.Exit(webapi_main(["--port", str(port)] if port else []))
+        raise typer.Exit(subprocess.call(command))
+
     from claudetrade import ui as ui_pkg
 
     app_path = Path(ui_pkg.__file__).parent / "app.py"
