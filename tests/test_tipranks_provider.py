@@ -28,6 +28,7 @@ from claudetrade.config import TipRanksConfig
 from claudetrade.domain import EarningsSession
 from claudetrade.providers.base import ProviderError, RateLimitError, SourceBlockedError
 from claudetrade.providers.market.tipranks import (
+    HISTORICAL_PRICES_URL,
     TipRanksProvider,
     _parse_getquotes_response,
     tipranks_ticker,
@@ -50,6 +51,7 @@ class _TipRanksStub:
         self.status_override: int | None = None
         self.content_type_override: str | None = None
         self.body_override: str | None = None
+        self.history_by_ticker: dict[str, list[dict]] = {}
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -60,6 +62,9 @@ class _TipRanksStub:
             return httpx.Response(200, headers=headers, content=self.body_override)
 
         ticker = httpx.QueryParams(request.url.query).get("ticker", "")
+        if str(request.url).startswith(HISTORICAL_PRICES_URL):
+            payload = self.history_by_ticker.get(ticker)
+            return httpx.Response(200, json=payload) if payload is not None else httpx.Response(404, json={})
         payload = self.payload_by_ticker.get(ticker)
         if payload is not None:
             return httpx.Response(200, json=payload)
@@ -365,6 +370,33 @@ def test_get_daily_bars_unknown_symbol_degrades_per_symbol(monkeypatch, tmp_path
     assert result["INTC"]
     assert result["NOSUCH"] == []
     assert "NOSUCH" in provider._not_found
+
+
+def test_get_daily_bars_uses_historical_endpoint_after_overview_404(
+    monkeypatch, tmp_path, stub
+):
+    stub.history_by_ticker["MHD"] = [
+        {
+            "date": "2026-07-29T00:00:00",
+            "open": 11.54,
+            "high": 11.62,
+            "low": 11.51,
+            "close": 11.54,
+            "volume": 290895,
+            "price": 11.54,
+        }
+    ]
+    _install(monkeypatch, stub)
+    provider = _provider(tmp_path)
+
+    bars = provider.get_daily_bars(["MHD"], dt.date(2026, 7, 1), dt.date(2026, 7, 31))["MHD"]
+
+    assert len(bars) == 1
+    assert bars[0].open == 11.54
+    assert bars[0].high == 11.62
+    assert bars[0].volume == 290895
+    assert any(str(request.url).startswith(HISTORICAL_PRICES_URL) for request in stub.requests)
+    assert provider.drain_quality_warnings() == []
 
 
 def test_get_intraday_bars_not_implemented(tmp_path):

@@ -372,8 +372,16 @@ Write-Ok "Database ready."
 # Step d: claudetrade refresh (first data load)
 # ---------------------------------------------------------------------------
 
+$refreshProcess = $null
 if ($SkipData) {
     Write-Step "Skipping first data load (-SkipData passed)"
+} elseif (-not $NoLaunch) {
+    # A whole-universe refresh can take a while when a live provider has many
+    # unknown symbols.  Do not hold the first UI launch hostage to network
+    # lookups: the dashboard is useful immediately and updates as rows arrive.
+    Write-Step "Starting first data load in the background (UI will load immediately)"
+    $refreshProcess = Start-Process -FilePath $venvClaudetrade -ArgumentList @('refresh') -PassThru -NoNewWindow
+    Write-Ok "Data refresh started in the background (process $($refreshProcess.Id))."
 } else {
     Write-Step "Loading data (claudetrade refresh -- defaults to the last 90 days)"
     & $venvClaudetrade refresh

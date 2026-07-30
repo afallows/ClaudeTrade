@@ -202,6 +202,9 @@ from claudetrade.utils.timeutils import trading_days_between, utc_now
 log = logging.getLogger(__name__)
 
 WIDGET_BASE_URL = "https://widgets.tipranks.com/api/etoro/dataForTicker"
+#: Price-only fallback which remains available for some instruments (notably
+#: closed-end funds) that the richer ``dataForTicker`` endpoint does not know.
+HISTORICAL_PRICES_URL = "https://widgets.tipranks.com/api/etoro/historicalprices"
 #: Optional batching path -- see the module docstring's GetQuotes section.
 #: UNVERIFIED response shape; off by default.
 GETQUOTES_BASE_URL = "https://marketsv3.tipranks.com/api/quotes/GetQuotes"
@@ -573,6 +576,10 @@ class TipRanksProvider(MarketDataProvider):
         return overview
 
     def _get(self, ticker_param: str) -> httpx.Response:
+        return self._get_url(WIDGET_BASE_URL, ticker_param)
+
+    def _get_url(self, url: str, ticker_param: str) -> httpx.Response:
+        """Fetch one widget endpoint with the adapter's common safeguards."""
         try:
             with httpx.Client(
                 timeout=self._config.request_timeout_s,
@@ -580,7 +587,7 @@ class TipRanksProvider(MarketDataProvider):
                 follow_redirects=True,
                 headers={"User-Agent": _USER_AGENT},
             ) as client:
-                response = client.get(WIDGET_BASE_URL, params={"ticker": ticker_param})
+                response = client.get(url, params={"ticker": ticker_param})
         except httpx.ConnectError as exc:
             self._last_error = str(exc)
             raise ProviderError(
@@ -652,6 +659,61 @@ class TipRanksProvider(MarketDataProvider):
             )
         return response
 
+    def _fetch_historical_bars(
+        self, symbol: str, start: dt.date, end: dt.date
+    ) -> list[Bar]:
+        """Try TipRanks' OHLCV history when its richer overview is absent.
+
+        TipRanks serves this endpoint for some valid funds for which
+        ``dataForTicker`` returns 404.  A miss remains local to the symbol;
+        malformed/block responses retain the common fail-closed behaviour.
+        """
+        ticker_param = tipranks_ticker(symbol)
+        self._rate_limiter.acquire()
+        self._calls += 1
+        try:
+            response = self._get_url(HISTORICAL_PRICES_URL, ticker_param)
+        except _TipRanksNotFoundError:
+            return []
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SourceBlockedError(
+                f"tipranks returned non-JSON history for {symbol}: {exc}",
+                provider=self.name,
+            ) from exc
+        if not isinstance(payload, list):
+            raise SourceBlockedError(
+                f"tipranks history for {symbol} had an unexpected shape",
+                provider=self.name,
+            )
+
+        bars: list[Bar] = []
+        for row in payload:
+            try:
+                session = dt.datetime.fromisoformat(row["date"]).date()
+                if not start <= session <= end:
+                    continue
+                bars.append(
+                    Bar(
+                        symbol=symbol,
+                        session=session,
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=float(row.get("volume") or 0),
+                        adj_close=_maybe_float(row.get("price")),
+                        source="tipranks",
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        bars.sort(key=lambda bar: bar.session)
+        if bars:
+            self._last_success = utc_now()
+        return bars
+
     # --- bars (last resort only) ----------------------------------------------
 
     def get_daily_bars(
@@ -668,7 +730,7 @@ class TipRanksProvider(MarketDataProvider):
         for symbol in symbols:
             overview = self._fetch_overview(symbol)
             if overview is None:
-                out[symbol] = []
+                out[symbol] = self._fetch_historical_bars(symbol, start, end)
                 continue
             bars = self._parse_close_only_bars(symbol, overview, start, end)
             out[symbol] = bars
