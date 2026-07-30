@@ -10,6 +10,14 @@ import pytest
 from claudetrade.config import AppConfig, FilterConfig, PathsConfig, RiskConfig, TradingModeConfig
 
 
+def test_live_stooq_market_data_is_the_default() -> None:
+    """Fresh installs must not silently generate fabricated market tickers."""
+    config = AppConfig()
+
+    assert config.market_data.provider == "stooq"
+    assert config.market_data.fallbacks == ["yahoo", "csv"]
+
+
 class TestPathsConfigExpandUser:
     """``app_dir`` must be expanded, or a literal '~' directory gets created (Windows bug)."""
 

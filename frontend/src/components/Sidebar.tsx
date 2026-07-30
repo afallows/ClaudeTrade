@@ -1,11 +1,13 @@
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, ScanSearch, LineChart, AlertTriangle } from 'lucide-react';
+import { LayoutDashboard, ScanSearch, LineChart, AlertTriangle, Settings, Activity } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 
 const NAV = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
   { to: '/screener', label: 'Screener', icon: ScanSearch },
+  { to: '/configuration', label: 'Configuration', icon: Settings },
+  { to: '/diagnostics', label: 'Diagnostics', icon: Activity },
 ];
 
 /** Fixed left navigation: brand, the two phase-1 screens, and a compact

@@ -385,6 +385,36 @@ def load_packaged_universe(
     return out
 
 
+def load_stooq_universe(
+    *,
+    min_market_cap_usd: float = 1_000_000_000.0,
+    exchanges: Sequence[str] = ("NYSE", "NASDAQ", "AMEX", "TSX"),
+) -> list[SecurityInfo]:
+    """Return the concrete stock universe that may be requested from Stooq.
+
+    Stooq's free CSV service is a history endpoint, not a security screener, so
+    the request universe must be assembled before any Stooq calls are made.
+    The packaged US and Canadian inventories are that bootstrap inventory;
+    this function applies the application's market/exchange contract in one
+    explicit place instead of relying on every row in those files continuing
+    to satisfy it forever.
+
+    The packaged capitalisations are conservative size buckets used only to
+    form the first request.  ``DataIngestor`` replaces them with current
+    provider values where available and applies the same floor again before
+    historical bars are requested.
+    """
+    permitted = {exchange.upper() for exchange in exchanges}
+    return [
+        security
+        for security in load_packaged_universe(("us_default", "ca_default"))
+        if security.exchange.upper() in permitted
+        and not security.is_etf
+        and security.market_cap_usd is not None
+        and security.market_cap_usd >= min_market_cap_usd
+    ]
+
+
 def _maybe_float(value: str | None) -> float | None:
     if not value:
         return None

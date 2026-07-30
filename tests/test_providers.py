@@ -273,16 +273,18 @@ def test_stooq_quota_message_also_degrades_per_symbol(monkeypatch):
     assert result == {"AAPL": [], "MSFT": []}
 
 
-def test_stooq_list_universe_returns_packaged_seed():
-    """Stooq's free tier has no bulk reference endpoint; list_universe must
-    fall back to the packaged seed universe rather than an empty list, or a
-    real-data refresh has nothing to fetch on a fresh install."""
+def test_stooq_list_universe_covers_us_and_tsx_stocks_above_one_billion():
+    """The Stooq request inventory is explicit, broad, and floor-filtered."""
     provider = StooqMarketProvider(MarketDataConfig())
     securities = provider.list_universe()
     symbols = {s.symbol for s in securities}
-    assert len(securities) > 500
+    exchanges = {s.exchange for s in securities}
+    assert len(securities) > 2_000
     assert "AAPL" in symbols
     assert "SHOP" in symbols  # Canadian (TSX)
+    assert {"NYSE", "NASDAQ", "AMEX", "TSX"} <= exchanges
+    assert all(not s.is_etf for s in securities)
+    assert all(s.market_cap_usd is not None and s.market_cap_usd >= 1_000_000_000 for s in securities)
 
 
 def test_stooq_status_declares_its_real_limitations():
@@ -295,6 +297,8 @@ def test_stooq_status_declares_its_real_limitations():
     assert status.supports_delisted is False
     assert status.supports_point_in_time is False
     assert status.licence_note, "licensing limits must be stated for a free feed"
+    assert status.capabilities["bulk_universe"] is False
+    assert "packaged seed universe" in status.message
 
 
 def test_stooq_refuses_intraday():

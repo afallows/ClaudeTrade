@@ -27,7 +27,7 @@ import logging
 from typing import Any
 
 from claudetrade.config import MarketDataConfig
-from claudetrade.data.universe import load_packaged_universe
+from claudetrade.data.universe import load_packaged_universe, load_stooq_universe
 from claudetrade.domain import Bar, SecurityInfo
 from claudetrade.providers.base import (
     MarketDataProvider,
@@ -138,7 +138,10 @@ class StooqMarketProvider(MarketDataProvider):
             kind="market",
             available=True,  # Always available to attempt; actual call may fail.
             configured=True,
-            message="free stooq.com endpoint; may require network access",
+            message=(
+                "free stooq.com daily-history endpoint; symbol coverage comes from "
+                "the packaged seed universe (not a live Stooq listing)"
+            ),
             supports_point_in_time=False,
             supports_delisted=False,
             rate_limit_per_minute=self._config.rate_limit_per_minute or
@@ -155,6 +158,7 @@ class StooqMarketProvider(MarketDataProvider):
                 "daily_bars": True,
                 "intraday": False,
                 "delisted": False,
+                "bulk_universe": False,
             },
         )
 
@@ -436,7 +440,7 @@ class StooqMarketProvider(MarketDataProvider):
         return {s: [] for s in symbols}
 
     def list_universe(self, *, as_of: dt.date | None = None) -> list[SecurityInfo]:
-        """The packaged US + Canadian seed universes (see module docstring).
+        """US and TSX stocks with bootstrap market caps of at least $1B.
 
         Stooq's free endpoint has no bulk reference-data/universe listing of
         its own, so without this a real-data refresh (``market_data.provider =
@@ -447,7 +451,7 @@ class StooqMarketProvider(MarketDataProvider):
         an honest reflection of what a hand-curated *current* seed list can
         promise, not point-in-time coverage.
         """
-        securities = load_packaged_universe()
+        securities = load_stooq_universe()
         if as_of is None:
             return securities
         return [s for s in securities if s.is_active_on(as_of)]

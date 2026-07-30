@@ -6,10 +6,10 @@ command below was checked against the actual CLI (`src/claudetrade/cli.py`) —
 if what you see on screen differs meaningfully from what's described here,
 that's a documentation bug; check [docs/troubleshooting.md](troubleshooting.md) first.
 
-**Everything in this guide works fully offline, with zero credentials, on
-synthetic (fabricated) data.** That is the application's default configuration —
-nothing here talks to the internet or requires an account unless you deliberately
-turn on a live data source in [Step 7](#step-7-optional-turn-on-real-data-with-reddit-and-stooq).
+**Market prices are live by default.** ClaudeTrade uses Stooq daily history for
+the US + TSX universe and requires internet access, but no Stooq account or API
+key. Synthetic (fabricated) prices are available only when explicitly selected
+for an offline demo.
 
 ---
 
@@ -196,22 +196,21 @@ Reddit needs a free script app (client id + secret); X search needs a paid tier.
 ```
 On a machine behind a corporate firewall or proxy, some rows may say `BLOCKED`
 instead of `reachable` — that's expected and does not stop the rest of this
-guide from working, because the default configuration doesn't need any of these
-hosts (see [Step 7](#step-7-optional-turn-on-real-data-with-reddit-and-stooq)). If
+guide from working, although Stooq itself must be reachable for the default
+live-price refresh. If
 you do need one of them reachable, see
 [docs/troubleshooting.md](troubleshooting.md#corporate-proxy--tls-interception).
 
-## Step 7 (optional): Turn on real data with Reddit and Stooq
+## Step 7 (optional): Configure sentiment or override market data
 
-Skip this section entirely for a first trial — everything downstream works on
-synthetic data with `provider = "synthetic"` (the default for market data,
-earnings, and Reddit). Come back to this once you want real Reddit sentiment or
-real Stooq price history.
+Stooq market history is already enabled by default. Earnings and Reddit retain
+offline synthetic defaults. Use this section when you want real Reddit
+sentiment or need to override the market provider.
 
-### Stooq market data — no account needed
+### Stooq market data — enabled by default, no account needed
 
-Stooq is a free market-data source that needs no API key or account. To switch
-to it, edit (or create) your config file at
+Stooq is a free market-data source that needs no API key or account. To confirm
+or customize it, edit (or create) your config file at
 `%LOCALAPPDATA%\ClaudeTrade\config.toml` (copy `config.example.toml` as a
 starting point — see the note below) and set:
 ```toml
@@ -302,7 +301,8 @@ claudetrade refresh --start 2024-01-01 --end 2024-12-31
 This is a realistic first date range: about a year of daily bars, which is
 enough for the technical indicators (which need roughly 200 trading days of
 history) to have real values without waiting on a much longer pull. With the
-default synthetic providers this runs quickly and needs no network.
+default Stooq market provider this requires network access and can take time
+because Stooq serves daily history one symbol at a time.
 
 If you omit `--start`/`--end` entirely, `refresh` defaults to the last 90
 calendar days ending today — enough for a quick look with a real provider

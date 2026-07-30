@@ -99,6 +99,7 @@ const SIGNAL: SignalRow = {
 describe('Screener row click navigation', () => {
   afterEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
   });
 
   it('navigates to the ticker detail route when a row is clicked', async () => {
@@ -133,5 +134,38 @@ describe('Screener row click navigation', () => {
 
     expect(await screen.findByText(/ledger is empty/i)).toBeInTheDocument();
     expect(screen.getByText('claudetrade scan')).toBeInTheDocument();
+  });
+
+  it('opens sentiment detail for a directly entered ticker', async () => {
+    listSignals.mockResolvedValue({ signals: [SIGNAL], total: 1 });
+    rejectedCandidates.mockResolvedValue({ available: false, reason: null, rejected: [] });
+    renderScreener();
+
+    fireEvent.change(await screen.findByLabelText(/search ticker sentiment/i), {
+      target: { value: ' msft ' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /view sentiment/i }));
+
+    await waitFor(() => expect(screen.getByTestId('ticker-detail')).toHaveTextContent('MSFT'));
+  });
+
+  it('restores numeric filters after navigating away and back', async () => {
+    listSignals.mockResolvedValue({ signals: [SIGNAL], total: 1 });
+    rejectedCandidates.mockResolvedValue({ available: false, reason: null, rejected: [] });
+    const router = renderScreener();
+
+    const score = await screen.findByLabelText(/min score/i);
+    const confidence = screen.getByLabelText(/min confidence/i);
+    const earnings = screen.getByLabelText(/max days to earnings/i);
+    fireEvent.change(score, { target: { value: '65' } });
+    fireEvent.change(confidence, { target: { value: '0.55' } });
+    fireEvent.change(earnings, { target: { value: '30' } });
+
+    await router.navigate('/tickers/AAPL');
+    await router.navigate('/screener');
+
+    expect(await screen.findByLabelText(/min score/i)).toHaveValue('65');
+    expect(screen.getByLabelText(/min confidence/i)).toHaveValue('0.55');
+    expect(screen.getByLabelText(/max days to earnings/i)).toHaveValue(30);
   });
 });

@@ -254,6 +254,11 @@ class TestUniverseConfigDefaults:
         the older, lower FilterConfig.min_market_cap_usd (500M) screen."""
         assert AppConfig().universe.min_market_cap_usd == 1_000_000_000.0
 
+    def test_default_capacity_holds_complete_us_and_tsx_inventory(self):
+        from claudetrade.data.universe import load_stooq_universe
+
+        assert AppConfig().universe.max_symbols >= len(load_stooq_universe())
+
     def test_unknown_cap_policy_defaults_to_include(self):
         assert AppConfig().universe.unknown_cap_policy == "include"
 

@@ -136,8 +136,11 @@ class MarketDataConfig(BaseModel):
     reduced-capability mode.
     """
 
-    provider: str = "synthetic"
-    fallbacks: list[str] = Field(default_factory=lambda: ["csv"])
+    # Live daily history is the product default. Synthetic remains available
+    # only as an explicit offline/demo choice; it must never silently populate
+    # a normal installation with fabricated tickers.
+    provider: str = "stooq"
+    fallbacks: list[str] = Field(default_factory=lambda: ["yahoo", "csv"])
     credential: str | None = None
     csv_dir: Path | None = None
     #: Bars older than this are flagged stale by the data-quality checks.
@@ -381,7 +384,7 @@ class NewsConfig(BaseModel):
             # US central bank: official press-release feed.
             "https://www.federalreserve.gov/feeds/press_all.xml",
             # Wire service: publishes per-category RSS for syndication.
-            "https://www.prnewswire.com/rss/financial-services-latest-news.rss",
+            "https://www.prnewswire.com/rss/financial-services-latest-news-list.rss",
             # Public broadcaster: publishes per-section RSS, including business.
             "https://feeds.npr.org/1006/rss.xml",
         ]
@@ -451,7 +454,10 @@ class UniverseConfig(BaseModel):
     permitted_exchanges: list[str] = Field(
         default_factory=lambda: ["NYSE", "NASDAQ", "AMEX", "TSX"]
     )
-    max_symbols: int = 2000
+    # The packaged >=$1B US + TSX inventory currently exceeds 2,000 names.
+    # Keep enough headroom that deterministic truncation cannot silently drop
+    # the Canadian tail merely because the US file is loaded first.
+    max_symbols: int = 3000
     include_etfs: bool = False
     #: Packaged seed universes (see ``data/universes/*.csv``) used to fill the
     #: scannable universe when ``source == "database"`` and the database has no

@@ -419,10 +419,11 @@ fails to reach PyPI.
    centrally, `probe`'s "Hosts to allow-list" line lists exactly which hostnames need
    adding; this is something only an administrator can grant, not something the app can
    work around.
-5. If live data sources are unreachable and can't be fixed quickly, the app still works
-   fully offline: leave `market_data.provider = "synthetic"`, `earnings.provider =
-   "synthetic"`, and `reddit.provider = "synthetic"` (the defaults) and continue the trial
-   without a network at all.
+5. If live data sources are unreachable and can't be fixed quickly, explicitly switch
+   the app to offline demo mode: set `market_data.provider = "synthetic"`,
+   `earnings.provider = "synthetic"`, and `reddit.provider = "synthetic"`. Market data
+   defaults to Stooq, so synthetic mode is an intentional opt-in and its tickers are
+   fabricated.
 
 ---
 

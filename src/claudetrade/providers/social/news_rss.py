@@ -193,7 +193,14 @@ class NewsRssProvider:
         ``fetch_posts`` continues with the rest.
         """
         try:
-            with httpx.Client(timeout=self.config.request_timeout_s) as client:
+            # Publisher feed URLs occasionally move.  Follow ordinary HTTP
+            # redirects so an existing user configuration keeps working when
+            # a publisher replaces a category endpoint (PR Newswire did this
+            # in 2026).  httpx deliberately defaults this to False.
+            with httpx.Client(
+                timeout=self.config.request_timeout_s,
+                follow_redirects=True,
+            ) as client:
                 response = client.get(
                     feed_url,
                     headers={"User-Agent": self.config.user_agent},

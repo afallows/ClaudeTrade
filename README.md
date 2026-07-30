@@ -64,8 +64,9 @@ install, no `git`) is in [docs/windows-install.md](docs/windows-install.md).
 ### First Run
 
 The `claudetrade` command is installed as a console script by the `pip install`
-above. Everything below works fully offline on synthetic data with zero
-credentials — that is the default configuration.
+above. Market prices use live Stooq data by default and require network access;
+no Stooq account or API key is required. Synthetic data is available only as
+an explicit offline/demo configuration.
 
 ```bash
 # Create the database and see where the app's data lives
@@ -75,7 +76,7 @@ claudetrade init
 claudetrade probe
 claudetrade status
 
-# Pull data from the configured providers (synthetic by default; no network needed)
+# Pull live Stooq history for the configured US + TSX universe
 claudetrade refresh
 
 # Generate ranked signals for today and print them

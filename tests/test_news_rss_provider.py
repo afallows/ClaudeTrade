@@ -124,6 +124,31 @@ class TestFormatParsing:
 
 
 class TestResilience:
+    def test_permanent_feed_redirect_is_followed(self, monkeypatch):
+        """Publisher migrations must not silently remove a news source."""
+        old_url = "https://wire.example.com/old-feed.xml"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == old_url:
+                return httpx.Response(301, headers={"Location": RSS_URL})
+            if str(request.url) == RSS_URL:
+                return httpx.Response(200, text=RSS_BASIC)
+            return httpx.Response(404)
+
+        real_client = httpx.Client
+
+        def factory(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr("claudetrade.providers.social.news_rss.httpx.Client", factory)
+
+        posts = NewsRssProvider(_config(feed_urls=[old_url])).fetch_posts(
+            since=WINDOW_SINCE, until=WINDOW_UNTIL
+        )
+
+        assert len(posts) == 2
+
     def test_malformed_feed_is_skipped_not_fatal(self, monkeypatch):
         """A whole malformed feed must degrade, not crash the refresh."""
         stub = _FeedStub({MALFORMED_URL: RSS_MALFORMED, RSS_URL: RSS_BASIC})

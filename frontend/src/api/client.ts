@@ -7,6 +7,8 @@
 
 import type {
   DashboardData,
+  CredentialsResponse,
+  DiagnosticsResponse,
   Meta,
   PaperAccountResponse,
   PaperOpenResponse,
@@ -50,6 +52,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiError(resp.status, detail);
   }
+  if (resp.status === 204) return undefined as T;
   return resp.json() as Promise<T>;
 }
 
@@ -69,6 +72,13 @@ function query(params: Record<string, string | number | string[] | undefined>): 
 
 export const api = {
   meta: () => request<Meta>('/api/meta'),
+
+  credentials: () => request<CredentialsResponse>('/api/system/credentials'),
+  saveCredential: (name: string, value: string) =>
+    request<{ name: string; configured: boolean; source: string }>(`/api/system/credentials/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ value }) }),
+  deleteCredential: (name: string) =>
+    request<void>(`/api/system/credentials/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  diagnostics: () => request<DiagnosticsResponse>('/api/system/diagnostics'),
 
   listSignals: (filters: SignalFilters = {}) =>
     request<SignalList>(

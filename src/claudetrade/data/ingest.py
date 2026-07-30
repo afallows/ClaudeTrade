@@ -219,7 +219,9 @@ class DataIngestor:
                 out.append(candidate)
         return out
 
-    def ingest_securities(self, securities: list[SecurityInfo], report: IngestReport) -> None:
+    def ingest_securities(
+        self, securities: list[SecurityInfo], report: IngestReport
+    ) -> list[SecurityInfo]:
         """Upsert reference data and alias rows.
 
         Runs market-cap enrichment first (see ``enrich_market_caps``) so the
@@ -274,6 +276,35 @@ class DataIngestor:
                                 kind=kind,
                             )
                         )
+
+        return securities
+
+    def symbols_passing_market_cap_floor(
+        self,
+        symbols: list[str],
+        securities: list[SecurityInfo],
+    ) -> list[str]:
+        """Select symbols eligible for expensive historical-data requests.
+
+        Market-cap enrichment deliberately happens before this method. A
+        current provider value therefore overrides the packaged bootstrap
+        bucket, preventing a company that has fallen below the configured
+        floor from consuming a Stooq history request. Unknown values follow
+        the operator's explicit policy; the benchmark is always retained
+        because it is needed for regime and relative-strength calculations.
+        """
+        by_symbol = {security.symbol: security for security in securities}
+        floor = self.config.universe.min_market_cap_usd
+        include_unknown = self.config.universe.unknown_cap_policy == "include"
+        benchmark = self.config.market_data.benchmark_symbol
+        eligible: list[str] = []
+        for symbol in symbols:
+            security = by_symbol.get(symbol)
+            cap = security.market_cap_usd if security else None
+            passes_floor = cap is not None and cap >= floor
+            if symbol == benchmark or passes_floor or (cap is None and include_unknown):
+                eligible.append(symbol)
+        return eligible
 
     # --- price data --------------------------------------------------------
 
@@ -636,7 +667,9 @@ class DataIngestor:
         report = IngestReport()
         reference = {s.symbol: s for s in (securities or [])}
         if securities:
-            self.ingest_securities(securities, report)
+            enriched = self.ingest_securities(securities, report)
+            reference = {s.symbol: s for s in enriched}
+            symbols = self.symbols_passing_market_cap_floor(symbols, enriched)
         self.ingest_prices(symbols, start, end, report, securities=reference)
         self.ingest_corporate_actions(symbols, start, end, report)
         self.ingest_earnings(symbols, start, end, report)
