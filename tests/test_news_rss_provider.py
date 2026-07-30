@@ -256,10 +256,18 @@ class TestSanitisationIdiom:
             # Publisher-level hash, not personal -- but still present and stable.
             assert post.author_hash
 
-        # This is exactly the input _credibility_score sees for a news post:
-        # all three components floor to 0.0, so credibility_weighted gives
-        # such a post zero weight even though it is a wire-service story.
-        assert _credibility_score(posts[0]) == 0.0
+        # This is exactly the input _credibility_score sees for a news post.
+        # SEMANTIC CHANGE (modelling-gap fix): this used to assert == 0.0,
+        # because all three components floored to 0.0 -- "no metrics
+        # reported" (structurally absent for a wire story) was scored
+        # identically to "worst possible metrics" (a real, karma-less
+        # throwaway account). _credibility_score now recognises "all author
+        # fields None" and returns the per-source baseline
+        # (SentimentConfig.credibility_baseline_by_source["news"], 0.6 by
+        # default) instead, so a news post carries real (if modest) weight
+        # in credibility_weighted rather than zero. See
+        # tests/test_sentiment_aggregation.py for the dedicated coverage.
+        assert _credibility_score(posts[0]) == pytest.approx(0.6)
 
 
 # --------------------------------------------------------------------------

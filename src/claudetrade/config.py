@@ -467,6 +467,24 @@ class SentimentConfig(BaseModel):
     #: Weight applied to engagement (log-scaled) in weighted sentiment.
     engagement_weight: float = 0.35
     credibility_weight: float = 0.35
+    #: Credibility assigned to a post whose author metrics (age/karma/
+    #: followers) are ALL ``None`` -- i.e. structurally absent, not merely
+    #: low. This is what keeps "no metrics reported" (a news-wire post,
+    #: which has no personal author to have karma or a follower count) from
+    #: being scored identically to "worst possible metrics" (a real,
+    #: karma-less throwaway account), which both floored to 0.0 before this
+    #: field existed. Keyed by ``SocialSource`` value; a post with *some*
+    #: (not all) metrics present never uses this baseline -- it keeps the
+    #: existing computed score, since partial information is real
+    #: information. A source with no entry here falls back to 0.0, the
+    #: original floor-to-zero behaviour.
+    credibility_baseline_by_source: dict[str, float] = Field(
+        default_factory=lambda: {
+            "news": 0.6,  # publisher-level content from curated feeds
+            "reddit": 0.3,  # unknown author, mild prior
+            "x": 0.3,  # unknown author, mild prior
+        }
+    )
     #: Windows (days) used for acceleration measures.
     fast_window_days: int = 2
     slow_window_days: int = 10

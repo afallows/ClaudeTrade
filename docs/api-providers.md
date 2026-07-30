@@ -473,30 +473,37 @@ seen is kept, its `duplicate_group` is set to that hash, and later copies are
 dropped rather than passed on to double-count the same story in sentiment
 aggregation.
 
-**A note on credibility weighting**: `SocialPost` engagement fields
+**A note on credibility weighting (fixed)**: `SocialPost` engagement fields
 (`score`/`num_comments`/`num_reposts`/`num_replies`) and author metrics
 (`author_age_days`/`author_karma`/`author_followers`) are structurally absent
 for a wire story -- there is no vote count or account history to report, so
-all of these are `0`/`None`. `sentiment.aggregation._credibility_score` scores
-absent metrics as their zero-value floor (age/karma/followers component all
-`0.0`), and `engagement_weighted` scales by `log1p(engagement)` which is also
-`0` for a post with no engagement counts at all. The practical effect: a news
-post contributes normally to `raw_sentiment`, `unique_author_sentiment`,
-`sentiment_acceleration` and the label averages (all of which use only the
-time-decay weight), but contributes **zero** weight to `engagement_weighted`
-and `credibility_weighted` -- an authoritative wire story is treated
-identically to a brand-new, karma-less throwaway account for those two
-measures specifically, not because it is *distrusted* but because "no
-metrics reported" and "worst possible metrics" are not currently
-distinguished by that scoring function. This is an existing characteristic of
-`sentiment/aggregation.py` (out of scope for this provider package to
-change) rather than a defect introduced here; it is worth knowing if
-`engagement_weighted`/`credibility_weighted` specifically are used to
-evaluate how much news content is influencing a symbol's sentiment.
+all of these are `0`/`None`. This used to mean `sentiment.aggregation
+._credibility_score` scored absent metrics as their zero-value floor
+(age/karma/followers component all `0.0`), and `engagement_weighted` scaled
+by `log1p(engagement)`, also `0` for a post with no engagement counts at
+all -- so a news post contributed **zero** weight to `engagement_weighted`
+and `credibility_weighted`, identical to a brand-new, karma-less throwaway
+account, because "no metrics reported" and "worst possible metrics" were not
+distinguished by that scoring function.
+
+Both scoring functions now distinguish the two cases. `_credibility_score`
+treats a post whose author fields are *all* `None` as reporting no metrics
+at all and assigns it a per-source baseline instead
+(`SentimentConfig.credibility_baseline_by_source`, defaulting to `0.6` for
+`news` and `0.3` for `reddit`/`x` -- a post with *some* metrics present, even
+a metric explicitly reported as zero, is real information and still uses the
+original computed score, never the baseline). The engagement-weighted
+average now gives a `SocialSource.NEWS` post a neutral, modest-engagement
+weight (`log1p(1.0) == 1.0`, scaled by the usual time decay) rather than
+`0`; this is gated on the post's *source*, not on its engagement count being
+zero, so a genuinely ignored Reddit/X post still correctly weighs `~0`. See
+`sentiment/aggregation.py::_credibility_score` / `_engagement_weight` and
+`tests/test_sentiment_aggregation.py` for the full behaviour and rationale.
 
 **Limitations**:
 
-- No engagement signal exists for a wire story (see credibility note above)
+- No engagement signal exists for a wire story (see credibility note above);
+  it now carries a configurable neutral weight instead of a hard zero
 - No author to pseudonymise; the "author" hash is a salted digest of the
   feed's own domain, not a person
 - Feeds serve only recent items (typically the last few dozen stories per

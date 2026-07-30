@@ -7,8 +7,14 @@ import math
 
 import pytest
 
-from claudetrade.domain import SocialPost, SocialSource
-from claudetrade.sentiment.aggregation import _credibility_score, time_decay_weight
+from claudetrade.config import SentimentConfig
+from claudetrade.domain import SentimentScores, SocialPost, SocialSource, TickerMention
+from claudetrade.sentiment.aggregation import (
+    SentimentAggregator,
+    _credibility_score,
+    _engagement_weight,
+    time_decay_weight,
+)
 
 
 def _post(**overrides) -> SocialPost:
@@ -192,3 +198,153 @@ class TestUniqueAuthorSentiment:
 
         # Result: (0.75 + 0.9) / 2 = 0.825
         assert aggregate == pytest.approx(0.825, abs=0.01)
+
+
+class TestAbsentMetricsGetBaselineNotZero:
+    """A post whose author metrics are ALL ``None`` gets a per-source
+    baseline credibility rather than the same 0.0 floor as a real account
+    reporting the worst possible metrics. This is the modelling-gap fix:
+    "no metrics reported" (structurally absent, e.g. a news-wire post) and
+    "worst possible metrics" (a fresh, karma-less throwaway account) must be
+    distinguishable."""
+
+    def test_news_post_with_no_author_metrics_uses_news_baseline(self):
+        news_post = _post(source=SocialSource.NEWS)
+        assert news_post.author_age_days is None
+        assert news_post.author_karma is None
+        assert news_post.author_followers is None
+        assert _credibility_score(news_post) == pytest.approx(0.6)
+
+    def test_reddit_post_with_no_author_metrics_uses_reddit_baseline(self):
+        reddit_post = _post()  # default source REDDIT, all metrics None
+        assert _credibility_score(reddit_post) == pytest.approx(0.3)
+
+    def test_x_post_with_no_author_metrics_uses_x_baseline(self):
+        x_post = _post(source=SocialSource.X)
+        assert _credibility_score(x_post) == pytest.approx(0.3)
+
+    def test_unmapped_source_falls_back_to_zero_floor(self):
+        """A source with no configured baseline keeps the original floor-to
+        -zero behaviour rather than raising or guessing."""
+        other_post = _post(source=SocialSource.OTHER)
+        assert _credibility_score(other_post) == pytest.approx(0.0)
+
+    def test_news_baseline_differs_from_real_karmaless_throwaway(self):
+        """The reported gap: a news-wire post and a real karma-less
+        throwaway account must not be scored identically."""
+        news_post = _post(source=SocialSource.NEWS)  # structurally no author metrics at all
+        throwaway = _post(
+            source=SocialSource.REDDIT,
+            author_age_days=0.0,
+            author_karma=0.0,
+            author_followers=0.0,
+        )  # a real account explicitly reporting the worst possible metrics
+        assert _credibility_score(throwaway) == pytest.approx(0.0)
+        assert _credibility_score(news_post) > _credibility_score(throwaway)
+
+    def test_some_metrics_present_keeps_computed_score_not_baseline(self):
+        """Partial information is real information -- the baseline must
+        never blend in just because one or two fields happen to be None,
+        even for a high-baseline source like NEWS."""
+        post = _post(source=SocialSource.NEWS, author_karma=0.0)
+        # author_age_days/author_followers remain None, but author_karma is
+        # explicitly reported (as 0.0) rather than absent -- computed the
+        # same way it always was, not the NEWS baseline (0.6).
+        assert _credibility_score(post) == pytest.approx(0.0)
+
+    def test_all_none_vs_some_present_differ(self):
+        all_none = _post(source=SocialSource.NEWS)
+        some_present = _post(source=SocialSource.NEWS, author_followers=5.0)
+        assert _credibility_score(all_none) != _credibility_score(some_present)
+
+    def test_config_overrides_baseline_per_source(self):
+        """Baselines are configurable per source via SentimentConfig."""
+        config = SentimentConfig(
+            credibility_baseline_by_source={"news": 0.9, "reddit": 0.1, "x": 0.1}
+        )
+        assert _credibility_score(_post(source=SocialSource.NEWS), config) == pytest.approx(0.9)
+        assert _credibility_score(_post(source=SocialSource.REDDIT), config) == pytest.approx(0.1)
+        assert _credibility_score(_post(source=SocialSource.X), config) == pytest.approx(0.1)
+
+    def test_default_config_matches_bare_function_default(self):
+        """The bare function's built-in fallback (used when no config is
+        passed) must not silently drift from SentimentConfig's own default."""
+        config = SentimentConfig()
+        for source in (SocialSource.NEWS, SocialSource.REDDIT, SocialSource.X):
+            post = _post(source=source)
+            assert _credibility_score(post) == pytest.approx(_credibility_score(post, config))
+
+
+class TestNewsEngagementNeutrality:
+    """NEWS posts have no engagement mechanic (no votes/replies to report),
+    so the engagement-weighted average must treat them at a neutral,
+    modest-engagement weight rather than the same zero a genuinely ignored
+    Reddit/X post gets. Gated on source, not on the count being zero."""
+
+    def test_news_post_gets_neutral_engagement_weight(self):
+        post = _post(source=SocialSource.NEWS)
+        assert post.engagement == 0.0
+        assert _engagement_weight(post, decay=1.0) == pytest.approx(1.0)
+
+    def test_news_neutral_weight_still_scales_with_decay(self):
+        post = _post(source=SocialSource.NEWS)
+        assert _engagement_weight(post, decay=0.5) == pytest.approx(0.5)
+
+    def test_zero_engagement_reddit_post_still_weighs_near_zero(self):
+        """A genuinely ignored Reddit post (real zero engagement) must not
+        pick up the NEWS neutral weight -- the gate is on source, not count."""
+        post = _post(source=SocialSource.REDDIT)
+        assert post.engagement == 0.0
+        assert _engagement_weight(post, decay=1.0) == pytest.approx(0.0)
+
+    def test_zero_engagement_x_post_still_weighs_near_zero(self):
+        post = _post(source=SocialSource.X)
+        assert post.engagement == 0.0
+        assert _engagement_weight(post, decay=1.0) == pytest.approx(0.0)
+
+    def test_reddit_post_with_real_engagement_is_unaffected(self):
+        """Reddit/X posts with real engagement counts are completely
+        unchanged by this fix -- still decay * log1p(engagement)."""
+        post = _post(source=SocialSource.REDDIT, score=50)
+        expected = 0.8 * math.log1p(50.0)
+        assert _engagement_weight(post, decay=0.8) == pytest.approx(expected)
+
+
+class TestCredibilityWeightedDistinguishesNewsFromRedditBaseline:
+    """End-to-end (``SentimentAggregator.aggregate``) proof that a news post
+    and a karma-less Reddit post -- both reporting no author metrics at all
+    -- now weigh differently in ``credibility_weighted``, rather than both
+    being weighted at zero as before."""
+
+    def test_news_post_outweighs_reddit_post_in_credibility_weighted(self):
+        created_at = dt.datetime(2024, 6, 3, 14, 0, tzinfo=dt.UTC)
+        news_post = _post(source=SocialSource.NEWS, external_id="news-1", created_at=created_at)
+        reddit_post = _post(
+            source=SocialSource.REDDIT, external_id="reddit-1", created_at=created_at
+        )
+
+        aggregator = SentimentAggregator(SentimentConfig())
+        session = dt.date(2024, 6, 3)
+        mentions = [
+            TickerMention(post_external_id="news-1", symbol="ACME", confidence=0.9, method="cashtag"),
+            TickerMention(
+                post_external_id="reddit-1", symbol="ACME", confidence=0.9, method="cashtag"
+            ),
+        ]
+        scores = {
+            "news-1": SentimentScores(bullish=1.0, bearish=0.0),
+            "reddit-1": SentimentScores(bullish=0.0, bearish=1.0),
+        }
+        result = aggregator.aggregate(
+            "ACME", session, [news_post, reddit_post], mentions, scores, source="test"
+        )
+
+        # Both posts share the same recency (decay cancels out of the
+        # weighted-mean ratio); the news post's 0.6 baseline vs the Reddit
+        # post's 0.3 baseline pulls credibility_weighted toward bullish:
+        # (1*0.6 - 1*0.3) / (0.6 + 0.3) == 1/3.
+        assert result.credibility_weighted == pytest.approx(1.0 / 3.0, abs=1e-6)
+        # Not the old buggy behaviour, where both posts floored to a zero
+        # credibility weight and _weighted_mean fell back to the plain,
+        # unweighted average of the two opposite polarities (0.0).
+        assert result.credibility_weighted != pytest.approx(0.0, abs=1e-6)
