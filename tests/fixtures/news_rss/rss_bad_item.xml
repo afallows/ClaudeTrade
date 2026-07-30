@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Mixed Quality Feed</title>
+    <item>
+      <title>Item with an unparseable publication date</title>
+      <link>https://wire.example.com/2024/06/03/bad-date</link>
+      <guid isPermaLink="false">wire-example-guid-baddate-1</guid>
+      <pubDate>not-a-real-date</pubDate>
+      <description>This item's pubDate cannot be parsed and must be skipped, not crash the feed.</description>
+    </item>
+    <item>
+      <title>Item with no pubDate at all</title>
+      <link>https://wire.example.com/2024/06/03/no-date</link>
+      <guid isPermaLink="false">wire-example-guid-nodate-1</guid>
+      <description>This item has no pubDate element and must also be skipped.</description>
+    </item>
+    <item>
+      <title>Item with a valid publication date</title>
+      <link>https://wire.example.com/2024/06/03/good-date</link>
+      <guid isPermaLink="false">wire-example-guid-gooddate-1</guid>
+      <pubDate>Mon, 03 Jun 2024 15:00:00 GMT</pubDate>
+      <description>This item is well-formed and must survive parsing.</description>
+    </item>
+  </channel>
+</rss>

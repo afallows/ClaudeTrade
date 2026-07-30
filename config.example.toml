@@ -42,8 +42,8 @@ audit_filename = "audit.log"              # Append-only security and integrity a
 
 [market_data]
 # Historical daily OHLCV bars and security reference data.
-provider = "synthetic"                    # Options: synthetic (offline), csv, stooq
-fallbacks = ["csv"]                       # Try these providers if primary fails
+provider = "stooq"                        # Live US/TSX daily history; use synthetic only for an explicit offline demo
+fallbacks = ["yahoo", "csv"]              # Yahoo supplies current market caps before Stooq history requests
 credential = ""                           # Named credential for providers that need auth (not used by default providers)
 csv_dir = ""                              # Path to CSV directory (when provider = "csv")
 stale_after_hours = 30.0                  # Flag bars older than this as stale (data quality check)
@@ -75,11 +75,16 @@ estimated_date_uncertainty_days = 3       # Widen estimated dates by this many d
 request_timeout_s = 20.0
 
 [reddit]
-# Official Reddit OAuth API. Disabled by default; enable only when credentials are configured.
+# Official Reddit OAuth API, an owner cookie-session mode, or an opt-in
+# unauthenticated fallback (see docs/api-providers.md). Disabled by default;
+# enable only when credentials (or a session cookie) are configured.
 enabled = false
-provider = "synthetic"                    # Options: synthetic (offline), reddit (requires OAuth)
+provider = "synthetic"                    # Options: synthetic (offline), reddit (requires OAuth, cookie session, or public JSON)
 client_id_credential = "reddit_client_id"         # Environment variable or keyring lookup name
 client_secret_credential = "reddit_client_secret"
+# Owner's own reddit_session browser cookie (personal use only, ADR-0008 Decision 1);
+# see docs/api-providers.md for how to export it from Chrome/Edge devtools.
+session_cookie_credential = "reddit_session_cookie"
 user_agent = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
 subreddits = [
   "stocks", "investing", "StockMarket", "SecurityAnalysis",
@@ -131,9 +136,12 @@ output_cost_per_mtok_usd = 15.0
 source = "database"                       # Options: database (from market provider), csv, static
 csv_path = ""                             # Path to symbol list CSV
 static_symbols = []                       # Hardcoded list of symbols (if source = "static")
-permitted_exchanges = ["NYSE", "NASDAQ", "AMEX"]
-max_symbols = 2000                        # Cap the universe size
+permitted_exchanges = ["NYSE", "NASDAQ", "AMEX", "TSX"]
+max_symbols = 3000                        # Covers the complete packaged >=$1B US + TSX inventory
 include_etfs = false                      # Whether to include exchange-traded funds
+packaged_universes = ["us_default", "ca_default"]
+min_market_cap_usd = 1_000_000_000        # Applied again after live cap enrichment, before history requests
+unknown_cap_policy = "exclude"            # Strict live mode: do not request names whose cap cannot be established
 
 [filters]
 # Candidate filters applied before strategy evaluation.

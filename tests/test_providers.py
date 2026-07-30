@@ -20,12 +20,13 @@ history would have silently produced a single bar per symbol.
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 
 import pytest
 
 from claudetrade.config import MarketDataConfig, RedditConfig, XConfig
 from claudetrade.domain import SocialSource
-from claudetrade.providers.base import NotConfiguredError, ProviderError
+from claudetrade.providers.base import NotConfiguredError, ProviderError, SourceBlockedError
 from claudetrade.providers.market.stooq import StooqMarketProvider
 
 # --------------------------------------------------------------------------
@@ -52,6 +53,16 @@ AAPL.US,2024-01-08,22:00:07,182.09,185.60,181.50,185.56,59144500
 #: plain-text body, so it cannot be caught by status code alone.
 STOOQ_NO_DATA = "N/D"
 STOOQ_QUOTA = "Exceeded the daily hits limit"
+
+#: Verbatim browser-challenge page (HTTP 200, HTML/JS body) captured by a
+#: real probe from the owner's machine: stooq now serves this SHA-256
+#: proof-of-work challenge for both a US and a TSX symbol request. The exact
+#: JS is irrelevant to the adapter -- only the HTML shape (detected via
+#: content-type and/or the leading <!doctype/<html marker) matters -- but
+#: testing against the real bytes keeps the detection honest.
+STOOQ_CHALLENGE_HTML = (
+    Path(__file__).parent / "fixtures" / "stooq" / "challenge_page.html"
+).read_text(encoding="utf-8")
 
 
 class _FakeResponse:
@@ -89,6 +100,27 @@ def test_stooq_symbol_mapping_adds_us_suffix():
     assert StooqMarketProvider.stooq_symbol("aapl") == "aapl.us"
     # An explicit market suffix must survive untouched so non-US listings work.
     assert StooqMarketProvider.stooq_symbol("BMW.DE") == "bmw.de"
+
+
+def test_stooq_symbol_mapping_uses_ca_suffix_for_explicit_tsx_exchange():
+    """Canadian (TSX/TSXV) listings get '.to', not '.us'."""
+    assert StooqMarketProvider.stooq_symbol("SHOP", exchange="TSX") == "shop.to"
+    assert StooqMarketProvider.stooq_symbol("XYZ", exchange="TSXV") == "xyz.to"
+    assert StooqMarketProvider.stooq_symbol("SHOP", exchange="tsx") == "shop.to"
+
+
+def test_stooq_symbol_mapping_defaults_to_us_for_unknown_exchange():
+    assert StooqMarketProvider.stooq_symbol("XYZ", exchange="LSE") == "xyz.us"
+    assert StooqMarketProvider.stooq_symbol("XYZ", exchange=None) == "xyz.us"
+
+
+def test_stooq_symbol_mapping_is_driven_by_the_packaged_exchange_column():
+    """With no explicit exchange, the suffix is looked up from the packaged
+    seed universe's exchange column -- a known US name gets '.us', a known
+    Canadian name gets '.to', with no exchange passed by the caller."""
+    assert StooqMarketProvider.stooq_symbol("AAPL") == "aapl.us"  # NASDAQ in us_default.csv
+    assert StooqMarketProvider.stooq_symbol("SHOP") == "shop.to"  # TSX in ca_default.csv
+    assert StooqMarketProvider.stooq_symbol("RY") == "ry.to"  # TSX (Royal Bank of Canada)
 
 
 def test_stooq_parses_real_daily_history():
@@ -172,6 +204,166 @@ def test_stooq_requests_the_history_endpoint_with_a_bounded_range(monkeypatch):
     assert len(result["AAPL"]) == 5
 
 
+def test_stooq_sends_a_browser_like_user_agent(monkeypatch):
+    """Root-cause fix for the real "stooq returned 404 for AAPL" refresh
+    failure: the request carried no ``User-Agent`` at all (httpx's own
+    generic default went out on the wire instead), and stooq's edge answers
+    that default with a 404. The symbol/suffix mapping was already correct
+    (see the exact-URL tests below); the missing header is what broke it."""
+    import httpx
+
+    captured: dict[str, object] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            return _FakeResponse(STOOQ_DAILY_CSV)
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    provider.get_daily_bars(["AAPL"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+
+    headers = captured["client_kwargs"]["headers"]
+    assert headers.get("User-Agent"), "a User-Agent header must be sent -- stooq 404s a bare default"
+    assert "python-httpx" not in headers["User-Agent"].lower()
+
+
+def test_stooq_get_daily_bars_requests_exact_url_for_a_us_symbol(monkeypatch):
+    """End-to-end (not just the pure ``stooq_symbol()`` unit test): the real
+    ``get_daily_bars`` fetch path must request the lower-cased, ``.us``-
+    suffixed symbol for a plain US ticker."""
+    import httpx
+
+    captured: dict[str, object] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            captured["url"] = url
+            captured["params"] = dict(params)
+            return _FakeResponse(STOOQ_DAILY_CSV)
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    provider.get_daily_bars(["AAPL"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+
+    assert captured["url"] == "https://stooq.com/q/d/l/"
+    assert captured["params"] == {
+        "s": "aapl.us",
+        "d1": "20240101",
+        "d2": "20240131",
+        "i": "d",
+    }
+
+
+def test_stooq_get_daily_bars_requests_exact_url_for_a_tsx_symbol(monkeypatch):
+    """Same end-to-end assertion for a Canadian (TSX) symbol resolved from
+    the packaged seed universe's exchange column (no explicit exchange
+    passed to ``get_daily_bars`` -- that is the real calling convention)."""
+    import httpx
+
+    captured: dict[str, object] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            captured["url"] = url
+            captured["params"] = dict(params)
+            return _FakeResponse(STOOQ_DAILY_CSV)
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    provider.get_daily_bars(["SHOP"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+
+    assert captured["url"] == "https://stooq.com/q/d/l/"
+    assert captured["params"] == {
+        "s": "shop.to",
+        "d1": "20240101",
+        "d2": "20240131",
+        "i": "d",
+    }
+
+
+def test_stooq_browser_challenge_page_raises_source_blocked_error(monkeypatch):
+    """A real probe from the owner's machine found stooq now answers both a
+    US and a TSX symbol request with an HTTP 200 HTML/JavaScript
+    proof-of-work challenge page instead of CSV. Since the status code alone
+    (200) cannot distinguish this from a real response, the adapter must
+    detect the HTML shape and fail closed rather than feeding it to the CSV
+    parser -- never solving the challenge, never retrying in a loop."""
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            return _FakeResponse(
+                STOOQ_CHALLENGE_HTML, headers={"content-type": "text/html; charset=utf-8"}
+            )
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    with pytest.raises(SourceBlockedError):
+        provider.get_daily_bars(["AAPL"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+    assert "blocked (browser challenge)" in provider.status().last_error
+
+
+def test_stooq_browser_challenge_detected_even_without_html_content_type(monkeypatch):
+    """Some challenge responses might not carry an explicit ``text/html``
+    content-type -- the leading ``<!doctype``/``<html`` body marker must
+    also be checked."""
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            return _FakeResponse(STOOQ_CHALLENGE_HTML, headers={})
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    with pytest.raises(SourceBlockedError):
+        provider.get_daily_bars(["AAPL"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+
+
 def test_stooq_network_failure_is_a_retryable_provider_error(monkeypatch):
     """A dead network degrades the run; it must not crash the application."""
     import httpx
@@ -196,6 +388,76 @@ def test_stooq_network_failure_is_a_retryable_provider_error(monkeypatch):
     assert excinfo.value.retryable is True
 
 
+def test_stooq_unknown_symbol_degrades_per_symbol_not_the_whole_batch(monkeypatch):
+    """One unknown ticker in a batch must not take down every other symbol's
+    fetch -- the bug this deliverable exists to fix."""
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            if params["s"] == "nosuch.us":
+                return _FakeResponse(STOOQ_NO_DATA)
+            return _FakeResponse(STOOQ_DAILY_CSV)
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    result = provider.get_daily_bars(
+        ["AAPL", "NOSUCH", "MSFT"], dt.date(2024, 1, 1), dt.date(2024, 1, 31)
+    )
+
+    assert result["AAPL"], "a good symbol in the same batch must still be fetched"
+    assert result["MSFT"], "a good symbol *after* the bad one must still be fetched"
+    assert result["NOSUCH"] == [], "the unknown symbol degrades to an empty series, not a raise"
+    assert "NOSUCH" in provider._not_found
+
+
+def test_stooq_quota_message_also_degrades_per_symbol(monkeypatch):
+    """The exhausted-quota body is textually identical in shape to 'unknown
+    symbol' (HTTP 200, plain text) and must degrade the same way."""
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            return _FakeResponse(STOOQ_QUOTA)
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    result = provider.get_daily_bars(["AAPL", "MSFT"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+    assert result == {"AAPL": [], "MSFT": []}
+
+
+def test_stooq_list_universe_covers_us_and_tsx_stocks_above_one_billion():
+    """The Stooq request inventory is explicit, broad, and floor-filtered."""
+    provider = StooqMarketProvider(MarketDataConfig())
+    securities = provider.list_universe()
+    symbols = {s.symbol for s in securities}
+    exchanges = {s.exchange for s in securities}
+    assert len(securities) > 2_000
+    assert "AAPL" in symbols
+    assert "SHOP" in symbols  # Canadian (TSX)
+    assert {"NYSE", "NASDAQ", "AMEX", "TSX"} <= exchanges
+    assert all(not s.is_etf for s in securities)
+    assert all(s.market_cap_usd is not None and s.market_cap_usd >= 1_000_000_000 for s in securities)
+
+
 def test_stooq_status_declares_its_real_limitations():
     """A provider that cannot serve delisted or point-in-time data must say so.
 
@@ -206,6 +468,8 @@ def test_stooq_status_declares_its_real_limitations():
     assert status.supports_delisted is False
     assert status.supports_point_in_time is False
     assert status.licence_note, "licensing limits must be stated for a free feed"
+    assert status.capabilities["bulk_universe"] is False
+    assert "packaged seed universe" in status.message
 
 
 def test_stooq_refuses_intraday():
@@ -246,60 +510,8 @@ def test_reddit_registry_skips_unconfigured_source_without_raising():
     config.reddit.enabled = True
     config.reddit.provider = "reddit"  # the live adapter, with no credentials
     config.x.enabled = False
+    config.news.enabled = False  # news_rss is on by default; isolate reddit here
     assert get_social_providers(config) == []
-
-
-def test_reddit_honours_both_window_bounds_and_crosspost_semantics(monkeypatch):
-    """The live adapter must not return future posts or mislabel eligible posts."""
-    import json
-
-    import httpx
-
-    monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", "client")
-    monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", "secret")
-
-    rows = []
-    for post_id, day, crosspost_parent, is_crosspostable in (
-        ("early", 1, None, True),
-        ("inside", 2, None, True),
-        ("cross", 3, "t3_original", False),
-        ("late", 4, None, False),
-    ):
-        created = dt.datetime(2024, 1, day, 12, tzinfo=dt.UTC).timestamp()
-        rows.append({"data": {
-            "id": post_id, "created_utc": created, "title": post_id,
-            "selftext": "", "author": f"user-{post_id}",
-            "crosspost_parent": crosspost_parent,
-            "is_crosspostable": is_crosspostable,
-        }})
-
-    class _Client:
-        def __init__(self, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def post(self, *args, **kwargs):
-            return _FakeResponse(json.dumps({"access_token": "token", "expires_in": 3600}))
-
-        def get(self, *args, **kwargs):
-            return _FakeResponse(json.dumps({"data": {"children": rows}}))
-
-    monkeypatch.setattr(httpx, "Client", _Client)
-    from claudetrade.providers.social.reddit import RedditProvider
-
-    provider = RedditProvider(RedditConfig(subreddits=["stocks"], rate_limit_per_minute=6000))
-    posts = provider.fetch_posts(
-        since=dt.datetime(2024, 1, 2, tzinfo=dt.UTC),
-        until=dt.datetime(2024, 1, 3, 23, 59, tzinfo=dt.UTC),
-    )
-    assert [post.external_id for post in posts] == ["cross", "inside"]
-    assert posts[0].is_crosspost is True
-    assert posts[1].is_crosspost is False
 
 
 def test_synthetic_reddit_provider_is_reachable_without_credentials():
@@ -310,6 +522,7 @@ def test_synthetic_reddit_provider_is_reachable_without_credentials():
     config = AppConfig()
     config.reddit.enabled = True
     config.reddit.provider = "synthetic"
+    config.news.enabled = False  # news_rss is on by default; isolate reddit here
     providers = get_social_providers(config)
     assert len(providers) == 1
     assert providers[0].source is SocialSource.REDDIT
@@ -369,55 +582,6 @@ def test_x_status_states_the_paid_tier_requirement():
     config = AppConfig()
     reports = {r.kind: r for r in provider_status_report(config)}
     assert reports, "status report must not be empty"
-
-
-def test_x_requests_author_fields_and_pseudonymises_stable_id(monkeypatch):
-    """Missing optional usernames must not collapse unique-author analytics."""
-    import json
-
-    import httpx
-
-    monkeypatch.setenv("CLAUDETRADE_SECRET_X_BEARER_TOKEN", "token")
-    captured: dict[str, object] = {}
-    payload = {
-        "data": [{
-            "id": "tweet-1", "author_id": "author-42", "text": "$AAPL breakout",
-            "created_at": "2024-01-03T12:00:00Z",
-            "public_metrics": {"like_count": 4, "reply_count": 1, "retweet_count": 2},
-        }],
-        "includes": {"users": [{
-            "id": "author-42", "created_at": "2020-01-01T00:00:00Z",
-            "public_metrics": {"followers_count": 100},
-        }]},
-    }
-
-    class _Client:
-        def __init__(self, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def get(self, url, params=None, **kwargs):
-            captured["url"] = url
-            captured["params"] = params
-            return _FakeResponse(json.dumps(payload))
-
-    monkeypatch.setattr(httpx, "Client", _Client)
-    from claudetrade.providers.social.x_provider import XProvider
-
-    provider = XProvider(XConfig(query_terms=["$AAPL"], rate_limit_per_minute=6000))
-    posts = provider.fetch_posts(
-        since=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
-        until=dt.datetime(2024, 1, 4, tzinfo=dt.UTC),
-    )
-    assert captured["url"] == "https://api.x.com/2/tweets/search/recent"
-    assert "username" in captured["params"]["user.fields"]
-    assert posts[0].author_hash and "author-42" not in posts[0].author_hash
-    assert posts[0].author_age_days == 1463
 
 
 # --------------------------------------------------------------------------

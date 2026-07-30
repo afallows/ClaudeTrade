@@ -21,7 +21,7 @@ from typing import Protocol
 
 from claudetrade.backtest.costs import CostModel
 from claudetrade.backtest.execution import EntryOrder, ExecutionSimulator
-from claudetrade.backtest.metrics import compute_metrics, segment_metrics, validation_warnings
+from claudetrade.backtest.metrics import compute_metrics, segment_metrics
 from claudetrade.backtest.portfolio import BacktestPortfolio, EquityPoint
 from claudetrade.config import AppConfig, BacktestConfig
 from claudetrade.domain import Bar, ExitReason, RegimeState, SecurityInfo, Trade
@@ -133,6 +133,95 @@ class DictContextProvider:
 
 
 @dataclass(slots=True)
+class RejectionFunnel:
+    """Per-stage counts of why candidates fell out of a backtest run.
+
+    ADR-0007 Decision 3(b): every scan/backtest reports this so "0 trades" is
+    always attributable rather than indistinguishable from a silently broken
+    pipeline (trading-bot's ``backtest_order_gateway.py`` bug class -- pattern
+    only, GPL/MIT conflict, not copied). Every (symbol, session) candidate the
+    provider offers enters at ``universe_candidates`` and is accounted for by
+    exactly one of the buckets below (a symbol can of course recur across
+    multiple sessions and contribute to several buckets over the run).
+
+    Field groups, in pipeline order:
+
+    * ``universe_candidates`` / ``universe_filtered_symbols`` / ``no_context``
+      -- data-layer attrition, before any strategy runs.
+    * ``strategy_declined`` / ``strategy_errors`` -- a strategy looked and
+      passed (declined) or blew up (an unhandled exception or an invalid
+      proposal; see ``signals.engine.RejectedCandidate`` stage "strategy").
+    * ``gate_rejected`` / ``score_rejected`` -- ``signals.scoring`` hard gates
+      and the overall-score/confidence thresholds.
+    * ``sizing_zero`` / ``limits_rejected`` -- risk sizing produced zero
+      shares, or portfolio-level limits (heat, concentration, kill switch)
+      blocked an otherwise-sized position.
+    * ``signals_generated`` -- cleared every stage above; an order was queued.
+    * ``entries_filled`` / ``entries_expired_unfilled`` / ``entries_carried_to_end``
+      -- what happened to a queued order: filled against a later bar, never
+      filled within ``SignalConfig.signal_expiry_days`` sessions and dropped,
+      or still queued (unfilled, unexpired) when the run's last session ended.
+    """
+
+    universe_candidates: int = 0
+    #: Symbols the provider offered at least once but for which
+    #: ``build_context`` returned None on *every* session in the run --
+    #: structurally excluded from the universe, as opposed to a transient
+    #: per-session gap (see ``no_context`` below).
+    universe_filtered_symbols: int = 0
+    #: (symbol, session) pairs where ``build_context`` returned None.
+    no_context: int = 0
+    #: strategy name -> decline reason -> count, drained from each
+    #: ``Strategy.decline()`` call via ``drain_rejections()``.
+    strategy_declined: dict[str, dict[str, int]] = field(default_factory=dict)
+    strategy_errors: int = 0
+    gate_rejected: int = 0
+    score_rejected: int = 0
+    sizing_zero: int = 0
+    limits_rejected: int = 0
+    signals_generated: int = 0
+    orders_queued: int = 0
+    entries_filled: int = 0
+    entries_expired_unfilled: int = 0
+    entries_carried_to_end: int = 0
+
+    def strategy_decline_total(self) -> int:
+        return sum(sum(reasons.values()) for reasons in self.strategy_declined.values())
+
+    def summary_lines(self) -> list[str]:
+        """Human-readable funnel, most-upstream stage first.
+
+        Used by both the CLI's plain-text output and the markdown report --
+        kept here rather than duplicated in each renderer.
+        """
+        lines = [
+            f"Universe candidates (symbol x session): {self.universe_candidates}",
+            f"  Symbols never producing a usable context: {self.universe_filtered_symbols}",
+            f"  (symbol, session) pairs with no context: {self.no_context}",
+            f"Strategy declines: {self.strategy_decline_total()} "
+            f"(errors/invalid proposals: {self.strategy_errors})",
+        ]
+        for strategy in sorted(self.strategy_declined):
+            reasons = self.strategy_declined[strategy]
+            top = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)
+            detail = ", ".join(f"{reason}={count}" for reason, count in top)
+            lines.append(f"    {strategy}: {sum(reasons.values())} ({detail})")
+        lines.extend(
+            [
+                f"Gate-rejected (hard filters): {self.gate_rejected}",
+                f"Score-rejected (below threshold): {self.score_rejected}",
+                f"Risk sizing produced zero shares: {self.sizing_zero}",
+                f"Portfolio-limit rejected: {self.limits_rejected}",
+                f"Signals generated (orders queued): {self.signals_generated}",
+                f"Entries filled: {self.entries_filled}",
+                f"Entries expired unfilled: {self.entries_expired_unfilled}",
+                f"Entries still queued at run end: {self.entries_carried_to_end}",
+            ]
+        )
+        return lines
+
+
+@dataclass(slots=True)
 class BacktestResult:
     """Complete backtest output: metadata, trades, equity curve, metrics."""
 
@@ -148,6 +237,9 @@ class BacktestResult:
     metrics: dict  # Overall metrics
     segment_metrics: dict  # Segmented metrics by dimension
     warnings: list[str]
+    #: ADR-0007 Decision 3(b): populated on every run, including a 0-trade
+    #: one, so "why zero?" always has an answer.
+    funnel: RejectionFunnel
 
     code_version: str
     config_hash: str
@@ -227,8 +319,17 @@ class BacktestEngine:
         strategy_names: set[str] = set()
         universe_size = 0
 
+        # ADR-0007 Decision 3(b): rejection funnel, populated across the whole
+        # run so a 0-trade result is always attributable. `all_symbols_seen`
+        # vs `symbols_with_context` distinguishes a symbol structurally
+        # excluded for the entire run from one with only transient per-session
+        # gaps (halts, late listing, etc. -- see RejectionFunnel.no_context).
+        funnel = RejectionFunnel()
+        all_symbols_seen: set[str] = set()
+        symbols_with_context: set[str] = set()
+
         log.info(
-            f"Starting backtest {run_id}: {len(sessions)} sessions "
+            f"Starting backtest {run_id} ({label or 'unlabeled'}): {len(sessions)} sessions "
             f"from {sessions[0]} to {sessions[-1]}"
         )
 
@@ -239,14 +340,19 @@ class BacktestEngine:
             universe_size = max(universe_size, len(symbols))
             regime = provider.regime(session)
 
+            funnel.universe_candidates += len(symbols)
+            all_symbols_seen.update(symbols)
+
             # --- Generate signals for this session ---
             contexts: list[StrategyContext] = []
             for symbol in symbols:
                 ctx = provider.build_context(symbol, session)
                 if ctx is None:
+                    funnel.no_context += 1
                     continue
                 ctx.assert_no_lookahead()
                 contexts.append(ctx)
+                symbols_with_context.add(symbol)
 
             portfolio_state = portfolio.portfolio_state(session)
             scan_result = self.signal_engine.scan(
@@ -259,21 +365,86 @@ class BacktestEngine:
 
             for signal in scan_result.signals:
                 strategy_names.add(signal.strategy)
+            funnel.signals_generated += len(scan_result.signals)
+
+            # Aggregate why the rest of this session's candidates fell out.
+            # `scan_result.rejected` is the signal engine's own pipeline:
+            # hard gates, the score/confidence threshold, its own sizing/
+            # limits check against the portfolio snapshot at scan time, and
+            # stage "strategy" -- which the signal engine uses for *both* an
+            # unhandled exception/invalid proposal (`SignalEngine.scan()`
+            # drains `Strategy.decline()` itself and folds the reasons in
+            # here, since a decline never produces a proposal to reject
+            # further downstream) *and* every recorded `Strategy.decline()`
+            # reason. The two are distinguished below by the "error: " prefix
+            # `SignalEngine._evaluate_one` puts only on the exception path.
+            for rejected_candidate in scan_result.rejected:
+                if rejected_candidate.stage == "gates":
+                    funnel.gate_rejected += 1
+                elif rejected_candidate.stage == "score":
+                    funnel.score_rejected += 1
+                elif rejected_candidate.stage == "sizing":
+                    funnel.sizing_zero += 1
+                elif rejected_candidate.stage == "limits":
+                    funnel.limits_rejected += 1
+                elif rejected_candidate.stage == "strategy":
+                    for reason_text in rejected_candidate.reasons:
+                        if reason_text.startswith("error: "):
+                            funnel.strategy_errors += 1
+                        else:
+                            # "reason" or "reason: detail" (see
+                            # Strategy.decline) -- the reason code is
+                            # everything before the first ": ".
+                            reason_code = reason_text.split(": ", 1)[0]
+                            by_reason = funnel.strategy_declined.setdefault(
+                                rejected_candidate.strategy, {}
+                            )
+                            by_reason[reason_code] = by_reason.get(reason_code, 0) + 1
+
+            # Defensive: drain any decline recorded outside a scan() call (a
+            # custom SignalEngine/Strategy wiring, or a future caller that
+            # invokes strategy.evaluate() directly) so nothing here leaks
+            # across sessions uncounted. Under the current SignalEngine this
+            # is always empty -- scan() already drained everything above.
+            for strategy in self.signal_engine.strategies:
+                for rejection in strategy.drain_rejections():
+                    by_reason = funnel.strategy_declined.setdefault(rejection.strategy, {})
+                    by_reason[rejection.reason] = by_reason.get(rejection.reason, 0) + 1
 
             # --- Execute queued orders from the previous session ---
             new_queued = []
             for symbol, order in queued_orders:
                 bar = provider.bar(symbol, session)
                 if bar is None or bar.volume <= 0:
-                    # Halted / no data: carry order forward
+                    # Halted / no data: carry order forward, subject to the
+                    # same expiry as a working-but-unfilled order below -- a
+                    # symbol that stays halted past the expiry window is just
+                    # as stale an idea as one that simply never triggered.
+                    age_sessions = (session - (order.queued_session or session)).days
+                    if age_sessions >= self.config.signals.signal_expiry_days:
+                        funnel.entries_expired_unfilled += 1
+                        log.debug(f"  {symbol}: entry expired unfilled (halted/no data) after {age_sessions}d")
+                        continue
                     new_queued.append((symbol, order))
                     continue
 
                 fill = self.execution.try_fill_entry(order, bar)
                 if fill is None:
-                    # Did not fill this bar; keep working
+                    # Did not fill this bar. An order that has been working
+                    # since before the signal's own expiry window (the same
+                    # window that governs the live scanner, see
+                    # SignalConfig.signal_expiry_days) is dropped rather than
+                    # left queued forever -- an entry chasing a price that
+                    # never came back is a stale idea, not a pending trade.
+                    age_sessions = (session - (order.queued_session or session)).days
+                    if age_sessions >= self.config.signals.signal_expiry_days:
+                        funnel.entries_expired_unfilled += 1
+                        log.debug(f"  {symbol}: entry expired unfilled after {age_sessions}d")
+                        continue
                     new_queued.append((symbol, order))
                     continue
+
+                funnel.entries_filled += 1
 
                 # Filled: open a position
                 stop_loss = order.direction.sign * float("inf")
@@ -319,9 +490,26 @@ class BacktestEngine:
             queued_orders = new_queued
 
             # --- Queue new entries from today's signals ---
+            # A symbol already has an order working (queued but not yet
+            # filled/expired) whenever it survived the execute-queued-orders
+            # step above into `queued_orders`. Without this check a strategy
+            # that re-proposes the same symbol on a later session (because its
+            # first order hasn't filled or expired yet) would get a *second*
+            # entry order queued for it; if both later filled, the second
+            # `portfolio.open_position()` call would silently overwrite the
+            # first position in `portfolio.positions`, orphaning the first
+            # position's entry cash debit forever (it is never closed, so its
+            # cost basis is never returned to cash) -- the exact defect that
+            # produced a ~$112k equity/trades divergence on a $100k account.
+            # `pending_symbols` is kept in sync as we queue below so two
+            # signals for the same symbol on the *same* session can't both
+            # queue either.
+            pending_symbols = {sym for sym, _ in queued_orders}
             for signal in scan_result.signals:
                 if signal.symbol in portfolio.positions:
                     continue  # Already holding this symbol
+                if signal.symbol in pending_symbols:
+                    continue  # Already have a working (unfilled) entry order
 
                 sizing, limit_check = portfolio.size_and_vet(
                     symbol=signal.symbol,
@@ -333,7 +521,15 @@ class BacktestEngine:
                     sector=provider.security(signal.symbol).sector,
                 )
 
+                if not sizing.is_tradable:
+                    # Distinguished from a portfolio-limit breach below: this
+                    # is "the risk budget rounds down to zero shares", not
+                    # "there was room sized, but a limit vetoed it".
+                    funnel.sizing_zero += 1
+                    log.debug(f"  {signal.symbol}: sizing produced zero shares")
+                    continue
                 if not limit_check.allowed:
+                    funnel.limits_rejected += 1
                     log.debug(f"  {signal.symbol}: limit breach: {limit_check.breaches}")
                     continue
 
@@ -358,6 +554,8 @@ class BacktestEngine:
                     queued_session=session,
                 )
                 queued_orders.append((signal.symbol, order))
+                pending_symbols.add(signal.symbol)
+                funnel.orders_queued += 1
                 log.debug(f"  Queued {signal.symbol} {signal.direction.value} entry")
 
             # --- Process existing positions: exits, mark-to-market ---
@@ -422,7 +620,17 @@ class BacktestEngine:
                         force_close_reason=ExitReason.END_OF_BACKTEST,
                     )
                     if trade is not None:
-                        portfolio.closed_trades.append(trade)
+                        # NOTE: process_bar_for_position -> _apply_exit_decision
+                        # already appends the completed Trade to
+                        # portfolio.closed_trades internally. A second
+                        # `portfolio.closed_trades.append(trade)` used to sit
+                        # here, silently double-counting every force-closed
+                        # trade (inflating trade_count and corrupting every
+                        # metric derived from it -- exactly the kind of
+                        # "garbage number" ADR-0007 Decision 3 exists to catch,
+                        # here on the input side rather than the metrics
+                        # formula). Caught by the rejection-funnel sanity test
+                        # (entries_filled must equal len(trades)).
                         log.debug(
                             f"  Force-closed {trade.symbol} at end-of-backtest "
                             f"P&L {trade.net_pnl:.0f}"
@@ -433,13 +641,21 @@ class BacktestEngine:
             "force_close_open_positions=true should have closed them"
         )
 
+        # --- Finalise the rejection funnel ---
+        # Anything still in queued_orders survived to the last session without
+        # filling *or* expiring -- distinct from `entries_expired_unfilled`,
+        # which is time-based and independent of when the run happens to end.
+        funnel.entries_carried_to_end += len(queued_orders)
+        funnel.universe_filtered_symbols = len(all_symbols_seen - symbols_with_context)
+
         # --- Compute metrics ---
         metrics_obj = compute_metrics(
             portfolio.closed_trades,
             portfolio.equity_curve,
             self.backtest_config,
         )
-        warnings_list = validation_warnings(metrics_obj, self.backtest_config)
+        # compute_metrics already attaches these; reuse rather than recompute.
+        warnings_list = metrics_obj.warnings
 
         segment_dims = [
             "strategy",
@@ -473,10 +689,19 @@ class BacktestEngine:
             metrics=asdict(metrics_obj),
             segment_metrics=all_segment_metrics,
             warnings=warnings_list,
+            funnel=funnel,
             code_version=CODE_VERSION,
             config_hash=config_hash,
             data_snapshot_hash=data_snapshot_hash,
         )
+
+        if not portfolio.closed_trades:
+            # The canary this table exists for (ADR-0007 Decision 3(b)): a
+            # 0-trade run is never left to speak for itself.
+            log.warning(
+                "Backtest produced 0 trades. Rejection funnel: %s",
+                "; ".join(funnel.summary_lines()),
+            )
 
         log.info(
             f"Backtest complete: {len(portfolio.closed_trades)} trades, "
@@ -485,16 +710,15 @@ class BacktestEngine:
 
         return result
 
+    _ENTRY_ORDER_TYPES = {
+        "next_open": "market_on_open",
+        "next_open_limit": "limit",
+        "stop_trigger": "stop_entry",
+    }
+
     def _entry_order_type(self) -> str:
         """Map BacktestConfig.entry_reference to EntryOrderType."""
-        ref = self.backtest_config.entry_reference
-        if ref == "next_open":
-            return "market_on_open"
-        elif ref == "next_open_limit":
-            return "limit"
-        elif ref == "stop_trigger":
-            return "stop_entry"
-        return "market_on_open"
+        return self._ENTRY_ORDER_TYPES.get(self.backtest_config.entry_reference, "market_on_open")
 
 
 __all__ = [
@@ -502,4 +726,5 @@ __all__ = [
     "BacktestResult",
     "ContextProvider",
     "DictContextProvider",
+    "RejectionFunnel",
 ]

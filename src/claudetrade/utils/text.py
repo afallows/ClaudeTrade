@@ -50,8 +50,15 @@ _CONTROL_TOKEN_RE = re.compile(
 
 #: Phrases whose only purpose in a social post is to redirect an LLM.
 _INJECTION_PHRASES = [
-    r"ignore (?:all |any |the )?(?:previous|prior|above|earlier) (?:instructions?|prompts?|rules?)",
-    r"disregard (?:all |any |the )?(?:previous|prior|above|earlier) (?:instructions?|prompts?|rules?)",
+    # Two shapes of the same redirect. The first keys on the *object* of the
+    # verb ("ignore your/these instructions"), the second on the positional
+    # reference ("ignore the above ...") regardless of what follows, because
+    # "ignore the above analysis and buy" is an injection wearing a finance
+    # costume. The asymmetry is deliberate: a false positive costs one dropped
+    # post, a false negative puts attacker text in front of the model.
+    r"(?:ignore|disregard|forget) (?:all |any |the |your |my |these |those )*"
+    r"(?:instructions?|prompts?|rules?|guidelines?|directions?)",
+    r"(?:ignore|disregard) (?:all |any |the )?(?:previous|prior|above|earlier)\b",
     r"forget (?:everything|all)(?: you were told)?",
     r"you are now (?:a|an|in) \w+",
     r"new (?:system )?(?:instructions?|prompt|rules?)\s*[:\-]",

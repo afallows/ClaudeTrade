@@ -305,8 +305,15 @@ def render_markdown_report(result: BacktestResult) -> str:
     lines.append(f"| Annualised Return | {metrics.annualised_return_pct:.2f}% |\n")
     lines.append(f"| Max Drawdown | {metrics.max_drawdown_pct:.2f}% |\n")
     lines.append(f"| Max DD Duration | {metrics.max_drawdown_duration_days} days |\n")
-    lines.append(f"| Sharpe Ratio | {metrics.sharpe:.2f} |\n")
-    lines.append(f"| Sortino Ratio | {metrics.sortino:.2f} |\n")
+    # ADR-0007 Decision 3(a): sharpe/sortino are None (with a reason in
+    # metrics.unavailable_reasons) below the sample-size/variance floor,
+    # rather than a numeric fallback -- render that honestly too, instead of
+    # crashing this report on the exact 0-trade/degenerate runs it exists to
+    # explain.
+    sharpe_display = "unavailable" if metrics.sharpe is None else f"{metrics.sharpe:.2f}"
+    sortino_display = "unavailable" if metrics.sortino is None else f"{metrics.sortino:.2f}"
+    lines.append(f"| Sharpe Ratio | {sharpe_display} |\n")
+    lines.append(f"| Sortino Ratio | {sortino_display} |\n")
     lines.append(f"| Avg Holding Days | {metrics.average_holding_days:.1f} |\n")
     lines.append(f"| Exposure | {metrics.exposure_pct:.1f}% |\n")
     lines.append("")

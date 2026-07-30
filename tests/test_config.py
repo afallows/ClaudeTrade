@@ -2,9 +2,61 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
-from claudetrade.config import AppConfig, FilterConfig, RiskConfig, TradingModeConfig
+from claudetrade.config import AppConfig, FilterConfig, PathsConfig, RiskConfig, TradingModeConfig
+
+
+def test_live_tipranks_market_data_is_the_default() -> None:
+    """Fresh installs must not silently generate fabricated market tickers.
+
+    TipRanks is primary (real market caps, reference data and earnings from
+    one unauthenticated widget call per symbol); Yahoo's chart endpoint is
+    the bar fallback, tried ahead of TipRanks' own close-only last-resort
+    bars (see ``providers.registry.FallbackMarketProvider.get_daily_bars``).
+    Stooq is deliberately NOT a default fallback -- a real probe found it now
+    sits behind an anti-bot browser-challenge wall (see
+    ``providers.market.stooq``'s module docstring); it remains available as
+    an explicit opt-in.
+    """
+    config = AppConfig()
+
+    assert config.market_data.provider == "tipranks"
+    assert config.market_data.fallbacks == ["yahoo", "csv"]
+    assert "stooq" not in config.market_data.fallbacks
+    assert config.earnings.provider == "tipranks"
+
+
+class TestPathsConfigExpandUser:
+    """``app_dir`` must be expanded, or a literal '~' directory gets created (Windows bug)."""
+
+    def test_tilde_app_dir_is_expanded(self):
+        paths = PathsConfig(app_dir="~/.claudetrade")
+        assert "~" not in str(paths.app_dir)
+        assert paths.app_dir == Path(os.path.expanduser("~/.claudetrade"))
+
+    def test_tilde_app_dir_expanded_when_loaded_from_toml(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[paths]\napp_dir = "~/.claudetrade"\n')
+        config = AppConfig.load(config_file)
+        assert "~" not in str(config.paths.app_dir)
+        assert config.paths.app_dir == Path(os.path.expanduser("~/.claudetrade"))
+
+    def test_absolute_app_dir_untouched(self, tmp_path):
+        paths = PathsConfig(app_dir=tmp_path)
+        assert paths.app_dir == tmp_path
+
+    def test_resolve_under_expanded_app_dir(self):
+        """A relative sub-directory resolves under the *expanded* app_dir, not a literal '~'."""
+        paths = PathsConfig(app_dir="~/.claudetrade-expand-test", data_dir=Path("data"))
+        resolved = paths.resolve("data_dir")
+        assert "~" not in str(resolved)
+        assert resolved == Path(os.path.expanduser("~/.claudetrade-expand-test")) / "data"
+        resolved.rmdir()
+        resolved.parent.rmdir()
 
 
 class TestConfigDefaults:

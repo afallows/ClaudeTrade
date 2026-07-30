@@ -18,6 +18,21 @@ All computation is deterministic, reproducible, and auditable. Every signal carr
 
 ## Quick Start
 
+### Windows: one-script setup (fastest path)
+
+If you're on Windows, this is the whole install:
+
+1. Download/clone the source, then open the `ClaudeTrade` folder.
+2. Double-click **`scripts\setup.bat`**.
+
+That checks for Python 3.11+ (installing it via `winget` if it's missing),
+creates the virtual environment, installs everything, creates the database,
+loads the last 90 days of data, and launches the app — one script, start to
+finish. Re-running it later is safe and fast. See
+[docs/windows-install.md](docs/windows-install.md#fastest-path-one-script)
+for details and optional flags (`-SkipData`, `-Classic`, `-NoLaunch`); the
+rest of this section covers the manual, cross-platform install.
+
 ### Prerequisites
 
 - Python 3.11+
@@ -39,63 +54,125 @@ python -m venv .venv
 # macOS/Linux:
 source .venv/bin/activate
 
-# Install the package in editable mode
-pip install -e .
+# Install the package in editable mode, with the UI extra (Streamlit, Plotly, openpyxl)
+pip install -e ".[ui]"
 ```
+
+A Windows-specific, step-by-step walkthrough for a non-developer (no editable
+install, no `git`) is in [docs/windows-install.md](docs/windows-install.md).
 
 ### First Run
 
+The `claudetrade` command is installed as a console script by the `pip install`
+above. Market prices use live Stooq data by default and require network access;
+no Stooq account or API key is required. Synthetic data is available only as
+an explicit offline/demo configuration.
+
 ```bash
-# Copy the example config
-cp config.example.toml ~/.claudetrade/config.toml
-# (Or set CLAUDETRADE_CONFIG to point to it)
+# Create the database and see where the app's data lives
+claudetrade init
 
-# Run a basic scan (generates signals from the default universe)
-python -m claudetrade.pipeline
+# Check provider/network reachability and stored data coverage
+claudetrade probe
+claudetrade status
 
-# View the app directory
-ls ~/.claudetrade/
-# You'll see: data/, logs/, exports/ (created on demand)
+# Pull live Stooq history for the configured US + TSX universe
+claudetrade refresh
+
+# Generate ranked signals for today and print them
+claudetrade scan
+
+# Launch the desktop UI (React/FastAPI app; use `claudetrade ui --classic` for the legacy Streamlit dashboard)
+claudetrade ui
+```
+
+Each command's exact output and options are documented in
+[docs/windows-install.md](docs/windows-install.md) and
+`claudetrade <command> --help`.
+
+To use a custom config, either copy `config.example.toml` to your app
+directory (see [Configuration](#configuration) below) or pass `--config`:
+
+```bash
+claudetrade --help
+claudetrade scan --config /path/to/config.toml
 ```
 
 ### Running the Backtest Engine
 
+```bash
+# From the CLI: replay strategies over the last 2 years and print a report
+claudetrade backtest --start 2022-01-01 --end 2024-01-01 --export ./out
+```
+
 ```python
-from claudetrade.config import AppConfig
-from claudetrade.db.session import Database
+# Or from the Pipeline/BacktestEngine API directly
+import datetime as dt
+
 from claudetrade.backtest.engine import BacktestEngine
+from claudetrade.config import AppConfig
+from claudetrade.pipeline import Pipeline
 
 config = AppConfig.load()
-db = Database(config)
-engine = BacktestEngine(config, db)
+pipeline = Pipeline.bootstrap(config)
 
-# Backtest the last 2 years
-results = engine.backtest_symbols(
-    symbols=["AAPL", "MSFT", "TSLA"],
-    start_date=date(2022, 1, 1),
-    end_date=date(2024, 1, 1),
+universe = pipeline.universe.for_session(dt.date(2024, 1, 1))
+provider = pipeline.make_context_provider(
+    symbols=universe.symbols,
+    start=dt.date(2022, 1, 1),
+    end=dt.date(2024, 1, 1),
 )
+engine = BacktestEngine(config)
+result = engine.run(provider, start_session=dt.date(2022, 1, 1), end_session=dt.date(2024, 1, 1))
+print(result.metrics)
 ```
 
 ### Using the Pipeline API
 
 ```python
-from claudetrade.pipeline import Pipeline
+import datetime as dt
+
 from claudetrade.config import AppConfig
-from claudetrade.db.session import Database
+from claudetrade.pipeline import Pipeline
 
 config = AppConfig.load()
-db = Database(config)
-pipeline = Pipeline(config, db)
+pipeline = Pipeline.bootstrap(config)  # opens the database and applies migrations
 
 # Refresh market and sentiment data
-refresh_result = pipeline.refresh()
+refresh_result = pipeline.refresh(
+    start=dt.date(2024, 1, 1),
+    end=dt.date(2024, 12, 31),
+)
 print(f"Ingested {refresh_result.sentiment_rows} sentiment rows")
 
 # Generate signals
-scan_result = pipeline.scan()
+scan_result = pipeline.scan(dt.date(2024, 12, 31))
 print(f"Generated {len(scan_result.scan.signals)} signals")
 ```
+
+## Command-Line Interface
+
+Every workflow is reachable from the `claudetrade` command (see `src/claudetrade/cli.py`);
+the UI is a convenience layer on top of the same pipeline, not a separate implementation:
+
+```
+claudetrade version               # version and code identity
+claudetrade init                  # create the database and apply migrations
+claudetrade status                # provider health and stored data coverage
+claudetrade probe                 # test reachability of live data endpoints
+claudetrade refresh               # pull data from configured providers
+claudetrade scan                  # generate ranked signals for a session
+claudetrade backtest              # replay strategies over history
+claudetrade ui                    # launch the Streamlit dashboard
+claudetrade secrets set|list|delete   # manage credentials in the OS credential store
+claudetrade paper status|positions|kill-switch   # inspect/drive the paper account
+claudetrade db migrate|backup|restore            # database maintenance
+claudetrade verify ledger|survivorship           # integrity and reproducibility checks
+```
+
+Run `claudetrade --help` or `claudetrade <command> --help` for full option lists.
+**Live trading is not implemented**; `trading.mode = "live"` is rejected unless a
+broker adapter is configured, and none ships with this project.
 
 ## Configuration
 
@@ -104,7 +181,9 @@ All configuration is in TOML format. A fully-commented example is provided in `c
 Configuration is resolved in layers (later layers win):
 
 1. **Built-in defaults** (in `src/claudetrade/config.py`) — safe, conservative, offline
-2. **TOML file** — `~/.claudetrade/config.toml` or `$CLAUDETRADE_CONFIG`
+2. **TOML file** — `<app_dir>/config.toml` or `$CLAUDETRADE_CONFIG`. `app_dir` defaults to
+   `%LOCALAPPDATA%\ClaudeTrade` on Windows and `~/.claudetrade` on macOS/Linux (see
+   `default_app_dir()` in `src/claudetrade/config.py`).
 3. **Environment variables** — `CLAUDETRADE_<section>__<field>` (double underscore for nesting)
 
 **Key directories** (created on demand under `app_dir`):
@@ -136,9 +215,11 @@ See [docs/api-providers.md](docs/api-providers.md) for credential setup.
 | [docs/database-schema.md](docs/database-schema.md) | Schema overview: tables, append-only guarantees, reproducibility columns |
 | [docs/assumptions-and-limitations.md](docs/assumptions-and-limitations.md) | Honest statement of what the system assumes and what it does not model |
 | [docs/known-limitations.md](docs/known-limitations.md) | Implementation gaps and design constraints |
-| [docs/program-review.md](docs/program-review.md) | Independent connector verification, test findings, and prioritized remediation plan |
 | [docs/terms-and-licensing.md](docs/terms-and-licensing.md) | Third-party terms of service, data licensing, and project licence |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Common issues and solutions |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Common issues and solutions (including Windows-specific issues) |
+| [docs/windows-install.md](docs/windows-install.md) | Step-by-step install and first-run guide for a non-developer on Windows |
+| [docs/windows-smoke-test.md](docs/windows-smoke-test.md) | Checklist for manually trialling the app end-to-end on Windows |
+| [docs/windows-build.md](docs/windows-build.md) | Building a standalone Windows executable with PyInstaller |
 | [docs/decisions/](docs/decisions/) | Architecture Decision Records (ADRs) explaining key design choices |
 
 ## Project Layout
@@ -146,6 +227,7 @@ See [docs/api-providers.md](docs/api-providers.md) for credential setup.
 ```
 ClaudeTrade/
 ├── src/claudetrade/              # Main package
+│   ├── cli.py                    # `claudetrade` command (init/status/probe/refresh/scan/backtest/ui/secrets/paper/db/verify)
 │   ├── domain.py                 # Shared domain types
 │   ├── config.py                 # Configuration models
 │   ├── pipeline.py               # End-to-end orchestration
@@ -185,7 +267,7 @@ ClaudeTrade/
 │   │   └── entity_resolution.py  # Ticker mention extraction
 │   │
 │   ├── features/                 # Technical feature computation
-│   │   └── builder.py            # OHLCV → technical indicators
+│   │   └── feature_builder.py    # OHLCV → technical indicators
 │   │
 │   ├── regime/                   # Market regime classification
 │   │   └── market_regime.py      # Bull/bear/neutral classification
@@ -196,10 +278,15 @@ ClaudeTrade/
 │   │   ├── costs.py              # Transaction cost models
 │   │   ├── metrics.py            # Performance accounting (Sharpe, win/loss, etc.)
 │   │   ├── portfolio.py          # Equity curve tracking
-│   │   └── reporting.py          # Result serialisation
+│   │   └── reporting.py          # Result serialisation (CSV/Excel export)
 │   │
 │   ├── paper/                    # Paper trading simulation
-│   │   └── tracker.py            # Open position tracking
+│   │   ├── portfolio.py          # Database-backed paper account, positions, equity curve
+│   │   └── broker.py             # PaperBroker: BrokerProvider implementation for paper mode
+│   │
+│   ├── brokers/                  # Execution boundary (ADR-0007 Decision 4)
+│   │   ├── base.py               # BrokerProvider ABC; risk-guard runs before every order
+│   │   └── null_live.py          # Stub live-broker shape; not a real venue, no live trading
 │   │
 │   ├── risk/                     # Position sizing and limits
 │   │   ├── sizing.py             # Kelly, fixed %, volatility-based
@@ -211,6 +298,10 @@ ClaudeTrade/
 │   │   ├── universe.py           # Security universe management
 │   │   ├── context.py            # Point-in-time context builder
 │   │   └── snapshot.py           # Reproducible data snapshots
+│   │
+│   ├── ui/                       # Streamlit dashboard (`claudetrade ui`)
+│   │   ├── app.py                # Entry point; 5-screen navigation
+│   │   └── screens/               # dashboard, scanner, ticker_detail, backtesting, settings
 │   │
 │   └── utils/                    # Utilities
 │       ├── text.py               # Social text sanitisation
@@ -268,8 +359,8 @@ pytest --cov=claudetrade tests/
 # Run only fast tests (skip slow backtests)
 pytest -m "not slow" tests/
 
-# Run a specific test
-pytest tests/test_strategies.py::test_sentiment_breakout
+# Run a specific test file
+pytest tests/test_engine.py
 ```
 
 ## Requirements
@@ -280,17 +371,20 @@ pytest tests/test_strategies.py::test_sentiment_breakout
 - `SQLAlchemy>=2.0` — ORM (SQLite and PostgreSQL)
 - `pandas>=2.1`, `numpy>=1.26` — Data manipulation
 - `httpx>=0.27` — HTTP client for API providers
-- `typer>=0.12` — CLI framework (when used)
-- `APScheduler>=3.10` — Background task scheduling
+- `typer>=0.12` — CLI framework used by `claudetrade` (see `src/claudetrade/cli.py`)
+- `APScheduler>=3.10` — listed dependency; no scheduled jobs are wired up yet (see
+  [docs/known-limitations.md](docs/known-limitations.md)). Use the OS scheduler
+  (cron, Windows Task Scheduler) to run `claudetrade refresh`/`scan` on a timer instead.
 - `keyring>=25.0` — OS credential store integration
 
 ### Optional Dependencies
 
-- **UI**: `streamlit>=1.36`, `plotly>=5.22`, `openpyxl>=3.1` (for dashboard and Excel export)
-- **ML**: `scikit-learn>=1.4` (for optional ML-based signal fusion, not required)
-- **Dev**: `pytest>=8.0`, `ruff>=0.5`, `mypy>=1.10` (testing, linting, type checking)
+- **UI**: `streamlit>=1.36`, `plotly>=5.22`, `openpyxl>=3.1` (`pip install -e ".[ui]"`) — required for `claudetrade ui`
+- **ML**: `scikit-learn>=1.4` (`pip install -e ".[ml]"`) — listed for future ML-based signal fusion; not currently used by any code path
+- **Build**: `pyinstaller>=6.6` (`pip install -e ".[build]"`) — for producing a standalone Windows executable; see [docs/windows-build.md](docs/windows-build.md)
+- **Dev**: `pytest>=8.0`, `ruff>=0.5`, `mypy>=1.10` (`pip install -e ".[dev]"`) — testing, linting, type checking
 
-See [pyproject.toml](pyproject.toml) for full list.
+See [pyproject.toml](pyproject.toml) for the full list.
 
 ## Security and Privacy
 

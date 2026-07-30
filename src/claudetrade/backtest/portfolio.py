@@ -258,7 +258,29 @@ class BacktestPortfolio:
         ``fill`` is the ``ExecutionSimulator.try_fill_entry`` result; the
         caller (the engine) is responsible for having decided the order
         should be placed at all (sizing, risk limits already passed).
+
+        Raises:
+            ValueError: if ``entry_order.symbol`` already has an open
+                position. ``self.positions`` is a plain dict keyed by symbol,
+                so a second open would silently overwrite (not merge with)
+                the first: the overwritten ``Position`` is never closed, so
+                its entry cash debit/credit is never reversed and the ledger
+                permanently diverges from the trade log by that position's
+                notional. This must never happen with correct callers (the
+                engine tracks working orders per symbol precisely so it never
+                asks for a second concurrent entry on the same symbol) -- see
+                ``BacktestEngine.run``'s ``pending_symbols`` guard -- so this
+                is a fail-fast integrity check, not a normal control-flow
+                path.
         """
+        if entry_order.symbol in self.positions:
+            existing = self.positions[entry_order.symbol]
+            raise ValueError(
+                f"cannot open {entry_order.symbol}: a position is already open "
+                f"(trade_id={existing.trade_id}, entered {existing.entry_session}); "
+                "opening a second one would silently overwrite it and orphan its "
+                "entry cash in the ledger"
+            )
         side = side_for(entry_order.direction.sign, is_entry=True)
         principal = fill.shares * fill.price
         commission = self.cost_model.commission(fill.shares, fill.price)
@@ -511,24 +533,55 @@ class BacktestPortfolio:
         ``last_prices`` should hold, for every open symbol, the latest
         observable close as of ``session`` (never a later one).
         """
-        unrealised = 0.0
+        mark_value = 0.0
         sector_notional: dict[str, float] = {}
         for symbol, position in self.positions.items():
             price = last_prices.get(symbol, position.entry_price)
-            unrealised += (price - position.entry_price) * position.shares * position.direction.sign
+            # Liquidation value of this position at the current mark: selling
+            # a long returns +price*shares; covering a short costs
+            # -price*shares. ``direction.sign`` is +1/-1, so this one term
+            # is correct for both sides -- see the accounting note below.
+            mark_value += position.direction.sign * price * position.shares
             sector_notional[position.sector] = (
                 sector_notional.get(position.sector, 0.0) + position.notional
             )
-        # Equity = cash still held + the entry-cost basis of open long
-        # positions (a long entry already reduced cash by its notional, so
-        # that notional is added back) + unrealised P&L on every open
-        # position. A short entry *raised* cash by its notional (see
-        # ``open_position``), so no basis add-back is needed on the short
-        # side -- its unrealised P&L alone captures the mark.
-        long_basis = sum(
-            p.notional for p in self.positions.values() if p.direction is Direction.LONG
-        )
-        self.equity = self.cash + long_basis + unrealised
+        # Equity = cash still held + the current liquidation value of every
+        # open position.
+        #
+        # A long entry *reduced* cash by its entry notional, so a long's
+        # ``mark_value`` (+price*shares) both returns that notional and adds
+        # the unrealised P&L when added to cash -- consistent with the old
+        # "add back entry basis, then add unrealised P&L" formulation this
+        # replaced.
+        #
+        # A short entry *raised* cash by its entry notional (see
+        # ``open_position``: proceeds are credited, not held as margin), so a
+        # short's mark value must be the *negative* of the full current
+        # notional (-price*shares), not just its unrealised P&L -- the prior
+        # formula added only unrealised P&L here, which left the entry
+        # proceeds sitting in cash uncancelled and overstated equity by
+        # exactly one short's entry notional for as long as it stayed open
+        # (self-correcting only once the short was covered, since covering
+        # cash flow is itself correct -- so it never showed up in the final
+        # cash/trades reconciliation, only in the equity curve while the
+        # short was live).
+        self.equity = self.cash + mark_value
+        if self.equity <= 0:
+            # Never let equity go underwater/negative silently: a real broker
+            # would issue a margin call long before this, so a backtest that
+            # reaches it either found a genuinely account-destroying strategy
+            # or -- as with the ledger-orphaning bug this check was added
+            # alongside -- has an accounting defect. Either way it must be
+            # loud, not a number a reader has to notice is implausible on
+            # their own.
+            log.warning(
+                "Portfolio equity non-positive on %s: equity=$%.2f (cash=$%.2f, "
+                "%d open position(s)); treat this run as underwater/margin-called.",
+                session,
+                self.equity,
+                self.cash,
+                len(self.positions),
+            )
         self.high_water_mark = max(self.high_water_mark, self.equity)
         drawdown_pct = (
             0.0

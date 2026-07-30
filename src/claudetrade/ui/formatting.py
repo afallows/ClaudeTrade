@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import datetime as dt
 
-import streamlit as st
-
 from claudetrade.config import AppConfig
 from claudetrade.domain import Direction, TradeOutcome
 
@@ -157,8 +155,10 @@ def format_confidence(value: float) -> str:
     return f"{emoji} {pct:.0f}%"
 
 
-def show_disclaimer() -> None:
-    """Display the research-signals disclaimer on every page."""
-    from claudetrade.version import DISCLAIMER
-
-    st.warning(f"⚠️ {DISCLAIMER}")
+def hours_ago(hours: float) -> str:
+    """Human-readable relative age, e.g. '2.5h ago' / '3.0d ago'."""
+    if hours < 0:
+        return "-"
+    if hours < 48:
+        return f"{hours:.1f}h ago"
+    return f"{hours / 24.0:.1f}d ago"

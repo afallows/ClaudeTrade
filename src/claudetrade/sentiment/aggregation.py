@@ -30,6 +30,7 @@ from claudetrade.domain import (
     SecurityInfo,
     SentimentScores,
     SocialPost,
+    SocialSource,
     SymbolSentiment,
     TickerMention,
 )
@@ -42,6 +43,15 @@ log = logging.getLogger(__name__)
 #: of the manipulation detector's pump-pattern amplification. A rough proxy
 #: only -- true liquidity is a market-data concern, not a sentiment one.
 _LOW_LIQUIDITY_MARKET_CAP_USD = 300_000_000.0
+
+#: Fallback used by ``_credibility_score`` when called without a config (unit
+#: tests exercising the bare function) -- mirrors ``SentimentConfig``'s own
+#: default so the two never drift apart silently.
+_DEFAULT_CREDIBILITY_BASELINE_BY_SOURCE: dict[str, float] = {
+    "news": 0.6,
+    "reddit": 0.3,
+    "x": 0.3,
+}
 
 
 def time_decay_weight(age_hours: float, half_life_hours: float) -> float:
@@ -69,19 +79,53 @@ def time_decay_weight(age_hours: float, half_life_hours: float) -> float:
     return math.pow(0.5, age_hours / half_life_hours)
 
 
-def _credibility_score(post: SocialPost) -> float:
+def _credibility_score(post: SocialPost, config: SentimentConfig | None = None) -> float:
     """0-1 proxy for account credibility from age/karma/followers.
 
     Log-scaled so a single verified/high-follower account cannot single-
     handedly dominate the credibility-weighted average, mirroring the
     engagement log-scaling below.
+
+    "No metrics reported" and "worst possible metrics" are deliberately kept
+    distinct: a post whose author fields are ALL ``None`` (e.g. a news-wire
+    story, which has no personal author to have karma or a follower count in
+    the first place) gets a per-source baseline instead of falling through
+    the same ``or 0.0`` floor as a real, karma-less throwaway account. A post
+    with *some* metrics present (even a metric explicitly reported as zero)
+    is real information and keeps the existing computed score below -- the
+    baseline is never blended in for those.
     """
+    if post.author_age_days is None and post.author_karma is None and post.author_followers is None:
+        baseline_by_source = (
+            config.credibility_baseline_by_source
+            if config is not None
+            else _DEFAULT_CREDIBILITY_BASELINE_BY_SOURCE
+        )
+        return baseline_by_source.get(post.source, 0.0)
+
     age_component = min(1.0, (post.author_age_days or 0.0) / 365.0)
     karma_component = min(1.0, math.log1p(max(0.0, post.author_karma or 0.0)) / math.log1p(10_000.0))
     follower_component = min(
         1.0, math.log1p(max(0.0, post.author_followers or 0.0)) / math.log1p(100_000.0)
     )
     return max(0.0, min(1.0, (age_component + karma_component + follower_component) / 3.0))
+
+
+def _engagement_weight(post: SocialPost, decay: float) -> float:
+    """Decay-scaled engagement weight, log-scaled to avoid one viral post
+    dominating the engagement-weighted average.
+
+    ``SocialSource.NEWS`` posts structurally carry no vote/reply counts --
+    there is no engagement mechanic on a wire story -- so ``log1p(0) == 0``
+    would otherwise give every news post zero weight here, identical to a
+    genuinely ignored Reddit/X post. Gating on the source (not on the count
+    being zero) gives a news post a neutral, modest-engagement weight
+    (``log1p(1.0) == 1.0``) while a Reddit/X post with zero real engagement
+    still correctly weighs ~0.
+    """
+    if post.source == SocialSource.NEWS:
+        return decay * 1.0
+    return decay * math.log1p(max(0.0, post.engagement))
 
 
 class SentimentAggregator:
@@ -179,12 +223,12 @@ class SentimentAggregator:
 
         raw_sentiment = _weighted_mean([(s.polarity, d) for _, s, d in weighted])
 
-        engagement_weights = [(d * math.log1p(max(0.0, p.engagement))) for p, _, d in weighted]
+        engagement_weights = [_engagement_weight(p, d) for p, _, d in weighted]
         engagement_weighted = _weighted_mean(
             [(s.polarity, w) for (_, s, _), w in zip(weighted, engagement_weights, strict=True)]
         )
 
-        credibility_weights = [d * _credibility_score(p) for p, _, d in weighted]
+        credibility_weights = [d * _credibility_score(p, self.config) for p, _, d in weighted]
         credibility_weighted = _weighted_mean(
             [(s.polarity, w) for (_, s, _), w in zip(weighted, credibility_weights, strict=True)]
         )

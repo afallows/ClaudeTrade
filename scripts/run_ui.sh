@@ -18,16 +18,17 @@ else
     echo "Running without activation (Python must be in PATH)"
 fi
 
-# Get the configured port from config or use default
+# Get the configured port from config or use default (matches UIConfig.port
+# in src/claudetrade/config.py)
 PORT=8501
 
 # Change to project directory
 cd "$PROJECT_ROOT"
 
-# Run Streamlit
+# Run the UI through the claudetrade CLI (src/claudetrade/cli.py: `ui`
+# command), which loads config, sets up logging and launches Streamlit --
+# equivalent to but more robust than calling `streamlit run` directly.
 echo "Starting ClaudeTrade UI on port $PORT..."
 echo "Open your browser to http://localhost:$PORT"
 
-streamlit run src/claudetrade/ui/app.py \
-    --server.port=$PORT \
-    --logger.level=info
+claudetrade ui --port "$PORT"

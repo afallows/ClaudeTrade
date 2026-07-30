@@ -12,33 +12,60 @@ ClaudeTrade is under active development. This roadmap outlines planned features 
 - Market regime classification
 - Risk controls and position sizing
 - SQLite database with PostgreSQL path
+- Full CLI (`claudetrade`: init, status, probe, refresh, scan, backtest, ui,
+  secrets, paper, db, verify — see `src/claudetrade/cli.py`)
+- Streamlit dashboard (`claudetrade ui`; five screens: dashboard, scanner,
+  ticker detail, backtesting, settings)
 
-**Major gaps**: 
-- No CLI (API-only)
-- No UI/dashboard
-- No live trading
+**Major gaps**:
+- No live trading (a `BrokerProvider` interface and a non-functional stub
+  adapter exist in `src/claudetrade/brokers/`; no real venue is wired up)
 - No intraday execution
-- No scheduler integration
+- No scheduler integration (`SchedulerConfig` exists but is not wired to any job runner)
+- The UI's backtest "Export as CSV/Excel" buttons are placeholders (the CLI's
+  `claudetrade backtest --export` works)
+- No CLI/UI command opens a paper trade — `PaperBroker.submit_signal` is
+  implemented and tested but unreachable outside the Python API (see
+  [docs/known-limitations.md](known-limitations.md#opening-a-paper-trade))
 
-## Near-term (v0.2.0, Q2 2024)
+## Near-term
 
-**CLI commands**:
-- `claudetrade refresh` — Fetch latest market, earnings, and social data
-- `claudetrade scan` — Generate signals for today
-- `claudetrade backtest` — Run walk-forward validation on a date range
-- `claudetrade export` — Write signals and trades to CSV/Excel
-- `claudetrade secrets` — Manage credentials
-- `claudetrade validate-config` — Check configuration syntax
+**Next UI rendition — ticker page modelled on CIBC Investor's Edge (owner TO-DO, 2026-07-30)**:
 
-**Streamlit dashboard** (basic):
-- Live signals table with filtering
-- Trade history view
-- Performance metrics summary
-- Settings panel for quick config changes
+The owner's reference is the Investor's Edge stock snapshot page (GOOGL example
+reviewed). Target a single rich ticker-detail view combining:
 
-**Effort**: Medium (40–60 hours)
+- **Chart controls**: timeframe pills (Intraday/1W/1M/3M/6M/YTD/1Y/3Y/5Y/Max)
+  over the price chart, with a full-history range-brush mini-chart beneath —
+  the specific control style the owner called out as good
+- **Statistics panel**: prev close, open, day/52-week range, volume,
+  market cap, P/E TTM, EPS TTM, beta, currency
+- **Financial events sidebar**: dated timeline of upcoming earnings (with EPS
+  estimate) and dividends (amount, yield)
+- **Dividends block**: yield, TTM/forward amounts, ex-div/pay dates, payout ratio
+- **Analyst consensus**: buy/hold/sell donut with rating count, average price
+  target with % upside, and the low/avg/high 12-month projection fan chart
+- **Headlines feed** with thumbnails
+- **Sentiment alongside**: our differentiator — the Reddit/Stocktwits/news
+  sentiment series and mention volume displayed next to the above, which
+  Investor's Edge does not have
 
-## Mid-term (v0.3.0, Q4 2024)
+Data availability note: the TipRanks `dataForTicker` payload we now consume as
+primary already carries most of this (analyst consensus + price targets +
+projection series via `ptConsensus`/`consensusOverTime`, earnings via
+`portfolioHoldingData`, dividends via `nextDividendDate`/`yearlyDividend*`,
+market cap, company description). Close-only prices limit candlesticks to the
+OHLCV chain; the range-brush works fine on closes.
+
+**Remaining CLI/UI gaps**:
+- `claudetrade validate-config` — Check configuration syntax (not implemented)
+- Wire the UI's export buttons to the existing `backtest.reporting.export_csv`/`export_excel`
+- `claudetrade paper submit <symbol>` (or a UI "paper trade this" button) to
+  actually call `PaperBroker.submit_signal`
+
+**Effort**: Low (a few hours each)
+
+## Mid-term
 
 **Background scheduler**:
 - Scheduled data refreshes (market, social, earnings)
@@ -92,11 +119,11 @@ ClaudeTrade is under active development. This roadmap outlines planned features 
 
 Contributions are welcome. Priority areas:
 
-1. **CLI implementation** (immediate impact; moderate complexity)
-2. **Streamlit UI** (improves usability significantly)
-3. **Broker adapters** (enables live trading for motivated users)
-4. **Additional strategies** (low barrier; high research value)
-5. **Documentation** (always appreciated)
+1. **Broker adapters** (enables live trading for motivated users; the CLI, scan/backtest
+   pipeline and UI are already in place and do not need to change)
+2. **Additional strategies** (low barrier; high research value)
+3. **Background scheduler wiring** (moderate complexity; config already exists)
+4. **Documentation** (always appreciated)
 
 See the project repository for contribution guidelines.
 
@@ -125,10 +152,9 @@ See the project repository for contribution guidelines.
 
 ## Release Schedule
 
-- **v0.1.0**: Q1 2024 (current)
-- **v0.2.0**: Q2 2024 (CLI + basic UI)
-- **v0.3.0**: Q4 2024 (scheduler + live trading)
-- **v1.0.0**: 2025 (production-ready)
+- **v0.1.0**: current — core engine, CLI, and Streamlit UI
+- **v0.2.0**: scheduler wiring + live-trading broker adapter
+- **v1.0.0**: production-ready
 
 Dates are aspirational and may slip. The backlog is public; feature requests and bug reports drive priorities.
 

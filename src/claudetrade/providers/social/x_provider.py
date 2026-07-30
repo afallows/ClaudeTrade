@@ -1,17 +1,39 @@
-"""X (Twitter) v2 API provider: real adapter to official X API.
+"""X (Twitter) provider: official API v2 adapter, plus an opt-in cookie-session
+mode (ADR-0008 Decision 1 / Decision 5's "broader sentiment universe
+including X via the owner's personal session").
 
-Uses the X API v2 recent-search endpoint with a bearer token. Requires
-meaningful search volume for a paid tier. If credential is absent, raises
-NotConfiguredError so the source is cleanly disabled.
+Two independent live paths, tried in this preference order at construction
+time:
 
-All text is sanitised via sanitize_social_text() and authors are salted
-hashes (never stored as usernames).
+1. **Official API v2** (``bearer_credential``) -- the recent-search endpoint
+   with a bearer token. Requires a paid tier for meaningful search volume.
+   Always preferred when configured: ADR-0008 Decision 1 requires the
+   official API remain first-choice.
+2. **Cookie-session mode** (``config.session_enabled``), only reached when
+   the official path has no bearer token configured. The owner's own
+   logged-in x.com session (``auth_token`` + ``ct0`` cookies, exported from
+   the browser) drives the same internal GraphQL endpoints the logged-in web
+   client itself uses, searching cashtags for configured watchlist symbols.
+
+**This automates a logged-in personal X account. Doing so violates X's Terms
+of Service and can lead to account suspension of that account.** The owner
+accepts this risk for their own account (ADR-0008 Decision 1); this
+application never bundles or defaults credentials for this path, never
+solves a CAPTCHA/challenge, never rotates a fingerprint or proxy to work
+around a block, and is off by default (``x.session_enabled = False``).
+
+Both paths' output goes through the same ``sanitize_social_text()`` /
+author-hash / injection-score pipeline every other adapter in this package
+uses.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import random
+import time
 
 import httpx
 
@@ -22,6 +44,7 @@ from claudetrade.providers.base import (
     ProviderStatus,
     RateLimiter,
     RateLimitError,
+    SourceBlockedError,
 )
 from claudetrade.secrets import get_secret
 from claudetrade.utils.hashing import pseudonymise, text_hash
@@ -30,57 +53,149 @@ from claudetrade.utils.text import injection_risk_score, sanitize_social_text
 log = logging.getLogger(__name__)
 
 
-class XProvider:
-    """Official X (Twitter) API v2 adapter for social posts.
+# ============================================================================
+# X internal web-client endpoint constants -- SESSION MODE ONLY.
+#
+# Everything in this block targets x.com's *internal*, unversioned GraphQL
+# API that the logged-in web client itself calls -- NOT the official,
+# contracted API v2 used by the "official" mode above. X changes these
+# paths, query IDs and response shapes without notice and without a
+# deprecation window. Breakage here is EXPECTED MAINTENANCE, not a defect in
+# this adapter's logic: when it breaks, ``_extract_tweet_results``'s
+# fail-closed behaviour (any unexpected shape raises ``SourceBlockedError``)
+# is what protects the pipeline -- this module must never guess at a new
+# shape or "helpfully" work around a change. Refresh these constants only by
+# capturing a fresh, real browser network request (devtools -> Network,
+# filter "graphql") while logged in as the account owner, then update this
+# block alone; nothing else in this file should need to change alongside it.
+#
+# The query ID below is illustrative/unverified: this sandbox has no network
+# egress to capture a live one (see docs/api-providers.md's honesty note).
+# Session mode will simply fail closed (typically a 404/400 on the GraphQL
+# path, caught by the status-code checks below) until an operator supplies a
+# current query ID from their own browser capture.
+# ============================================================================
+_SEARCH_GRAPHQL_QUERY_ID = "UNVERIFIED_CAPTURE_YOUR_OWN_QUERY_ID"
+_SEARCH_GRAPHQL_URL = f"https://x.com/i/api/graphql/{_SEARCH_GRAPHQL_QUERY_ID}/SearchTimeline"
+#: The static, public bearer token the logged-in web client itself sends
+#: alongside session cookies (not a secret -- it identifies the web app, the
+#: cookies are what authenticate the *user*). Left as a documented constant
+#: here rather than a credential because it carries no account-specific
+#: authority on its own.
+_WEB_CLIENT_BEARER = (
+    "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs="
+    "1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+)
+_SEARCH_GRAPHQL_FEATURES = {
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+}
+# ============================================================================
 
-    Fetches recent posts matching configured query terms using the
-    recent-search endpoint. Requires a paid API tier for meaningful volume.
-    Respects rate limits and X's API contract.
+
+class XProvider:
+    """X (Twitter) adapter for social posts: official API v2, or an opt-in
+    cookie-session mode when no official credential is configured.
+
+    Fetches recent posts matching configured query terms (official mode) or
+    cashtag-searches configured watchlist symbols (session mode). Respects
+    rate limits and fails closed on any block signal in session mode.
     """
 
     name: str = "x"
     source: SocialSource = SocialSource.X
 
     def __init__(self, config: XConfig):
-        """Initialize the X provider.
+        """Initialize the X provider, selecting the best available mode.
 
         Args:
-            config: XConfig with bearer token credential and query terms.
+            config: XConfig with bearer token credential and/or session
+                cookie credentials.
 
         Raises:
-            NotConfiguredError: if bearer token is not available.
+            NotConfiguredError: if neither the official bearer token nor
+                (with ``session_enabled=True``) both session cookies resolve.
         """
         self.config = config
 
-        # Resolve credentials
         bearer_secret = get_secret(config.bearer_credential)
-        if bearer_secret is None:
+        if bearer_secret is not None:
+            self.mode = "official"
+            self._bearer_token: str | None = bearer_secret.reveal()
+            self._auth_token: str | None = None
+            self._ct0: str | None = None
+            self._rate_limiter = RateLimiter(
+                config.rate_limit_per_minute, name="x", max_wait_s=config.request_timeout_s
+            )
+            log.info("X provider configured (mode=official) with %d query terms",
+                      len(config.query_terms))
+            return
+
+        if config.session_enabled:
+            auth_token_secret = get_secret(config.auth_token_credential)
+            ct0_secret = get_secret(config.ct0_credential)
+            if auth_token_secret is not None and ct0_secret is not None:
+                self.mode = "session"
+                self._bearer_token = None
+                self._auth_token = auth_token_secret.reveal()
+                self._ct0 = ct0_secret.reveal()
+                self._rate_limiter = RateLimiter(
+                    config.session_rate_limit_per_minute,
+                    name="x_session",
+                    max_wait_s=config.session_request_timeout_s,
+                )
+                log.warning(
+                    "X provider configured (mode=session): this automates a logged-in "
+                    "personal X account, which violates X's Terms of Service and can "
+                    "lead to account suspension. Owner-accepted risk (ADR-0008 "
+                    "Decision 1). %d watchlist symbols.",
+                    len(config.session_symbols),
+                )
+                return
             raise NotConfiguredError(
-                f"X bearer token '{config.bearer_credential}' not configured",
+                f"X session mode is enabled but credentials are missing: "
+                f"{config.auth_token_credential}, {config.ct0_credential}",
                 provider="x",
             )
 
-        self._bearer_token = bearer_secret.reveal()
-
-        self._rate_limiter = RateLimiter(
-            config.rate_limit_per_minute,
-            name="x",
-            max_wait_s=config.request_timeout_s,
+        raise NotConfiguredError(
+            f"X bearer token '{config.bearer_credential}' not configured, and "
+            "x.session_enabled is False",
+            provider="x",
         )
-
-        log.info("X provider configured with %d query terms", len(config.query_terms))
 
     def status(self) -> ProviderStatus:
         """Report provider status."""
+        if self.mode == "official":
+            return ProviderStatus(
+                name=self.name,
+                kind="social",
+                available=True,
+                configured=True,
+                message=f"X API v2 ({len(self.config.query_terms)} queries)",
+                supports_point_in_time=False,
+                rate_limit_per_minute=self._rate_limiter.calls_per_minute,
+                licence_note="Official X API v2; requires paid tier for production volume",
+            )
         return ProviderStatus(
             name=self.name,
             kind="social",
             available=True,
             configured=True,
-            message=f"X API v2 ({len(self.config.query_terms)} queries)",
+            message=(
+                f"X cookie-session mode, UNOFFICIAL "
+                f"({len(self.config.session_symbols)} watchlist symbols)"
+            ),
             supports_point_in_time=False,
-            rate_limit_per_minute=self.config.rate_limit_per_minute,
-            licence_note="Official X API v2; requires paid tier for production volume",
+            rate_limit_per_minute=self._rate_limiter.calls_per_minute,
+            licence_note=(
+                "Automates the owner's own logged-in x.com session against internal, "
+                "unversioned web-client GraphQL endpoints -- NOT the official API. "
+                "This violates X's Terms of Service and risks suspension of that "
+                "account; the owner accepts this risk for their own account "
+                "(ADR-0008 Decision 1). Off by default; fails closed (disables the "
+                "source for the rest of the cycle, no workaround attempted) on any "
+                "401/403/challenge/rate-limit signal or unparseable response."
+            ),
         )
 
     def fetch_posts(
@@ -91,26 +206,34 @@ class XProvider:
         symbols: list[str] | None = None,  # noqa: ARG002
         limit: int | None = None,
     ) -> list[SocialPost]:
-        """Fetch recent posts matching configured query terms.
+        """Fetch recent posts for the configured mode.
 
         Args:
-            since: Start timestamp (honoured by X API with start_time parameter).
-            until: End timestamp (honoured by X API with end_time parameter).
-            symbols: Optional symbols to search for (not used; queries are pre-configured).
+            since: Start timestamp.
+            until: End timestamp; defaults to now.
+            symbols: Unused; queries/cashtags are pre-configured.
             limit: Maximum posts to return across all queries.
 
         Returns:
             List of SocialPost, newest first, all sanitised and author-hashed.
+
+        Raises:
+            SourceBlockedError: (session mode only) on any 401/403, challenge,
+                or unparseable response -- terminates the fetch for the whole
+                cycle per ADR-0008 Decision 1's fail-closed constraint.
         """
-        if since.tzinfo is None:
-            raise ValueError("since must be timezone-aware")
-        if until is not None and until.tzinfo is None:
-            raise ValueError("until must be timezone-aware")
         if until is None:
             until = dt.datetime.now(tz=dt.UTC)
-        if since > until:
-            raise ValueError("since must not be later than until")
 
+        if self.mode == "official":
+            return self._fetch_official_posts(since=since, until=until, limit=limit)
+        return self._fetch_session_posts(since=since, until=until, limit=limit)
+
+    # --- official API v2 mode (unchanged code path) ------------------------
+
+    def _fetch_official_posts(
+        self, *, since: dt.datetime, until: dt.datetime, limit: int | None
+    ) -> list[SocialPost]:
         posts: list[SocialPost] = []
 
         for query in self.config.query_terms:
@@ -123,7 +246,7 @@ class XProvider:
             try:
                 with httpx.Client(timeout=self.config.request_timeout_s) as client:
                     response = client.get(
-                        "https://api.x.com/2/tweets/search/recent",
+                        "https://api.twitter.com/2/tweets/search/recent",
                         headers={"Authorization": f"Bearer {self._bearer_token}"},
                         params={
                             "query": query,
@@ -134,7 +257,7 @@ class XProvider:
                                 "created_at,author_id,public_metrics,lang"
                             ),
                             "expansions": "author_id",
-                            "user.fields": "created_at,public_metrics,username",
+                            "user.fields": "created_at,public_metrics",
                         },
                     )
 
@@ -175,23 +298,18 @@ class XProvider:
 
                         text = tweet.get("text", "")
                         sanitised = sanitize_social_text(text)
+                        # Score the RAW text: sanitisation rewrites injection
+                        # phrases to "[filtered]", so scoring the sanitised
+                        # copy would always return ~0 and leave the stored
+                        # risk flag permanently blind.
+                        injection_risk = injection_risk_score(text)
 
                         author_id = tweet.get("author_id", "")
                         author_user = users_by_id.get(author_id, {})
                         author_name = author_user.get("username", "")
-                        # Hash the stable API id when the optional username is
-                        # absent. This preserves unique-author metrics without
-                        # persisting either identifier in plaintext.
-                        author_key = author_name or author_id
-                        author_hash = pseudonymise(author_key, salt="x") if author_key else ""
-
-                        author_age_days = None
-                        account_created = author_user.get("created_at")
-                        if account_created:
-                            created = dt.datetime.fromisoformat(
-                                account_created.replace("Z", "+00:00")
-                            )
-                            author_age_days = max(0, (created_at - created).days)
+                        author_hash = (
+                            pseudonymise(author_name, salt="x") if author_name else ""
+                        )
 
                         metrics = tweet.get("public_metrics", {})
                         post = SocialPost(
@@ -205,7 +323,7 @@ class XProvider:
                             num_reposts=metrics.get("retweet_count", 0),
                             num_replies=metrics.get("reply_count", 0),
                             author_hash=author_hash,
-                            author_age_days=author_age_days,
+                            author_age_days=None,
                             author_karma=None,
                             author_followers=author_user.get("public_metrics", {}).get(
                                 "followers_count"
@@ -217,7 +335,7 @@ class XProvider:
                             crosspost_parent=None,
                             text_hash=text_hash(sanitised),
                             duplicate_group=None,
-                            injection_risk=injection_risk_score(sanitised),
+                            injection_risk=injection_risk,
                             fetched_at=dt.datetime.now(tz=dt.UTC),
                         )
                         posts.append(post)
@@ -239,3 +357,251 @@ class XProvider:
             posts = posts[:limit]
 
         return posts
+
+    # --- cookie-session mode (ADR-0008 Decision 1; owner-accepted risk) ----
+
+    def _fetch_session_posts(
+        self, *, since: dt.datetime, until: dt.datetime, limit: int | None
+    ) -> list[SocialPost]:
+        posts: list[SocialPost] = []
+
+        for raw_symbol in self.config.session_symbols:
+            cashtag = raw_symbol if raw_symbol.startswith("$") else f"${raw_symbol}"
+
+            try:
+                self._rate_limiter.acquire()
+            except RateLimitError as exc:
+                log.warning("Session rate limit reached for '%s': %s", cashtag, exc)
+                continue
+
+            _human_scale_jitter()
+
+            try:
+                fetched = self._fetch_session_query(cashtag, since=since, until=until)
+            except (RateLimitError, SourceBlockedError):
+                # Fail-closed: disables the source for the rest of THIS
+                # cycle. Never retried in a loop, never worked around.
+                raise
+            except Exception as exc:
+                log.warning("Failed to fetch X session search for '%s': %s", cashtag, exc)
+                continue
+
+            posts.extend(fetched)
+            if limit is not None and len(posts) >= limit:
+                break
+
+        posts.sort(key=lambda p: p.created_at, reverse=True)
+        if limit is not None:
+            posts = posts[:limit]
+        return posts
+
+    def _fetch_session_query(
+        self, cashtag: str, *, since: dt.datetime, until: dt.datetime
+    ) -> list[SocialPost]:
+        """One cashtag search over the logged-in web client's GraphQL endpoint.
+
+        Raises ``SourceBlockedError``/``RateLimitError`` on any signal ADR-0008
+        Decision 1 requires failing closed on; never guesses at a shape it
+        cannot confidently parse.
+        """
+        headers = {
+            "authorization": f"Bearer {_WEB_CLIENT_BEARER}",
+            "cookie": f"auth_token={self._auth_token}; ct0={self._ct0}",
+            "x-csrf-token": self._ct0 or "",
+            "user-agent": self.config.session_user_agent,
+            "accept": "application/json",
+        }
+        params = {
+            "variables": json.dumps(
+                {
+                    "rawQuery": f"{cashtag} lang:en",
+                    "count": self.config.session_max_results_per_query,
+                    "querySource": "typed_query",
+                    "product": "Latest",
+                }
+            ),
+            "features": json.dumps(_SEARCH_GRAPHQL_FEATURES),
+        }
+
+        with httpx.Client(timeout=self.config.session_request_timeout_s) as client:
+            response = client.get(_SEARCH_GRAPHQL_URL, headers=headers, params=params)
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "60")
+            try:
+                wait_s = float(retry_after)
+            except (ValueError, TypeError):
+                wait_s = 60.0
+            raise RateLimitError(
+                f"X session rate limit for '{cashtag}'",
+                provider="x",
+                retry_after_s=wait_s,
+            )
+
+        if response.status_code in (401, 403):
+            raise SourceBlockedError(
+                f"X session denied access for '{cashtag}' (HTTP {response.status_code}) "
+                "-- fail-closed per ADR-0008 Decision 1: the session cookies are likely "
+                "expired, logged out, or challenged. No retry, no fingerprint/proxy "
+                "rotation, no CAPTCHA handling; re-export fresh cookies to resume.",
+                provider="x",
+            )
+
+        content_type = response.headers.get("content-type", "")
+        if "json" not in content_type.lower():
+            raise SourceBlockedError(
+                f"X session search returned unexpected content-type '{content_type}' "
+                f"for '{cashtag}' (possible login wall or challenge page) -- "
+                "fail-closed per ADR-0008 Decision 1.",
+                provider="x",
+            )
+
+        if response.status_code >= 400:
+            raise SourceBlockedError(
+                f"X session search returned HTTP {response.status_code} for "
+                f"'{cashtag}' -- fail-closed per ADR-0008 Decision 1. This is the "
+                "expected failure mode if the GraphQL query ID constant above has "
+                "gone stale; see this module's constants-block doc note.",
+                provider="x",
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SourceBlockedError(
+                f"X session search response for '{cashtag}' was not valid JSON -- "
+                "fail-closed per ADR-0008 Decision 1.",
+                provider="x",
+            ) from exc
+
+        try:
+            tweet_results = list(_extract_tweet_results(payload))
+        except Exception as exc:
+            # Any unexpected shape -- including a schema change to the
+            # internal endpoint -- fails closed rather than guessing.
+            raise SourceBlockedError(
+                f"X session search response for '{cashtag}' did not match the "
+                "expected timeline shape -- fail-closed per ADR-0008 Decision 1. "
+                "This is expected maintenance if x.com changed its internal "
+                "GraphQL response shape; see this module's constants-block doc "
+                f"note. ({type(exc).__name__}: {exc})",
+                provider="x",
+            ) from exc
+
+        out: list[SocialPost] = []
+        for result in tweet_results:
+            try:
+                post = self._to_post(result, cashtag)
+            except Exception as exc:
+                log.debug("skipping malformed X session tweet for %s: %s", cashtag, exc)
+                continue
+            if post.created_at < since or post.created_at > until:
+                continue
+            out.append(post)
+        return out
+
+    def _to_post(self, tweet_result: dict, cashtag: str) -> SocialPost:
+        """Map one internal-API tweet result onto a sanitised ``SocialPost``.
+
+        Raises on any missing/malformed required field so the caller's
+        per-item ``except Exception`` degrades that single item, never the
+        whole response.
+        """
+        legacy = tweet_result["legacy"]
+        external_id = str(legacy["id_str"])
+        created_at = _parse_twitter_datetime(legacy["created_at"])
+        if created_at is None:
+            raise ValueError("unparseable created_at")
+
+        text = legacy.get("full_text") or legacy.get("text") or ""
+        sanitised = sanitize_social_text(text)
+        injection_risk = injection_risk_score(text)
+
+        user_legacy = (
+            tweet_result.get("core", {})
+            .get("user_results", {})
+            .get("result", {})
+            .get("legacy", {})
+        )
+        screen_name = user_legacy.get("screen_name") or ""
+        author_hash = pseudonymise(screen_name, salt="x") if screen_name else ""
+        followers = user_legacy.get("followers_count")
+
+        return SocialPost(
+            source=SocialSource.X,
+            external_id=external_id,
+            created_at=created_at,
+            text=sanitised,
+            community=cashtag,
+            score=int(legacy.get("favorite_count") or 0),
+            num_comments=int(legacy.get("reply_count") or 0),
+            num_reposts=int(legacy.get("retweet_count") or 0),
+            num_replies=int(legacy.get("reply_count") or 0),
+            author_hash=author_hash,
+            author_age_days=None,
+            author_karma=None,
+            author_followers=float(followers) if followers is not None else None,
+            is_comment=False,
+            parent_id=None,
+            is_removed=False,
+            is_crosspost=False,
+            crosspost_parent=None,
+            text_hash=text_hash(sanitised),
+            duplicate_group=None,
+            injection_risk=injection_risk,
+            fetched_at=dt.datetime.now(tz=dt.UTC),
+        )
+
+
+# --------------------------------------------------------------------------
+# Session-mode parsing helpers
+# --------------------------------------------------------------------------
+
+
+def _extract_tweet_results(payload: dict) -> list[dict]:
+    """Walk the internal timeline response down to a flat list of tweet
+    results (each a dict with a ``legacy`` field).
+
+    Every step is an explicit key/index lookup with no defaulting -- a
+    missing key raises ``KeyError``/``TypeError`` immediately, which the
+    caller turns into a fail-closed ``SourceBlockedError``. Guessing a
+    plausible-looking fallback here is exactly the behaviour ADR-0008
+    Decision 1 forbids: better to disable the source than silently return
+    zero, or worse, malformed, posts.
+    """
+    instructions = payload["data"]["search_by_raw_query"]["search_timeline"]["timeline"][
+        "instructions"
+    ]
+    results: list[dict] = []
+    for instruction in instructions:
+        for entry in instruction.get("entries", []):
+            content = entry.get("content", {})
+            item_content = content.get("itemContent")
+            if not item_content:
+                continue  # cursor/module entries carry no tweet
+            tweet_results = item_content["tweet_results"]
+            result = tweet_results.get("result")
+            if not result:
+                continue
+            # Some shapes wrap the real tweet one level deeper under "tweet"
+            # (e.g. when the top-level result is a moderation wrapper).
+            result = result.get("tweet", result)
+            if "legacy" in result:
+                results.append(result)
+    return results
+
+
+def _parse_twitter_datetime(value: str) -> dt.datetime | None:
+    """Parse X's legacy ``created_at`` format, e.g. 'Wed Jun 05 18:00:00 +0000 2024'."""
+    try:
+        parsed = dt.datetime.strptime(value, "%a %b %d %H:%M:%S %z %Y")
+    except (ValueError, TypeError):
+        return None
+    return parsed.astimezone(dt.UTC)
+
+
+def _human_scale_jitter() -> None:
+    """Small randomised pause between requests (ADR-0008 Decision 1: rates
+    must be "conservative, human-scale ... with jitter"), on top of the
+    deterministic per-minute spacing the rate limiter already enforces."""
+    time.sleep(random.uniform(0.05, 0.25))

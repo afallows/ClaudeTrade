@@ -6,4 +6,5 @@ __all__ = [
     "CSVMarketProvider",
     "StooqMarketProvider",
     "SyntheticMarketProvider",
+    "YahooMarketProvider",
 ]

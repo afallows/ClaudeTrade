@@ -65,6 +65,26 @@ class PathsConfig(BaseModel):
     cache_dir: Path = Path("cache")
     snapshots_dir: Path = Path("snapshots")
 
+    @field_validator("app_dir", mode="before")
+    @classmethod
+    def _expand_app_dir(cls, value: object) -> object:
+        """Expand a leading ``~`` before it is used anywhere.
+
+        A ``config.toml`` like ``app_dir = "~/.claudetrade"`` parses as a
+        *literal* path -- there is no shell here to expand it, least of all
+        on Windows, where ``~`` has no special meaning to the filesystem at
+        all. Without this, ``PathsConfig.resolve()`` silently creates a
+        directory named ``~`` next to the process's current working
+        directory instead of the user's home. Expanding here, once, means
+        every consumer (``resolve()``, ``database_url()``, the CLI) sees the
+        intended location without each having to remember to expand it.
+        """
+        if isinstance(value, str):
+            return Path(value).expanduser()
+        if isinstance(value, Path):
+            return value.expanduser()
+        return value
+
     def resolve(self, which: str) -> Path:
         """Absolute path for a named directory, created on demand."""
         value: Path = getattr(self, which)
@@ -114,10 +134,38 @@ class MarketDataConfig(BaseModel):
     ``claudetrade.providers.registry``. ``fallbacks`` are tried in order when
     the primary fails or lacks a symbol, which is what keeps the app running in
     reduced-capability mode.
+
+    ``provider = "tipranks"`` (the default) is primary for reference data,
+    market caps and earnings -- see ``TipRanksConfig`` and
+    ``providers.market.tipranks.TipRanksProvider``. Its own daily-bars
+    capability is deliberately a *last resort*: ``TipRanksProvider`` close-only
+    ``overview.prices`` series (no open/high/low/volume) is enough to keep a
+    symbol's price series moving when nothing better is available, but it must
+    never pre-empt a real OHLCV source. ``providers.registry.
+    FallbackMarketProvider.get_daily_bars`` respects this by deferring any
+    provider whose ``bars_last_resort`` attribute is ``True`` to the end of
+    the per-call cascade for bars specifically -- every other capability
+    (``get_market_caps``, ``get_security_info``) still tries the configured
+    primary/fallback order as written, i.e. tipranks first.
+
+    ``"stooq"`` is deliberately **not** in the default ``fallbacks`` any more.
+    A real probe from the owner's machine found stooq's edge now answers CSV
+    history requests -- for both a US and a TSX symbol, with the correct
+    ``.us``/``.to`` suffix and a proper browser ``User-Agent`` already applied
+    -- with an HTTP 200 HTML/JavaScript proof-of-work challenge page instead
+    of the CSV body. Per ADR-0008 Decision 1 this application never solves a
+    challenge, so stooq is unusable as an unattended default; it remains
+    fully registered in ``providers.registry`` (see
+    ``providers.market.stooq``'s fail-closed challenge detection) as an
+    explicit opt-in for an operator whose network path to stooq.com is not
+    challenged.
     """
 
-    provider: str = "synthetic"
-    fallbacks: list[str] = Field(default_factory=lambda: ["csv"])
+    # Live daily history is the product default. Synthetic remains available
+    # only as an explicit offline/demo choice; it must never silently populate
+    # a normal installation with fabricated tickers.
+    provider: str = "tipranks"
+    fallbacks: list[str] = Field(default_factory=lambda: ["yahoo", "csv"])
     credential: str | None = None
     csv_dir: Path | None = None
     #: Bars older than this are flagged stale by the data-quality checks.
@@ -145,7 +193,17 @@ class MarketDataConfig(BaseModel):
 
 
 class EarningsConfig(BaseModel):
-    provider: str = "synthetic"
+    """Earnings-calendar provider selection.
+
+    ``provider = "tipranks"`` (the default) replaces the previous synthetic
+    default with real upcoming/last-reported dates and surprise history from
+    TipRanks' widget API (see ``TipRanksConfig`` and
+    ``providers.market.tipranks.TipRanksProvider``). ``synthetic`` remains
+    fully available and is what the test suite pins (``tests/conftest.py``)
+    and what an operator running fully offline/demo should select explicitly.
+    """
+
+    provider: str = "tipranks"
     fallbacks: list[str] = Field(default_factory=lambda: ["csv"])
     credential: str | None = None
     csv_path: Path | None = None
@@ -154,17 +212,116 @@ class EarningsConfig(BaseModel):
     request_timeout_s: float = 20.0
 
 
+class TipRanksConfig(BaseModel):
+    """TipRanks unauthenticated partner-widget API (ADR-0008 Decision 1 posture).
+
+    ``providers.market.tipranks.TipRanksProvider`` reads
+    ``widgets.tipranks.com/api/etoro/dataForTicker?ticker={SYMBOL}`` -- a
+    keyless, unauthenticated JSON endpoint that is not a published, contracted
+    API: it could be restricted, reshaped or withdrawn without notice. This is
+    the same "free, unauthenticated, personal-use, fail-closed" posture this
+    codebase already applies to stooq/Yahoo/Stocktwits, not a special case.
+
+    One provider instance serves earnings, market caps, reference data and
+    (last-resort only) daily bars, because all four are different views onto
+    the same per-symbol ``overview`` object -- fetching it once per symbol per
+    day and caching the raw response is what keeps a whole-universe refresh to
+    one call per symbol rather than four.
+    """
+
+    #: Conservative default for an unauthenticated, undocumented endpoint --
+    #: same posture as stooq/yahoo's own defaults.
+    rate_limit_per_minute: int = 30
+    request_timeout_s: float = 20.0
+    #: Cached ``overview`` responses are reused until this many trading
+    #: sessions have elapsed since they were fetched (see
+    #: ``utils.timeutils.trading_days_between``), so a scan universe of
+    #: thousands of symbols does not re-fetch earnings/caps/refdata on every
+    #: refresh within the same trading day -- only once a new session begins.
+    #: Stored under ``paths.cache_dir/tipranks/``.
+    cache_ttl_trading_days: int = 1
+    #: OPTIONAL, UNVERIFIED batching optimisation for Canadian market caps via
+    #: ``marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=TSE:A,TSE:B,...``
+    #: (the CIBC-app endpoint, not the widget). Off by default: this sandbox
+    #: never obtained a real response body for this endpoint, so the parser
+    #: is defensive-but-unverified (see
+    #: ``providers.market.tipranks._parse_getquotes_response``). Canadian cap
+    #: coverage never depends on this -- ``dataForTicker`` (with the
+    #: ``TSE:SYMBOL`` ticker notation) is the primary path for every symbol,
+    #: US and Canadian alike; this is purely a call-count optimisation for a
+    #: large TSX universe, and any failure here falls straight back to the
+    #: per-symbol ``dataForTicker`` path with no user-visible effect beyond
+    #: one extra batch of calls.
+    use_getquotes_batch: bool = False
+    getquotes_batch_size: int = 25
+
+
 class RedditConfig(BaseModel):
     """Authorised Reddit access.
 
-    Uses the official OAuth API only. Disabled unless credentials resolve, in
-    which case the pipeline continues without this source rather than failing.
+    Prefers the official OAuth API, in decreasing order of preference: the
+    password grant (script app + the owner's own username/password -- an
+    official Reddit flow), then cookie-session mode (the owner's own
+    logged-in browser session, ``session_cookie_credential``), then the
+    client-credentials grant (script app alone), then -- only if
+    ``public_json_fallback`` is explicitly opted into -- an unauthenticated
+    read of Reddit's public ``.json`` listing endpoint. Disabled unless
+    *some* path resolves, in which case the pipeline continues without this
+    source rather than failing (ADR-0008 Decision 1).
+
+    **Cookie-session mode**: reads the same public ``.json`` listing endpoint
+    as the public-JSON fallback below, but authenticated with the owner's own
+    ``reddit_session`` cookie (pasted from a logged-in browser's devtools) and
+    a browser-style User-Agent, rather than anonymously. This is the owner's
+    own session, for personal use only (ADR-0008 Decision 1: "own credentials
+    only" -- never a shared/default account or someone else's cookie). It is
+    automatically preferred over the client-credentials grant whenever the
+    cookie resolves and the password-grant credentials do not, and shares the
+    public-JSON path's fail-closed behaviour exactly (no retry, no
+    fingerprint/proxy rotation, no CAPTCHA handling).
+
+    **Honest status of the public-JSON fallback**: reading
+    ``www.reddit.com/r/<sub>/new.json`` without authentication is not
+    something Reddit's API terms affirmatively grant -- it is a ToS-gray
+    area for automated/scheduled use, tolerated in practice for casual,
+    low-volume, identifying-UA traffic but not a sanctioned integration
+    path the way the OAuth API is. It exists here only as a last-resort,
+    opt-in fallback for when neither OAuth path is configured or working,
+    is off by default, and is capped at a conservative rate. The moment
+    OAuth credentials work, this class prefers them automatically.
     """
 
-    enabled: bool = False
+    #: On by default pointing at the *synthetic* generator, so a fresh install
+    #: exercises the whole sentiment pipeline with no credentials and no
+    #: network. Set ``provider = "reddit"`` and store credentials to go live;
+    #: if those credentials do not resolve the source disables itself cleanly
+    #: rather than failing the run.
+    enabled: bool = True
     provider: str = "synthetic"
     client_id_credential: str = "reddit_client_id"
     client_secret_credential: str = "reddit_client_secret"
+    #: Owner's own Reddit account credentials (ADR-0008 Decision 1: "own
+    #: credentials only" -- never a shared/default account). When these
+    #: resolve *and* the client id/secret also resolve, the password grant
+    #: is preferred over client-credentials, per the owner's explicit ask
+    #: ("use my reddit credentials ... retain the fallback to the standard
+    #: API"). Both are official OAuth flows against the same endpoints.
+    username_credential: str = "reddit_username"
+    password_credential: str = "reddit_password"
+    #: Cookie-session mode (ADR-0008 Decision 1: the owner's own personal
+    #: session, pasted from their browser's devtools -- never a shared or
+    #: default cookie). Holds the value of the ``reddit_session`` cookie.
+    #: Consulted only when the password-grant credentials above do not both
+    #: resolve; preferred over the client-credentials grant when it does
+    #: resolve. See ``docs/api-providers.md`` for how to export it (F12 ->
+    #: Application -> Cookies -> reddit.com -> reddit_session).
+    session_cookie_credential: str = "reddit_session_cookie"
+    #: Cookie-session mode shares the same public listing endpoint as the
+    #: public-JSON fallback below (an unauthenticated-by-design endpoint,
+    #: just authenticated here via the owner's own cookie rather than
+    #: anonymously), so it is held to the same conservative, human-scale
+    #: pace rather than the OAuth budget.
+    session_rate_limit_per_minute: int = 30
     user_agent: str = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
     subreddits: list[str] = Field(
         default_factory=lambda: [
@@ -176,7 +333,12 @@ class RedditConfig(BaseModel):
             "swingtrading",
         ]
     )
+    #: Reddit caps a listing page at 100 items, so a busy subreddit needs
+    #: several pages to cover a full lookback window. This bounds how many
+    #: pages one refresh will walk before giving up, keeping a runaway loop
+    #: from burning the whole rate-limit budget on one community.
     posts_per_subreddit: int = 100
+    max_pages_per_subreddit: int = 10
     comments_per_post: int = 50
     lookback_hours: int = 72
     #: Official API guidance for OAuth clients; kept conservative on purpose.
@@ -185,13 +347,46 @@ class RedditConfig(BaseModel):
     #: Store only salted author digests, never usernames.
     store_author_names: bool = False
 
+    # --- Public-JSON fallback (unauthenticated, ToS-gray; opt-in) -----------
+    #: Off by default. Only takes effect when BOTH OAuth paths above are
+    #: unconfigured (or fail at runtime) -- official APIs remain first-choice
+    #: per ADR-0008 Decision 1. See the class docstring for the honest ToS
+    #: caveat before turning this on.
+    public_json_fallback: bool = False
+    #: Hard-capped at 30/min in the validator below -- "conservative,
+    #: human-scale rate" for an unauthenticated path is a ceiling, not a
+    #: suggestion an operator can configure their way past.
+    public_json_rate_limit_per_minute: int = 30
+
+    @field_validator("public_json_rate_limit_per_minute")
+    @classmethod
+    def _cap_public_json_rate(cls, v: int) -> int:
+        return min(v, 30)
+
 
 class XConfig(BaseModel):
     """Authorised X (Twitter) access.
 
-    Requires a paid API tier for any meaningful search volume. When no
-    credential is configured the source is disabled cleanly and the remaining
-    sources continue to operate.
+    Two independent live paths, tried in this order:
+
+    1. **Official API v2** (``bearer_credential``). Requires a paid tier for
+       any meaningful search volume. Preferred whenever configured -- this is
+       the officially sanctioned path and ADR-0008 Decision 1 requires the
+       official API remain first-choice.
+    2. **Cookie-session mode** (``session_enabled``), only when the official
+       path has no bearer token configured. The owner's own logged-in x.com
+       session cookies drive the same GraphQL endpoints the web client uses,
+       for cashtag search over ``session_symbols``. **This automates a
+       logged-in personal account and violates X's Terms of Service; it can
+       lead to account suspension.** The owner accepts this risk for their
+       own account (ADR-0008 Decision 1); the application never bundles or
+       defaults credentials, never solves a challenge/CAPTCHA, and disables
+       the source for the rest of the cycle on any 401/403/challenge/
+       rate-limit signal rather than attempting a workaround. Off by
+       default (``session_enabled = False``).
+
+    When neither path is configured the source is disabled cleanly and the
+    remaining sources continue to operate.
     """
 
     enabled: bool = False
@@ -203,6 +398,125 @@ class XConfig(BaseModel):
     rate_limit_per_minute: int = 15
     request_timeout_s: float = 20.0
     store_author_names: bool = False
+
+    # --- Cookie-session mode (ADR-0008 Decision 1; owner-accepted risk) -----
+    #: Off by default. Only consulted when ``bearer_credential`` does not
+    #: resolve -- the official API path is always preferred when available.
+    session_enabled: bool = False
+    #: Exported from the browser's devtools -> Application/Storage -> Cookies
+    #: for x.com, after logging in as the owner: ``auth_token`` and ``ct0``
+    #: (the CSRF token cookie). See docs/api-providers.md for the exact
+    #: click-path. Stored via the normal credential store, never in config.
+    auth_token_credential: str = "x_auth_token"
+    ct0_credential: str = "x_ct0"
+    #: Watchlist symbols searched as cashtags (``$AAPL``); the leading ``$``
+    #: is added automatically if a bare symbol is given.
+    session_symbols: list[str] = Field(default_factory=list)
+    session_max_results_per_query: int = 40
+    #: Deliberately much lower than the official API's already-conservative
+    #: default -- a logged-in personal session is held to a stricter,
+    #: human-scale pace than a sanctioned API client.
+    session_rate_limit_per_minute: int = 6
+    session_request_timeout_s: float = 20.0
+    session_user_agent: str = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ClaudeTrade-research/0.1 "
+        "(contact configured by operator)"
+    )
+
+
+class StocktwitsConfig(BaseModel):
+    """Stocktwits public symbol-stream API (ADR-0008 Decision 1's "official
+    APIs first-choice" path for this source): keyless for basic reads, no
+    scraping, no ToS boundary crossed.
+
+    Reads ``api.stocktwits.com/api/2/streams/symbol/{SYMBOL}.json``, which is
+    Stocktwits' own documented, unauthenticated basic-read endpoint. Off by
+    default: even though no credential is at risk here, the vendor's
+    published unauthenticated budget (200 requests/hour) is easy to exhaust
+    across a large universe, so this is an explicit opt-in with a hard cap on
+    symbols scanned per cycle rather than a silent default.
+    """
+
+    enabled: bool = False
+    provider: str = "stocktwits"
+    #: Symbols fetched when the caller does not supply a more specific
+    #: (recent-signal / watchlist) hint via ``fetch_posts(symbols=...)``.
+    watchlist_symbols: list[str] = Field(default_factory=list)
+    #: Hard budget per refresh cycle: at most this many symbols are fetched,
+    #: prioritised by the order of the caller-supplied ``symbols`` hint (the
+    #: pipeline passes recent-signal / watchlist symbols first) so a broad
+    #: universe degrades to "covered the names that matter this cycle"
+    #: rather than silently rationing across the whole universe evenly.
+    max_symbols_per_cycle: int = 20
+    #: Stocktwits documents 200 unauthenticated requests/hour; the default
+    #: below (3/min == 180/hour) keeps a working margin rather than running
+    #: right up against the published ceiling.
+    rate_limit_per_minute: int = 3
+    request_timeout_s: float = 20.0
+    #: Kept for config-file backwards compatibility, but no longer sent:
+    #: live-probe evidence (2026-07-30) showed this endpoint's edge rejecting
+    #: this descriptive app UA (and generic non-browser UAs) with HTTP 403
+    #: while accepting a real browser tab, so the provider now sends a fixed
+    #: browser-style User-Agent instead -- see
+    #: ``providers.social.stocktwits._BROWSER_HEADERS``.
+    user_agent: str = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
+    store_author_names: bool = False
+
+
+class NewsConfig(BaseModel):
+    """Publisher-syndicated RSS/Atom news feeds: a lawful, credential-free
+    social-sentiment source.
+
+    This exists to reduce the application's reliance on Reddit's official API
+    (rate-limited, OAuth-gated, and subject to Reddit's own availability).
+    RSS/Atom feeds that a publisher explicitly serves for syndication are a
+    different kind of source entirely: there is no authentication to fail,
+    no scraping, no ToS boundary to test -- the operator publishes the feed
+    for exactly this purpose. That is also why, unlike Reddit/X, this source
+    defaults to its *live* adapter (``provider = "news_rss"``) rather than the
+    offline synthetic generator: there are no credentials to be missing and
+    no paid tier to gate behind an opt-in.
+
+    ``feed_urls`` ships a small default list of major exchange/regulator,
+    wire-service and public-broadcaster feeds chosen because their owners
+    document them as public syndication feeds (see ``docs/api-providers.md``
+    for the rationale on each). This package cannot verify the URLs are still
+    live from a sandboxed, egress-blocked build -- operators should confirm
+    reachability with ``claudetrade probe`` after deploying and are free to
+    replace the list with feeds of their own choosing.
+    """
+
+    enabled: bool = True
+    provider: str = "news_rss"
+    feed_urls: list[str] = Field(
+        default_factory=lambda: [
+            # US securities regulator: official press-release feed.
+            "https://www.sec.gov/news/pressreleases.rss",
+            # US central bank: official press-release feed.
+            "https://www.federalreserve.gov/feeds/press_all.xml",
+            # Wire service: publishes per-category RSS for syndication.
+            "https://www.prnewswire.com/rss/financial-services-latest-news-list.rss",
+            # Public broadcaster: publishes per-section RSS, including business.
+            "https://feeds.npr.org/1006/rss.xml",
+        ]
+    )
+    user_agent: str = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
+    rate_limit_per_minute: int = 30
+    request_timeout_s: float = 20.0
+    lookback_hours: int = 72
+    #: Salt for the publisher-level author hash (see ``NewsRssProvider``:
+    #: there is no personal author to pseudonymise, only the feed's domain).
+    author_salt: str = "news_rss"
+
+    # --- Hosted (paid) sentiment aggregator seam ---------------------------
+    # See providers/social/hosted_api.py::HostedSentimentProvider. Disabled
+    # by default: this is a documented adapter seam, not a working
+    # integration, so all three of these must be explicitly set before the
+    # constructor even attempts to proceed (and even then it raises -- see
+    # that module's docstring for what a real implementation must add).
+    hosted_base_url: str | None = None
+    hosted_credential: str | None = None
+    hosted_enabled: bool = False
 
 
 class AIConfig(BaseModel):
@@ -241,9 +555,51 @@ class UniverseConfig(BaseModel):
     source: Literal["database", "csv", "static"] = "database"
     csv_path: Path | None = None
     static_symbols: list[str] = Field(default_factory=list)
-    permitted_exchanges: list[str] = Field(default_factory=lambda: ["NYSE", "NASDAQ", "AMEX"])
-    max_symbols: int = 2000
+    #: TSX is permitted alongside the US exchanges by default so a real-data
+    #: refresh (``market_data.provider = "stooq"``) covers both markets out of
+    #: the box; see ``data.universe.load_packaged_universe``. Deliberately
+    #: TSX (main board) only -- TSX Venture (TSXV), CSE and NEO are more
+    #: speculative venture-tier boards the owner scoped out of this
+    #: application entirely (ADR-0008 Decision 3); they are neither seeded
+    #: nor permitted here.
+    permitted_exchanges: list[str] = Field(
+        default_factory=lambda: ["NYSE", "NASDAQ", "AMEX", "TSX"]
+    )
+    # The packaged >=$1B US + TSX inventory currently exceeds 2,000 names.
+    # Keep enough headroom that deterministic truncation cannot silently drop
+    # the Canadian tail merely because the US file is loaded first.
+    max_symbols: int = 3000
     include_etfs: bool = False
+    #: Packaged seed universes (see ``data/universes/*.csv``) used to fill the
+    #: scannable universe when ``source == "database"`` and the database has no
+    #: stored securities yet -- i.e. before the first ``claudetrade refresh``.
+    #: Set to ``[]`` to disable this fallback and start from a genuinely empty
+    #: universe. See ``data.universe.load_packaged_universe`` for what each
+    #: name covers and its honest coverage caveats.
+    packaged_universes: list[str] = Field(
+        default_factory=lambda: ["us_default", "ca_default"]
+    )
+    #: ADR-0008 Decision 3: the durable, authoritative fix for "the universe is
+    #: too small" is computed at refresh time, not the packaged seed files
+    #: (those are bootstrap coverage only -- see ``data/universes/*.csv``).
+    #: This is the floor ``UniverseSelector.for_session`` applies against each
+    #: security's *stored* (provider-sourced, real) ``market_cap_usd`` -- a
+    #: deliberately separate field from ``FilterConfig.min_market_cap_usd``,
+    #: which is a lower, longer-standing candidate-quality screen applied
+    #: again later at signal-scoring time (see ``signals.scoring``). Raising
+    #: or lowering this one changes who is even eligible to be scanned at
+    #: all; it does not touch the scoring-time gate.
+    min_market_cap_usd: float = 1_000_000_000.0
+    #: What to do with a security for which NO configured market-data
+    #: provider could establish a market cap at all (as opposed to one priced
+    #: below the floor above). "include" (default) keeps it in the universe --
+    #: silently dropping a name just because its cap could not be established
+    #: would reintroduce survivorship-style bias at the universe layer, the
+    #: same failure mode ``for_session``'s point-in-time delisting logic
+    #: already guards against. "exclude" drops it instead, for an operator who
+    #: would rather under-cover than risk scanning an unpriced name; either
+    #: way the gap is always flagged in the data-quality report, never silent.
+    unknown_cap_policy: Literal["include", "exclude"] = "include"
 
 
 class FilterConfig(BaseModel):
@@ -367,6 +723,24 @@ class SentimentConfig(BaseModel):
     #: Weight applied to engagement (log-scaled) in weighted sentiment.
     engagement_weight: float = 0.35
     credibility_weight: float = 0.35
+    #: Credibility assigned to a post whose author metrics (age/karma/
+    #: followers) are ALL ``None`` -- i.e. structurally absent, not merely
+    #: low. This is what keeps "no metrics reported" (a news-wire post,
+    #: which has no personal author to have karma or a follower count) from
+    #: being scored identically to "worst possible metrics" (a real,
+    #: karma-less throwaway account), which both floored to 0.0 before this
+    #: field existed. Keyed by ``SocialSource`` value; a post with *some*
+    #: (not all) metrics present never uses this baseline -- it keeps the
+    #: existing computed score, since partial information is real
+    #: information. A source with no entry here falls back to 0.0, the
+    #: original floor-to-zero behaviour.
+    credibility_baseline_by_source: dict[str, float] = Field(
+        default_factory=lambda: {
+            "news": 0.6,  # publisher-level content from curated feeds
+            "reddit": 0.3,  # unknown author, mild prior
+            "x": 0.3,  # unknown author, mild prior
+        }
+    )
     #: Windows (days) used for acceleration measures.
     fast_window_days: int = 2
     slow_window_days: int = 10
@@ -437,6 +811,77 @@ class SignalConfig(BaseModel):
             "manipulation_risk": 0.04,
         }
     )
+
+
+class StrategyCalibrationConfig(BaseModel):
+    """Score-accumulation calibration for the five strategies (ADR-0007 Decision 2).
+
+    Strategies in ``src/claudetrade/strategies/`` no longer decline at the
+    first unmet absolute threshold. Each non-veto condition contributes a
+    weighted score component (see ``strategies.scoring_utils.ScoreAccumulator``)
+    and a strategy emits a proposal once its accumulated score clears
+    ``proposal_score_threshold``. A short, strategy-documented list of
+    conditions remain hard vetoes -- earnings window, insufficient history,
+    liquidity, manipulation risk -- because a weighted average is the wrong
+    tool for a disqualifying fact.
+
+    The values below are PERCENTILE LEVELS (0-1) against a symbol's OWN
+    trailing distribution, not bare absolute price/volume/indicator
+    constants: e.g. ``breakout_volume_percentile`` asks "is today's relative
+    volume in the top 30% of this symbol's own trailing 120 sessions?", never
+    "is relative volume above 1.5x". A percentile is comparable across a
+    quiet utility and a volatile small-cap in a way an absolute number is
+    not, and it is what lets the same threshold serve every regime.
+
+    Reversal: raising ``proposal_score_threshold`` toward 100 restores
+    near-AND-gate strictness; a percentile level set to 0.0 or 1.0 removes
+    that condition's ability to move the score.
+    """
+
+    #: Trailing sessions of sentiment history used by the on-the-fly
+    #: ``strategies.scoring_utils.percentile_rank`` helper (sentiment has no
+    #: precomputed feature column, unlike price/volume series -- see
+    #: ``features.feature_builder``'s fixed 120-session window for those).
+    sentiment_percentile_window: int = 90
+
+    #: Minimum accumulated score (0-100, before the engine's 13-component
+    #: blend in ``signals.scoring.score_candidate``) for a strategy to emit a
+    #: proposal at all. This is deliberately a separate, lower-friction gate
+    #: from ``SignalConfig.min_overall_score`` -- that gate applies to the
+    #: engine's blended score across all candidates; this one only decides
+    #: whether the strategy's OWN thesis is worth proposing in the first place.
+    proposal_score_threshold: float = 48.0
+
+    # --- Strategy A: sentiment_breakout -------------------------------------
+    breakout_volume_percentile: float = 0.70
+    breakout_trend_percentile: float = 0.55
+    breakout_sentiment_accel_percentile: float = 0.65
+    breakout_mention_accel_percentile: float = 0.60
+
+    # --- Strategy B: sentiment_pullback --------------------------------------
+    pullback_trend_percentile: float = 0.55
+    #: Down-volume during the pullback should rank LOW among its own history.
+    pullback_quiet_volume_percentile: float = 0.45
+    pullback_rsi_low_percentile: float = 0.25
+    pullback_rsi_high_percentile: float = 0.65
+
+    # --- Strategy C: capitulation_reversal -----------------------------------
+    #: How far below the symbol's own trailing distribution of
+    #: dist_from_sma50_pct today's reading must rank (LOW percentile = most
+    #: stretched below average in its own history).
+    capitulation_extension_percentile: float = 0.20
+    capitulation_oversold_percentile: float = 0.20
+    capitulation_climax_volume_percentile: float = 0.80
+
+    # --- Strategy D: hype_failure_short ---------------------------------------
+    hype_advance_percentile: float = 0.85
+    hype_sentiment_spike_percentile: float = 0.75
+
+    # --- Strategy E: post_earnings_drift ---------------------------------------
+    #: Event-day reaction magnitude percentile against the symbol's own
+    #: trailing |ROC-20| distribution -- a 3% move is a repricing for a
+    #: sleepy utility and noise for a volatile small-cap.
+    drift_reaction_percentile: float = 0.55
 
 
 class BacktestConfig(BaseModel):
@@ -557,8 +1002,11 @@ class AppConfig(BaseSettings):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
     earnings: EarningsConfig = Field(default_factory=EarningsConfig)
+    tipranks: TipRanksConfig = Field(default_factory=TipRanksConfig)
     reddit: RedditConfig = Field(default_factory=RedditConfig)
     x: XConfig = Field(default_factory=XConfig)
+    stocktwits: StocktwitsConfig = Field(default_factory=StocktwitsConfig)
+    news: NewsConfig = Field(default_factory=NewsConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     filters: FilterConfig = Field(default_factory=FilterConfig)
@@ -567,6 +1015,7 @@ class AppConfig(BaseSettings):
     sentiment: SentimentConfig = Field(default_factory=SentimentConfig)
     regime: RegimeConfig = Field(default_factory=RegimeConfig)
     signals: SignalConfig = Field(default_factory=SignalConfig)
+    calibration: StrategyCalibrationConfig = Field(default_factory=StrategyCalibrationConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
@@ -629,6 +1078,8 @@ class AppConfig(BaseSettings):
             "earnings": True,
             "reddit": self.reddit.enabled,
             "x": self.x.enabled,
+            "stocktwits": self.stocktwits.enabled,
+            "news": self.news.enabled,
             "ai": self.ai.provider != "null",
             "notifications": self.notifications.enabled,
             "scheduler": self.scheduler.enabled,

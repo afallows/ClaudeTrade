@@ -134,8 +134,8 @@ class TestBollingerBands:
 
         # After warm-up
         subset = result.iloc[20:]
-        assert (subset["upper"] > subset["middle"]).all()
-        assert (subset["middle"] > subset["lower"]).all()
+        assert (subset["upper"] > subset["mid"]).all()
+        assert (subset["mid"] > subset["lower"]).all()
 
     def test_bb_causal(self, sample_bars):
         """Bollinger Bands are causal."""

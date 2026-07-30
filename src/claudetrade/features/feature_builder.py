@@ -14,6 +14,15 @@ from claudetrade.features import indicators, patterns, relative_strength
 
 FEATURE_VERSION = "v1"
 
+#: Trailing window (sessions) for the self-history percentile features below
+#: (ADR-0007 Decision 2). 120 sessions is roughly half a trading year -- long
+#: enough to span more than one short-term regime, short enough that a young
+#: listing still warms up within the app's typical history requirements.
+#: Computed via ``indicators.rolling_percentile``, which is causal by
+#: construction (see that function's docstring): the percentile at row ``i``
+#: only ever ranks against rows ``i - 119 .. i``.
+PERCENTILE_WINDOW = 120
+
 # Every feature name that strategies and scoring depend on.
 # Grep src/claudetrade/strategies/ and src/claudetrade/signals/ to confirm.
 REQUIRED_FEATURES = (
@@ -79,6 +88,16 @@ REQUIRED_FEATURES = (
     "dist_from_52w_high_pct",
     "dist_from_52w_low_pct",
     "days_since_52w_high",
+    # ---- Self-history percentiles (ADR-0007 Decision 2) ----
+    # Trailing PERCENTILE_WINDOW-session percentile rank (0-1) of each series
+    # within its OWN history -- the reference frame strategies use instead of
+    # bare absolute constants (e.g. "is relative volume above 1.5x" becomes
+    # "is relative volume in the top 30% of this symbol's own history").
+    "rel_volume_pctl_120",
+    "roc_20_pctl_120",
+    "adx_pctl_120",
+    "rsi_pctl_120",
+    "dist_sma50_pctl_120",
 )
 
 
@@ -354,6 +373,27 @@ class FeatureBuilder:
             if ~np.isnan(x).all()
             else np.nan,
             raw=False,
+        )
+
+        # ---- Self-history percentiles (ADR-0007 Decision 2) ----
+        # Causal by construction (see PERCENTILE_WINDOW docstring above);
+        # NaN for the warm-up period like every other rolling feature here,
+        # which ``StrategyContext.feature()`` treats as "missing" and
+        # defaults to a neutral 0.5 rather than crashing a scan.
+        result["rel_volume_pctl_120"] = indicators.rolling_percentile(
+            result["rel_volume_20"], PERCENTILE_WINDOW
+        )
+        result["roc_20_pctl_120"] = indicators.rolling_percentile(
+            result["roc_20"], PERCENTILE_WINDOW
+        )
+        result["adx_pctl_120"] = indicators.rolling_percentile(
+            result["adx_14"], PERCENTILE_WINDOW
+        )
+        result["rsi_pctl_120"] = indicators.rolling_percentile(
+            result["rsi_14"], PERCENTILE_WINDOW
+        )
+        result["dist_sma50_pctl_120"] = indicators.rolling_percentile(
+            result["dist_from_sma50_pct"], PERCENTILE_WINDOW
         )
 
         return result

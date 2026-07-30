@@ -67,7 +67,7 @@ class TestStopGapsThrough:
         # Should fill near the open, not at stop price
         assert decision.price < 95.0  # Not at stop
         assert decision.price <= 92.5  # Near but not above open (with slippage)
-        assert decision.reason == ExitReason.STOP_LOSS
+        assert decision.reason == ExitReason.GAP_THROUGH_STOP
 
     def test_short_stop_gaps_above(self):
         """Short stop gapped above fills at open (pessimistic)."""
@@ -114,7 +114,8 @@ class TestIntrabarAmbiguity:
 
         decision = sim.simulate_exit(position, bar)
         assert decision is not None
-        # Pessimistic: stop is hit
+        # Pessimistic: stop is hit. The bar opens at 100, above the stop, so
+        # this is an ordinary intrabar touch rather than a gap through it.
         assert decision.reason == ExitReason.STOP_LOSS
 
     def test_optimistic_target_wins_over_stop(self):
@@ -193,9 +194,9 @@ class TestParticipationCap:
         cost_model = CostModel(cost_config)
         sim = ExecutionSimulator(cost_model, cost_config)
 
-        # Try to enter 1000 shares when bar volume is 500k
-        # Max participation: 0.05 * 500k = 25k dollars worth
-        # At $100/share, that's 250 shares
+        # The cap is a share of the bar's *share* volume, not its dollar
+        # volume: 5% of 10,000 shares = 500, so a 1,000-share order fills half.
+        # (5% of a 500k-share bar would be 25,000 shares and fill in full.)
         order = EntryOrder(
             symbol="TEST",
             direction=Direction.LONG,
@@ -210,13 +211,13 @@ class TestParticipationCap:
             high=102.0,
             low=98.0,
             close=101.0,
-            volume=500_000.0,
+            volume=10_000.0,
         )
 
         result = sim.try_fill_entry(order, bar)
         assert result is not None
         # Should be partially filled
-        assert result.shares < 1000
+        assert result.shares == 500
         assert result.is_partial
 
     def test_participation_cap_exempt_for_forced_close(self):

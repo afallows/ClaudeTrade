@@ -20,3 +20,8 @@ PyYAML>=6.0,<7.0
 streamlit>=1.36,<2.0
 plotly>=5.22,<7.0
 openpyxl>=3.1,<4.0
+
+# Web API + desktop shell layer (React/TS SPA served over FastAPI, ADR-0008 D2)
+fastapi>=0.115,<1.0
+uvicorn>=0.30,<1.0
+pywebview>=5.0,<7.0

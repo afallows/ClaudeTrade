@@ -17,6 +17,34 @@ Known weaknesses:
   profits earlier.
 * Requires social data. With sources disabled it degrades to a volume-confirmed
   breakout, and its score is capped to reflect the missing evidence.
+
+Scoring model (ADR-0007 Decision 2)
+------------------------------------
+This used to be an AND-chain: any one of six absolute-threshold checks
+(resistance level found, not too extended, above the 50-day average, ADX
+above a fixed 18, relative volume above a fixed 1.5x, then -- if sentiment was
+available -- acceleration/mentions/authors/manipulation all clearing fixed
+bars) returned ``None`` at the first miss. That shape is why the strategy
+almost never fired: six independent gates each with, say, a 60% pass rate
+compound to a ~5% joint pass rate.
+
+It is now a :class:`~claudetrade.strategies.scoring_utils.ScoreAccumulator`:
+each condition contributes points in proportion to how strongly it is met
+(:func:`~claudetrade.strategies.scoring_utils.ramp_up`, or a percentile rank
+against the symbol's own trailing distribution for relative volume, trend
+strength and sentiment acceleration -- see ``config.calibration``), and a
+proposal is only emitted once the total clears
+``config.calibration.proposal_score_threshold``. Absent sentiment costs the
+candidate the sentiment components' points rather than declining it outright,
+which is what "degrades rather than disables" now means structurally, not
+just narratively.
+
+Only four conditions remain hard vetoes, per the ADR: insufficient history,
+the earnings window, illiquidity, and manipulation risk above the configured
+cap. A missing reference level (no resistance and no Donchian channel) is
+also a hard decline -- not because it is a curve-fit threshold, but because
+there is no structural input left to build an entry/stop/target from; that is
+a data-availability precondition, not a scored opinion.
 """
 
 from __future__ import annotations
@@ -24,36 +52,57 @@ from __future__ import annotations
 from claudetrade.domain import Direction
 from claudetrade.strategies.base import Strategy, StrategyContext, StrategyProposal
 from claudetrade.strategies.registry import register_strategy
+from claudetrade.strategies.scoring_utils import ScoreAccumulator, percentile_rank, ramp_up
 
 
 @register_strategy
 class SentimentBreakoutStrategy(Strategy):
     name = "sentiment_breakout"
-    version = "v1"
+    version = "v2"
     description = "Breakout above resistance with volume and rising unique-author attention"
     direction_bias = Direction.LONG
     min_history_bars = 80
     permits_earnings_risk = False
     requires_sentiment = False  # degrades rather than disabling
 
-    #: Breakout bar must trade this multiple of its 20-day average volume.
-    MIN_RELATIVE_VOLUME = 1.5
-    #: Trend gate: price must hold above the intermediate average.
-    MIN_ADX = 18.0
-    #: Sentiment acceleration required when social data is available.
-    MIN_SENTIMENT_ACCELERATION = 0.15
-    MIN_MENTION_ACCELERATION = 0.20
     #: Stop distance in ATR when structural support is too far away.
     ATR_STOP_MULTIPLE = 2.0
-    #: Reject if price has already run this far beyond the breakout level.
-    MAX_EXTENSION_ATR = 1.0
+    #: Extension (in ATR beyond the level) at which the extension penalty
+    #: starts, and at which it reaches its maximum -- a soft cap, not a veto:
+    #: a very extended breakout with everything else exceptional can still
+    #: score, just not as highly.
+    EXTENSION_PENALTY_START_ATR = 1.0
+    EXTENSION_PENALTY_FULL_ATR = 2.5
+
+    # --- score weights (points out of the 0-100 setup_score) --------------
+    # BASELINE is calibrated so a candidate with genuinely solid (not perfect)
+    # evidence across the components below lands comfortably above both
+    # ``config.calibration.proposal_score_threshold`` and the engine's
+    # existing ``SignalConfig.min_overall_score`` blended gate, in which this
+    # strategy's own score is only one of thirteen weighted components.
+    BASELINE = 22.0
+    W_BREAKOUT = 22.0
+    W_TREND_CONTEXT = 8.0
+    W_ADX_PERCENTILE = 15.0
+    W_VOLUME_PERCENTILE = 18.0
+    W_RS_PERCENTILE = 8.0
+    W_SENTIMENT_ACCEL = 15.0
+    W_MENTION_ACCEL = 8.0
+    W_UNIQUE_AUTHORS = 6.0
+    PENALTY_EXTENSION = -15.0
+    PENALTY_HYPE = -10.0
 
     def evaluate(self, ctx: StrategyContext) -> StrategyProposal | None:
+        # --- hard vetoes ---------------------------------------------------
         if not self.has_sufficient_history(ctx):
             self.decline(ctx, "insufficient_history", f"{len(ctx.bars)} bars")
             return None
         if self.earnings_blocked(ctx):
             self.decline(ctx, "earnings_window", f"{ctx.days_to_earnings()}d to earnings")
+            return None
+        adv = ctx.feature("avg_dollar_volume_20", 0.0)
+        if adv < self.config.filters.min_avg_dollar_volume_usd:
+            self.decline(ctx, "illiquid", f"avg dollar volume ${adv:,.0f}")
             return None
 
         price = ctx.price
@@ -64,92 +113,135 @@ class SentimentBreakoutStrategy(Strategy):
         # 20-day channel high when no level has enough touches to be meaningful.
         level = resistance if resistance > 0 else donchian_high
         if level <= 0:
-            self.decline(ctx, "no_resistance_level")
+            self.decline(ctx, "no_reference_level", "no resistance or Donchian high available")
             return None
 
-        # --- price structure ---------------------------------------------
-        broke_out = bool(ctx.feature("breakout_20d", 0.0) > 0) or price > level
-        if not broke_out:
-            self.decline(ctx, "no_breakout", f"close {price:.2f} vs level {level:.2f}")
+        sentiment = ctx.sentiment
+        if sentiment is not None and sentiment.manipulation_risk > self.config.filters.max_manipulation_risk:
+            self.decline(ctx, "manipulation_risk", f"{sentiment.manipulation_risk:.2f}")
             return None
 
         extension_atr = (price - level) / atr if atr > 0 else 0.0
-        if extension_atr > self.MAX_EXTENSION_ATR:
-            # The move already happened. Chasing it inverts the reward:risk that
-            # justified the trade in the first place.
-            self.decline(ctx, "extended", f"{extension_atr:.2f} ATR beyond the level")
+        # Not a curve-fit threshold: this is the same structural boundary as
+        # "no reference level" above -- far enough below the level that an
+        # entry pegged to it would not be a breakout trade under any scoring,
+        # only a bet on price travelling most of the way there first.
+        if extension_atr < -1.5:
+            self.decline(ctx, "not_near_breakout", f"{extension_atr:.2f} ATR below the level")
             return None
 
-        if ctx.feature("close", price) < ctx.feature("sma_50", 0.0):
-            self.decline(ctx, "below_sma50")
-            return None
-        if ctx.feature("adx_14", 0.0) < self.MIN_ADX:
-            self.decline(ctx, "weak_trend", f"ADX {ctx.feature('adx_14'):.1f}")
-            return None
+        # --- score accumulation ---------------------------------------------
+        cal = self.config.calibration
+        score = ScoreAccumulator(baseline=self.BASELINE)
 
-        # --- volume confirmation -----------------------------------------
-        rel_volume = ctx.feature("rel_volume_20", 0.0)
-        if rel_volume < self.MIN_RELATIVE_VOLUME:
-            self.decline(ctx, "no_volume_confirmation", f"relvol {rel_volume:.2f}")
-            return None
+        score.add(
+            "breakout",
+            ramp_up(price, level - 0.15 * atr, level + 0.10 * atr),
+            self.W_BREAKOUT,
+        )
+        score.add(
+            "above_sma50",
+            ramp_up(ctx.feature("dist_from_sma50_pct", -5.0), -3.0, 0.5),
+            self.W_TREND_CONTEXT,
+        )
+
+        adx_pctl = ctx.feature("adx_pctl_120", 0.5)
+        score.add(
+            "trend_strength_pctl",
+            ramp_up(adx_pctl, cal.breakout_trend_percentile - 0.25, cal.breakout_trend_percentile),
+            self.W_ADX_PERCENTILE,
+        )
+
+        rel_volume = ctx.feature("rel_volume_20", 1.0)
+        vol_pctl = ctx.feature("rel_volume_pctl_120", 0.5)
+        score.add(
+            "volume_pctl",
+            ramp_up(vol_pctl, cal.breakout_volume_percentile - 0.30, cal.breakout_volume_percentile),
+            self.W_VOLUME_PERCENTILE,
+        )
+        score.add(
+            "relative_strength",
+            ramp_up(ctx.feature("rs_percentile", 50.0), 50.0, 90.0),
+            self.W_RS_PERCENTILE,
+        )
+
+        if extension_atr > self.EXTENSION_PENALTY_START_ATR:
+            score.penalty(
+                "extension",
+                self.PENALTY_EXTENSION
+                * ramp_up(extension_atr, self.EXTENSION_PENALTY_START_ATR, self.EXTENSION_PENALTY_FULL_ATR),
+            )
 
         evidence = [
-            f"Closed at {price:.2f}, above the {level:.2f} resistance level",
-            f"Breakout volume {rel_volume:.1f}x the 20-day average",
-            f"ADX {ctx.feature('adx_14'):.0f} confirms a trending environment",
-            f"Price {ctx.feature('dist_from_sma50_pct', 0.0):+.1f}% versus its 50-day average",
+            f"Trading at {price:.2f} vs the {level:.2f} resistance level "
+            f"({extension_atr:+.2f} ATR through it)",
+            f"Relative volume {rel_volume:.2f}x its 20-day average, "
+            f"{vol_pctl:.0%} percentile of its own trailing history",
+            f"ADX {ctx.feature('adx_14'):.0f} ({adx_pctl:.0%} percentile of its own trailing history)",
         ]
         risks: list[str] = []
-        setup_score = 55.0
-        setup_score += min(15.0, (rel_volume - self.MIN_RELATIVE_VOLUME) * 10.0)
-        setup_score += min(10.0, max(0.0, ctx.feature("rs_percentile", 50.0) - 50.0) * 0.2)
 
-        # --- sentiment confirmation ---------------------------------------
-        sentiment = ctx.sentiment
+        # --- sentiment confirmation (soft: absent costs points, not the trade) ---
         if self.sentiment_available(ctx) and sentiment is not None:
-            if sentiment.sentiment_acceleration < self.MIN_SENTIMENT_ACCELERATION:
-                self.decline(
-                    ctx,
-                    "sentiment_not_accelerating",
-                    f"accel {sentiment.sentiment_acceleration:.2f}",
-                )
-                return None
-            if sentiment.mention_acceleration < self.MIN_MENTION_ACCELERATION:
-                self.decline(
-                    ctx, "attention_flat", f"mention accel {sentiment.mention_acceleration:.2f}"
-                )
-                return None
+            accel_history = [s.sentiment_acceleration for s in ctx.sentiment_history][
+                -cal.sentiment_percentile_window :
+            ]
+            mention_history = [s.mention_acceleration for s in ctx.sentiment_history][
+                -cal.sentiment_percentile_window :
+            ]
+            accel_pctl = percentile_rank(accel_history, sentiment.sentiment_acceleration)
+            mention_pctl = percentile_rank(mention_history, sentiment.mention_acceleration)
+
+            score.add(
+                "sentiment_accel_pctl",
+                ramp_up(
+                    accel_pctl,
+                    cal.breakout_sentiment_accel_percentile - 0.30,
+                    cal.breakout_sentiment_accel_percentile,
+                ),
+                self.W_SENTIMENT_ACCEL,
+            )
+            score.add(
+                "mention_accel_pctl",
+                ramp_up(
+                    mention_pctl,
+                    cal.breakout_mention_accel_percentile - 0.30,
+                    cal.breakout_mention_accel_percentile,
+                ),
+                self.W_MENTION_ACCEL,
+            )
             # Unique authors, not raw mentions: fifty posts from five accounts is
-            # a promotion, not a change in opinion.
-            if sentiment.unique_authors < self.config.filters.min_unique_authors:
-                self.decline(
-                    ctx, "too_few_authors", f"{sentiment.unique_authors} unique authors"
-                )
-                return None
-            if sentiment.manipulation_risk > self.config.filters.max_manipulation_risk:
-                self.decline(
-                    ctx, "manipulation_risk", f"{sentiment.manipulation_risk:.2f}"
-                )
-                return None
-            evidence.append(
-                f"Sentiment accelerating ({sentiment.sentiment_acceleration:+.2f}) across "
-                f"{sentiment.unique_authors} unique authors"
+            # a promotion, not a change in opinion. Soft now, not a hard gate --
+            # manipulation_risk (above) remains the hard backstop against that.
+            score.add(
+                "unique_authors",
+                ramp_up(
+                    sentiment.unique_authors,
+                    self.config.filters.min_unique_authors * 0.4,
+                    self.config.filters.min_unique_authors,
+                ),
+                self.W_UNIQUE_AUTHORS,
             )
-            evidence.append(
-                f"Mention rate {sentiment.mention_acceleration:+.0%} versus its baseline"
-            )
-            setup_score += min(15.0, sentiment.sentiment_acceleration * 30.0)
-            if sentiment.hype > 0.6:
+            if sentiment.hype > 0.5:
+                score.penalty("hype", self.PENALTY_HYPE * ramp_up(sentiment.hype, 0.5, 0.85))
                 risks.append(
                     f"Elevated hype ({sentiment.hype:.2f}); crowded entries reverse quickly"
                 )
-                setup_score -= 8.0
+            evidence.append(
+                f"Sentiment acceleration {sentiment.sentiment_acceleration:+.2f} "
+                f"({accel_pctl:.0%} percentile) across {sentiment.unique_authors} unique authors"
+            )
+            evidence.append(
+                f"Mention rate {sentiment.mention_acceleration:+.0%} ({mention_pctl:.0%} percentile)"
+            )
         else:
-            # Reduced-capability mode: the setup is still valid on price and
-            # volume, but it is a weaker claim and must score as one.
-            setup_score = min(setup_score, 62.0)
             evidence.append("Social sentiment unavailable: scored on price and volume only")
             risks.append("No sentiment confirmation available for this candidate")
+
+        threshold = cal.proposal_score_threshold
+        if score.score < threshold:
+            self.decline(ctx, "score_below_threshold", score.summary(threshold))
+            return None
 
         # --- levels --------------------------------------------------------
         # Prefer the breakout base's support; use an ATR stop when that support
@@ -160,8 +252,13 @@ class SentimentBreakoutStrategy(Strategy):
         stop = max(structural_stop, atr_stop) if structural_stop > 0 else atr_stop
         stop = min(stop, price - 0.35 * atr)  # never place the stop inside the noise band
 
+        # ``entry_low`` may sit at the level itself (a stop-entry, waiting for
+        # the breakout) rather than at the current price when the candidate
+        # scored on strength elsewhere while still approaching the level --
+        # ``entry_high`` is anchored relative to ``entry_low``, never to
+        # ``price`` alone, so the zone can never invert.
         entry_low = max(level, price - 0.25 * atr)
-        entry_high = price + 0.35 * atr
+        entry_high = max(price + 0.35 * atr, entry_low + 0.30 * atr)
         risk_per_share = ((entry_low + entry_high) / 2.0) - stop
         if risk_per_share <= 0:
             self.decline(ctx, "degenerate_risk")
@@ -188,7 +285,7 @@ class SentimentBreakoutStrategy(Strategy):
             expected_holding_days=10,
             time_stop_days=15,
             trailing_stop_atr=2.5,
-            setup_score=max(0.0, min(100.0, setup_score)),
+            setup_score=score.score,
             evidence=evidence,
             invalidation=[
                 f"Close back below {level:.2f} reclaimed resistance",
@@ -204,8 +301,13 @@ class SentimentBreakoutStrategy(Strategy):
             ],
             risks=risks,
             thesis_hint=(
-                f"{ctx.symbol} broke {level:.2f} resistance on {rel_volume:.1f}x volume with "
-                "attention broadening across new participants."
+                f"{ctx.symbol} traded {extension_atr:+.2f} ATR through {level:.2f} resistance on "
+                f"{rel_volume:.1f}x volume ({vol_pctl:.0%} percentile) with attention broadening "
+                "across new participants."
             ),
-            extras={"breakout_level": level, "extension_atr": extension_atr},
+            extras={
+                "breakout_level": level,
+                "extension_atr": extension_atr,
+                "score_breakdown": score.breakdown,
+            },
         )

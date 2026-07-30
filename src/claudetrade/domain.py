@@ -105,6 +105,10 @@ class EarningsSession(StrEnum):
 class SocialSource(StrEnum):
     REDDIT = "reddit"
     X = "x"
+    NEWS = "news"
+    #: Stocktwits public symbol-stream API (ADR-0008 Decision 1 source
+    #: expansion). Additive member; existing values are unchanged.
+    STOCKTWITS = "stocktwits"
     OTHER = "other"
 
 
@@ -112,6 +116,43 @@ class DataQualitySeverity(StrEnum):
     INFO = "info"
     WARNING = "warning"
     ERROR = "error"
+
+
+class OrderStatus(StrEnum):
+    """Lifecycle of a broker order.
+
+    Closed on purpose: every ``claudetrade.brokers.base.BrokerProvider``
+    implementation -- paper today, a live adapter later -- must report one of
+    these values and nothing else, so callers can reason about "is this order
+    still live?" without knowing which broker placed it. Values match the
+    strings already persisted by the paper broker (``PaperOrderRow.status``:
+    ``"working"`` / ``"filled"``), so this enum documents behaviour that
+    already existed rather than migrating it.
+    """
+
+    NEW = "new"  # constructed, not yet sent to a venue
+    ACCEPTED = "accepted"  # acknowledged by the venue, not yet working
+    WORKING = "working"  # live and eligible to fill
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"  # never became live: risk guard, venue reject, bad request
+    EXPIRED = "expired"  # time in force lapsed unfilled
+    ERROR = "error"  # broker/transport failure; status is unknown, not "safe"
+
+
+#: Orders in one of these states can still fill, be cancelled, or be
+#: modified. Anything else is terminal. Kept as a frozenset (not a property
+#: on the enum) so a caller can test membership without importing the enum
+#: class itself -- ``status in ACTIVE_STATUSES`` reads the same everywhere.
+ACTIVE_STATUSES: frozenset[OrderStatus] = frozenset(
+    {
+        OrderStatus.NEW,
+        OrderStatus.ACCEPTED,
+        OrderStatus.WORKING,
+        OrderStatus.PARTIALLY_FILLED,
+    }
+)
 
 
 # --------------------------------------------------------------------------
@@ -269,6 +310,15 @@ class SocialPost:
     injection_risk: float = 0.0
     fetched_at: dt.datetime | None = None
     raw_ref: str | None = None
+    #: Self-declared sentiment label the *source itself* attaches to a post
+    #: (currently only Stocktwits, whose authors may tag a message "Bullish"
+    #: / "Bearish"), normalised to ``"bullish"``/``"bearish"``/``None``.
+    #: This is a PRIOR HINT, never a substitute for classification: a
+    #: self-declared label is evidence a human asserted it, not truth about
+    #: the post's actual sentiment, so the ensemble classifier still runs on
+    #: ``text`` unconditionally. Sources with no such concept (Reddit, X,
+    #: news) always leave this ``None``.
+    sentiment_prior: str | None = None
 
     @property
     def engagement(self) -> float:

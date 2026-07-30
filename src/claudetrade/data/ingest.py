@@ -17,7 +17,7 @@ with its defects labelled.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from sqlalchemy import select
 
@@ -42,6 +42,7 @@ from claudetrade.domain import (
 )
 from claudetrade.logging_setup import get_logger
 from claudetrade.providers.base import ProviderError
+from claudetrade.sentiment.entity_resolution import TickerResolver
 from claudetrade.utils.timeutils import ensure_utc, utc_now
 
 log = get_logger(__name__)
@@ -106,8 +107,149 @@ class DataIngestor:
 
     # --- reference data ---------------------------------------------------
 
-    def ingest_securities(self, securities: list[SecurityInfo], report: IngestReport) -> None:
-        """Upsert reference data and alias rows."""
+    def enrich_market_caps(
+        self, securities: list[SecurityInfo], report: IngestReport
+    ) -> list[SecurityInfo]:
+        """Establish a real market cap for each security via the market-data
+        path (ADR-0008 Decision 3's durable fix -- "computed at refresh time",
+        not the packaged seed CSVs' approximate size buckets).
+
+        Tries ``get_market_caps`` (an optional ``MarketDataProvider``
+        capability -- see ``providers.base.MarketDataProvider.get_market_caps``
+        and ``providers.market.yahoo.YahooMarketProvider``) against every
+        configured market-data source in turn -- the primary provider, then,
+        if it is a cascading ``FallbackMarketProvider``-shaped wrapper, each
+        of its ``.primary``/``.fallbacks`` in order -- stopping once every
+        symbol has a price. The first provider to price a symbol wins,
+        matching the existing get_daily_bars/get_security_info fallback
+        convention. A provider that does not support this (the default: every
+        adapter except yahoo) or that errors contributes nothing and is not
+        treated as a failure of the run.
+
+        A security whose cap could NOT be established by any configured
+        source is deliberately **not** dropped here and its existing
+        ``market_cap_usd`` (if any) is left untouched -- only ever overwritten
+        with a freshly *resolved* real figure, never cleared to ``None`` for
+        having failed to re-resolve on this particular run. The gap is
+        recorded as a ``unknown_market_cap`` data-quality finding instead, so
+        it is visible rather than either a silent drop (survivorship-style
+        bias at the universe layer) or a silently stale value. What to *do*
+        about an unresolved cap (include vs exclude from the scannable
+        universe) is ``UniverseSelector.for_session``'s decision, governed by
+        ``UniverseConfig.unknown_cap_policy`` -- this method only establishes
+        and flags, it never filters.
+        """
+        symbols = [s.symbol for s in securities]
+        resolved: dict[str, float] = {}
+        for provider in self._market_cap_sources():
+            missing = [s for s in symbols if s not in resolved]
+            if not missing:
+                break
+            try:
+                caps = provider.get_market_caps(missing)
+            except ProviderError as exc:
+                log.warning(
+                    "market-cap lookup via %s failed: %s", getattr(provider, "name", "?"), exc
+                )
+                continue
+            except Exception:
+                log.exception(
+                    "unexpected error calling get_market_caps on %s", getattr(provider, "name", "?")
+                )
+                continue
+            for symbol, cap in caps.items():
+                if symbol not in resolved and cap is not None and cap > 0:
+                    resolved[symbol] = cap
+
+        enriched: list[SecurityInfo] = []
+        #: Resolved THIS run (a configured provider returned a fresh figure).
+        resolved_this_run = 0
+        #: Not resolved this run, but already carried a cap from a prior run
+        #: or a seed source -- NOT the same thing as "unresolved", and must
+        #: not be counted as such: this is exactly the accounting bug a real
+        #: Windows refresh surfaced ("resolved 0/2417 symbols (1 unresolved,
+        #: flagged)" -- 0 resolved but only 1 flagged silently implied the
+        #: other 2,416 had been resolved *this run*, when in fact they simply
+        #: already had a pre-existing/seed cap that this run did nothing to).
+        already_had_cap = 0
+        #: Genuinely unresolved -- no cap at all, seed or fresh -- and always
+        #: flagged below regardless of these counts.
+        unresolved_count = 0
+        for security in securities:
+            cap = resolved.get(security.symbol)
+            if cap is not None:
+                enriched.append(replace(security, market_cap_usd=cap))
+                resolved_this_run += 1
+                continue
+            enriched.append(security)
+            if security.market_cap_usd is not None:
+                already_had_cap += 1
+                continue
+            unresolved_count += 1
+            report.quality.add(
+                DataQualitySeverity.WARNING,
+                "unknown_market_cap",
+                f"{security.symbol}: market cap could not be established by any "
+                "configured market-data provider this refresh; "
+                f"unknown_cap_policy={self.config.universe.unknown_cap_policy!r} decides "
+                "whether it stays in the scannable universe -- it is not silently dropped "
+                "here regardless of that policy.",
+                symbol=security.symbol,
+            )
+
+        # Logged unconditionally (not just when something is unresolved) so
+        # the accounting always tells the truth about all three buckets,
+        # including the common "nothing new resolved, but nothing is actually
+        # missing either" case that a provider outage produces.
+        log.info(
+            "market-cap enrichment: resolved %d/%d symbols this run "
+            "(%d already had a cap, %d unresolved and flagged)",
+            resolved_this_run, len(securities), already_had_cap, unresolved_count,
+        )
+        return enriched
+
+    def _market_cap_sources(self) -> list[object]:
+        """Ordered, de-duplicated candidate providers to try for
+        ``get_market_caps``.
+
+        Duck-typed rather than importing ``FallbackMarketProvider`` (which
+        lives in ``providers.registry`` and does not itself implement
+        ``get_market_caps``): a cascading wrapper's ``.primary`` and
+        ``.fallbacks`` are plain public attributes, so this reaches through
+        one transparently whether ``self.market`` is a raw adapter or a
+        wrapped one, without depending on that wrapper's internals beyond
+        those two attribute names.
+        """
+        if self.market is None:
+            return []
+        candidates: list[object] = [self.market]
+        primary = getattr(self.market, "primary", None)
+        if primary is not None:
+            candidates.append(primary)
+        candidates.extend(getattr(self.market, "fallbacks", None) or [])
+
+        seen: set[int] = set()
+        out: list[object] = []
+        for candidate in candidates:
+            if id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            if callable(getattr(candidate, "get_market_caps", None)):
+                out.append(candidate)
+        return out
+
+    def ingest_securities(
+        self, securities: list[SecurityInfo], report: IngestReport
+    ) -> list[SecurityInfo]:
+        """Upsert reference data and alias rows.
+
+        Runs market-cap enrichment first (see ``enrich_market_caps``) so the
+        stored ``market_cap_usd`` reflects the real, provider-sourced figure
+        wherever the market-data path could establish one -- this is what
+        ``UniverseSelector.for_session`` later enforces the ADR-0008
+        Decision 3 ">= $1B" floor against.
+        """
+        securities = self.enrich_market_caps(securities, report)
         with self.db.session() as session:
             for info in securities:
                 row = session.get(Security, info.symbol)
@@ -153,6 +295,35 @@ class DataIngestor:
                                 kind=kind,
                             )
                         )
+
+        return securities
+
+    def symbols_passing_market_cap_floor(
+        self,
+        symbols: list[str],
+        securities: list[SecurityInfo],
+    ) -> list[str]:
+        """Select symbols eligible for expensive historical-data requests.
+
+        Market-cap enrichment deliberately happens before this method. A
+        current provider value therefore overrides the packaged bootstrap
+        bucket, preventing a company that has fallen below the configured
+        floor from consuming a Stooq history request. Unknown values follow
+        the operator's explicit policy; the benchmark is always retained
+        because it is needed for regime and relative-strength calculations.
+        """
+        by_symbol = {security.symbol: security for security in securities}
+        floor = self.config.universe.min_market_cap_usd
+        include_unknown = self.config.universe.unknown_cap_policy == "include"
+        benchmark = self.config.market_data.benchmark_symbol
+        eligible: list[str] = []
+        for symbol in symbols:
+            security = by_symbol.get(symbol)
+            cap = security.market_cap_usd if security else None
+            passes_floor = cap is not None and cap >= floor
+            if symbol == benchmark or passes_floor or (cap is None and include_unknown):
+                eligible.append(symbol)
+        return eligible
 
     # --- price data --------------------------------------------------------
 
@@ -471,6 +642,35 @@ class DataIngestor:
                     )
                     report.mentions_inserted += 1
 
+    def resolve_and_persist_mentions(
+        self,
+        posts: list[SocialPost],
+        directory: dict[str, SecurityInfo],
+        report: IngestReport,
+    ) -> None:
+        """Resolve ticker mentions for ``posts`` and store the confident ones.
+
+        Without this step posts land in the database with nothing linking them
+        to a symbol, so sentiment aggregation finds no rows and the whole
+        social half of the signal engine silently contributes nothing. Only
+        mentions at or above the configured confidence floor are stored --
+        below it, a "mention" is just a word that happens to look like a
+        ticker.
+        """
+        if not posts or not directory:
+            return
+
+        resolver = TickerResolver(directory)
+        floor = self.config.sentiment.min_ticker_confidence
+        mentions_by_post: dict[str, list] = {}
+        for post in posts:
+            mentions = resolver.resolve_filtered(post, floor)
+            if mentions:
+                mentions_by_post[post.external_id] = mentions
+
+        if mentions_by_post:
+            self.persist_mentions(mentions_by_post, report)
+
     # --- orchestration ---------------------------------------------------------
 
     def run_full_refresh(
@@ -486,7 +686,9 @@ class DataIngestor:
         report = IngestReport()
         reference = {s.symbol: s for s in (securities or [])}
         if securities:
-            self.ingest_securities(securities, report)
+            enriched = self.ingest_securities(securities, report)
+            reference = {s.symbol: s for s in enriched}
+            symbols = self.symbols_passing_market_cap_floor(symbols, enriched)
         self.ingest_prices(symbols, start, end, report, securities=reference)
         self.ingest_corporate_actions(symbols, start, end, report)
         self.ingest_earnings(symbols, start, end, report)
@@ -501,7 +703,10 @@ class DataIngestor:
             else:
                 since = dt.datetime.combine(start, dt.time.min, tzinfo=dt.UTC)
                 until = dt.datetime.combine(end, dt.time.max, tzinfo=dt.UTC)
-            self.ingest_social(since=since, until=until, symbols=symbols, report=report)
+            posts = self.ingest_social(
+                since=since, until=until, symbols=symbols, report=report
+            )
+            self.resolve_and_persist_mentions(posts, reference, report)
 
         self.checker.persist(report.quality)
         report.finished_at = utc_now()

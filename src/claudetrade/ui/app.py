@@ -14,59 +14,51 @@ from __future__ import annotations
 
 import streamlit as st
 
+from claudetrade.ui import theme
+from claudetrade.ui.components.layout import render_footer, render_sidebar_status
 from claudetrade.ui.screens import backtesting, dashboard, scanner, settings, ticker_detail
-from claudetrade.ui.state import init_session_state
+from claudetrade.ui.state import get_config, get_pipeline, init_session_state
 from claudetrade.version import CODE_VERSION
+
+_PAGES = {
+    "Dashboard": ("📊", dashboard.page_dashboard),
+    "Scanner": ("🔍", scanner.page_scanner),
+    "Ticker Detail": ("📈", ticker_detail.page_ticker_detail),
+    "Backtesting": ("🧪", backtesting.page_backtesting),
+    "Settings": ("⚙️", settings.page_settings),
+}
 
 
 def main() -> None:
     """Main application entry point."""
-    # Page configuration
     st.set_page_config(
         page_title="ClaudeTrade",
         page_icon="📈",
         layout="wide",
         initial_sidebar_state="expanded",
     )
-
-    # Initialize session state
+    theme.inject_css()
     init_session_state()
 
-    # Sidebar navigation
+    config = get_config()
+    pipeline = get_pipeline(config)
+
     st.sidebar.title("📊 ClaudeTrade")
-    st.sidebar.write(f"v{CODE_VERSION}")
+    st.sidebar.caption(f"Research terminal · v{CODE_VERSION}")
 
     page = st.sidebar.radio(
         "Navigation",
-        options=[
-            "Dashboard",
-            "Scanner",
-            "Ticker Detail",
-            "Backtesting",
-            "Settings",
-        ],
+        options=list(_PAGES.keys()),
+        format_func=lambda name: f"{_PAGES[name][0]}  {name}",
         label_visibility="collapsed",
     )
 
-    # Route to selected page
-    if page == "Dashboard":
-        dashboard.page_dashboard()
-    elif page == "Scanner":
-        scanner.page_scanner()
-    elif page == "Ticker Detail":
-        ticker_detail.page_ticker_detail()
-    elif page == "Backtesting":
-        backtesting.page_backtesting()
-    elif page == "Settings":
-        settings.page_settings()
+    render_sidebar_status(config, pipeline)
 
-    # Footer
-    st.sidebar.divider()
-    st.sidebar.write("**About**")
-    st.sidebar.write(
-        "ClaudeTrade is an automated swing-trading research tool. "
-        "All signals are research only and not investment advice."
-    )
+    _, render = _PAGES[page]
+    render()
+
+    render_footer()
 
 
 if __name__ == "__main__":

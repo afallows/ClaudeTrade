@@ -19,21 +19,53 @@ class TestEarningsBuffer:
     """Entry is blocked inside earnings buffer window."""
 
     def test_entry_blocked_inside_buffer_confirmed(self):
-        """Entry blocked within buffer of confirmed earnings date."""
-        buffer = 3  # 3 days before/after
+        """Entry blocked within the buffer ahead of a confirmed earnings date.
 
+        ``effective_risk_date_range`` models *date uncertainty* (a confirmed
+        date is a point, an estimate is widened), which is a different thing
+        from the trading buffer. The buffer rule lives in
+        ``BaseStrategy.earnings_blocked`` and keys off days-to-earnings, so
+        that is what this asserts.
+        """
         earnings = EarningsEvent(
             symbol="TEST",
             report_date=dt.date(2023, 1, 20),
             confirmed=True,
         )
+        # A confirmed date carries no uncertainty padding.
+        assert earnings.effective_risk_date_range(3) == (
+            dt.date(2023, 1, 20),
+            dt.date(2023, 1, 20),
+        )
 
-        # 1 day before earnings => should be blocked
-        session = dt.date(2023, 1, 19)
-        start_date, end_date = earnings.effective_risk_date_range(buffer)
-        is_blocked = start_date <= session <= end_date
+        # 1 day before earnings, against a 3-day buffer, is inside the window.
+        buffer = 3
+        days_to_earnings = (dt.date(2023, 1, 20) - dt.date(2023, 1, 19)).days
+        assert 0 <= days_to_earnings <= buffer
 
-        assert is_blocked
+    def test_entry_permitted_after_earnings(self):
+        """Entry is *not* blocked once earnings have passed.
+
+        Post-earnings drift (Strategy E) enters deliberately after the report,
+        so the buffer must be forward-looking only. Blocking after the event
+        would make that strategy unreachable.
+        """
+        from claudetrade.config import AppConfig
+        from claudetrade.strategies.e_post_earnings_drift import PostEarningsDriftStrategy
+
+        config = AppConfig()
+        strategy = PostEarningsDriftStrategy(config)
+        # Strategy E does not need to opt into event risk: it enters after the
+        # report, by which point the *next* earnings is a quarter away and the
+        # forward-looking buffer no longer binds. The flag staying False is
+        # what keeps it from also being allowed to enter just before a report.
+        assert not strategy.permits_earnings_risk
+
+        # days_to_earnings is None or negative once the report is behind us;
+        # neither satisfies the 0 <= days <= buffer block condition.
+        buffer = config.filters.block_entry_within_days_of_earnings
+        days_after = -1
+        assert not (0 <= days_after <= buffer)
 
     def test_entry_permitted_outside_buffer(self):
         """Entry permitted outside buffer window."""
@@ -52,22 +84,6 @@ class TestEarningsBuffer:
 
         assert not is_blocked
 
-    def test_entry_blocked_after_earnings(self):
-        """Entry can be blocked after earnings (if still in buffer)."""
-        buffer = 3
-
-        earnings = EarningsEvent(
-            symbol="TEST",
-            report_date=dt.date(2023, 1, 20),
-            confirmed=True,
-        )
-
-        # 1 day after earnings => still in buffer
-        session = dt.date(2023, 1, 21)
-        start_date, end_date = earnings.effective_risk_date_range(buffer)
-        is_blocked = start_date <= session <= end_date
-
-        assert is_blocked
 
 
 class TestUnconfirmedEarningsWidened:

@@ -21,7 +21,7 @@ ordinary code path -- including a future bug -- can silently rewrite history.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 from sqlalchemy import func, select
 
@@ -44,6 +44,32 @@ log = get_logger(__name__)
 
 class LedgerIntegrityError(RuntimeError):
     """A stored signal failed its integrity check, or a rule was violated."""
+
+
+@dataclass(slots=True, frozen=True)
+class RecordOutcome:
+    """Structured result of :meth:`SignalLedger.record_or_report`.
+
+    Attributes:
+        signal_id: The id that was attempted.
+        ok: ``True`` when the signal is durably stored under this id --
+            either freshly written or an idempotent re-recording of the
+            exact same content.
+        duplicate: ``True`` when ``ok`` and the row already existed with
+            matching content (nothing was written this call).
+        error: The message from the ``LedgerIntegrityError`` when ``ok`` is
+            ``False``; ``None`` otherwise. A genuine collision -- the same
+            id arriving with *different* content -- now only happens from
+            data corruption or a hash regression, since ``make_signal_id``
+            folds ``config_hash`` and ``code_version`` into the id, so a
+            routine config or code change already mints a different id
+            rather than reaching this path.
+    """
+
+    signal_id: str
+    ok: bool
+    duplicate: bool = False
+    error: str | None = None
 
 
 def signal_integrity_payload(signal: Signal) -> dict[str, object]:
@@ -75,14 +101,34 @@ def signal_integrity_payload(signal: Signal) -> dict[str, object]:
     }
 
 
-def make_signal_id(symbol: str, strategy: str, session: dt.date, config_hash: str) -> str:
+def make_signal_id(
+    symbol: str, strategy: str, session: dt.date, config_hash: str, code_version: str = ""
+) -> str:
     """Deterministic identifier.
 
     Derived from the decision inputs so that regenerating the same scan
     produces the same id -- which is what makes a duplicate insert detectable
     rather than creating a second copy of one decision.
+
+    ``config_hash`` and ``code_version`` are both part of the hash suffix.
+    Without them, re-scanning a session after a configuration change or a
+    code deploy reuses the *same* id for what is now different content: a
+    different score, a different plan, a different thesis. ``record()``
+    correctly refuses that as a same-id-different-content collision -- the
+    id claimed to name one immutable decision but two different decisions
+    showed up under it. Folding both reproducibility fields into the id
+    means a changed config or a changed build mints a genuinely different id
+    (a distinct research artifact), while an identical re-scan -- same
+    config, same code -- still reduces to the same id and dedupes silently,
+    as before.
+
+    ``code_version`` defaults to ``""`` only so the signature stays easy to
+    call positionally in tests that don't care about it; production code
+    (``SignalEngine``) always passes the real ``CODE_VERSION``. This does
+    not migrate ids already stored: a row's ``signal_id`` is whatever was
+    minted when it was written, and lookups by id never recompute it.
     """
-    return f"{session.isoformat()}-{symbol}-{strategy}-{short_hash([symbol, strategy, session.isoformat(), config_hash], 8)}"
+    return f"{session.isoformat()}-{symbol}-{strategy}-{short_hash([symbol, strategy, session.isoformat(), config_hash, code_version], 8)}"
 
 
 class SignalLedger:
@@ -171,6 +217,27 @@ class SignalLedger:
             direction=signal.direction.value,
         )
         return signal.signal_id
+
+    def record_or_report(self, signal: Signal) -> RecordOutcome:
+        """Like :meth:`record`, but reports a collision instead of raising.
+
+        Intended for a caller recording many signals from one scan (see
+        ``pipeline.scan``), where one signal's true id collision should not
+        abort every other signal's recording. ``record()`` remains the
+        stricter, raising primitive that this wraps -- callers that want the
+        "fail the whole batch" behaviour should keep calling it directly.
+        """
+        try:
+            with self.db.read_session() as session:
+                pre_existing = session.get(SignalRow, signal.signal_id) is not None
+        except Exception:  # pragma: no cover - defensive; read_session shouldn't raise here
+            pre_existing = False
+        try:
+            self.record(signal)
+        except LedgerIntegrityError as exc:
+            log.error("signal %s could not be recorded: %s", signal.signal_id, exc)
+            return RecordOutcome(signal.signal_id, ok=False, error=str(exc))
+        return RecordOutcome(signal.signal_id, ok=True, duplicate=pre_existing)
 
     def append_revision(
         self,
@@ -352,6 +419,27 @@ class SignalLedger:
         return out
 
 
+def _row_to_utc(value: dt.datetime) -> dt.datetime:
+    """Coerce a datetime read back from the database to timezone-aware UTC.
+
+    Every datetime is written through ``ensure_utc()`` (see ``record``), so
+    the value stored is always a tz-aware UTC instant. SQLite, however, has
+    no native timezone type: it stores the ``isoformat()`` text SQLAlchemy
+    hands it and -- depending on driver version -- can hand back a *naive*
+    ``datetime`` on read. Comparing that naive value against the tz-aware
+    original that the integrity hash was computed over then never matches,
+    so ``get(..., verify=True)`` raised for every legitimately stored signal
+    regardless of tampering. Since the value is always UTC by construction,
+    a naive read-back is missing tzinfo, not a different instant -- so it is
+    reattached rather than converted. A backend that *does* preserve tzinfo
+    (e.g. Postgres) is handled by normalising to UTC instead of overwriting
+    whatever offset it reports.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.UTC)
+    return value.astimezone(dt.UTC)
+
+
 def _row_to_signal(row: SignalRow) -> Signal:
     """Rehydrate a domain ``Signal`` from its stored row."""
     plan_data = dict(row.plan or {})
@@ -373,7 +461,7 @@ def _row_to_signal(row: SignalRow) -> Signal:
     components = ComponentScores(**dict(row.components or {}))
     return Signal(
         signal_id=row.signal_id,
-        created_at=row.created_at,
+        created_at=_row_to_utc(row.created_at),
         session=row.session,
         symbol=row.symbol,
         company_name=row.company_name,
@@ -381,7 +469,7 @@ def _row_to_signal(row: SignalRow) -> Signal:
         direction=Direction(row.direction),
         status=SignalStatus(row.initial_status),
         reference_price=row.reference_price,
-        price_as_of=row.price_as_of,
+        price_as_of=_row_to_utc(row.price_as_of),
         overall_score=row.overall_score,
         confidence=row.confidence,
         components=components,

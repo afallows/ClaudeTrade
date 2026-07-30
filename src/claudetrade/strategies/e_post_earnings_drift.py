@@ -9,19 +9,39 @@ never before the announcement. Pre-announcement positioning is a coin flip
 dressed as analysis, and it is also the easiest place for earnings-date leakage
 to contaminate a backtest.
 
-Two settling conditions must both hold:
-
-1. At least ``MIN_DAYS_AFTER`` sessions have elapsed since the report.
-2. The bar range has normalised relative to the earnings-day spike.
-
-Direction comes from the surprise **and** must agree with what price and
-sentiment have actually done since. A positive surprise that the market sold is
-not drift; it is a rejection, and the strategy declines.
+Direction comes from the surprise **and** must agree with what price has
+actually done since. A positive surprise that the market sold is not drift; it
+is a rejection, and the strategy still declines outright on that -- see below.
 
 Known weaknesses: the drift effect has weakened over time as it became widely
 known, and it is sensitive to how "surprise" is measured. Whether a vendor's
 consensus was the true pre-announcement consensus is not verifiable here, so
-surprise magnitude is treated as approximate.
+surprise magnitude is treated as approximate -- which is exactly why it is now
+scored against the symbol's OWN trailing surprise history rather than a bare
+5% constant (a 5% surprise is routine for one name and enormous for another).
+
+Scoring model (ADR-0007 Decision 2)
+------------------------------------
+Previously an AND-chain of roughly eight absolute-threshold checks: a fixed
+2-12 day settling window, a fixed 5% surprise floor, a fixed 3% event-move
+floor, a fixed volatility-settled ratio, and a fixed proximity-to-the-9-day-
+average gap-fading test. Now a
+:class:`~claudetrade.strategies.scoring_utils.ScoreAccumulator`: the settling
+window becomes a scored sweet-spot band, surprise magnitude is ranked against
+the symbol's own trailing earnings-surprise history (from ``ctx.earnings``,
+which is already point-in-time filtered by knowledge date -- no look-ahead is
+introduced by reading it further back), and the volatility/gap checks become
+continuous ramps.
+
+Two conditions stay hard vetoes because they are not threshold judgements at
+all: **the market's reaction contradicting the surprise's sign** (a positive
+surprise the market sold is not drift, it is a rejection -- there is no
+partial credit for a thesis that has been falsified) and the ordinary
+earnings-window / insufficient-history / illiquidity / manipulation-risk set
+shared with the other strategies. A next earnings report landing inside the
+expected holding window is folded into the earnings-window veto, since it is
+the same underlying risk (holding through an unmodelled event) as the entry
+buffer.
 """
 
 from __future__ import annotations
@@ -29,12 +49,19 @@ from __future__ import annotations
 from claudetrade.domain import Direction
 from claudetrade.strategies.base import Strategy, StrategyContext, StrategyProposal
 from claudetrade.strategies.registry import register_strategy
+from claudetrade.strategies.scoring_utils import (
+    ScoreAccumulator,
+    band_credit,
+    percentile_rank,
+    ramp_down,
+    ramp_up,
+)
 
 
 @register_strategy
 class PostEarningsDriftStrategy(Strategy):
     name = "post_earnings_drift"
-    version = "v1"
+    version = "v2"
     description = "Drift continuation after a settled earnings surprise"
     direction_bias = Direction.LONG
     min_history_bars = 80
@@ -42,67 +69,60 @@ class PostEarningsDriftStrategy(Strategy):
     permits_earnings_risk = False
     requires_sentiment = False
 
-    #: Settling window after the report.
+    #: Settling window after the report -- sweet-spot band, not a hard cutoff.
     MIN_DAYS_AFTER = 2
     MAX_DAYS_AFTER = 12
-    #: Surprise magnitude, in percent, needed to be worth trading.
-    MIN_SURPRISE_PCT = 5.0
-    #: Earnings-day move that qualifies as a genuine repricing.
-    MIN_EVENT_MOVE_PCT = 3.0
-    #: Volatility must have normalised to at most this multiple of average.
-    MAX_SETTLED_RANGE_RATIO = 1.6
-    #: Refuse to open a drift trade this close to the *next* report.
+    DAYS_AFTER_TAPER = 2
+    #: Refuse to open a drift trade this close to the *next* report (folded
+    #: into the earnings-window hard veto -- same risk class as the entry buffer).
     MIN_DAYS_TO_NEXT_EARNINGS = 5
+    #: Volatility must have normalised to at most roughly this multiple of
+    #: average before the settled-volatility score component saturates.
+    SETTLED_RANGE_RATIO_TARGET = 1.6
     ATR_STOP_MULTIPLE = 2.0
 
+    # --- score weights --------------------------------------------------------
+    # See Strategy A's BASELINE comment.
+    BASELINE = 24.0
+    W_DAYS_AFTER = 14.0
+    W_SURPRISE_PCTL = 18.0
+    W_EVENT_MOVE = 16.0
+    W_VOLATILITY_SETTLED = 12.0
+    W_HOLDING_THE_MOVE = 10.0
+    W_SENTIMENT_ALIGNED = 10.0
+    PENALTY_SENTIMENT_AGAINST = -12.0
+
     def evaluate(self, ctx: StrategyContext) -> StrategyProposal | None:
+        # --- hard vetoes ---------------------------------------------------
         if not self.has_sufficient_history(ctx):
             self.decline(ctx, "insufficient_history", f"{len(ctx.bars)} bars")
+            return None
+        adv = ctx.feature("avg_dollar_volume_20", 0.0)
+        if adv < self.config.filters.min_avg_dollar_volume_usd:
+            self.decline(ctx, "illiquid", f"avg dollar volume ${adv:,.0f}")
             return None
 
         event = ctx.last_earnings()
         if event is None:
             self.decline(ctx, "no_prior_earnings")
             return None
-
         days_after = ctx.days_since_earnings()
         if days_after is None:
             self.decline(ctx, "unknown_earnings_timing")
             return None
-        if days_after < self.MIN_DAYS_AFTER:
-            # Entering into the immediate post-report volatility is not drift
-            # capture; it is paying the widest spreads of the quarter.
-            self.decline(ctx, "not_settled", f"{days_after}d since the report")
-            return None
-        if days_after > self.MAX_DAYS_AFTER:
-            self.decline(ctx, "drift_window_passed", f"{days_after}d since the report")
-            return None
-
-        # The *next* report must not land inside the expected holding period.
-        days_to_next = ctx.days_to_earnings()
-        if days_to_next is not None and days_to_next < self.MIN_DAYS_TO_NEXT_EARNINGS:
-            self.decline(ctx, "next_earnings_too_close", f"{days_to_next}d")
-            return None
-
         if event.surprise_pct is None:
             self.decline(ctx, "no_surprise_data")
             return None
         surprise = event.surprise_pct
-        if abs(surprise) < self.MIN_SURPRISE_PCT:
-            self.decline(ctx, "surprise_too_small", f"{surprise:+.1f}%")
-            return None
 
-        # --- the market's own reaction --------------------------------------
         event_move = self._event_day_move(ctx, event.report_date)
         if event_move is None:
             self.decline(ctx, "no_event_bar")
             return None
-        if abs(event_move) < self.MIN_EVENT_MOVE_PCT:
-            self.decline(ctx, "muted_reaction", f"{event_move:+.1f}% on the event bar")
-            return None
 
         # Surprise and reaction must agree. A positive surprise that was sold
-        # tells you the number was not the news.
+        # tells you the number was not the news -- this falsifies the thesis
+        # outright, it is not a matter of degree.
         if (surprise > 0) != (event_move > 0):
             self.decline(
                 ctx,
@@ -116,27 +136,62 @@ class PostEarningsDriftStrategy(Strategy):
             self.decline(ctx, "shorts_disabled")
             return None
 
-        # --- volatility must have settled -------------------------------------
-        settled_ratio = self._range_ratio(ctx)
-        if settled_ratio > self.MAX_SETTLED_RANGE_RATIO:
-            self.decline(ctx, "still_volatile", f"range {settled_ratio:.2f}x average")
+        # The *next* report must not land inside the expected holding period --
+        # the same earnings-risk class as the entry buffer, so it is a veto too.
+        days_to_next = ctx.days_to_earnings()
+        if days_to_next is not None and days_to_next < self.MIN_DAYS_TO_NEXT_EARNINGS:
+            self.decline(ctx, "earnings_window", f"next report in {days_to_next}d")
             return None
 
-        # --- price must be holding the gap, not filling it ---------------------
+        sentiment = ctx.sentiment
+        if sentiment is not None and sentiment.manipulation_risk > self.config.filters.max_manipulation_risk:
+            self.decline(ctx, "manipulation_risk", f"{sentiment.manipulation_risk:.2f}")
+            return None
+
+        # --- score accumulation ---------------------------------------------
+        cal = self.config.calibration
+        score = ScoreAccumulator(baseline=self.BASELINE)
+
+        score.add(
+            "settling_window",
+            band_credit(float(days_after), self.MIN_DAYS_AFTER, self.MAX_DAYS_AFTER, self.DAYS_AFTER_TAPER),
+            self.W_DAYS_AFTER,
+        )
+
+        past_surprises = [
+            abs(e.surprise_pct)
+            for e in ctx.earnings
+            if e.surprise_pct is not None and e.report_date < event.report_date
+        ]
+        surprise_pctl = percentile_rank(past_surprises, abs(surprise))
+        score.add(
+            "surprise_magnitude_pctl",
+            ramp_up(surprise_pctl, cal.drift_reaction_percentile - 0.30, cal.drift_reaction_percentile),
+            self.W_SURPRISE_PCTL,
+        )
+
+        score.add("event_move_magnitude", ramp_up(abs(event_move), 1.5, 5.0), self.W_EVENT_MOVE)
+
+        settled_ratio = self._range_ratio(ctx)
+        score.add(
+            "volatility_settled",
+            ramp_down(settled_ratio, self.SETTLED_RANGE_RATIO_TARGET * 1.3, self.SETTLED_RANGE_RATIO_TARGET),
+            self.W_VOLATILITY_SETTLED,
+        )
+
         price = ctx.price
         atr = ctx.atr
         ema_9 = ctx.feature("ema_9", 0.0)
-        if direction is Direction.LONG and ema_9 > 0 and price < ema_9:
-            self.decline(ctx, "gap_fading", "trading below the 9-day average")
-            return None
-        if direction is Direction.SHORT and ema_9 > 0 and price > ema_9:
-            self.decline(ctx, "gap_fading", "trading above the 9-day average")
-            return None
+        if ema_9 > 0:
+            signed_gap = (price - ema_9) if direction is Direction.LONG else (ema_9 - price)
+            score.add("holding_the_move", ramp_up(signed_gap, -0.01 * price, 0.005 * price), self.W_HOLDING_THE_MOVE)
+        else:
+            score.add("holding_the_move", 0.5, self.W_HOLDING_THE_MOVE)
 
         evidence = [
             f"{'Positive' if surprise > 0 else 'Negative'} EPS surprise of {surprise:+.1f}% "
-            f"reported {days_after} sessions ago"
-            + (" (confirmed date)" if event.confirmed else " (estimated date)"),
+            f"({surprise_pctl:.0%} percentile of its own trailing surprises) reported {days_after} "
+            "sessions ago" + (" (confirmed date)" if event.confirmed else " (estimated date)"),
             f"Market repriced {event_move:+.1f}% on the event bar",
             f"Volatility settled: current range {settled_ratio:.2f}x its average",
             f"Price holding the move at {price:.2f}, "
@@ -149,28 +204,30 @@ class PostEarningsDriftStrategy(Strategy):
         if not event.confirmed:
             risks.append("The earnings date was estimated rather than confirmed")
 
-        setup_score = 55.0 + min(15.0, (abs(surprise) - self.MIN_SURPRISE_PCT) * 0.5)
-        setup_score += min(8.0, (abs(event_move) - self.MIN_EVENT_MOVE_PCT) * 0.8)
-
-        sentiment = ctx.sentiment
         if self.sentiment_available(ctx) and sentiment is not None:
             aligned = (sentiment.raw_sentiment > 0) == (direction is Direction.LONG)
-            if not aligned and abs(sentiment.raw_sentiment) > 0.3:
-                self.decline(
-                    ctx,
-                    "sentiment_contradicts",
-                    f"sentiment {sentiment.raw_sentiment:+.2f} against a "
-                    f"{direction.value} drift",
-                )
-                return None
             if aligned:
-                setup_score += 7.0
+                score.add(
+                    "sentiment_aligned", ramp_up(abs(sentiment.raw_sentiment), 0.05, 0.35), self.W_SENTIMENT_ALIGNED
+                )
                 evidence.append(
-                    f"Discussion agrees with the drift direction "
-                    f"({sentiment.raw_sentiment:+.2f})"
+                    f"Discussion agrees with the drift direction ({sentiment.raw_sentiment:+.2f})"
+                )
+            elif abs(sentiment.raw_sentiment) > 0.15:
+                score.penalty(
+                    "sentiment_against",
+                    self.PENALTY_SENTIMENT_AGAINST * ramp_up(abs(sentiment.raw_sentiment), 0.15, 0.5),
+                )
+                risks.append(
+                    f"Discussion ({sentiment.raw_sentiment:+.2f}) is not aligned with the drift direction"
                 )
         else:
             evidence.append("Social sentiment unavailable: scored on price and surprise only")
+
+        threshold = cal.proposal_score_threshold
+        if score.score < threshold:
+            self.decline(ctx, "score_below_threshold", score.summary(threshold))
+            return None
 
         # --- levels ------------------------------------------------------------
         if direction is Direction.LONG:
@@ -211,7 +268,7 @@ class PostEarningsDriftStrategy(Strategy):
             expected_holding_days=15,
             time_stop_days=20,
             trailing_stop_atr=2.5,
-            setup_score=max(0.0, min(100.0, setup_score)),
+            setup_score=score.score,
             evidence=evidence,
             invalidation=[
                 "Full retracement of the earnings-day move",
@@ -227,14 +284,16 @@ class PostEarningsDriftStrategy(Strategy):
             ],
             risks=risks,
             thesis_hint=(
-                f"{ctx.symbol} reported a {surprise:+.1f}% surprise {days_after} sessions ago, "
-                f"repriced {event_move:+.1f}%, and is holding the move as volatility settles."
+                f"{ctx.symbol} reported a {surprise:+.1f}% surprise ({surprise_pctl:.0%} percentile) "
+                f"{days_after} sessions ago, repriced {event_move:+.1f}%, and is holding the move as "
+                "volatility settles."
             ),
             extras={
                 "surprise_pct": surprise,
                 "event_move_pct": event_move,
                 "days_after_earnings": days_after,
                 "earnings_confirmed": event.confirmed,
+                "score_breakdown": score.breakdown,
             },
         )
 

@@ -409,6 +409,16 @@ AMBIGUOUS_TICKER_WORDS: frozenset[str] = frozenset(
 #: token really is being used as a ticker rather than an ordinary word.
 FINANCE_CONTEXT_TERMS: frozenset[str] = frozenset(
     {
+        # Core trading verbs. Generic in isolation, but this set is only ever
+        # consulted in the small window around a candidate ticker, where
+        # "buy AAPL" is exactly the context that should raise confidence. Kept
+        # alongside the equally generic "long"/"short"/"position" already here.
+        "buy",
+        "buying",
+        "bought",
+        "sell",
+        "selling",
+        "sold",
         "calls",
         "puts",
         "shares",

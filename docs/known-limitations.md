@@ -14,23 +14,54 @@ This document lists what is NOT implemented in the current codebase.
 
 ### CLI
 
-- **Status**: Not implemented
-- **Current state**: Entry point defined in `pyproject.toml` but no commands are defined
-- **Workaround**: Use the Python API directly
-- **Effort to implement**: Medium; CLI commands (refresh, scan, backtest, export) would wrap the pipeline API
+- **Status**: Implemented
+- **Current state**: `claudetrade` (see `src/claudetrade/cli.py`) provides `version`, `init`,
+  `status`, `probe`, `refresh`, `scan`, `backtest`, `ui`, `secrets set|list|delete`,
+  `paper status|positions|kill-switch`, `db migrate|backup|restore`, and
+  `verify ledger|survivorship`. Run `claudetrade --help` for the full list.
+- **Not implemented**: A standalone `claudetrade export` command and a
+  `claudetrade validate-config` command do not exist. Export is a flag on
+  `claudetrade backtest` (`--report`, `--export`) rather than its own command.
 
 ### Streamlit UI Dashboard
 
-- **Status**: Not implemented (optional dependency listed)
-- **Workaround**: Use the Python API or export results to spreadsheets
-- **Effort to implement**: High; requires UI components for signals, trades, metrics, settings
+- **Status**: Implemented
+- **Current state**: `claudetrade ui` launches a five-screen Streamlit dashboard
+  (`src/claudetrade/ui/`: dashboard, scanner, ticker detail, backtesting, settings).
+- **Known gap**: The backtesting screen's "Export as CSV" / "Export as Excel" buttons
+  are placeholders — they show an informational message rather than writing a file
+  (`src/claudetrade/ui/screens/backtesting.py`). Use `claudetrade backtest --export <dir>`
+  from the CLI for a working export, or `claudetrade.backtest.reporting.export_csv` /
+  `export_excel` directly.
+
+### Opening a Paper Trade
+
+- **Status**: Partially implemented
+- **Current state**: `PaperBroker.submit_signal` (`src/claudetrade/paper/broker.py`) and the
+  underlying `PaperPortfolio` accounting (`src/claudetrade/paper/portfolio.py`) are fully
+  implemented and covered by tests, but neither the CLI nor the UI exposes a way to call it.
+  `claudetrade paper status/positions/kill-switch` only inspect the account (which
+  auto-creates itself with `risk.account_size_usd` starting cash on first access) and gate
+  new entries; none of them opens a position.
+- **Workaround**: Call `PaperBroker.submit_signal(...)` (or the guarded `submit_order(...)`
+  from the `BrokerProvider` interface it implements) from the Python API directly — see
+  `tests/test_broker_contract.py::TestPaperBrokerLifecycle` for working examples — or
+  generate signals with `claudetrade scan` and use those as an entry list for manual
+  paper tracking.
+- **Effort to implement**: Low; add a `claudetrade paper submit <symbol>` command (or a
+  "Paper trade this" button in the UI scanner/dashboard) that looks up a recorded signal
+  and calls the existing `submit_signal`.
 
 ### Background Scheduler
 
-- **Status**: APScheduler is included but no scheduled tasks are implemented
-- **Current state**: Config has scheduler settings but they are ignored
-- **Workaround**: Use cron (Linux/macOS) or Task Scheduler (Windows) to call the pipeline
-- **Effort to implement**: Low; hook up the config settings to APScheduler tasks
+- **Status**: Not implemented
+- **Current state**: `APScheduler` is a declared dependency and `SchedulerConfig` exists
+  in `src/claudetrade/config.py`, but no code constructs an `apscheduler` scheduler or
+  registers a job; the config settings are inert. There is no `claudetrade` subcommand
+  that runs continuously.
+- **Workaround**: Use cron (Linux/macOS) or Task Scheduler (Windows) to call
+  `claudetrade refresh` / `claudetrade scan` on a timer.
+- **Effort to implement**: Low; hook up the config settings to APScheduler jobs.
 
 ### Machine Learning Signal Fusion
 
@@ -231,15 +262,19 @@ This document lists what is NOT implemented in the current codebase.
 
 ## Future Work (Roadmap)
 
-1. **CLI commands** (refresh, scan, backtest, export, secrets)
-2. **Streamlit dashboard** (signals, trades, settings, metrics)
-3. **Background scheduler** (APScheduler integration)
-4. **Live trading** (broker adapter pattern; starting with Alpaca or Interactive Brokers)
-5. **Intraday bars and strategies** (minute-bar provider integration)
-6. **ML-based signal fusion** (scikit-learn classification)
-7. **Options support** (if demand exists)
-8. **International markets** (extend beyond US equities)
-9. **Tax efficiency reporting** (wash-sale, holding-period classification)
-10. **Mobile app** (real-time alerts and portfolio view)
+1. **Background scheduler** (wire `SchedulerConfig` up to APScheduler jobs)
+2. **Live trading** (a real `BrokerProvider` implementation; the ABC and a
+   non-functional `NullLiveBroker` stub already exist in `src/claudetrade/brokers/`,
+   starting with Alpaca or Interactive Brokers)
+3. **Wire up the UI's backtest export buttons** to the existing `export_csv`/`export_excel` functions
+4. **Intraday bars and strategies** (minute-bar provider integration)
+5. **ML-based signal fusion** (scikit-learn classification)
+6. **Options support** (if demand exists)
+7. **International markets** (extend beyond US equities)
+8. **Tax efficiency reporting** (wash-sale, holding-period classification)
+9. **Mobile app** (real-time alerts and portfolio view)
+
+CLI commands and the Streamlit dashboard shipped and are covered above under
+"Unimplemented Features" only where a specific piece (like UI export) still has a gap.
 
 Priority is determined by user feedback and feature requests.
