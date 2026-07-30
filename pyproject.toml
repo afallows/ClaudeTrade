@@ -58,7 +58,15 @@ Documentation = "https://github.com/afallows/claudetrade/tree/main/docs"
 where = ["src"]
 
 [tool.setuptools.package-data]
-claudetrade = ["py.typed", "resources/*.json", "resources/*.csv", "data/universes/*.csv"]
+claudetrade = [
+    "py.typed",
+    "resources/*.json",
+    "resources/*.csv",
+    "data/universes/*.csv",
+    # The built React SPA ships inside the wheel so end users never need Node.
+    "webapi/static/*",
+    "webapi/static/assets/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
