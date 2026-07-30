@@ -13,7 +13,10 @@ from claudetrade.webapi.app import create_app
 
 @pytest.fixture
 def client(tmp_app_config: AppConfig, tmp_db: Database) -> TestClient:
-    return TestClient(create_app(tmp_app_config, pipeline=Pipeline(tmp_app_config, tmp_db)))
+    return TestClient(
+        create_app(tmp_app_config, pipeline=Pipeline(tmp_app_config, tmp_db)),
+        base_url="http://127.0.0.1",
+    )
 
 
 def test_credentials_never_return_secret(client, monkeypatch) -> None:
@@ -44,3 +47,21 @@ def test_diagnostics_has_price_and_sentiment_pipelines(client) -> None:
     assert {item["kind"] for item in body["pipelines"]} == {"stock_price", "sentiment"}
     assert all(item["status"] in {"reachable", "configured", "not_configured"} for item in body["pipelines"])
     assert all("secret" not in item for item in body["pipelines"])
+
+
+class TestHostValidation:
+    """DNS-rebinding guard: non-local Host headers are rejected.
+
+    The API binds 127.0.0.1, but a hostile page can point its own hostname at
+    127.0.0.1 and the browser will send the request with that Host -- CORS
+    never applies because it is same-origin from the browser's view. With a
+    credential-writing endpoint on this server, Host must be validated.
+    """
+
+    def test_rebound_host_is_rejected(self, client):
+        response = client.get("/api/meta", headers={"host": "evil.example.com"})
+        assert response.status_code == 400
+
+    def test_localhost_host_is_accepted(self, client):
+        response = client.get("/api/meta", headers={"host": "127.0.0.1:8765"})
+        assert response.status_code == 200

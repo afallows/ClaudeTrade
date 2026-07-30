@@ -19,7 +19,7 @@ from claudetrade.webapi.app import create_app
 def client(tmp_app_config: AppConfig, tmp_db: Database) -> TestClient:
     pipeline = Pipeline(tmp_app_config, tmp_db)
     app = create_app(tmp_app_config, pipeline=pipeline)
-    return TestClient(app)
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 def test_meta_reports_code_version_and_disclaimer(client: TestClient):
@@ -61,7 +61,7 @@ def test_root_without_a_built_frontend_is_a_clean_404(tmp_app_config, tmp_db):
     the app must still construct and serve the API, just not the SPA shell."""
     pipeline = Pipeline(tmp_app_config, tmp_db)
     app = create_app(tmp_app_config, pipeline=pipeline)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1")
     resp = client.get("/")
     # Either genuinely not mounted (404) or serving the real built index --
     # both are acceptable; what must never happen is a 500.

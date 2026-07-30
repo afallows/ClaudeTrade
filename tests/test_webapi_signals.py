@@ -25,7 +25,7 @@ from claudetrade.webapi.app import create_app
 def client(tmp_app_config: AppConfig, tmp_db: Database) -> TestClient:
     pipeline = Pipeline(tmp_app_config, tmp_db)
     app = create_app(tmp_app_config, pipeline=pipeline)
-    return TestClient(app)
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 def _record(db: Database, sig: Signal) -> None:

@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from claudetrade.config import AppConfig
 from claudetrade.pipeline import Pipeline
@@ -44,6 +45,16 @@ def create_app(config: AppConfig, pipeline: Pipeline | None = None) -> FastAPI:
         docs_url="/api/docs",
         redoc_url="/api/redoc",
         openapi_url="/api/openapi.json",
+    )
+    # The server binds 127.0.0.1 only, but binding alone does not stop DNS
+    # rebinding: a hostile page can point its own hostname at 127.0.0.1 and
+    # the browser will happily send requests here with that hostname in the
+    # Host header -- same-origin as far as the browser is concerned, so CORS
+    # never enters into it. Since this API can WRITE credentials
+    # (PUT /api/credentials/*), reject any request whose Host is not a local
+    # name. Port numbers are ignored by the middleware's comparison.
+    app.add_middleware(
+        TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]"]
     )
     app.state.config = config
     app.state.pipeline = pipeline or Pipeline.bootstrap(config)
