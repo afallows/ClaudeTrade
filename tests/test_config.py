@@ -10,12 +10,24 @@ import pytest
 from claudetrade.config import AppConfig, FilterConfig, PathsConfig, RiskConfig, TradingModeConfig
 
 
-def test_live_stooq_market_data_is_the_default() -> None:
-    """Fresh installs must not silently generate fabricated market tickers."""
+def test_live_tipranks_market_data_is_the_default() -> None:
+    """Fresh installs must not silently generate fabricated market tickers.
+
+    TipRanks is primary (real market caps, reference data and earnings from
+    one unauthenticated widget call per symbol); Yahoo's chart endpoint is
+    the bar fallback, tried ahead of TipRanks' own close-only last-resort
+    bars (see ``providers.registry.FallbackMarketProvider.get_daily_bars``).
+    Stooq is deliberately NOT a default fallback -- a real probe found it now
+    sits behind an anti-bot browser-challenge wall (see
+    ``providers.market.stooq``'s module docstring); it remains available as
+    an explicit opt-in.
+    """
     config = AppConfig()
 
-    assert config.market_data.provider == "stooq"
+    assert config.market_data.provider == "tipranks"
     assert config.market_data.fallbacks == ["yahoo", "csv"]
+    assert "stooq" not in config.market_data.fallbacks
+    assert config.earnings.provider == "tipranks"
 
 
 class TestPathsConfigExpandUser:

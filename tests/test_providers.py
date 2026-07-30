@@ -20,12 +20,13 @@ history would have silently produced a single bar per symbol.
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 
 import pytest
 
 from claudetrade.config import MarketDataConfig, RedditConfig, XConfig
 from claudetrade.domain import SocialSource
-from claudetrade.providers.base import NotConfiguredError, ProviderError
+from claudetrade.providers.base import NotConfiguredError, ProviderError, SourceBlockedError
 from claudetrade.providers.market.stooq import StooqMarketProvider
 
 # --------------------------------------------------------------------------
@@ -52,6 +53,16 @@ AAPL.US,2024-01-08,22:00:07,182.09,185.60,181.50,185.56,59144500
 #: plain-text body, so it cannot be caught by status code alone.
 STOOQ_NO_DATA = "N/D"
 STOOQ_QUOTA = "Exceeded the daily hits limit"
+
+#: Verbatim browser-challenge page (HTTP 200, HTML/JS body) captured by a
+#: real probe from the owner's machine: stooq now serves this SHA-256
+#: proof-of-work challenge for both a US and a TSX symbol request. The exact
+#: JS is irrelevant to the adapter -- only the HTML shape (detected via
+#: content-type and/or the leading <!doctype/<html marker) matters -- but
+#: testing against the real bytes keeps the detection honest.
+STOOQ_CHALLENGE_HTML = (
+    Path(__file__).parent / "fixtures" / "stooq" / "challenge_page.html"
+).read_text(encoding="utf-8")
 
 
 class _FakeResponse:
@@ -191,6 +202,166 @@ def test_stooq_requests_the_history_endpoint_with_a_bounded_range(monkeypatch):
     assert captured["params"]["d2"] == "20240131"
     assert captured["client_kwargs"]["verify"] is True, "TLS verification must stay on"
     assert len(result["AAPL"]) == 5
+
+
+def test_stooq_sends_a_browser_like_user_agent(monkeypatch):
+    """Root-cause fix for the real "stooq returned 404 for AAPL" refresh
+    failure: the request carried no ``User-Agent`` at all (httpx's own
+    generic default went out on the wire instead), and stooq's edge answers
+    that default with a 404. The symbol/suffix mapping was already correct
+    (see the exact-URL tests below); the missing header is what broke it."""
+    import httpx
+
+    captured: dict[str, object] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            return _FakeResponse(STOOQ_DAILY_CSV)
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    provider.get_daily_bars(["AAPL"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+
+    headers = captured["client_kwargs"]["headers"]
+    assert headers.get("User-Agent"), "a User-Agent header must be sent -- stooq 404s a bare default"
+    assert "python-httpx" not in headers["User-Agent"].lower()
+
+
+def test_stooq_get_daily_bars_requests_exact_url_for_a_us_symbol(monkeypatch):
+    """End-to-end (not just the pure ``stooq_symbol()`` unit test): the real
+    ``get_daily_bars`` fetch path must request the lower-cased, ``.us``-
+    suffixed symbol for a plain US ticker."""
+    import httpx
+
+    captured: dict[str, object] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            captured["url"] = url
+            captured["params"] = dict(params)
+            return _FakeResponse(STOOQ_DAILY_CSV)
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    provider.get_daily_bars(["AAPL"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+
+    assert captured["url"] == "https://stooq.com/q/d/l/"
+    assert captured["params"] == {
+        "s": "aapl.us",
+        "d1": "20240101",
+        "d2": "20240131",
+        "i": "d",
+    }
+
+
+def test_stooq_get_daily_bars_requests_exact_url_for_a_tsx_symbol(monkeypatch):
+    """Same end-to-end assertion for a Canadian (TSX) symbol resolved from
+    the packaged seed universe's exchange column (no explicit exchange
+    passed to ``get_daily_bars`` -- that is the real calling convention)."""
+    import httpx
+
+    captured: dict[str, object] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            captured["url"] = url
+            captured["params"] = dict(params)
+            return _FakeResponse(STOOQ_DAILY_CSV)
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    provider.get_daily_bars(["SHOP"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+
+    assert captured["url"] == "https://stooq.com/q/d/l/"
+    assert captured["params"] == {
+        "s": "shop.to",
+        "d1": "20240101",
+        "d2": "20240131",
+        "i": "d",
+    }
+
+
+def test_stooq_browser_challenge_page_raises_source_blocked_error(monkeypatch):
+    """A real probe from the owner's machine found stooq now answers both a
+    US and a TSX symbol request with an HTTP 200 HTML/JavaScript
+    proof-of-work challenge page instead of CSV. Since the status code alone
+    (200) cannot distinguish this from a real response, the adapter must
+    detect the HTML shape and fail closed rather than feeding it to the CSV
+    parser -- never solving the challenge, never retrying in a loop."""
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            return _FakeResponse(
+                STOOQ_CHALLENGE_HTML, headers={"content-type": "text/html; charset=utf-8"}
+            )
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    with pytest.raises(SourceBlockedError):
+        provider.get_daily_bars(["AAPL"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+    assert "blocked (browser challenge)" in provider.status().last_error
+
+
+def test_stooq_browser_challenge_detected_even_without_html_content_type(monkeypatch):
+    """Some challenge responses might not carry an explicit ``text/html``
+    content-type -- the leading ``<!doctype``/``<html`` body marker must
+    also be checked."""
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            return _FakeResponse(STOOQ_CHALLENGE_HTML, headers={})
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    with pytest.raises(SourceBlockedError):
+        provider.get_daily_bars(["AAPL"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
 
 
 def test_stooq_network_failure_is_a_retryable_provider_error(monkeypatch):

@@ -162,31 +162,50 @@ class DataIngestor:
                     resolved[symbol] = cap
 
         enriched: list[SecurityInfo] = []
+        #: Resolved THIS run (a configured provider returned a fresh figure).
+        resolved_this_run = 0
+        #: Not resolved this run, but already carried a cap from a prior run
+        #: or a seed source -- NOT the same thing as "unresolved", and must
+        #: not be counted as such: this is exactly the accounting bug a real
+        #: Windows refresh surfaced ("resolved 0/2417 symbols (1 unresolved,
+        #: flagged)" -- 0 resolved but only 1 flagged silently implied the
+        #: other 2,416 had been resolved *this run*, when in fact they simply
+        #: already had a pre-existing/seed cap that this run did nothing to).
+        already_had_cap = 0
+        #: Genuinely unresolved -- no cap at all, seed or fresh -- and always
+        #: flagged below regardless of these counts.
         unresolved_count = 0
         for security in securities:
             cap = resolved.get(security.symbol)
             if cap is not None:
                 enriched.append(replace(security, market_cap_usd=cap))
+                resolved_this_run += 1
                 continue
             enriched.append(security)
-            if security.market_cap_usd is None:
-                unresolved_count += 1
-                report.quality.add(
-                    DataQualitySeverity.WARNING,
-                    "unknown_market_cap",
-                    f"{security.symbol}: market cap could not be established by any "
-                    "configured market-data provider this refresh; "
-                    f"unknown_cap_policy={self.config.universe.unknown_cap_policy!r} decides "
-                    "whether it stays in the scannable universe -- it is not silently dropped "
-                    "here regardless of that policy.",
-                    symbol=security.symbol,
-                )
-
-        if unresolved_count:
-            log.info(
-                "market-cap enrichment: resolved %d/%d symbols (%d unresolved, flagged)",
-                len(resolved), len(securities), unresolved_count,
+            if security.market_cap_usd is not None:
+                already_had_cap += 1
+                continue
+            unresolved_count += 1
+            report.quality.add(
+                DataQualitySeverity.WARNING,
+                "unknown_market_cap",
+                f"{security.symbol}: market cap could not be established by any "
+                "configured market-data provider this refresh; "
+                f"unknown_cap_policy={self.config.universe.unknown_cap_policy!r} decides "
+                "whether it stays in the scannable universe -- it is not silently dropped "
+                "here regardless of that policy.",
+                symbol=security.symbol,
             )
+
+        # Logged unconditionally (not just when something is unresolved) so
+        # the accounting always tells the truth about all three buckets,
+        # including the common "nothing new resolved, but nothing is actually
+        # missing either" case that a provider outage produces.
+        log.info(
+            "market-cap enrichment: resolved %d/%d symbols this run "
+            "(%d already had a cap, %d unresolved and flagged)",
+            resolved_this_run, len(securities), already_had_cap, unresolved_count,
+        )
         return enriched
 
     def _market_cap_sources(self) -> list[object]:

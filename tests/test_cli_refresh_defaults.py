@@ -91,15 +91,16 @@ def test_init_reports_active_universe_and_live_provider(cli_env):
     assert "universe:" in result.output
     assert "us_default" in result.output
     assert "ca_default" in result.output
-    assert "provider=stooq" in result.output
-    assert "live; Stooq is the default" in result.output
+    assert "provider=tipranks" in result.output
+    assert "live; TipRanks is the default" in result.output
 
 
-def test_stooq_is_the_default_market_provider(cli_env):
+def test_tipranks_is_the_default_market_provider(cli_env):
     """A fresh install must not silently populate fabricated market tickers."""
     from claudetrade.config import get_config
 
     runner.invoke(app, ["init"])
     config = get_config(reload=True)
-    assert config.market_data.provider == "stooq"
+    assert config.market_data.provider == "tipranks"
     assert config.market_data.fallbacks == ["yahoo", "csv"]
+    assert config.earnings.provider == "tipranks"

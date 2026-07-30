@@ -29,6 +29,7 @@ from claudetrade.providers.earnings.synthetic import SyntheticEarningsProvider
 from claudetrade.providers.market.csv_provider import CSVMarketProvider
 from claudetrade.providers.market.stooq import StooqMarketProvider
 from claudetrade.providers.market.synthetic import SyntheticMarketProvider
+from claudetrade.providers.market.tipranks import TipRanksProvider
 from claudetrade.providers.market.yahoo import YahooMarketProvider
 
 log = logging.getLogger(__name__)
@@ -42,16 +43,29 @@ _MARKET_PROVIDERS: dict[str, type[MarketDataProvider]] = {
     "synthetic": SyntheticMarketProvider,
     "csv": CSVMarketProvider,
     "stooq": StooqMarketProvider,
-    # Yahoo is the one adapter with get_market_caps support, which the
-    # runtime >= $1B universe filter (ADR-0008 Decision 3) depends on for
-    # real-data runs; typical live config is stooq primary + yahoo fallback.
+    # Yahoo's chart endpoint is a bars fallback only -- it no longer exposes
+    # get_market_caps (the quote API that backed it required cookie+crumb
+    # auth and was removed outright; see providers.market.yahoo).
     "yahoo": YahooMarketProvider,
+    # Primary source (ADR-0008 Decision 1 amendment): real market caps,
+    # reference data and earnings from one unauthenticated widget call per
+    # symbol. Its own daily-bars capability is deliberately last-resort only
+    # (TipRanksProvider.bars_last_resort) -- see
+    # FallbackMarketProvider.get_daily_bars for the cascade mechanism this
+    # relies on.
+    "tipranks": TipRanksProvider,
 }
 
 #: Earnings adapters. Add new providers here.
 _EARNINGS_PROVIDERS: dict[str, type[EarningsProvider]] = {
     "synthetic": SyntheticEarningsProvider,
     "csv": CSVEarningsProvider,
+    # Same TipRanksProvider instance-shape as the market registry above --
+    # EarningsProvider is a structural Protocol, so this class satisfies it
+    # without a second inheritance declaration. Registered here as the
+    # DEFAULT earnings provider (see EarningsConfig.provider); synthetic
+    # remains fully selectable for offline/demo use.
+    "tipranks": TipRanksProvider,
 }
 
 
@@ -106,6 +120,29 @@ class FallbackMarketProvider:
             ),
         )
 
+    def _bars_cascade(self) -> list[MarketDataProvider]:
+        """Ordered providers to try for ``get_daily_bars`` specifically.
+
+        Normally this is just ``[primary, *fallbacks]``, the same order every
+        other capability (``get_security_info``, and ``DataIngestor.
+        enrich_market_caps``'s own ``.primary``/``.fallbacks`` walk) uses.
+        Bars are the one exception: a provider whose ``bars_last_resort``
+        class/instance attribute is ``True`` (currently only
+        ``providers.market.tipranks.TipRanksProvider``, whose bars are
+        close-only and exist purely as a fallback of last resort -- see that
+        module's docstring) is moved to the very end of the cascade *for this
+        method only*, even when it is configured as the primary provider.
+        This is a plain ``getattr`` check (default ``False``), not a
+        ``Protocol`` requirement or a ``status().capabilities`` lookup, so
+        every pre-existing provider (synthetic/csv/stooq/yahoo) is completely
+        unaffected -- they simply lack the attribute and sort first, exactly
+        as before this mechanism existed.
+        """
+        chain = [self.primary, *self.fallbacks]
+        deferred = [p for p in chain if getattr(p, "bars_last_resort", False)]
+        normal = [p for p in chain if not getattr(p, "bars_last_resort", False)]
+        return normal + deferred
+
     def get_daily_bars(
         self,
         symbols: list[str],
@@ -114,49 +151,35 @@ class FallbackMarketProvider:
         *,
         adjusted: bool = True,
     ) -> dict[str, list[Bar]]:
-        """Get daily bars, filling missing symbols from fallbacks."""
+        """Get daily bars, filling missing symbols from the bars cascade.
+
+        See ``_bars_cascade`` for why this can differ from simple
+        primary-then-fallbacks order.
+        """
         out: dict[str, list[Bar]] = {}
-        unfilled: set[str] = set()
+        unfilled: set[str] = set(symbols)
 
-        # Try primary.
-        try:
-            primary_result = self.primary.get_daily_bars(
-                symbols, start, end, adjusted=adjusted
-            )
-            for symbol, bars in primary_result.items():
-                if bars:
-                    out[symbol] = bars
-                else:
-                    unfilled.add(symbol)
-        except ProviderError as exc:
-            log.warning(
-                "primary market provider %s failed: %s; trying fallbacks",
-                self.primary.name, exc
-            )
-            unfilled = set(symbols)
-
-        # Try fallbacks for unfilled symbols.
-        for fallback in self.fallbacks:
+        for provider in self._bars_cascade():
             if not unfilled:
                 break
             try:
-                fallback_result = fallback.get_daily_bars(
-                    list(unfilled), start, end, adjusted=adjusted
-                )
-                filled_now: set[str] = set()
-                for symbol, bars in fallback_result.items():
-                    if bars and symbol not in out:
-                        out[symbol] = bars
-                        filled_now.add(symbol)
-                if filled_now:
-                    log.info(
-                        "filled %s from fallback %s",
-                        filled_now, fallback.name
-                    )
-                unfilled -= filled_now
+                result = provider.get_daily_bars(list(unfilled), start, end, adjusted=adjusted)
             except ProviderError as exc:
-                log.debug("fallback %s failed: %s", fallback.name, exc)
+                log.warning(
+                    "market provider %s failed fetching bars for %d symbols: %s; "
+                    "trying the next source in the cascade",
+                    provider.name, len(unfilled), exc,
+                )
                 continue
+
+            filled_now: set[str] = set()
+            for symbol, bars in result.items():
+                if bars and symbol not in out:
+                    out[symbol] = bars
+                    filled_now.add(symbol)
+            if filled_now:
+                log.info("filled %s from %s", filled_now, provider.name)
+            unfilled -= filled_now
 
         # Return all requested symbols with empty lists for anything unfilled.
         for symbol in symbols:
@@ -244,12 +267,7 @@ def get_market_provider(config: AppConfig) -> MarketDataProvider:
     # Instantiate primary.
     primary_class = _MARKET_PROVIDERS[primary_name]
     try:
-        if primary_name == "csv":
-            primary = primary_class(csv_dir=config.market_data.csv_dir)
-        elif primary_name == "stooq":
-            primary = primary_class(config=config.market_data)
-        else:  # synthetic
-            primary = primary_class(config=config.market_data)
+        primary = _instantiate_market_provider(primary_name, primary_class, config)
     except Exception as exc:
         raise ProviderError(
             f"failed to instantiate {primary_name}: {exc}",
@@ -268,12 +286,7 @@ def get_market_provider(config: AppConfig) -> MarketDataProvider:
             continue
         try:
             fallback_class = _MARKET_PROVIDERS[fallback_name]
-            if fallback_name == "csv":
-                fallback = fallback_class(csv_dir=config.market_data.csv_dir)
-            elif fallback_name == "stooq":
-                fallback = fallback_class(config=config.market_data)
-            else:
-                fallback = fallback_class(config=config.market_data)
+            fallback = _instantiate_market_provider(fallback_name, fallback_class, config)
             fallbacks.append(fallback)
             log.info("loaded fallback market provider: %s", fallback.name)
         except Exception as exc:
@@ -283,6 +296,24 @@ def get_market_provider(config: AppConfig) -> MarketDataProvider:
             )
 
     return FallbackMarketProvider(primary, fallbacks)
+
+
+def _instantiate_market_provider(
+    name: str, provider_class: type[MarketDataProvider], config: AppConfig
+) -> MarketDataProvider:
+    """Construct one named market-data adapter with its own constructor shape.
+
+    Pulled out of ``get_market_provider`` since it is used identically for
+    both the primary and every fallback slot.
+    """
+    if name == "csv":
+        return provider_class(csv_dir=config.market_data.csv_dir)  # type: ignore[call-arg]
+    if name == "tipranks":
+        return provider_class(  # type: ignore[call-arg]
+            config=config.tipranks, cache_dir=config.paths.resolve("cache_dir")
+        )
+    # stooq, yahoo, synthetic all take the shared MarketDataConfig.
+    return provider_class(config=config.market_data)  # type: ignore[call-arg]
 
 
 def get_earnings_provider(config: AppConfig) -> EarningsProvider:
@@ -309,6 +340,10 @@ def get_earnings_provider(config: AppConfig) -> EarningsProvider:
     try:
         if primary_name == "csv":
             primary = primary_class(csv_path=config.earnings.csv_path)
+        elif primary_name == "tipranks":
+            primary = primary_class(
+                config=config.tipranks, cache_dir=config.paths.resolve("cache_dir")
+            )
         else:  # synthetic
             primary = primary_class()
     except Exception as exc:

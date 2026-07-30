@@ -134,12 +134,37 @@ class MarketDataConfig(BaseModel):
     ``claudetrade.providers.registry``. ``fallbacks`` are tried in order when
     the primary fails or lacks a symbol, which is what keeps the app running in
     reduced-capability mode.
+
+    ``provider = "tipranks"`` (the default) is primary for reference data,
+    market caps and earnings -- see ``TipRanksConfig`` and
+    ``providers.market.tipranks.TipRanksProvider``. Its own daily-bars
+    capability is deliberately a *last resort*: ``TipRanksProvider`` close-only
+    ``overview.prices`` series (no open/high/low/volume) is enough to keep a
+    symbol's price series moving when nothing better is available, but it must
+    never pre-empt a real OHLCV source. ``providers.registry.
+    FallbackMarketProvider.get_daily_bars`` respects this by deferring any
+    provider whose ``bars_last_resort`` attribute is ``True`` to the end of
+    the per-call cascade for bars specifically -- every other capability
+    (``get_market_caps``, ``get_security_info``) still tries the configured
+    primary/fallback order as written, i.e. tipranks first.
+
+    ``"stooq"`` is deliberately **not** in the default ``fallbacks`` any more.
+    A real probe from the owner's machine found stooq's edge now answers CSV
+    history requests -- for both a US and a TSX symbol, with the correct
+    ``.us``/``.to`` suffix and a proper browser ``User-Agent`` already applied
+    -- with an HTTP 200 HTML/JavaScript proof-of-work challenge page instead
+    of the CSV body. Per ADR-0008 Decision 1 this application never solves a
+    challenge, so stooq is unusable as an unattended default; it remains
+    fully registered in ``providers.registry`` (see
+    ``providers.market.stooq``'s fail-closed challenge detection) as an
+    explicit opt-in for an operator whose network path to stooq.com is not
+    challenged.
     """
 
     # Live daily history is the product default. Synthetic remains available
     # only as an explicit offline/demo choice; it must never silently populate
     # a normal installation with fabricated tickers.
-    provider: str = "stooq"
+    provider: str = "tipranks"
     fallbacks: list[str] = Field(default_factory=lambda: ["yahoo", "csv"])
     credential: str | None = None
     csv_dir: Path | None = None
@@ -168,13 +193,67 @@ class MarketDataConfig(BaseModel):
 
 
 class EarningsConfig(BaseModel):
-    provider: str = "synthetic"
+    """Earnings-calendar provider selection.
+
+    ``provider = "tipranks"`` (the default) replaces the previous synthetic
+    default with real upcoming/last-reported dates and surprise history from
+    TipRanks' widget API (see ``TipRanksConfig`` and
+    ``providers.market.tipranks.TipRanksProvider``). ``synthetic`` remains
+    fully available and is what the test suite pins (``tests/conftest.py``)
+    and what an operator running fully offline/demo should select explicitly.
+    """
+
+    provider: str = "tipranks"
     fallbacks: list[str] = Field(default_factory=lambda: ["csv"])
     credential: str | None = None
     csv_path: Path | None = None
     #: Treat an unconfirmed (estimated) date as if it were N days wide.
     estimated_date_uncertainty_days: int = 3
     request_timeout_s: float = 20.0
+
+
+class TipRanksConfig(BaseModel):
+    """TipRanks unauthenticated partner-widget API (ADR-0008 Decision 1 posture).
+
+    ``providers.market.tipranks.TipRanksProvider`` reads
+    ``widgets.tipranks.com/api/etoro/dataForTicker?ticker={SYMBOL}`` -- a
+    keyless, unauthenticated JSON endpoint that is not a published, contracted
+    API: it could be restricted, reshaped or withdrawn without notice. This is
+    the same "free, unauthenticated, personal-use, fail-closed" posture this
+    codebase already applies to stooq/Yahoo/Stocktwits, not a special case.
+
+    One provider instance serves earnings, market caps, reference data and
+    (last-resort only) daily bars, because all four are different views onto
+    the same per-symbol ``overview`` object -- fetching it once per symbol per
+    day and caching the raw response is what keeps a whole-universe refresh to
+    one call per symbol rather than four.
+    """
+
+    #: Conservative default for an unauthenticated, undocumented endpoint --
+    #: same posture as stooq/yahoo's own defaults.
+    rate_limit_per_minute: int = 30
+    request_timeout_s: float = 20.0
+    #: Cached ``overview`` responses are reused until this many trading
+    #: sessions have elapsed since they were fetched (see
+    #: ``utils.timeutils.trading_days_between``), so a scan universe of
+    #: thousands of symbols does not re-fetch earnings/caps/refdata on every
+    #: refresh within the same trading day -- only once a new session begins.
+    #: Stored under ``paths.cache_dir/tipranks/``.
+    cache_ttl_trading_days: int = 1
+    #: OPTIONAL, UNVERIFIED batching optimisation for Canadian market caps via
+    #: ``marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=TSE:A,TSE:B,...``
+    #: (the CIBC-app endpoint, not the widget). Off by default: this sandbox
+    #: never obtained a real response body for this endpoint, so the parser
+    #: is defensive-but-unverified (see
+    #: ``providers.market.tipranks._parse_getquotes_response``). Canadian cap
+    #: coverage never depends on this -- ``dataForTicker`` (with the
+    #: ``TSE:SYMBOL`` ticker notation) is the primary path for every symbol,
+    #: US and Canadian alike; this is purely a call-count optimisation for a
+    #: large TSX universe, and any failure here falls straight back to the
+    #: per-symbol ``dataForTicker`` path with no user-visible effect beyond
+    #: one extra batch of calls.
+    use_getquotes_batch: bool = False
+    getquotes_batch_size: int = 25
 
 
 class RedditConfig(BaseModel):
@@ -891,6 +970,7 @@ class AppConfig(BaseSettings):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
     earnings: EarningsConfig = Field(default_factory=EarningsConfig)
+    tipranks: TipRanksConfig = Field(default_factory=TipRanksConfig)
     reddit: RedditConfig = Field(default_factory=RedditConfig)
     x: XConfig = Field(default_factory=XConfig)
     stocktwits: StocktwitsConfig = Field(default_factory=StocktwitsConfig)

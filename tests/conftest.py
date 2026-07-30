@@ -33,10 +33,12 @@ def tmp_app_config(tmp_path: Path, monkeypatch) -> AppConfig:
     reset_config_cache()
 
     config = AppConfig()
-    # Production defaults to live Stooq data. Unit tests must remain
-    # deterministic and must never make outbound provider requests implicitly.
+    # Production defaults to live TipRanks (market data) and TipRanks
+    # (earnings) data. Unit tests must remain deterministic and must never
+    # make outbound provider requests implicitly.
     config.market_data.provider = "synthetic"
     config.market_data.fallbacks = []
+    config.earnings.provider = "synthetic"
     config.logging.console = False
     config.paths.app_dir = tmp_path
 

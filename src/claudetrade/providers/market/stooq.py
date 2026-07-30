@@ -1,15 +1,54 @@
 """Free daily OHLCV from stooq.com via published CSV endpoint.
 
 Real data source with proper rate limiting and error handling. Does NOT scrape
-HTML or bypass access controls. If the source is unavailable, the provider
-cleanly reports itself unavailable rather than working around the limitation.
+HTML or bypass access controls, and does not solve any anti-bot challenge it
+encounters (see below). If the source is unavailable, the provider cleanly
+reports itself unavailable rather than working around the limitation.
+
+**NOT a default fallback any more.** Two separate real-world findings drove
+that, both from the owner's own machine:
+
+1. **Diagnosis of the "stooq returned 404 for AAPL/META/PG" refresh
+   failure**: the request URL/params were already correct -- ``stooq_symbol()``
+   lower-cases the ticker and adds the exchange-appropriate ``.us``/``.to``
+   suffix, and that mapping was (and always had been) applied on the real
+   ``get_daily_bars`` fetch path (``_fetch_symbol`` passes
+   ``self.stooq_symbol(symbol)`` straight into the request params; exercised
+   end-to-end by ``tests/test_providers.py::
+   test_stooq_requests_the_history_endpoint_with_a_bounded_range`` and the
+   URL-assertion tests added alongside this fix). What was actually missing
+   was a ``User-Agent`` header: the client sent none at all, so httpx's own
+   generic default went out on the wire, and stooq's edge answered that
+   default with a 404 rather than the CSV. A browser-like ``User-Agent``
+   (``_USER_AGENT``) fixes that specific symptom.
+2. **A subsequent live probe (both a US and a TSX symbol, correctly
+   ``.us``/``.to``-suffixed, with the ``User-Agent`` fix from (1) already in
+   place) found stooq now answers with HTTP 200 and an HTML, JavaScript
+   SHA-256 proof-of-work challenge page (posts to ``/__verify``, then
+   reloads) instead of the CSV body -- an anti-bot wall, not a request
+   defect.** Per ADR-0008 Decision 1 this application never solves a
+   challenge, so this is fail-closed: ``_looks_like_challenge_page`` detects
+   the HTML response (note it is HTTP 200 -- status code alone cannot
+   distinguish it from a real CSV response) and raises
+   ``SourceBlockedError`` before the body ever reaches the CSV parser, rather
+   than parsing garbage or silently returning nothing. Since this makes the
+   endpoint unusable without manual intervention on an unknown cadence,
+   ``stooq`` has been removed from the default ``market_data.fallbacks``
+   (see ``config.MarketDataConfig``) -- it remains fully registered and
+   usable as an explicit opt-in for an operator whose network path to
+   stooq.com is not challenged.
 
 Limitations:
+
 - Free endpoint only: no redistribution rights.
 - Daily data only (no intraday).
 - No delisted security coverage.
 - Rate limited to reasonable frequency.
 - Requires active network access (will fail offline).
+- May be behind an anti-bot JavaScript challenge depending on the requesting
+  network's reputation with stooq's edge (see finding 2 above) -- this
+  adapter detects and fails closed rather than working around it; there is
+  no code-level fix for this the application can apply.
 - No bulk reference-data/universe endpoint in the free tier: ``list_universe``
   serves the packaged seed universes (see ``data.universe.load_packaged_universe``)
   rather than a live listing from stooq itself.
@@ -34,6 +73,7 @@ from claudetrade.providers.base import (
     ProviderError,
     ProviderStatus,
     RateLimiter,
+    SourceBlockedError,
 )
 
 log = logging.getLogger(__name__)
@@ -43,6 +83,11 @@ log = logging.getLogger(__name__)
 #: application one bar of history per symbol instead of a price series.
 STOOQ_HISTORY_URL = "https://stooq.com/q/d/l/"
 DEFAULT_RATE_LIMIT = 30  # Calls per minute
+
+#: Stooq's edge answers a request with no (or a generic/default) User-Agent
+#: with a 404 rather than serving the CSV -- see the ``headers=`` comment in
+#: ``_fetch_symbol`` for the diagnosis behind this.
+_USER_AGENT = "Mozilla/5.0 (compatible; claudetrade research use)"
 
 #: Stooq namespaces its symbols by market. US listings carry a ``.us`` suffix,
 #: so a bare ``AAPL`` resolves to nothing.
@@ -56,6 +101,22 @@ CA_EXCHANGES = frozenset({"TSX", "TSXV"})
 #: Stooq answers a request it cannot serve with this literal body rather than an
 #: HTTP error, so it has to be detected in the payload.
 _NO_DATA_MARKERS = ("N/D", "No data", "Exceeded the daily hits limit")
+
+#: Markers of stooq's HTML/JavaScript anti-bot challenge page (HTTP 200, so
+#: the status code alone cannot distinguish it from a real CSV response).
+_CHALLENGE_MARKERS = ("<!doctype", "<html")
+
+
+def _looks_like_challenge_page(response: object) -> bool:
+    """Whether ``response`` looks like stooq's browser-challenge page rather
+    than a CSV body -- checked by content-type first (cheap), then by the
+    first few bytes of the body (covers a challenge page served without an
+    explicit ``text/html`` content-type)."""
+    content_type = str(getattr(response, "headers", {}).get("content-type", "")).lower()
+    if "html" in content_type:
+        return True
+    text_start = response.text.lstrip()[:32].lower()  # type: ignore[attr-defined]
+    return text_start.startswith(_CHALLENGE_MARKERS)
 
 
 class SymbolNotFoundError(ProviderError):
@@ -139,8 +200,10 @@ class StooqMarketProvider(MarketDataProvider):
             available=True,  # Always available to attempt; actual call may fail.
             configured=True,
             message=(
-                "free stooq.com daily-history endpoint; symbol coverage comes from "
-                "the packaged seed universe (not a live Stooq listing)"
+                "free stooq.com daily-history endpoint (opt-in only; not a default "
+                "fallback -- may be behind an anti-bot browser challenge); symbol coverage "
+                "comes from the packaged seed universe (not a live Stooq listing)"
+                + (f"; last error: {self._last_error}" if self._last_error else "")
             ),
             supports_point_in_time=False,
             supports_delisted=False,
@@ -195,6 +258,12 @@ class StooqMarketProvider(MarketDataProvider):
                 self._not_found.add(symbol)
                 out[symbol] = []
                 continue
+            except SourceBlockedError:
+                # Preserve the specific "blocked (browser challenge)" marker
+                # _fetch_symbol already set on self._last_error -- the
+                # generic ProviderError branch below would otherwise
+                # overwrite it with a less informative message.
+                raise
             except ProviderError:
                 self._last_error = f"failed to fetch {symbol}"
                 raise
@@ -240,6 +309,17 @@ class StooqMarketProvider(MarketDataProvider):
                 timeout=self._config.request_timeout_s,
                 verify=True,  # Always verify SSL
                 follow_redirects=True,
+                # Root cause of the 404s a real Windows refresh hit for
+                # AAPL/META/PG/etc (see module docstring): this client sent no
+                # ``User-Agent`` at all, which meant httpx's own generic
+                # default (``python-httpx/<version>``) went out on the wire.
+                # Stooq's edge answers requests carrying that default with a
+                # 404 rather than a normal response -- the symbol/suffix
+                # mapping below was, and always has been, correct (``s`` is
+                # already lower-cased and suffixed by ``stooq_symbol`` right
+                # here); a browser-like ``User-Agent`` is what was actually
+                # missing from the request.
+                headers={"User-Agent": _USER_AGENT},
             ) as client:
                 response = client.get(STOOQ_HISTORY_URL, params=params)
                 response.raise_for_status()
@@ -273,6 +353,24 @@ class StooqMarketProvider(MarketDataProvider):
                 provider=self.name,
                 retryable=True,
             ) from exc
+
+        # Anti-bot / browser-challenge detection (HTTP 200, HTML body) -- must
+        # be checked BEFORE CSV parsing, since the challenge page is served
+        # with a normal 200 status, not an error status. Confirmed against a
+        # real probe from the owner's machine: stooq now answers both a US
+        # and a TSX symbol request with a SHA-256 proof-of-work JavaScript
+        # challenge page (POSTs to "/__verify", then reloads) instead of the
+        # CSV history body. Per ADR-0008 Decision 1 this fails closed -- no
+        # PoW is ever solved, no retry loop -- rather than being silently fed
+        # into the CSV parser.
+        if _looks_like_challenge_page(response):
+            self._last_error = "blocked (browser challenge)"
+            raise SourceBlockedError(
+                f"stooq served a browser-challenge/anti-bot page for {symbol} (HTTP 200, "
+                "HTML body, not CSV) -- fail-closed per ADR-0008 Decision 1: no "
+                "proof-of-work solving, no retry loop, no fingerprint/proxy rotation.",
+                provider=self.name,
+            )
 
         # Parse CSV response.
         try:

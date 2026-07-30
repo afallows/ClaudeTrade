@@ -1,11 +1,20 @@
-"""Tests for the Yahoo Finance fallback market-data provider.
+"""Tests for the Yahoo Finance bars-fallback market-data provider.
 
 Driven over a mocked transport (``httpx.MockTransport``, same pattern as
 ``tests/test_reddit_provider.py``) with response shapes transcribed from
-Yahoo Finance's real, undocumented ``v8/finance/chart`` and
-``v7/finance/quote`` endpoints. Only the socket is fake; everything the
-provider does with the response -- URL construction, symbol mapping, JSON
-parsing, rate limiting, error handling -- is real.
+Yahoo Finance's real, undocumented ``v8/finance/chart`` endpoint. Only the
+socket is fake; everything the provider does with the response -- URL
+construction, symbol mapping, JSON parsing, rate limiting, error handling --
+is real.
+
+This is the ONLY Yahoo endpoint this adapter calls. The batched
+``v7/finance/quote`` endpoint previously tested here has been removed
+outright: a real production refresh found it now requires cookie+crumb
+authentication and returns HTTP 401 unconditionally, so
+``YahooMarketProvider`` no longer attempts it and ``get_market_caps`` simply
+inherits the ``MarketDataProvider`` protocol's "not supported" default (see
+``providers.market.tipranks.TipRanksProvider`` for the real market-cap
+source now).
 
 This environment cannot reach ``query1.finance.yahoo.com`` (egress policy
 answers 403), so these mocked-transport tests are the only way to exercise
@@ -65,18 +74,13 @@ _CHART_ERROR_PAYLOAD = {
 }
 
 
-def _quote_payload(rows: list[dict]) -> dict:
-    return {"quoteResponse": {"result": rows, "error": None}}
-
-
 class _YahooStub:
-    """Serves chart/quote responses, recording every request made."""
+    """Serves chart responses, recording every request made."""
 
     def __init__(self):
         self.requests: list[httpx.Request] = []
         self.rate_limited_next = False
         self.chart_by_symbol: dict[str, dict] = {}
-        self.quote_rows: list[dict] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -87,9 +91,6 @@ class _YahooStub:
             symbol = request.url.path.rsplit("/", 1)[-1]
             payload = self.chart_by_symbol.get(symbol, _CHART_ERROR_PAYLOAD)
             return httpx.Response(200, json=payload)
-
-        if request.url.path == "/v7/finance/quote":
-            return httpx.Response(200, json=_quote_payload(self.quote_rows))
 
         return httpx.Response(404, json={})  # pragma: no cover - unexpected path
 
@@ -117,6 +118,14 @@ def test_yahoo_symbol_mapping_us_is_bare():
 def test_yahoo_symbol_mapping_ca_gets_to_suffix():
     assert YahooMarketProvider.yahoo_symbol("SHOP", exchange="TSX") == "SHOP.TO"
     assert YahooMarketProvider.yahoo_symbol("XYZ", exchange="TSXV") == "XYZ.TO"
+
+
+def test_yahoo_symbol_mapping_ca_share_class_confirmed_by_real_probe():
+    """CONFIRMED by a real probe from the owner's machine: Yahoo's chart
+    endpoint accepts the Canadian share-class ticker as ``TECK-B.TO`` --
+    this codebase's own hyphenated convention with the ``.TO`` suffix
+    appended, NOT a dotted rewrite the way TipRanks' ``TSE:`` notation uses."""
+    assert YahooMarketProvider.yahoo_symbol("TECK-B", exchange="TSX") == "TECK-B.TO"
 
 
 def test_yahoo_symbol_mapping_defaults_from_packaged_universe():
@@ -251,102 +260,52 @@ def test_get_intraday_bars_not_implemented():
 
 
 # --------------------------------------------------------------------------
-# get_market_caps -- the capability this provider exists to add
+# get_market_caps -- REMOVED capability (quote API now requires cookie+crumb)
 # --------------------------------------------------------------------------
 
 
-def test_get_market_caps_parses_real_quote_shape(monkeypatch):
-    stub = _YahooStub()
-    stub.quote_rows = [
-        {"symbol": "AAPL", "marketCap": 2_800_000_000_000, "shortName": "Apple Inc."},
-        {"symbol": "INTC", "marketCap": 413_002_720_000, "shortName": "Intel Corporation"},
-    ]
-    _install(monkeypatch, stub)
-
+def test_get_market_caps_is_not_supported():
+    """The v7/finance/quote batched endpoint this used to call now requires
+    cookie+crumb auth in production (HTTP 401 unconditionally) and has been
+    removed from this adapter outright -- ``get_market_caps`` is no longer
+    overridden at all, so it inherits the ``MarketDataProvider`` protocol's
+    "not supported" default, same as synthetic/csv. Real market caps now come
+    from ``providers.market.tipranks.TipRanksProvider``."""
     provider = YahooMarketProvider(MarketDataConfig())
-    caps = provider.get_market_caps(["AAPL", "INTC"])
-
-    assert caps["AAPL"] == pytest.approx(2_800_000_000_000)
-    assert caps["INTC"] == pytest.approx(413_002_720_000)
+    assert provider.get_market_caps(["AAPL", "MSFT"]) == {}
 
 
-def test_get_market_caps_requests_the_batched_quote_endpoint(monkeypatch):
+def test_get_market_caps_never_calls_the_network(monkeypatch):
+    """Not overridden at all -- there must be no HTTP call of any kind."""
     stub = _YahooStub()
-    stub.quote_rows = [{"symbol": "AAPL", "marketCap": 2_800_000_000_000}]
     _install(monkeypatch, stub)
-
     provider = YahooMarketProvider(MarketDataConfig())
-    provider.get_market_caps(["AAPL", "MSFT"])
-
-    req = stub.requests[0]
-    assert "/v7/finance/quote" in str(req.url)
-    assert "symbols=AAPL%2CMSFT" in str(req.url) or "symbols=AAPL,MSFT" in str(req.url)
+    provider.get_market_caps(["AAPL"])
+    assert stub.requests == []
 
 
-def test_get_market_caps_omits_symbols_yahoo_has_no_figure_for(monkeypatch):
-    """A symbol Yahoo's response has no marketCap for must be ABSENT from the
-    mapping, never filled in with a guess, zero, or a stale value -- this is
-    the specific behaviour ADR-0008 Decision 3's data-quality rule depends on
-    to distinguish 'unresolved' from 'resolved to zero'."""
-    stub = _YahooStub()
-    stub.quote_rows = [
-        {"symbol": "AAPL", "marketCap": 2_800_000_000_000},
-        {"symbol": "NOSUCH", "marketCap": None},
-        {"symbol": "ZEROCAP", "marketCap": 0},
-    ]
-    _install(monkeypatch, stub)
+# --------------------------------------------------------------------------
+# get_security_info -- packaged-seed-only degrade (no quote endpoint left)
+# --------------------------------------------------------------------------
 
+
+def test_get_security_info_serves_packaged_seed_only():
+    """With the quote endpoint gone, this can only ever return what the
+    packaged seed universe already knows -- same honest degrade as
+    ``StooqMarketProvider.get_security_info``."""
     provider = YahooMarketProvider(MarketDataConfig())
-    caps = provider.get_market_caps(["AAPL", "NOSUCH", "ZEROCAP", "NEVERRETURNED"])
-
-    assert caps == {"AAPL": pytest.approx(2_800_000_000_000)}
-    assert "NOSUCH" not in caps
-    assert "ZEROCAP" not in caps
-    assert "NEVERRETURNED" not in caps
+    info = provider.get_security_info(["AAPL", "NOTREAL999"])
+    assert info["AAPL"].name  # packaged seed has a name for AAPL
+    assert info["NOTREAL999"].symbol == "NOTREAL999"
+    assert info["NOTREAL999"].name == ""
 
 
-def test_get_market_caps_batches_respect_max_symbols_per_request(monkeypatch):
+def test_get_security_info_never_calls_the_network(monkeypatch):
     stub = _YahooStub()
-    stub.quote_rows = [{"symbol": "A", "marketCap": 1_500_000_000}]
     _install(monkeypatch, stub)
-
-    config = MarketDataConfig(max_symbols_per_request=2)
-    provider = YahooMarketProvider(config)
-    provider.get_market_caps(["A", "B", "C", "D", "E"])
-
-    quote_requests = [r for r in stub.requests if "/v7/finance/quote" in r.url.path]
-    assert len(quote_requests) == 3  # 5 symbols at batch size 2 -> 3 requests
-
-
-def test_get_market_caps_batch_failure_does_not_abort_other_batches(monkeypatch):
-    """A network failure fetching one batch degrades those symbols to
-    'unresolved' rather than raising and losing every other batch's caps."""
-    stub = _YahooStub()
-    stub.quote_rows = [{"symbol": "C", "marketCap": 3_000_000_000}]
-
-    calls = {"n": 0}
-    real_handler = stub.handler
-    real_client = httpx.Client
-
-    def flaky_handler(request: httpx.Request) -> httpx.Response:
-        if "/v7/finance/quote" in request.url.path:
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise httpx.ConnectError("connection refused")
-        return real_handler(request)
-
-    def _factory(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(flaky_handler)
-        return real_client(*args, **kwargs)
-
-    monkeypatch.setattr("claudetrade.providers.market.yahoo.httpx.Client", _factory)
-
-    config = MarketDataConfig(max_symbols_per_request=1)
-    provider = YahooMarketProvider(config)
-    caps = provider.get_market_caps(["A", "C"])
-
-    assert "A" not in caps  # first batch failed
-    assert caps["C"] == pytest.approx(3_000_000_000)  # second batch still succeeded
+    provider = YahooMarketProvider(MarketDataConfig())
+    provider.get_security_info(["AAPL"])
+    assert stub.requests == []
 
 
 # --------------------------------------------------------------------------
@@ -354,9 +313,9 @@ def test_get_market_caps_batch_failure_does_not_abort_other_batches(monkeypatch)
 # --------------------------------------------------------------------------
 
 
-def test_status_declares_market_cap_capability():
+def test_status_declares_no_market_cap_capability():
     status = YahooMarketProvider(MarketDataConfig()).status()
-    assert status.capabilities["market_caps"] is True
+    assert status.capabilities["market_caps"] is False
     assert status.capabilities["intraday"] is False
     assert status.licence_note, "undocumented-endpoint caveat must be stated"
     assert "fallback" in status.message.lower() or "fallback" in status.licence_note.lower()
@@ -384,9 +343,9 @@ def test_get_corporate_actions_returns_honest_empty_result():
 
 
 def test_other_market_providers_default_to_unsupported_market_caps():
-    """The protocol addition must be a no-op for every pre-existing provider:
-    synthetic/csv/stooq inherit the Protocol's default (empty mapping) without
-    any code change to those modules."""
+    """Every provider except tipranks inherits the Protocol's "not supported"
+    default (empty mapping) for ``get_market_caps`` -- including yahoo now
+    that its quote-API-backed override has been removed outright."""
     from claudetrade.providers.market.csv_provider import CSVMarketProvider
     from claudetrade.providers.market.stooq import StooqMarketProvider
     from claudetrade.providers.market.synthetic import SyntheticMarketProvider
@@ -394,3 +353,4 @@ def test_other_market_providers_default_to_unsupported_market_caps():
     assert SyntheticMarketProvider().get_market_caps(["AAPL"]) == {}
     assert CSVMarketProvider().get_market_caps(["AAPL"]) == {}
     assert StooqMarketProvider().get_market_caps(["AAPL"]) == {}
+    assert YahooMarketProvider().get_market_caps(["AAPL"]) == {}

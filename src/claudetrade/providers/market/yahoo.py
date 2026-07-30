@@ -1,30 +1,38 @@
-"""Daily OHLCV and market-cap reference data from Yahoo Finance's undocumented
-public JSON endpoints (``query1.finance.yahoo.com``).
+"""Daily OHLCV from Yahoo Finance's undocumented public chart JSON endpoint
+(``query1.finance.yahoo.com/v8/finance/chart``).
 
-**This is a fallback provider, not the primary one.** It exists for one thing
-the free stooq endpoint cannot do at all: establish a real, current market
-capitalisation per symbol (see ``get_market_caps``), which is what ADR-0008
-Decision 3's runtime universe filter needs to enforce the owner's ">= $1B
-market cap" rule. ``market_data.fallbacks`` is the intended place to add
-``"yahoo"`` alongside (or instead of) ``"csv"`` once it is registered with a
-name in ``providers.registry`` -- that registration is a deliberately separate
-change (outside this module's remit) from having a complete, independently
-testable adapter here.
+**This is a bars fallback, not the primary provider, and it has NO market-cap
+capability any more.** A real production refresh (see the owner's Windows
+refresh log this change responds to) found that Yahoo's *quote*/
+*quoteSummary* endpoints (``v7/finance/quote`` and friends) now require
+cookie+crumb authentication and returned HTTP 401 for every single request --
+that whole API surface has been removed from this adapter outright rather
+than left in place to fail on every call. The *chart* endpoint
+(``v8/finance/chart/{symbol}``) has no such requirement and kept working
+unauthenticated in that same log (the "filled ... from fallback yahoo" bars
+entries) -- it is the only thing this module still calls. Consequently:
 
-Honesty about what this is:
+* ``get_market_caps`` is **not overridden** here any more -- this class now
+  inherits ``MarketDataProvider``'s protocol default (an empty mapping, i.e.
+  "not supported"), exactly like synthetic/csv have always done. Real market
+  caps now come from ``providers.market.tipranks.TipRanksProvider`` (the
+  primary source; see ``docs/api-providers.md``'s Runtime Market-Cap Filter
+  section) -- the chart API has no cap field to offer, so the chain simply
+  skips past this provider for that capability.
+* ``get_security_info`` no longer calls a batched quote endpoint (there is
+  none left to call): it serves the packaged seed universe only, the same
+  honest degrade ``StooqMarketProvider.get_security_info`` has always used.
 
-* **Undocumented, unofficial API.** These are the same JSON endpoints Yahoo
-  Finance's own web frontend calls, not a published, contracted API. There is
-  no SLA, no rate-limit guarantee, and the shape can change without notice.
-  This mirrors this project's posture elsewhere (see stooq's module
+Honesty about what remains:
+
+* **Undocumented, unofficial API.** The chart endpoint is the same JSON
+  Yahoo Finance's own web frontend calls, not a published, contracted API.
+  There is no SLA, no rate-limit guarantee, and the shape can change without
+  notice. This mirrors this project's posture elsewhere (see stooq's module
   docstring): a free source used conservatively, not depended upon for
   anything the application cannot degrade gracefully without.
 * **No redistribution rights.** Personal/research use only, same posture as
   stooq's free tier.
-* **Real data or nothing.** ``get_market_caps`` returns only symbols Yahoo's
-  own quote response actually carried a ``marketCap`` figure for; a symbol
-  it has nothing for is simply absent from the returned mapping, never
-  filled in with an estimate, a stale value, or zero.
 * **No bulk universe/reference-data endpoint** in this free tier either --
   ``list_universe`` serves the same packaged seed universes as stooq (see
   ``data.universe.load_packaged_universe``).
@@ -50,11 +58,12 @@ from claudetrade.providers.base import (
 
 log = logging.getLogger(__name__)
 
-#: Historical daily bars ("chart") endpoint. Single symbol per request; the
-#: quote endpoint below is the one that supports a batch of symbols.
+#: Historical daily bars ("chart") endpoint. Single symbol per request. This
+#: is now the ONLY Yahoo endpoint this adapter calls -- the batched quote
+#: endpoint (``v7/finance/quote``) that used to live here required
+#: cookie+crumb auth in production and has been removed outright; see the
+#: module docstring.
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-#: Batched quote endpoint -- this is where ``marketCap`` lives.
-YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 DEFAULT_RATE_LIMIT = 30  # Calls per minute -- conservative, undocumented endpoint.
 
 #: Canadian (TSX/TSXV) listings carry a ``.TO`` suffix on Yahoo. Matched
@@ -110,7 +119,7 @@ class YahooMarketProvider(MarketDataProvider):
             kind="market",
             available=True,  # Always available to attempt; actual call may fail.
             configured=True,
-            message="undocumented query1.finance.yahoo.com endpoints; fallback provider",
+            message="undocumented query1.finance.yahoo.com/v8/finance/chart endpoint; bars fallback",
             supports_point_in_time=False,
             supports_delisted=False,
             rate_limit_per_minute=self._config.rate_limit_per_minute or DEFAULT_RATE_LIMIT,
@@ -118,16 +127,17 @@ class YahooMarketProvider(MarketDataProvider):
             last_error=self._last_error,
             last_success=self._last_success,
             licence_note=(
-                "Undocumented Yahoo Finance JSON endpoints (the same ones the Yahoo Finance "
+                "Undocumented Yahoo Finance chart JSON endpoint (the same one the Yahoo Finance "
                 "web frontend calls) -- not a published/contracted API, no SLA, no redistribution "
-                "rights. Personal/research use only; unsuitable for commercial use. Fallback "
-                "provider, not primary: use for market-cap enrichment and as a secondary bar "
-                "source when the primary is unavailable, not as the sole market-data source."
+                "rights. Personal/research use only; unsuitable for commercial use. Bars fallback "
+                "only, not primary and not a market-cap source: the quote/quoteSummary endpoints "
+                "that used to provide market caps now require cookie+crumb auth and have been "
+                "removed from this adapter -- see providers.market.tipranks for real caps."
             ),
             capabilities={
                 "daily_bars": True,
                 "intraday": False,
-                "market_caps": True,
+                "market_caps": False,
                 "corporate_actions": False,
             },
         )
@@ -253,91 +263,22 @@ class YahooMarketProvider(MarketDataProvider):
             provider=self.name,
         )
 
-    # --- market caps ----------------------------------------------------------
-
-    def get_market_caps(self, symbols: list[str]) -> dict[str, float]:
-        """Bulk market-capitalisation lookup via the batched quote endpoint.
-
-        Batches respect ``MarketDataConfig.max_symbols_per_request``. A
-        symbol Yahoo's response has no positive ``marketCap`` figure for is
-        simply absent from the returned mapping -- this is the one method in
-        the codebase that must never invent a number, since it exists
-        specifically to feed the ADR-0008 Decision 3 ">= $1B" universe floor.
-        """
-        out: dict[str, float] = {}
-        batch_size = max(1, self._config.max_symbols_per_request)
-        for i in range(0, len(symbols), batch_size):
-            chunk = symbols[i : i + batch_size]
-            try:
-                self._rate_limiter.acquire()
-                response = self._get(
-                    YAHOO_QUOTE_URL,
-                    {"symbols": ",".join(self.yahoo_symbol(s) for s in chunk)},
-                    ",".join(chunk),
-                )
-                self._last_success = dt.datetime.now(tz=dt.UTC)
-            except ProviderError as exc:
-                # A batch failing to fetch degrades those symbols to
-                # "unresolved", not a hard failure of the whole call -- the
-                # data-quality layer is where "unresolved" gets surfaced.
-                log.warning("yahoo market-cap batch failed for %s: %s", chunk, exc)
-                self._last_error = str(exc)
-                continue
-
-            payload = response.json()
-            quote_response = payload.get("quoteResponse", {})
-            if quote_response.get("error"):
-                log.warning("yahoo quote error for %s: %s", chunk, quote_response["error"])
-                continue
-
-            by_yahoo_symbol = {self.yahoo_symbol(s): s for s in chunk}
-            for row in quote_response.get("result") or []:
-                cap = row.get("marketCap")
-                y_symbol = row.get("symbol", "")
-                original = by_yahoo_symbol.get(y_symbol, y_symbol)
-                if isinstance(cap, (int, float)) and cap > 0:
-                    out[original] = float(cap)
-        return out
-
     # --- reference data -------------------------------------------------------
+    #
+    # No ``get_market_caps`` override lives here any more: this class inherits
+    # ``MarketDataProvider.get_market_caps``'s protocol default (an empty
+    # mapping, "not supported"), same as synthetic/csv. The batched quote
+    # endpoint that used to back it now requires cookie+crumb auth and has
+    # been removed outright rather than left in place to fail on every call
+    # -- see the module docstring and ``tests/test_yahoo_provider.py``'s
+    # ``test_other_market_providers_default_to_unsupported_market_caps``.
 
     def get_security_info(self, symbols: list[str]) -> dict[str, SecurityInfo]:
-        """Reference data from the same batched quote endpoint used for caps.
-
-        Falls back to the packaged seed universe for a symbol the quote
-        endpoint returned nothing usable for -- same degrade pattern as
-        ``StooqMarketProvider.get_security_info``.
-        """
-        out: dict[str, SecurityInfo] = {}
+        """No batched quote endpoint remains to call -- serves the packaged
+        seed universe only, same honest degrade as
+        ``StooqMarketProvider.get_security_info``."""
         by_symbol = {s.symbol: s for s in load_packaged_universe()}
-        batch_size = max(1, self._config.max_symbols_per_request)
-        for i in range(0, len(symbols), batch_size):
-            chunk = symbols[i : i + batch_size]
-            try:
-                self._rate_limiter.acquire()
-                response = self._get(
-                    YAHOO_QUOTE_URL,
-                    {"symbols": ",".join(self.yahoo_symbol(s) for s in chunk)},
-                    ",".join(chunk),
-                )
-            except ProviderError:
-                continue
-            payload = response.json()
-            by_yahoo_symbol = {self.yahoo_symbol(s): s for s in chunk}
-            for row in payload.get("quoteResponse", {}).get("result") or []:
-                original = by_yahoo_symbol.get(row.get("symbol", ""), row.get("symbol", ""))
-                cap = row.get("marketCap")
-                out[original] = SecurityInfo(
-                    symbol=original,
-                    name=row.get("longName") or row.get("shortName") or "",
-                    exchange=_yahoo_exchange_to_internal(row.get("fullExchangeName", "")),
-                    sector=row.get("sector", ""),
-                    market_cap_usd=float(cap) if isinstance(cap, (int, float)) and cap > 0 else None,
-                )
-        for symbol in symbols:
-            if symbol not in out:
-                out[symbol] = by_symbol.get(symbol.upper(), SecurityInfo(symbol=symbol))
-        return out
+        return {s: by_symbol.get(s.upper(), SecurityInfo(symbol=s)) for s in symbols}
 
     def get_corporate_actions(
         self, symbols: list[str], start: dt.date, end: dt.date  # noqa: ARG002
@@ -434,21 +375,3 @@ class _YahooNoDataError(ProviderError):
 
     def __init__(self, message: str) -> None:
         super().__init__(message, provider="yahoo", retryable=False)
-
-
-def _yahoo_exchange_to_internal(full_exchange_name: str) -> str:
-    """Map Yahoo's ``fullExchangeName`` strings to this codebase's exchange
-    codes (``NASDAQ``/``NYSE``/``AMEX``/``TSX``). Anything unrecognised is
-    passed through as-is rather than dropped, so an unmapped exchange name is
-    still visible for a human to correct rather than silently blanked."""
-    name = (full_exchange_name or "").strip()
-    lowered = name.lower()
-    if "nasdaq" in lowered or lowered in {"nms", "ngm", "ncm"}:
-        return "NASDAQ"
-    if "nyse american" in lowered or lowered == "asemex":
-        return "AMEX"
-    if lowered == "nyq" or "new york stock exchange" in lowered or lowered == "nyse":
-        return "NYSE"
-    if "toronto" in lowered or lowered == "tor":
-        return "TSX"
-    return name

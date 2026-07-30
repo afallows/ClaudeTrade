@@ -185,15 +185,15 @@ def init(config: ConfigOption = None) -> None:
         + (
             "(offline synthetic demo data -- fabricated tickers)"
             if cfg.market_data.provider == "synthetic"
-            else "(live; Stooq is the default)"
+            else "(live; TipRanks is the default, with a Yahoo bar fallback)"
         )
     )
     if cfg.market_data.provider == "synthetic":
         typer.echo(
             "  WARNING: synthetic mode creates fabricated tickers. To restore real "
-            "US + Canadian daily bars, set "
-            'market_data.provider = "stooq" in config.toml, run `claudetrade probe` '
-            "to confirm this machine can reach stooq.com, then `claudetrade refresh`."
+            "US + Canadian daily bars, market caps and earnings, set "
+            'market_data.provider = "tipranks" in config.toml, run `claudetrade probe` '
+            "to confirm this machine can reach widgets.tipranks.com, then `claudetrade refresh`."
         )
 
 
@@ -243,6 +243,16 @@ LIVE_ENDPOINTS: tuple[tuple[str, str, str, bool], ...] = (
         "market",
         "query1.finance.yahoo.com",
         "https://query1.finance.yahoo.com/v8/finance/chart/AAPL?range=5d&interval=1d",
+        False,
+    ),
+    # TipRanks widget API (primary market-data/earnings source; ADR-0008
+    # Decision 1 amendment). Unauthenticated and keyless, so needs_key=False
+    # is fully accurate -- see providers.market.tipranks and
+    # docs/api-providers.md for the ToS posture.
+    (
+        "market",
+        "widgets.tipranks.com",
+        "https://widgets.tipranks.com/api/etoro/dataForTicker?ticker=AAPL",
         False,
     ),
     ("reddit", "www.reddit.com", "https://www.reddit.com/api/v1/access_token", True),

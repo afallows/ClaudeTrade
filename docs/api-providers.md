@@ -110,20 +110,43 @@ Date,Open,High,Low,Close,AdjClose,Volume
 
 **Licence**: You are responsible for the licence of the data you provide. Stooq free data, for example, does not permit redistribution.
 
-### Stooq (Online)
+### Stooq (Online, opt-in only -- see the anti-bot caveat below)
 
 **Module**: `src/claudetrade/providers/market/stooq.py`
 
 Free historical data from Stooq.
 
-**Configuration**:
+**NOT a default fallback.** Two real-world findings, both from the owner's
+own machine, moved stooq out of `market_data.fallbacks`' default value:
+
+1. A first production refresh logged `stooq returned 404 for AAPL,MSFT,...`.
+   Diagnosis: the symbol/suffix mapping (lower-case + `.us`/`.to`) was
+   already correct on the real fetch path; what was actually missing was a
+   `User-Agent` header -- the client sent none at all, so httpx's own
+   generic default went out on the wire, and stooq's edge answered that
+   default with a 404. Fixed by sending a browser-like `User-Agent`.
+2. A follow-up live probe (both a US and a TSX symbol, `User-Agent` fix
+   already applied) found stooq now answers with **HTTP 200 and an HTML,
+   JavaScript SHA-256 proof-of-work challenge page** (posts to `/__verify`,
+   then reloads) instead of the CSV body -- an anti-bot wall, not a request
+   defect. Per ADR-0008 Decision 1 this application never solves a
+   challenge: the adapter detects the HTML shape (content-type and/or a
+   leading `<!doctype`/`<html` body marker -- **the status code alone
+   is 200 and cannot distinguish this from a real response**) and raises
+   `SourceBlockedError` before the body ever reaches the CSV parser.
+
+Because that wall's presence appears to depend on the requesting network's
+reputation with stooq (and could change at any time in either direction),
+`stooq` remains fully registered and usable -- just not as an unattended
+default. Add it back explicitly if your own network path to stooq.com is not
+challenged:
 
 ```toml
 [market_data]
-provider = "stooq"
+provider = "tipranks"
+fallbacks = ["yahoo", "stooq", "csv"]   # add stooq back explicitly if desired
 rate_limit_per_minute = 60
 request_timeout_s = 20.0
-fallbacks = ["csv"]
 ```
 
 **Credentials**: None required (no authentication).
@@ -165,6 +188,10 @@ fail the whole refresh. The gap shows up as a `data_quality` finding
 
 - Free data; no commercial redistribution rights
 - Rate limited (public API, shared across users)
+- **May be behind an anti-bot browser challenge** (see above) depending on
+  the requesting network's reputation with stooq's edge -- this adapter
+  detects and fails closed rather than working around it; there is no
+  code-level fix for this the application can apply
 - Stale data possible if the service is under load
 - Delisting information may be incomplete
 - No bulk universe/reference-data endpoint in the free tier -- `list_universe`
@@ -173,54 +200,55 @@ fail the whole refresh. The gap shows up as a `data_quality` finding
 
 **Licence**: Stooq data is free for personal research only. Commercial use requires a paid licence.
 
-### Yahoo Finance (Fallback, Online)
+### Yahoo Finance (Bars fallback, Online -- no market-cap capability)
 
 **Module**: `src/claudetrade/providers/market/yahoo.py`
 
-Daily OHLCV and, importantly, **real market capitalisation** from Yahoo
-Finance's public (undocumented) `v8/finance/chart` and `v7/finance/quote`
-JSON endpoints -- the same ones the Yahoo Finance website itself calls.
-This is the provider ADR-0008 Decision 3's runtime market-cap filter is built
-around: stooq's free tier has no market-cap field at all, so establishing a
-real, current cap per symbol needs a source that has one.
+Daily OHLCV from Yahoo Finance's public (undocumented) `v8/finance/chart`
+JSON endpoint -- the same one the Yahoo Finance website itself calls. This
+adapter's own production refresh log showed every `v7/finance/quote` batch
+call failing with `yahoo returned 401 for AAPL,MSFT,...` (that endpoint now
+requires cookie+crumb authentication), while the *same run* filled roughly
+a hundred symbols' bars from "fallback yahoo" via the chart endpoint. The
+fix: **the quote/quoteSummary API has been removed from this adapter
+outright** -- chart is the only thing it calls now, and `get_market_caps` is
+no longer overridden (see below).
 
 **Configuration**:
 
 ```toml
 [market_data]
-provider = "stooq"          # or another primary
-fallbacks = ["yahoo", "csv"]
+provider = "tipranks"        # real market caps/refdata/earnings
+fallbacks = ["yahoo", "csv"] # yahoo is the bars fallback
 ```
 
 **Credentials**: None required (no authentication).
 
-**Capability**: implements the optional `MarketDataProvider.get_market_caps`
-capability (see `providers.base.MarketDataProvider.get_market_caps` and
-[Runtime Market-Cap Filter](#runtime-market-cap-filter-adr-0008-decision-3)
-below) via the batched quote endpoint. A symbol the quote response has no
-positive `marketCap` figure for is simply absent from the returned mapping --
-never filled in with an estimate or a stale value. Every pre-existing
-provider (synthetic/csv/stooq) is unaffected by this addition: they all
-inherit the protocol's default (an empty mapping, i.e. "not supported")
-without any change to those modules.
+**No market-cap capability any more**: `get_market_caps` is not overridden
+on this class -- it inherits `MarketDataProvider`'s protocol default (an
+empty mapping, "not supported"), the same as synthetic/csv. Real market caps
+now come from `providers.market.tipranks.TipRanksProvider` (see
+[TipRanks](#tipranks-primary-online) below and
+[Runtime Market-Cap Filter](#runtime-market-cap-filter-adr-0008-decision-3)).
 
-**Symbol mapping**: same convention as stooq -- a bare US ticker is passed
-through unchanged; a Canadian (TSX/TSXV) one gets a `.TO` suffix (`SHOP` ->
-`SHOP.TO`), resolved from the packaged seed universe's exchange column when
-not supplied explicitly. Share classes already use this codebase's hyphen
-notation (`BRK-B`), which happens to be Yahoo's own convention too.
+**Symbol mapping**: a bare US ticker is passed through unchanged; a Canadian
+(TSX/TSXV) one gets a `.TO` suffix, resolved from the packaged seed
+universe's exchange column when not supplied explicitly. Share classes
+already use this codebase's hyphen notation (`BRK-B`), which happens to be
+Yahoo's own convention too -- **confirmed by a live probe from the owner's
+machine**: a TSX share-class symbol (`TECK-B`) is requested, and correctly
+served, as `TECK-B.TO` (dash preserved, `.TO` appended), distinct from
+TipRanks' own `TSE:TECK.B` (dotted) notation for the same security. Two
+different vendors, two different conventions -- each mapping table lives in
+its own adapter module (`yahoo.yahoo_symbol`, `stooq.stooq_symbol`,
+`tipranks.tipranks_ticker`) rather than being unified into one, since a
+"universal" ticker format that has to special-case three vendors' quirks is
+more error-prone than three small, independently testable ones.
 
-**Known integration gap**: this module is a complete, independently testable
-adapter (see `tests/test_yahoo_provider.py`), but it is **not yet registered**
-in `providers.registry._MARKET_PROVIDERS` -- that factory/registry file was
-out of scope for the change that added this module. Until a follow-up change
-adds a `"yahoo": YahooMarketProvider` entry there, `market_data.fallbacks =
-["yahoo"]` will log a warning and be skipped rather than actually loading it.
-`DataIngestor.enrich_market_caps` (see below) still works correctly today
-against any market-data path that *does* expose `get_market_caps` --
-including a `YahooMarketProvider` instance constructed and passed in
-directly -- it is only the config-driven `provider`/`fallbacks` selection by
-the string `"yahoo"` that needs that follow-up registration.
+**Known integration gap (resolved)**: earlier drafts of this module noted it
+was not yet registered in `providers.registry._MARKET_PROVIDERS` -- it now
+is (`"yahoo": YahooMarketProvider`), and is one of the two default
+`market_data.fallbacks` entries.
 
 **Limitations**:
 
@@ -232,6 +260,8 @@ the string `"yahoo"` that needs that follow-up registration.
 - No bulk universe/reference-data endpoint -- `list_universe` serves the
   packaged seed universes, same as stooq.
 - No corporate-actions coverage in this adapter.
+- No reference-data (`get_security_info`) beyond the packaged seed universe
+  -- there is no quote endpoint left to call for a live company name/sector.
 - This sandbox cannot reach `query1.finance.yahoo.com` to verify any of the
   above live (egress policy answers 403); every behaviour above is exercised
   against transcribed real response shapes over a mocked transport instead
@@ -239,6 +269,175 @@ the string `"yahoo"` that needs that follow-up registration.
 
 **Licence**: Personal/research use only, same posture as stooq's free tier;
 unsuitable for commercial use.
+
+### TipRanks (Primary, Online)
+
+**Module**: `src/claudetrade/providers/market/tipranks.py`
+
+**Primary source** for market caps, reference data and earnings (and a
+last-resort-only bars capability): `TipRanksProvider` reads
+`https://widgets.tipranks.com/api/etoro/dataForTicker?ticker={SYMBOL}` -- an
+unauthenticated, keyless JSON endpoint (the same one TipRanks' own eToro
+integration widget calls) that returns one rich `overview` object per
+symbol. One HTTP call per symbol serves all four capabilities, because they
+are all different views onto that same object.
+
+**Configuration**:
+
+```toml
+[market_data]
+provider = "tipranks"          # the default
+fallbacks = ["yahoo", "csv"]
+
+[earnings]
+provider = "tipranks"          # also the default
+
+[tipranks]
+rate_limit_per_minute = 30
+request_timeout_s = 20.0
+cache_ttl_trading_days = 1     # response cache under paths.cache_dir/tipranks/
+use_getquotes_batch = false    # optional Canadian cap batching, see below
+```
+
+**Credentials**: None required (no authentication).
+
+**ToS posture (ADR-0008 Decision 1) -- read before relying on this in
+production**: this is an unauthenticated partner-widget endpoint, **not** a
+published, contracted API. TipRanks could restrict, reshape, rate-limit or
+withdraw it at any time with no notice and no deprecation window. This is
+the same posture this codebase already applies to stooq's free CSV endpoint,
+Yahoo's undocumented chart JSON, and Stocktwits' keyless stream: personal/
+research use only, a conservative self-imposed rate limit (default
+30/minute), and a **fail-closed** response to anything that looks like a
+block or an unexpected shape -- see the fail-closed rules below. Nothing
+here bypasses authentication, defeats a paywall, or solves a challenge.
+
+**Symbol notation**: a bare US ticker is passed through unchanged (`AAPL`).
+A Canadian (TSX/TSXV) one is rewritten to `TSE:<SYMBOL-WITH-DOTS>` -- this
+codebase's hyphenated share-class convention (`TECK-B`) becomes TipRanks'
+dotted one (`TSE:TECK.B`) -- confirmed against a real Canadian-listing
+fixture (`tests/fixtures/tipranks/dataForTicker_TECK_B.json`), whose
+`overview.ticker` echoes exactly that form back. This is a *different*
+convention from both stooq's (`teck-b.to`) and Yahoo's (`TECK-B.TO`) --
+each adapter owns its own mapping table.
+
+**Earnings (the headline capability)**: `get_upcoming_earnings` /
+`get_historical_earnings` map `overview.portfolioHoldingData.
+nextEarningsReport` / `.lastReportedEps` onto `EarningsEvent`. Only the
+single next/last report is available (not a multi-quarter calendar) -- an
+honest, narrower capability than the synthetic generator's full quarterly
+series or a hand-maintained CSV. Two mapping details worth knowing:
+
+- **The inner `ticker` field inside those blocks is not the requested
+  symbol.** Confirmed from the Canadian fixture: requesting `TSE:TECK.B`
+  returns `lastReportedEps.ticker == "TECK"` (the *US cross-listing*
+  ticker). Every `EarningsEvent` this adapter returns is keyed by the symbol
+  the caller actually asked for, never by this field.
+- **`timeOfDay` is PROVISIONAL.** Two values are stated with confidence
+  (`1` = before market open, `4` = after market close); a third (`2`,
+  observed on a *confirmed* historical report in the Canadian fixture) is
+  mapped to `EarningsSession.DURING` by elimination -- an educated guess,
+  not a confirmed vendor documentation fact. Any other value maps to
+  `EarningsSession.UNKNOWN` rather than failing the parse. Revisit
+  `providers.market.tipranks._TIME_OF_DAY_MAP` if TipRanks' own
+  documentation, or further real captures, clarify this.
+
+**Market caps**: prefers `overview.marketCapUSD`; falls back to
+`overview.marketCap` as-is with **no currency gating** -- the >= $1B
+universe floor is currency-agnostic by explicit owner decision (a nominal
+$1B in either USD or CAD clears it). Nested blocks that also happen to carry
+a `marketCap` field (e.g. `portfolioHoldingData.nextDividendDate.marketCap`
+in the Canadian fixture, a *different*, CAD-only figure from the top-level
+cap) are never used as a cap source.
+
+**Reference data**: `get_security_info` maps `overview.companyName` / market
+/ `companyData.sector` / `.industry` / cap. `overview.market` is
+inconsistently cased across listings (`"NASDAQ"` for a US name, `"tsx"`
+lower-case for a Canadian one, confirmed against both fixtures) -- matching
+is always case-insensitive.
+
+**Daily bars -- close-only, LAST RESORT ONLY.** `overview.prices` is a list
+of `{"date", "d", "p"}` -- a closing print per session, nothing else.
+Synthesising fake open/high/low/volume would silently corrupt every
+downstream ATR/gap/volume feature, so this adapter never does that:
+`get_daily_bars` emits `Bar(open=high=low=close=p, volume=0)` and logs (and
+queues, via `drain_quality_warnings()`) a `close_only_bars` data-quality
+WARNING per symbol so the degrade is visible, never silent. This capability
+is reached only when both `yahoo` and (if configured) `stooq` have nothing
+for a symbol: `TipRanksProvider.bars_last_resort = True` is a plain
+attribute `providers.registry.FallbackMarketProvider.get_daily_bars` checks
+to defer this provider to the very end of the bars cascade *for bars only*,
+even though it is the configured primary provider for every other
+capability (market caps, reference data, earnings still try it first, as
+written in `market_data.provider`/`fallbacks`).
+
+**Fail-closed rules (ADR-0008 Decision 1)**, confirmed against a real probe:
+
+| Response | Meaning | Behaviour |
+| --- | --- | --- |
+| HTTP 404 | Confirmed: unknown/garbage ticker | Degrades that one symbol only, cached as "no data" |
+| HTTP 401/403 | Blocked | `SourceBlockedError` |
+| HTTP 429 | Rate limited | `RateLimitError` |
+| HTTP 5xx | Outage | `ProviderError(retryable=True)` -- not treated as a block |
+| Non-JSON body / missing `overview` key | Unexpected shape | `SourceBlockedError` |
+| `overview` present but empty/null | Unknown ticker | Same per-symbol degrade as 404 |
+
+**Response cache**: every `overview` fetched is cached as one JSON file per
+symbol under `paths.cache_dir/tipranks/`, with a 1-trading-day TTL
+(`tipranks.cache_ttl_trading_days`, checked via
+`utils.timeutils.trading_days_between` so it survives a weekend but
+invalidates on the next real trading session) -- this is what keeps a
+whole-universe refresh of thousands of symbols to one call per symbol per
+trading day, shared across all four capabilities, rather than one call per
+symbol per capability per run. An "unknown ticker" result is cached too, so
+a universe's always-a-few unresolvable names don't get re-probed every run.
+
+**GetQuotes batching (optional, off by default)**: TipRanks also exposes a
+CIBC-integration batch endpoint,
+`https://marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=TSE:A,TSE:B,...`,
+that can reduce Canadian cap enrichment to a handful of calls instead of one
+per symbol. A real probe (7 mixed US/TSX tickers) confirmed it works and
+that requested tickers are echoed back exactly as sent, but this repository
+still has no committed fixture of the exact response body, so the parser
+(`providers.market.tipranks._parse_getquotes_response`) stays defensive and
+the feature stays behind `tipranks.use_getquotes_batch = false`.
+**Confirmed currency trap**: GetQuotes' own `marketCap` field is in the
+listing's *local* currency, not USD (`TSE:TECK.B`'s GetQuotes `marketCap` is
+~40.6B CAD with an `exchangeRate` of ~0.712, while `dataForTicker`'s
+`marketCapUSD` is the already-converted ~28.9B USD figure -- the two are
+consistent once converted). The parser therefore only trusts a GetQuotes cap
+via `marketCapUSD` when present, or `marketCap * exchangeRate` when both
+fields are present and positive; a bare, un-converted `marketCap` is never
+used for a non-USD listing. Canadian cap coverage never depends on this
+optimisation succeeding -- `dataForTicker` (with the `TSE:SYMBOL` notation)
+is the primary path for every symbol regardless.
+
+**Limitations**:
+
+- **Unauthenticated partner-widget endpoint, not a published/contracted
+  API.** No SLA; could be restricted or withdrawn without notice.
+- Only the single next/last earnings report per symbol -- not a full
+  calendar or surprise history.
+- `timeOfDay` mapping is provisional for the value `2` (see above).
+- Bars are close-only and last-resort; ATR/gap/volume features are degraded
+  (flagged, never silent) whenever this is the only source that returned
+  anything for a symbol.
+- No currency field on `SecurityInfo` -- a Canadian listing's own currency
+  (CAD) is not persisted at the security-reference level, only its already-
+  USD-converted market cap is used for the universe floor.
+- Relative-strength comparisons against the USD benchmark (SPY) mix
+  currencies uncorrected for a TSX listing's own price series -- documented
+  here as a known limitation, not silently "fixed" by a conversion this
+  adapter cannot verify.
+- This sandbox cannot reach `widgets.tipranks.com` or
+  `marketsv3.tipranks.com` (egress fully blocked) -- every behaviour above
+  is exercised against two real fixtures the owner captured from their own
+  machine (`tests/fixtures/tipranks/dataForTicker_INTC.json` and
+  `dataForTicker_TECK_B.json`) over a mocked transport, never fabricated
+  data (see `tests/test_tipranks_provider.py`).
+
+**Licence**: Personal/research use only, same posture as stooq/Yahoo's free
+tiers; unsuitable for commercial use; fails closed per ADR-0008 Decision 1.
 
 ---
 
@@ -331,33 +530,26 @@ database has no stored securities yet -- i.e. before the first
 `claudetrade refresh` completes. Once securities are stored, those take
 precedence and are merged with any packaged symbol not yet stored, so newly
 added packaged names remain visible even after a refresh. This is also what
-`StooqMarketProvider.list_universe()` returns, since stooq's free tier has no
-bulk reference-data endpoint of its own -- it is why a fresh install pointed at
-`market_data.provider = "stooq"` has thousands of US and hundreds of Canadian
-symbols to pull on the very first `claudetrade refresh` instead of an empty
-universe. The adapter builds that inventory through `load_stooq_universe()`,
-which admits only NYSE, Nasdaq, NYSE American and TSX common stocks whose
-bootstrap size is at least $1B. The inventory contains more than 2,000 US
-stocks and more than 200 TSX stocks.
+`StooqMarketProvider.list_universe()` / `YahooMarketProvider.list_universe()`
+/ `TipRanksProvider.list_universe()` all return, since none of the three has
+a bulk reference-data endpoint of its own -- it is why a fresh install has
+thousands of US and hundreds of Canadian symbols to pull on the very first
+`claudetrade refresh` instead of an empty universe regardless of which of
+them is configured as primary. `StooqMarketProvider` additionally builds a
+size-filtered inventory through `load_stooq_universe()` (only NYSE, Nasdaq,
+NYSE American and TSX common stocks whose bootstrap size is at least $1B;
+more than 2,000 US and 200 TSX stocks) for when it is used explicitly.
 
 ### Why do I see tickers such as `AMFI`, `ANFI`, or `ANPR`?
 
 Those four-letter names are generated by the **synthetic** provider; they are
-deliberately fictional and are not failed Stooq lookups. New installations now
-default to `market_data.provider = "stooq"`, so seeing these symbols means an
-older configuration explicitly still selects synthetic data or the database
-contains rows from an earlier synthetic run. Existing synthetic rows do not
-become real merely because the provider setting changes; use a fresh data
-directory/database, or remove the synthetic data and run `claudetrade refresh`.
-
-Stooq itself is limited in a different way: its free CSV endpoint returns daily
-history for **one requested symbol at a time** and provides no bulk current-
-listing or market-cap endpoint. Consequently ClaudeTrade starts from the
-packaged seed CSVs described above, which can become stale, and asks Stooq for
-each seed symbol. Stooq is therefore the price-history source, not the ticker-
-list source. Configure the Yahoo reference-data fallback if current market caps
-are required for the runtime `$1B` filter; neither Stooq nor the seed bucket is
-a live market-cap authority.
+deliberately fictional and are not failed lookups against a real source. A
+fresh install defaults to `market_data.provider = "tipranks"`, so seeing
+these symbols means an older configuration explicitly still selects
+synthetic data or the database contains rows from an earlier synthetic run.
+Existing synthetic rows do not become real merely because the provider
+setting changes; use a fresh data directory/database, or remove the
+synthetic data and run `claudetrade refresh`.
 
 **Configuration**:
 
@@ -370,11 +562,11 @@ min_market_cap_usd = 1000000000              # ADR-0008 Decision 3 runtime floor
 unknown_cap_policy = "include"               # "include" | "exclude" -- see below
 ```
 
-For strict live operation, configure Stooq history with Yahoo cap enrichment:
+For strict live operation with the default chain:
 
 ```toml
 [market_data]
-provider = "stooq"
+provider = "tipranks"
 fallbacks = ["yahoo", "csv"]
 
 [universe]
@@ -389,20 +581,23 @@ unknown_cap_policy = "exclude"
 
 **Modules**: `src/claudetrade/data/ingest.py` (`DataIngestor.enrich_market_caps`),
 `src/claudetrade/data/universe.py` (`UniverseSelector.for_session`),
-`src/claudetrade/providers/market/yahoo.py`
+`src/claudetrade/providers/market/tipranks.py`
 
 This is the durable fix, not the expanded seeds above (which are bootstrap
 coverage only). At refresh time, `DataIngestor.enrich_market_caps` tries to
 establish a real market cap for every candidate security via the market-data
-path: the configured primary provider, then, if it is a cascading fallback
+path: the configured primary provider (**TipRanks by default -- the only
+adapter that resolves a positive figure by default now**, since Yahoo's
+former quote-API-backed cap capability required cookie+crumb auth in
+production and was removed outright), then, if it is a cascading fallback
 wrapper, each of its fallbacks in turn (a provider's `get_market_caps` is an
 **optional** capability -- see `providers.base.MarketDataProvider.get_market_caps`
 -- so a provider that does not support it, the default for every adapter
-except `yahoo`, simply contributes nothing rather than erroring). The
+except `tipranks`, simply contributes nothing rather than erroring). The
 resolved figure is stored on `Security.market_cap_usd`. The enriched floor is
 also applied **before** price, corporate-action, earnings and sentiment
 requests, so a company that currently resolves below $1B does not consume a
-Stooq history request. The benchmark is retained because regime and
+bars-history request. The benchmark is retained because regime and
 relative-strength calculations require it even though it is an ETF.
 
 `UniverseSelector.for_session` then applies `universe.min_market_cap_usd`
@@ -431,21 +626,46 @@ candidate-quality screen re-applied later at signal-scoring time in
 changes who is eligible to be scanned at all; it does not touch that
 downstream gate.
 
-**Getting `yahoo` wired in**: stooq/synthetic/csv do not expose market caps.
-For a live `stooq`-primary deployment, add `"yahoo"` to
-`market_data.fallbacks`; it is already registered in
-`providers.registry._MARKET_PROVIDERS`. Use `unknown_cap_policy = "exclude"`
-when the request set must strictly contain only currently resolved caps.
+**Market-cap sources today**: `tipranks` (the default primary) is the only
+adapter that resolves a positive figure by default -- stooq/yahoo/synthetic/
+csv all contribute nothing (the protocol default). Use
+`unknown_cap_policy = "exclude"` when the request set must strictly contain
+only currently resolved caps.
 
 ---
 
 ## Earnings Providers
 
-### Synthetic (Default)
+### TipRanks (Default)
+
+**Module**: `src/claudetrade/providers/market/tipranks.py`
+(`TipRanksProvider` implements both `MarketDataProvider` and the structural
+`EarningsProvider` protocol -- see the [TipRanks](#tipranks-primary-online)
+section above for the full account: the headline win, `timeOfDay` mapping
+caveats, the earnings-ticker-mismatch gotcha, caching and ToS posture).
+
+Real next-scheduled and last-reported earnings, replacing the previous
+synthetic default.
+
+**Configuration**:
+
+```toml
+[earnings]
+provider = "tipranks"   # the default
+fallbacks = ["csv"]
+```
+
+**Limitations**: only one upcoming and one historical report per symbol
+(not a full calendar); `timeOfDay` mapping is provisional for the observed
+value `2`. See the TipRanks section above for the complete list.
+
+### Synthetic (Offline/demo)
 
 **Module**: `src/claudetrade/providers/earnings/synthetic.py`
 
-Fabricated earnings events. Deterministic (seeded).
+Fabricated earnings events. Deterministic (seeded). No longer the default,
+but fully available -- this is what `tests/conftest.py` pins for every test,
+and what an operator running fully offline/demo should select explicitly.
 
 **Configuration**:
 
@@ -1171,15 +1391,15 @@ This lets you test with real bars but still runs offline.
 
 ### For Live Research (Small Budget)
 
-Use **Stooq + Reddit + rule-based AI**:
+Use the **default chain (TipRanks + Yahoo) + Reddit + rule-based AI**:
 
 ```toml
 [market_data]
-provider = "stooq"
-fallbacks = ["csv", "synthetic"]
+provider = "tipranks"
+fallbacks = ["yahoo", "csv"]
 
 [earnings]
-provider = "synthetic"
+provider = "tipranks"
 
 [reddit]
 enabled = true
@@ -1200,12 +1420,11 @@ Enable all live sources:
 
 ```toml
 [market_data]
-provider = "stooq"
-fallbacks = ["csv"]
+provider = "tipranks"
+fallbacks = ["yahoo", "csv"]
 
 [earnings]
-provider = "csv"
-csv_path = "~/my_data/earnings.csv"
+provider = "tipranks"
 
 [reddit]
 enabled = true
