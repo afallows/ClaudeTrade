@@ -177,8 +177,24 @@ class EarningsConfig(BaseModel):
 class RedditConfig(BaseModel):
     """Authorised Reddit access.
 
-    Uses the official OAuth API only. Disabled unless credentials resolve, in
-    which case the pipeline continues without this source rather than failing.
+    Prefers the official OAuth API, in decreasing order of preference: the
+    password grant (script app + the owner's own username/password -- an
+    official Reddit flow), then the client-credentials grant (script app
+    alone), then -- only if ``public_json_fallback`` is explicitly opted
+    into -- an unauthenticated read of Reddit's public ``.json`` listing
+    endpoint. Disabled unless *some* path resolves, in which case the
+    pipeline continues without this source rather than failing (ADR-0008
+    Decision 1).
+
+    **Honest status of the public-JSON fallback**: reading
+    ``www.reddit.com/r/<sub>/new.json`` without authentication is not
+    something Reddit's API terms affirmatively grant -- it is a ToS-gray
+    area for automated/scheduled use, tolerated in practice for casual,
+    low-volume, identifying-UA traffic but not a sanctioned integration
+    path the way the OAuth API is. It exists here only as a last-resort,
+    opt-in fallback for when neither OAuth path is configured or working,
+    is off by default, and is capped at a conservative rate. The moment
+    OAuth credentials work, this class prefers them automatically.
     """
 
     #: On by default pointing at the *synthetic* generator, so a fresh install
@@ -190,6 +206,14 @@ class RedditConfig(BaseModel):
     provider: str = "synthetic"
     client_id_credential: str = "reddit_client_id"
     client_secret_credential: str = "reddit_client_secret"
+    #: Owner's own Reddit account credentials (ADR-0008 Decision 1: "own
+    #: credentials only" -- never a shared/default account). When these
+    #: resolve *and* the client id/secret also resolve, the password grant
+    #: is preferred over client-credentials, per the owner's explicit ask
+    #: ("use my reddit credentials ... retain the fallback to the standard
+    #: API"). Both are official OAuth flows against the same endpoints.
+    username_credential: str = "reddit_username"
+    password_credential: str = "reddit_password"
     user_agent: str = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
     subreddits: list[str] = Field(
         default_factory=lambda: [
@@ -215,13 +239,46 @@ class RedditConfig(BaseModel):
     #: Store only salted author digests, never usernames.
     store_author_names: bool = False
 
+    # --- Public-JSON fallback (unauthenticated, ToS-gray; opt-in) -----------
+    #: Off by default. Only takes effect when BOTH OAuth paths above are
+    #: unconfigured (or fail at runtime) -- official APIs remain first-choice
+    #: per ADR-0008 Decision 1. See the class docstring for the honest ToS
+    #: caveat before turning this on.
+    public_json_fallback: bool = False
+    #: Hard-capped at 30/min in the validator below -- "conservative,
+    #: human-scale rate" for an unauthenticated path is a ceiling, not a
+    #: suggestion an operator can configure their way past.
+    public_json_rate_limit_per_minute: int = 30
+
+    @field_validator("public_json_rate_limit_per_minute")
+    @classmethod
+    def _cap_public_json_rate(cls, v: int) -> int:
+        return min(v, 30)
+
 
 class XConfig(BaseModel):
     """Authorised X (Twitter) access.
 
-    Requires a paid API tier for any meaningful search volume. When no
-    credential is configured the source is disabled cleanly and the remaining
-    sources continue to operate.
+    Two independent live paths, tried in this order:
+
+    1. **Official API v2** (``bearer_credential``). Requires a paid tier for
+       any meaningful search volume. Preferred whenever configured -- this is
+       the officially sanctioned path and ADR-0008 Decision 1 requires the
+       official API remain first-choice.
+    2. **Cookie-session mode** (``session_enabled``), only when the official
+       path has no bearer token configured. The owner's own logged-in x.com
+       session cookies drive the same GraphQL endpoints the web client uses,
+       for cashtag search over ``session_symbols``. **This automates a
+       logged-in personal account and violates X's Terms of Service; it can
+       lead to account suspension.** The owner accepts this risk for their
+       own account (ADR-0008 Decision 1); the application never bundles or
+       defaults credentials, never solves a challenge/CAPTCHA, and disables
+       the source for the rest of the cycle on any 401/403/challenge/
+       rate-limit signal rather than attempting a workaround. Off by
+       default (``session_enabled = False``).
+
+    When neither path is configured the source is disabled cleanly and the
+    remaining sources continue to operate.
     """
 
     enabled: bool = False
@@ -232,6 +289,63 @@ class XConfig(BaseModel):
     lookback_hours: int = 48
     rate_limit_per_minute: int = 15
     request_timeout_s: float = 20.0
+    store_author_names: bool = False
+
+    # --- Cookie-session mode (ADR-0008 Decision 1; owner-accepted risk) -----
+    #: Off by default. Only consulted when ``bearer_credential`` does not
+    #: resolve -- the official API path is always preferred when available.
+    session_enabled: bool = False
+    #: Exported from the browser's devtools -> Application/Storage -> Cookies
+    #: for x.com, after logging in as the owner: ``auth_token`` and ``ct0``
+    #: (the CSRF token cookie). See docs/api-providers.md for the exact
+    #: click-path. Stored via the normal credential store, never in config.
+    auth_token_credential: str = "x_auth_token"
+    ct0_credential: str = "x_ct0"
+    #: Watchlist symbols searched as cashtags (``$AAPL``); the leading ``$``
+    #: is added automatically if a bare symbol is given.
+    session_symbols: list[str] = Field(default_factory=list)
+    session_max_results_per_query: int = 40
+    #: Deliberately much lower than the official API's already-conservative
+    #: default -- a logged-in personal session is held to a stricter,
+    #: human-scale pace than a sanctioned API client.
+    session_rate_limit_per_minute: int = 6
+    session_request_timeout_s: float = 20.0
+    session_user_agent: str = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ClaudeTrade-research/0.1 "
+        "(contact configured by operator)"
+    )
+
+
+class StocktwitsConfig(BaseModel):
+    """Stocktwits public symbol-stream API (ADR-0008 Decision 1's "official
+    APIs first-choice" path for this source): keyless for basic reads, no
+    scraping, no ToS boundary crossed.
+
+    Reads ``api.stocktwits.com/api/2/streams/symbol/{SYMBOL}.json``, which is
+    Stocktwits' own documented, unauthenticated basic-read endpoint. Off by
+    default: even though no credential is at risk here, the vendor's
+    published unauthenticated budget (200 requests/hour) is easy to exhaust
+    across a large universe, so this is an explicit opt-in with a hard cap on
+    symbols scanned per cycle rather than a silent default.
+    """
+
+    enabled: bool = False
+    provider: str = "stocktwits"
+    #: Symbols fetched when the caller does not supply a more specific
+    #: (recent-signal / watchlist) hint via ``fetch_posts(symbols=...)``.
+    watchlist_symbols: list[str] = Field(default_factory=list)
+    #: Hard budget per refresh cycle: at most this many symbols are fetched,
+    #: prioritised by the order of the caller-supplied ``symbols`` hint (the
+    #: pipeline passes recent-signal / watchlist symbols first) so a broad
+    #: universe degrades to "covered the names that matter this cycle"
+    #: rather than silently rationing across the whole universe evenly.
+    max_symbols_per_cycle: int = 20
+    #: Stocktwits documents 200 unauthenticated requests/hour; the default
+    #: below (3/min == 180/hour) keeps a working margin rather than running
+    #: right up against the published ceiling.
+    rate_limit_per_minute: int = 3
+    request_timeout_s: float = 20.0
+    user_agent: str = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
     store_author_names: bool = False
 
 
