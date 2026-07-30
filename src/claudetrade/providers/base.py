@@ -177,6 +177,33 @@ class MarketDataProvider(Protocol):
         """
         ...
 
+    def get_market_caps(self, symbols: list[str]) -> dict[str, float]:  # noqa: ARG002
+        """Optional bulk market-capitalisation lookup, in USD.
+
+        This is an **optional capability**, not a required part of the
+        interface every adapter must implement: the default body below
+        returns an empty mapping ("not supported"), and every existing
+        subclass (synthetic, csv, stooq) inherits that default unchanged --
+        adding this method to the protocol does not require touching any of
+        them. A provider that *can* look this up (see
+        ``providers.market.yahoo.YahooMarketProvider``) overrides it.
+
+        Returns:
+            ``{symbol: market_cap_usd}`` for symbols this provider could
+            price. A symbol this provider has no figure for is simply absent
+            from the mapping -- never populated with a guess or a stale
+            fallback value. Callers (``data.ingest.DataIngestor``) treat "not
+            supported" and "supported but priced nothing" identically: both
+            leave the symbol's cap unresolved, which is flagged in the
+            data-quality report rather than silently dropped (ADR-0008
+            Decision 3's data-quality risk note -- silently excluding a name
+            whose cap cannot be established would reintroduce
+            survivorship-style bias at the universe layer, the same failure
+            mode ``UniverseSelector.for_session`` already guards against for
+            delisted names).
+        """
+        return {}
+
 
 @runtime_checkable
 class EarningsProvider(Protocol):

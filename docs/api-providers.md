@@ -134,7 +134,10 @@ Canadian listings (`exchange = "TSX"` or `"TSXV"`) get a `.to` suffix (`SHOP`
 -> `shop.to`). The exchange is looked up from the packaged seed universe (see
 [Universe Selection](#universe-selection) below) when it isn't supplied
 explicitly. A symbol that already carries its own suffix (e.g. `BMW.DE`) is
-passed through untouched.
+passed through untouched. (Stooq's suffix mapping still recognises `TSXV`
+as a technical capability of `stooq_symbol()`; the application's own seeds
+and default `permitted_exchanges` no longer include TSX Venture at all --
+see the exchange-scope note under [Universe Selection](#universe-selection).)
 
 **What to expect from Canadian (TSX/TSXV) coverage**: it is real but partial
 and this repository cannot verify it from a sandboxed environment with no
@@ -170,6 +173,73 @@ fail the whole refresh. The gap shows up as a `data_quality` finding
 
 **Licence**: Stooq data is free for personal research only. Commercial use requires a paid licence.
 
+### Yahoo Finance (Fallback, Online)
+
+**Module**: `src/claudetrade/providers/market/yahoo.py`
+
+Daily OHLCV and, importantly, **real market capitalisation** from Yahoo
+Finance's public (undocumented) `v8/finance/chart` and `v7/finance/quote`
+JSON endpoints -- the same ones the Yahoo Finance website itself calls.
+This is the provider ADR-0008 Decision 3's runtime market-cap filter is built
+around: stooq's free tier has no market-cap field at all, so establishing a
+real, current cap per symbol needs a source that has one.
+
+**Configuration**:
+
+```toml
+[market_data]
+provider = "stooq"          # or another primary
+fallbacks = ["yahoo", "csv"]
+```
+
+**Credentials**: None required (no authentication).
+
+**Capability**: implements the optional `MarketDataProvider.get_market_caps`
+capability (see `providers.base.MarketDataProvider.get_market_caps` and
+[Runtime Market-Cap Filter](#runtime-market-cap-filter-adr-0008-decision-3)
+below) via the batched quote endpoint. A symbol the quote response has no
+positive `marketCap` figure for is simply absent from the returned mapping --
+never filled in with an estimate or a stale value. Every pre-existing
+provider (synthetic/csv/stooq) is unaffected by this addition: they all
+inherit the protocol's default (an empty mapping, i.e. "not supported")
+without any change to those modules.
+
+**Symbol mapping**: same convention as stooq -- a bare US ticker is passed
+through unchanged; a Canadian (TSX/TSXV) one gets a `.TO` suffix (`SHOP` ->
+`SHOP.TO`), resolved from the packaged seed universe's exchange column when
+not supplied explicitly. Share classes already use this codebase's hyphen
+notation (`BRK-B`), which happens to be Yahoo's own convention too.
+
+**Known integration gap**: this module is a complete, independently testable
+adapter (see `tests/test_yahoo_provider.py`), but it is **not yet registered**
+in `providers.registry._MARKET_PROVIDERS` -- that factory/registry file was
+out of scope for the change that added this module. Until a follow-up change
+adds a `"yahoo": YahooMarketProvider` entry there, `market_data.fallbacks =
+["yahoo"]` will log a warning and be skipped rather than actually loading it.
+`DataIngestor.enrich_market_caps` (see below) still works correctly today
+against any market-data path that *does* expose `get_market_caps` --
+including a `YahooMarketProvider` instance constructed and passed in
+directly -- it is only the config-driven `provider`/`fallbacks` selection by
+the string `"yahoo"` that needs that follow-up registration.
+
+**Limitations**:
+
+- **Undocumented, unofficial endpoint.** Not a published/contracted API; no
+  SLA; the response shape can change without notice.
+- Free; no redistribution rights.
+- Rate limited by this adapter conservatively (default 30 calls/minute) since
+  there is no published limit to respect.
+- No bulk universe/reference-data endpoint -- `list_universe` serves the
+  packaged seed universes, same as stooq.
+- No corporate-actions coverage in this adapter.
+- This sandbox cannot reach `query1.finance.yahoo.com` to verify any of the
+  above live (egress policy answers 403); every behaviour above is exercised
+  against transcribed real response shapes over a mocked transport instead
+  (see `tests/test_yahoo_provider.py`), never fabricated data.
+
+**Licence**: Personal/research use only, same posture as stooq's free tier;
+unsuitable for commercial use.
+
 ---
 
 ## Universe Selection
@@ -177,22 +247,83 @@ fail the whole refresh. The gap shows up as a `data_quality` finding
 **Module**: `src/claudetrade/data/universe.py`, seed data under
 `src/claudetrade/data/universes/*.csv`
 
-By default the scannable universe is built from two packaged CSV files shipped
+**ADR-0008 Decision 3: the universe is computed, not shipped.** The packaged
+CSVs below are bootstrap seeds only. The authoritative universe is the one
+computed at refresh time: every US + Canadian listing on a permitted exchange
+for which the market-data path can establish a real market cap, filtered to
+`>= universe.min_market_cap_usd` (default $1B) -- see
+[Runtime Market-Cap Filter](#runtime-market-cap-filter-adr-0008-decision-3)
+below. A name missing from the seeds but present in provider data joins the
+universe on the next refresh; a seeded name that delists falls out. The
+seeds exist only so a fresh install has hundreds of symbols to pull on its
+very first `claudetrade refresh` instead of an empty universe.
+
+By default the scannable universe seeds from two packaged CSV files shipped
 inside the application:
 
 | File | Coverage | Rows |
 | --- | --- | --- |
-| `us_default.csv` | Roughly the S&P 500 plus some liquid mid-caps, US exchanges (NASDAQ/NYSE/AMEX) | ~500 |
-| `ca_default.csv` | TSX 60 plus other liquid TSX names | ~110 |
+| `us_default.csv` | NYSE / Nasdaq / NYSE American (AMEX) common stocks, real market cap >= $1B (see the file's own banner for the exact fetch/filter methodology and date) | ~2,200 |
+| `ca_default.csv` | TSX (main board) large/mid-cap Canadian companies | ~220 |
+
+**Exchange scope (owner-set, hard boundary)**: only NYSE, Nasdaq, NYSE
+American (AMEX) and TSX proper. **TSX Venture (TSXV), CSE and NEO are
+explicitly out of scope** -- neither seeded nor permitted by default (see
+`UniverseConfig.permitted_exchanges`, which no longer includes `TSXV`).
+`tests/test_universe.py::TestPackagedUniverseFiles::test_no_forbidden_exchanges_in_either_seed_file`
+and `test_permitted_exchanges_is_exactly_the_owner_allowed_set` enforce this.
 
 **These are hand-curated seed lists, not a live index feed.** Index
 constituents drift constantly -- additions, removals, mergers, renames -- and
 these files will go stale over time; each carries a generation-date comment at
-the top. Edit them freely (add, remove, or correct rows) if you want a
-different starting universe; the column format matches the CSV universe source
-below (`symbol,name,exchange,sector,market_cap_bucket,country`).
-`market_cap_bucket` (`mega`/`large`/`mid`) is an approximate size label, not a
-live market capitalisation figure -- do not treat it as current.
+the top documenting exactly what was fetched, from where, and when (or, for
+the Canadian file, why a live fetch was not possible and what was used
+instead -- see below). Edit them freely (add, remove, or correct rows) if you
+want a different starting universe; the column format matches the CSV
+universe source below (`symbol,name,exchange,sector,market_cap_bucket,country`).
+`market_cap_bucket` (`mega`/`large`/`mid`/`small`) is an approximate size
+label, not a live market capitalisation figure -- the runtime filter below is
+what is actually authoritative.
+
+**How the 2026-07-30 expansion was sourced** (owner complaint: "I don't see
+names like INTC or AMD"): `us_default.csv` was merged with rows derived from
+a real, live-fetched dataset -- `rreichel3/US-Stock-Symbols`
+(github.com/rreichel3/US-Stock-Symbols), a nightly-updated mirror of NASDAQ's
+own public stock-screener listing, fetched via `raw.githubusercontent.com` on
+2026-07-30 -- filtered to real, provider-reported `marketCap >= $1B`,
+non-Canada domicile, and non-instrument junk (warrants/units/notes/preferred/
+SPAC shells) excluded, multi-share-class duplicates collapsed to one row. The
+originally-planned Wikipedia-index-list approach (Russell 1000 / S&P 400 /
+S&P 600) was **not used** because `WebFetch` returned HTTP 403 for every host
+tried in this sandbox at implementation time, Wikipedia included, and a
+non-Wikipedia control URL (`example.com`) also 403'd, ruling out a
+Wikipedia-specific block rather than a general WebFetch outage; `github.com`
+and `raw.githubusercontent.com` were reachable and became the real-data path
+instead. Arguably this is a more literal reading of the underlying ask ("all
+... stocks over 1 Billion market cap") than an index-membership proxy would
+have been. `ca_default.csv`'s expansion had no equivalent live, comprehensive,
+current TSX-constituent dataset reachable from this sandbox and is compiled
+from trained knowledge instead, cross-checked against the same live US-side
+dataset wherever the same company is also US-cross-listed; see that file's
+own banner for the full account, including the specific per-symbol judgement
+calls made to resolve US/Canada ticker collisions and cross-listings.
+
+**Cross-listing rule**: a Canada-domiciled company dual-listed on TSX and a
+US exchange is represented **once**, in `ca_default.csv`, under its TSX
+ticker -- never also in `us_default.csv`. `tests/test_universe.py`'s
+`test_no_symbol_collision_across_packaged_files` and
+`test_cross_listed_canadian_names_appear_only_in_ca_file` (spot-checking
+Shopify and Barrick) enforce this.
+
+**Known cross-market symbol collisions**: a handful of well-known tickers are
+used by *different* companies on the US and Canadian markets (e.g. `T` is
+AT&T on NYSE and TELUS on TSX; `K` is Kellanova on NYSE and Kinross Gold on
+TSX; several more surfaced during the 2026-07-30 expansion -- e.g. `PPL` is
+PPL Corporation on NYSE vs Pembina Pipeline on TSX, `KEY` is KeyCorp vs
+Keyera). Because the universe is keyed by bare symbol, the packaged CSVs
+deliberately omit the Canadian side of each such collision rather than have
+one silently overwrite the other -- an accuracy trade-off documented here
+(and inline in each seed-generation script) rather than hidden.
 
 **When they apply**: with `universe.source = "database"` (the default), the
 packaged universes are used to seed the scannable universe only while the
@@ -202,8 +333,9 @@ precedence and are merged with any packaged symbol not yet stored, so newly
 added packaged names remain visible even after a refresh. This is also what
 `StooqMarketProvider.list_universe()` returns, since stooq's free tier has no
 bulk reference-data endpoint of its own -- it is why a fresh install pointed at
-`market_data.provider = "stooq"` has hundreds of US and Canadian symbols to
-pull on the very first `claudetrade refresh` instead of an empty universe.
+`market_data.provider = "stooq"` has thousands of US and hundreds of Canadian
+symbols to pull on the very first `claudetrade refresh` instead of an empty
+universe.
 
 **Configuration**:
 
@@ -211,16 +343,64 @@ pull on the very first `claudetrade refresh` instead of an empty universe.
 [universe]
 source = "database"                          # default
 packaged_universes = ["us_default", "ca_default"]  # set to [] to disable the fallback
-permitted_exchanges = ["NYSE", "NASDAQ", "AMEX", "TSX", "TSXV"]  # TSX/TSXV on by default
+permitted_exchanges = ["NYSE", "NASDAQ", "AMEX", "TSX"]  # TSXV/CSE/NEO excluded
+min_market_cap_usd = 1000000000              # ADR-0008 Decision 3 runtime floor, default $1B
+unknown_cap_policy = "include"               # "include" | "exclude" -- see below
 ```
 
-**Known cross-market symbol collisions**: a handful of well-known tickers are
-used by *different* companies on the US and Canadian markets (e.g. `T` is
-AT&T on NYSE and Telus on TSX; `K` is Kellanova on NYSE and Kinross Gold on
-TSX). Because the universe is keyed by bare symbol, the packaged CSVs
-deliberately omit the Canadian side of each such collision rather than have
-one silently overwrite the other -- an accuracy trade-off documented here
-rather than hidden.
+---
+
+## Runtime Market-Cap Filter (ADR-0008 Decision 3)
+
+**Modules**: `src/claudetrade/data/ingest.py` (`DataIngestor.enrich_market_caps`),
+`src/claudetrade/data/universe.py` (`UniverseSelector.for_session`),
+`src/claudetrade/providers/market/yahoo.py`
+
+This is the durable fix, not the expanded seeds above (which are bootstrap
+coverage only). At refresh time, `DataIngestor.enrich_market_caps` tries to
+establish a real market cap for every candidate security via the market-data
+path: the configured primary provider, then, if it is a cascading fallback
+wrapper, each of its fallbacks in turn (a provider's `get_market_caps` is an
+**optional** capability -- see `providers.base.MarketDataProvider.get_market_caps`
+-- so a provider that does not support it, the default for every adapter
+except `yahoo`, simply contributes nothing rather than erroring). The
+resolved figure is stored on `Security.market_cap_usd`.
+
+`UniverseSelector.for_session` then applies `universe.min_market_cap_usd`
+(default $1B) against that stored figure:
+
+- `market_cap_usd >= min_market_cap_usd` -> included.
+- `market_cap_usd < min_market_cap_usd` -> excluded, reason `below_min_market_cap`.
+- `market_cap_usd is None` (no configured provider could establish one) ->
+  governed by `universe.unknown_cap_policy`:
+  - `"include"` (default): **not** excluded for this reason. Silently
+    dropping a name just because its cap could not be established would
+    reintroduce survivorship-style bias at the universe layer -- the same
+    failure mode the point-in-time delisting check in the same method
+    already guards against for names that stopped trading.
+  - `"exclude"`: excluded, reason `unknown_market_cap` -- an explicit opt-in
+    for an operator who prefers under-coverage to scanning an unpriced name.
+
+**Either way, an unresolved cap is always flagged**, never silently
+absorbed: `enrich_market_caps` records an `unknown_market_cap` data-quality
+finding (`WARNING` severity) for every security it could not price, visible
+via `claudetrade status` / the data-quality report, regardless of which
+`unknown_cap_policy` is in effect. This is deliberately a *separate* concept
+from `FilterConfig.min_market_cap_usd` (the older, lower, $500M
+candidate-quality screen re-applied later at signal-scoring time in
+`signals.scoring`) -- raising or lowering `universe.min_market_cap_usd`
+changes who is eligible to be scanned at all; it does not touch that
+downstream gate.
+
+**Getting `yahoo` actually wired in**: today, no configured provider chain
+resolves real caps out of the box (stooq/synthetic/csv all default-decline
+`get_market_caps`), so every symbol reports `unknown_market_cap` and is
+included by default -- an honest reflection of current capability, not a
+bug. To turn this on for a live `stooq`-primary deployment, add `"yahoo"` to
+`market_data.fallbacks` *once it is registered* in
+`providers.registry._MARKET_PROVIDERS` (see the integration-gap note under
+[Yahoo Finance](#yahoo-finance-fallback-online) above -- that registration
+was out of scope for the change that added the adapter itself).
 
 ---
 

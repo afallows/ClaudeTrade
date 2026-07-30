@@ -327,11 +327,15 @@ class UniverseConfig(BaseModel):
     source: Literal["database", "csv", "static"] = "database"
     csv_path: Path | None = None
     static_symbols: list[str] = Field(default_factory=list)
-    #: TSX/TSXV are permitted alongside the US exchanges by default so a
-    #: real-data refresh (``market_data.provider = "stooq"``) covers both
-    #: markets out of the box; see ``data.universe.load_packaged_universe``.
+    #: TSX is permitted alongside the US exchanges by default so a real-data
+    #: refresh (``market_data.provider = "stooq"``) covers both markets out of
+    #: the box; see ``data.universe.load_packaged_universe``. Deliberately
+    #: TSX (main board) only -- TSX Venture (TSXV), CSE and NEO are more
+    #: speculative venture-tier boards the owner scoped out of this
+    #: application entirely (ADR-0008 Decision 3); they are neither seeded
+    #: nor permitted here.
     permitted_exchanges: list[str] = Field(
-        default_factory=lambda: ["NYSE", "NASDAQ", "AMEX", "TSX", "TSXV"]
+        default_factory=lambda: ["NYSE", "NASDAQ", "AMEX", "TSX"]
     )
     max_symbols: int = 2000
     include_etfs: bool = False
@@ -344,6 +348,27 @@ class UniverseConfig(BaseModel):
     packaged_universes: list[str] = Field(
         default_factory=lambda: ["us_default", "ca_default"]
     )
+    #: ADR-0008 Decision 3: the durable, authoritative fix for "the universe is
+    #: too small" is computed at refresh time, not the packaged seed files
+    #: (those are bootstrap coverage only -- see ``data/universes/*.csv``).
+    #: This is the floor ``UniverseSelector.for_session`` applies against each
+    #: security's *stored* (provider-sourced, real) ``market_cap_usd`` -- a
+    #: deliberately separate field from ``FilterConfig.min_market_cap_usd``,
+    #: which is a lower, longer-standing candidate-quality screen applied
+    #: again later at signal-scoring time (see ``signals.scoring``). Raising
+    #: or lowering this one changes who is even eligible to be scanned at
+    #: all; it does not touch the scoring-time gate.
+    min_market_cap_usd: float = 1_000_000_000.0
+    #: What to do with a security for which NO configured market-data
+    #: provider could establish a market cap at all (as opposed to one priced
+    #: below the floor above). "include" (default) keeps it in the universe --
+    #: silently dropping a name just because its cap could not be established
+    #: would reintroduce survivorship-style bias at the universe layer, the
+    #: same failure mode ``for_session``'s point-in-time delisting logic
+    #: already guards against. "exclude" drops it instead, for an operator who
+    #: would rather under-cover than risk scanning an unpriced name; either
+    #: way the gap is always flagged in the data-quality report, never silent.
+    unknown_cap_policy: Literal["include", "exclude"] = "include"
 
 
 class FilterConfig(BaseModel):

@@ -21,7 +21,11 @@ from claudetrade.data.universe import (
 from claudetrade.db.models import Security
 from claudetrade.domain import SecurityInfo
 
-VALID_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "TSX", "TSXV"}
+#: ADR-0008 Decision 3 owner scope: only NYSE/Nasdaq/NYSE American (AMEX) for
+#: US listings and TSX proper for Canadian listings. TSX Venture, CSE and NEO
+#: are explicitly out of scope -- never seeded, never permitted.
+VALID_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "TSX"}
+FORBIDDEN_EXCHANGES = {"TSXV", "CSE", "NEO"}
 
 
 # --------------------------------------------------------------------------
@@ -36,14 +40,26 @@ class TestPackagedUniverseFiles:
             assert path.exists(), f"packaged universe {name!r} missing at {path}"
 
     def test_us_default_parses_with_sane_row_count(self):
-        """Roughly the S&P 500 plus liquid mid-caps -- the task calls ~500-700 fine."""
+        """ADR-0008 Decision 3: expanded to Russell-1000-scale US coverage
+        (roughly all NYSE/NASDAQ/NYSE American common stocks with a
+        real, live-fetched market cap >= $1B) -- expect roughly 1,700-2,200
+        unique rows."""
         securities = load_packaged_universe(["us_default"])
-        assert 400 <= len(securities) <= 700, len(securities)
+        assert 1700 <= len(securities) <= 2200, len(securities)
 
     def test_ca_default_parses_with_sane_row_count(self):
-        """TSX 60 plus other liquid TSX names -- ~100-200 rows."""
+        """ADR-0008 Decision 3: expanded toward TSX Composite scale --
+        expect roughly 220-250 rows."""
         securities = load_packaged_universe(["ca_default"])
-        assert 80 <= len(securities) <= 200, len(securities)
+        assert 220 <= len(securities) <= 250, len(securities)
+
+    def test_us_default_includes_owner_complaint_symbols(self):
+        """The owner's literal complaint driving ADR-0008 Decision 3: 'I don't
+        see names like INTC or AMD' -- these and a few other well-known
+        mid/large-cap names must be present after the expansion."""
+        symbols = {s.symbol for s in load_packaged_universe(["us_default"])}
+        for expected in ("INTC", "AMD", "MU", "DELL", "F", "GM"):
+            assert expected in symbols, f"{expected} missing from the expanded us_default seed"
 
     def test_no_duplicate_symbols_within_us_default(self):
         securities = load_packaged_universe(["us_default"])
@@ -71,8 +87,35 @@ class TestPackagedUniverseFiles:
                 )
 
     def test_ca_default_is_all_canadian_exchanges(self):
+        """TSX proper only -- TSX Venture is a separate, more speculative
+        board and out of scope per the owner's US+TSX-only instruction."""
         for security in load_packaged_universe(["ca_default"]):
-            assert security.exchange in {"TSX", "TSXV"}, security.symbol
+            assert security.exchange == "TSX", security.symbol
+
+    def test_no_forbidden_exchanges_in_either_seed_file(self):
+        """Hard scope boundary: TSX Venture (TSXV), CSE and NEO listings must
+        never appear in either shipped seed file."""
+        for name in PACKAGED_UNIVERSE_FILES:
+            found = {
+                s.exchange for s in load_packaged_universe([name])
+                if s.exchange in FORBIDDEN_EXCHANGES
+            }
+            assert not found, f"{name}: forbidden exchange(s) present: {found}"
+
+    def test_cross_listed_canadian_names_appear_only_in_ca_file(self):
+        """Spot-check known TSX/US dual-listed Canadian companies: each must
+        appear exactly once, in ca_default.csv, under its TSX notation --
+        never duplicated into us_default.csv under a US ticker."""
+        us = {s.symbol: s for s in load_packaged_universe(["us_default"])}
+        ca = {s.symbol: s for s in load_packaged_universe(["ca_default"])}
+
+        assert "SHOP" in ca and ca["SHOP"].exchange == "TSX"
+        assert "SHOP" not in us, "Shopify must not also appear in the US seed"
+
+        assert "ABX" in ca and ca["ABX"].exchange == "TSX"
+        assert not any("barrick" in s.name.lower() for s in us.values()), (
+            "Barrick must not also appear in the US seed under a different (NYSE) ticker"
+        )
 
     def test_us_default_is_all_us_exchanges(self):
         for security in load_packaged_universe(["us_default"]):
@@ -190,13 +233,12 @@ class TestUniverseConfigDefaults:
     def test_packaged_universes_default(self):
         assert AppConfig().universe.packaged_universes == ["us_default", "ca_default"]
 
-    def test_permitted_exchanges_include_tsx_and_tsxv(self):
-        exchanges = AppConfig().universe.permitted_exchanges
-        assert "TSX" in exchanges
-        assert "TSXV" in exchanges
-        # US exchanges must still be permitted -- this is additive, not a swap.
-        assert "NASDAQ" in exchanges
-        assert "NYSE" in exchanges
+    def test_permitted_exchanges_is_exactly_the_owner_allowed_set(self):
+        """ADR-0008 Decision 3 owner scope: NYSE / Nasdaq / NYSE American (AMEX)
+        and TSX proper -- nothing else. TSX Venture (TSXV), CSE and NEO are
+        explicitly excluded, not merely unlisted."""
+        exchanges = set(AppConfig().universe.permitted_exchanges)
+        assert exchanges == {"NYSE", "NASDAQ", "AMEX", "TSX"}
 
     def test_for_session_permits_tsx_by_default(self, memory_db):
         """A TSX security must clear the exchange-permission gate with default config."""
@@ -206,3 +248,71 @@ class TestUniverseConfigDefaults:
                              market_cap_usd=50e9)
         report = selector.for_session(dt.date(2024, 6, 3), securities=[shop])
         assert "SHOP" in report.symbols
+
+    def test_min_market_cap_usd_default_is_one_billion(self):
+        """ADR-0008 Decision 3's literal ask: the owner's floor is $1B, not
+        the older, lower FilterConfig.min_market_cap_usd (500M) screen."""
+        assert AppConfig().universe.min_market_cap_usd == 1_000_000_000.0
+
+    def test_unknown_cap_policy_defaults_to_include(self):
+        assert AppConfig().universe.unknown_cap_policy == "include"
+
+
+class TestRuntimeMarketCapFloor:
+    """ADR-0008 Decision 3: the computed-at-refresh-time market-cap floor is
+    authoritative over the packaged seeds' approximate size buckets."""
+
+    def test_below_floor_is_excluded(self, memory_db):
+        config = AppConfig()
+        selector = UniverseSelector(config, memory_db)
+        tiny = SecurityInfo(symbol="TINY", name="Tiny Corp", exchange="NASDAQ",
+                             market_cap_usd=999_999_999.0)
+        report = selector.for_session(dt.date(2024, 6, 3), securities=[tiny])
+        assert "TINY" not in report.symbols
+        assert "TINY" in report.excluded.get("below_min_market_cap", [])
+
+    def test_at_or_above_floor_is_included(self, memory_db):
+        config = AppConfig()
+        selector = UniverseSelector(config, memory_db)
+        big = SecurityInfo(symbol="BIG", name="Big Corp", exchange="NASDAQ",
+                            market_cap_usd=1_000_000_000.0)
+        report = selector.for_session(dt.date(2024, 6, 3), securities=[big])
+        assert "BIG" in report.symbols
+
+    def test_configured_floor_is_respected(self, memory_db):
+        """Raising the floor excludes a name the default $1B floor would keep."""
+        config = AppConfig()
+        config.universe.min_market_cap_usd = 5_000_000_000.0
+        selector = UniverseSelector(config, memory_db)
+        mid = SecurityInfo(symbol="MIDCO", name="Mid Corp", exchange="NASDAQ",
+                            market_cap_usd=2_000_000_000.0)
+        report = selector.for_session(dt.date(2024, 6, 3), securities=[mid])
+        assert "MIDCO" not in report.symbols
+        assert "MIDCO" in report.excluded.get("below_min_market_cap", [])
+
+    def test_unknown_cap_included_by_default(self, memory_db):
+        """The default data-quality-conscious behaviour: a symbol whose cap
+        could not be established is NOT silently dropped -- excluding unknowns
+        by default would reintroduce survivorship-style bias at the universe
+        layer (ADR-0008 Decision 3's risk note)."""
+        config = AppConfig()
+        selector = UniverseSelector(config, memory_db)
+        unpriced = SecurityInfo(symbol="UNPRICED", name="Unpriced Corp", exchange="NASDAQ",
+                                 market_cap_usd=None)
+        report = selector.for_session(dt.date(2024, 6, 3), securities=[unpriced])
+        assert "UNPRICED" in report.symbols
+        assert "unknown_market_cap" not in report.excluded
+
+    def test_unknown_cap_excluded_when_policy_set_to_exclude(self, memory_db):
+        """An operator may opt into excluding unpriced names instead; the
+        exclusion reason is always explicit, never merged into a generic
+        'below_min_market_cap' bucket that would misrepresent an unknown as a
+        known-too-small cap."""
+        config = AppConfig()
+        config.universe.unknown_cap_policy = "exclude"
+        selector = UniverseSelector(config, memory_db)
+        unpriced = SecurityInfo(symbol="UNPRICED", name="Unpriced Corp", exchange="NASDAQ",
+                                 market_cap_usd=None)
+        report = selector.for_session(dt.date(2024, 6, 3), securities=[unpriced])
+        assert "UNPRICED" not in report.symbols
+        assert "UNPRICED" in report.excluded.get("unknown_market_cap", [])

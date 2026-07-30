@@ -210,12 +210,31 @@ class UniverseSelector:
             ):
                 report.exclude(security.symbol, "binary_event_sector")
                 continue
-            # Market cap is slow-moving; the value stored is the latest known.
-            # Treated as advisory here and re-checked point-in-time in scoring.
-            if (
-                security.market_cap_usd is not None
-                and security.market_cap_usd < filters.min_market_cap_usd
-            ):
+            # Market cap is slow-moving; the value stored is the latest known,
+            # established at refresh time via the market-data path (see
+            # ``data.ingest.DataIngestor.enrich_market_caps`` and
+            # ``providers.market.yahoo.YahooMarketProvider.get_market_caps``).
+            # This is ADR-0008 Decision 3's authoritative, computed-at-refresh
+            # floor -- deliberately ``cfg.min_market_cap_usd``
+            # (``UniverseConfig``), not ``filters.min_market_cap_usd``, which
+            # remains a separate, lower candidate-quality screen re-applied
+            # later at signal-scoring time.
+            if security.market_cap_usd is None:
+                # A cap that could not be established by ANY configured
+                # provider is NOT the same thing as a cap known to be below
+                # the floor: silently dropping it here would reintroduce
+                # survivorship-style bias at the universe layer, exactly the
+                # failure mode the point-in-time delisting check above exists
+                # to prevent for delisted names. "include" (the default) lets
+                # it through; "exclude" is an explicit, documented opt-in for
+                # an operator who prefers under-coverage. Either way the gap
+                # itself is always flagged separately in the data-quality
+                # report (see ``DataIngestor.enrich_market_caps``), never
+                # silent.
+                if cfg.unknown_cap_policy == "exclude":
+                    report.exclude(security.symbol, "unknown_market_cap")
+                    continue
+            elif security.market_cap_usd < cfg.min_market_cap_usd:
                 report.exclude(security.symbol, "below_min_market_cap")
                 continue
 

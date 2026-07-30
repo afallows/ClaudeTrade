@@ -1,10 +1,42 @@
 # generated: 2026-07-30
-# This is a hand-curated SEED universe, not a live index feed. Index
-# constituents drift (additions, removals, mergers, renames); this file will
-# go stale over time. Edit it freely -- add, remove or correct rows -- it is a
-# starting point for the scannable universe, not an authoritative source.
-# market_cap_bucket is an approximate size label (mega/large/mid), not a live
-# market capitalisation figure.
+# This is a hand-curated SEED universe, not a live index feed (ADR-0008
+# Decision 3: the runtime market-cap filter at refresh time is authoritative;
+# this file is bootstrap coverage only). Index constituents drift (additions,
+# removals, mergers, renames); this file will go stale over time. Edit it
+# freely -- add, remove or correct rows.
+#
+# Expansion history:
+#   2026-07-30: merged the original ~500-row hand-curated seed with rows
+#   derived from a real, live-fetched dataset: rreichel3/US-Stock-Symbols
+#   (https://github.com/rreichel3/US-Stock-Symbols), a nightly-updated mirror
+#   of NASDAQ's own public stock-screener listing for the NASDAQ, NYSE and
+#   NYSE American (AMEX) exchanges, fetched via raw.githubusercontent.com on
+#   2026-07-30. Each candidate row's own self-reported marketCap/sector/
+#   industry/country fields (not estimates) were used to: keep only rows
+#   with marketCap >= $1,000,000,000; drop non-common-equity instruments
+#   (warrants/rights/units/notes/preferred/SPAC shells); drop rows whose
+#   reported domicile is Canada (see the ca_default.csv cross-listing note --
+#   Canada-domiciled dual listings live there instead, under their TSX
+#   ticker, never both places); and collapse duplicate share classes of the
+#   same company to a single row. Note: this is a market-cap-floor filter,
+#   not literally "Russell 1000 + S&P 400 + S&P 600" index membership (that
+#   Wikipedia-based path was planned but WebFetch returned HTTP 403 for
+#   every host tried in this sandbox during implementation, Wikipedia
+#   included -- see docs/api-providers.md for the full account); it is
+#   arguably a more literal match for the underlying ask ("all ... stocks
+#   over 1 Billion market cap") than an index-membership proxy would be.
+#   Companies incorporated offshore (Bermuda/Ireland/UK/Switzerland/
+#   Netherlands/Cayman/Jersey/Luxembourg) but NYSE/Nasdaq-primary-listed are
+#   still counted as "US" here, consistent with pre-existing rows already in
+#   this file (Chubb, Aon, Willis Towers Watson, Invesco, Linde) -- that is
+#   an inherited convention, not a new policy introduced by this expansion.
+#
+# market_cap_bucket is an approximate size label (mega/large/mid/small), not
+# a live market capitalisation figure -- see providers/market/yahoo.py and
+# data/universe.py for the real, runtime market-cap floor
+# (universe.min_market_cap_usd) that is authoritative at refresh time.
+# Permitted exchanges: NASDAQ, NYSE, AMEX (NYSE American) only -- no OTC
+# markets.
 symbol,name,exchange,sector,market_cap_bucket,country
 AAPL,Apple Inc.,NASDAQ,Technology,mega,US
 MSFT,Microsoft Corporation,NASDAQ,Technology,mega,US
@@ -302,7 +334,6 @@ WYNN,Wynn Resorts Limited,NASDAQ,Consumer Discretionary,mid,US
 LVS,Las Vegas Sands Corp.,NYSE,Consumer Discretionary,mid,US
 GPC,Genuine Parts Company,NYSE,Consumer Discretionary,mid,US
 AAP,Advance Auto Parts Inc.,NYSE,Consumer Discretionary,mid,US
-QSR,Restaurant Brands International Inc.,NYSE,Consumer Discretionary,mid,US
 UBER,Uber Technologies Inc.,NYSE,Consumer Discretionary,large,US
 LYFT,Lyft Inc.,NASDAQ,Consumer Discretionary,mid,US
 ABNB,Airbnb Inc.,NASDAQ,Consumer Discretionary,large,US
@@ -389,7 +420,6 @@ ADP,Automatic Data Processing Inc.,NASDAQ,Industrials,large,US
 CTAS,Cintas Corporation,NASDAQ,Industrials,large,US
 RSG,Republic Services Inc.,NYSE,Industrials,large,US
 WM,Waste Management Inc.,NYSE,Industrials,large,US
-WCN,Waste Connections Inc.,NYSE,Industrials,large,US
 VRSK,Verisk Analytics Inc.,NASDAQ,Industrials,mid,US
 EFX,Equifax Inc.,NYSE,Industrials,mid,US
 RHI,Robert Half Inc.,NYSE,Industrials,mid,US
@@ -515,3 +545,1689 @@ PKG,Packaging Corporation of America,NYSE,Materials,mid,US
 IP,International Paper Company,NYSE,Materials,mid,US
 BALL,Ball Corporation,NYSE,Materials,mid,US
 AMCR,Amcor plc,NYSE,Materials,mid,US
+AA,Alcoa Corporation,NYSE,Industrials,mid,US
+AADX,Applied Aerospace & Defense Inc.,NYSE,Industrials,small,US
+AAMI,Acadian Asset Management Inc.,NYSE,Financials,small,US
+AAOI,Applied Optoelectronics Inc.,NASDAQ,Technology,mid,US
+AAON,AAON Inc.,NASDAQ,Industrials,mid,US
+AAT,American Assets Trust Inc.,NYSE,Real Estate,small,US
+AAUC,Allied Gold Corporation,NYSE,,small,US
+ABCB,Ameris Bancorp,NYSE,Financials,mid,US
+ABG,Asbury Automotive Group Inc,NYSE,Consumer Discretionary,small,US
+ABM,ABM Industries Incorporated,NYSE,Consumer Discretionary,small,US
+ABSI,Absci Corporation,NASDAQ,Health Care,small,US
+ACA,Arcosa Inc.,NYSE,Industrials,mid,US
+ACAD,ACADIA Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+ACEL,Accel Entertainment Inc.,NYSE,Consumer Discretionary,small,US
+ACGL,Arch Capital Group Ltd.,NASDAQ,Financials,mid,US
+ACHC,Acadia Healthcare Company Inc.,NASDAQ,Health Care,small,US
+ACHR,Archer Aviation Inc.,NYSE,Industrials,small,US
+ACIW,ACI Worldwide Inc.,NASDAQ,Technology,mid,US
+ACLS,Axcelis Technologies Inc.,NASDAQ,Technology,small,US
+ACM,AECOM,NYSE,Consumer Discretionary,mid,US
+ACMR,ACM Research Inc.,NASDAQ,Technology,small,US
+ACT,Enact Holdings Inc.,NASDAQ,Financials,mid,US
+ACVA,ACV Auctions Inc.,NYSE,Consumer Discretionary,small,US
+AD,Array Digital Infrastructure Inc.,NYSE,Communication Services,small,US
+ADC,Agree Realty Corporation,NYSE,Real Estate,mid,US
+ADEA,Adeia Inc.,NASDAQ,Technology,small,US
+ADMA,ADMA Biologics Inc,NASDAQ,Health Care,small,US
+ADNT,Adient plc,NYSE,Consumer Discretionary,small,US
+ADPT,Adaptive Biotechnologies Corporation,NASDAQ,Health Care,small,US
+ADT,ADT Inc.,NYSE,Consumer Discretionary,mid,US
+ADUS,Addus HomeCare Corporation,NASDAQ,Health Care,small,US
+AEBI,Aebi Schmidt Holding AG,NASDAQ,Industrials,small,US
+AEG,Aegon Ltd. New York Registry Shares,NYSE,Financials,mid,US
+AEHR,Aehr Test Systems,NASDAQ,Industrials,small,US
+AEIS,Advanced Energy Industries Inc.,NASDAQ,Technology,mid,US
+AEO,American Eagle Outfitters Inc.,NYSE,Consumer Discretionary,small,US
+AER,AerCap Holdings N.V.,NYSE,Consumer Discretionary,mid,US
+AES,The AES Corporation,NYSE,Utilities,mid,US
+AESI,Atlas Energy Solutions Inc.,NYSE,Industrials,small,US
+AFG,American Financial Group Inc.,NYSE,Financials,mid,US
+AFRM,Affirm Holdings Inc.,NASDAQ,Financials,mid,US
+AGBK,AGI Inc Class A,NYSE,Financials,small,US
+AGCO,AGCO Corporation,NYSE,Industrials,mid,US
+AGIO,Agios Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+AGL,agilon health inc.,NYSE,Health Care,small,US
+AGM,Federal Agricultural Mortgage Corporation,NYSE,Financials,small,US
+AGNC,AGNC Investment Corp.,NASDAQ,Real Estate,mid,US
+AGO,Assured Guaranty Ltd.,NYSE,Financials,small,US
+AGRO,Adecoagro S.A.,NYSE,Consumer Staples,small,US
+AGX,Argan Inc.,NYSE,Consumer Discretionary,mid,US
+AGYS,Agilysys Inc. Common Stock (DE),NASDAQ,Technology,small,US
+AHCO,AdaptHealth Corp.,NASDAQ,Health Care,small,US
+AHR,American Healthcare REIT Inc.,NYSE,Real Estate,mid,US
+AI,C3.ai Inc.,NYSE,Technology,small,US
+AIN,Albany International Corporation,NYSE,Consumer Discretionary,small,US
+AIP,Arteris Inc.,NASDAQ,Technology,small,US
+AIR,AAR Corp.,NYSE,Industrials,mid,US
+AIT,Applied Industrial Technologies Inc.,NYSE,Consumer Discretionary,mid,US
+AIZ,Assurant Inc.,NYSE,Financials,mid,US
+AKR,Acadia Realty Trust,NYSE,Real Estate,small,US
+AKTS,Aktis Oncology Inc.,NASDAQ,Health Care,small,US
+ALAB,Astera Labs Inc.,NASDAQ,Technology,mid,US
+ALC,Alcon Inc.,NYSE,Health Care,mid,US
+ALG,Alamo Group Inc.,NYSE,Industrials,small,US
+ALGM,Allegro MicroSystems Inc.,NASDAQ,Technology,mid,US
+ALGT,Allegiant Travel Company,NASDAQ,Consumer Discretionary,small,US
+ALH,Alliance Laundry Holdings Inc.,NYSE,Industrials,mid,US
+ALHC,Alignment Healthcare Inc.,NASDAQ,Health Care,small,US
+ALKS,Alkermes plc,NASDAQ,Health Care,mid,US
+ALKT,Alkami Technology Inc.,NASDAQ,Technology,small,US
+ALLY,Ally Financial Inc.,NYSE,Financials,mid,US
+ALMR,Alamar Biosciences Inc.,NASDAQ,Industrials,small,US
+ALMS,Alumis Inc.,NASDAQ,Health Care,small,US
+ALNT,Allient Inc.,NASDAQ,Industrials,small,US
+ALNY,Alnylam Pharmaceuticals Inc.,NASDAQ,Health Care,mid,US
+ALRM,Alarm.com Holdings Inc.,NASDAQ,Technology,small,US
+ALSN,Allison Transmission Holdings Inc.,NYSE,Consumer Discretionary,mid,US
+ALVO,Alvotech,NASDAQ,Health Care,small,US
+ALX,Alexander's Inc.,NYSE,Real Estate,small,US
+AM,Antero Midstream Corporation,NYSE,Utilities,mid,US
+AMAL,Amalgamated Financial Corp. Common Stock (DE),NASDAQ,Financials,small,US
+AMBA,Ambarella Inc.,NASDAQ,Technology,small,US
+AMBP,Ardagh Metal Packaging S.A.,NYSE,Industrials,small,US
+AMBQ,Ambiq Micro Inc.,NYSE,Technology,small,US
+AMC,AMC Entertainment Holdings Inc.,NYSE,Consumer Discretionary,small,US
+AMG,Affiliated Managers Group Inc.,NYSE,Financials,mid,US
+AMH,American Homes 4 Rent Common,NYSE,Real Estate,mid,US
+AMKR,Amkor Technology Inc.,NASDAQ,Technology,mid,US
+AMLX,Amylyx Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+AMN,AMN Healthcare Services Inc,NYSE,Consumer Discretionary,small,US
+AMPL,Amplitude Inc.,NASDAQ,Technology,small,US
+AMPX,Amprius Technologies Inc.,NYSE,Industrials,small,US
+AMR,Alpha Metallurgical Resources Inc.,NYSE,Energy,small,US
+AMRX,Amneal Pharmaceuticals Inc.,NASDAQ,Health Care,mid,US
+AMRZ,Amrize Ltd,NYSE,Industrials,mid,US
+AMSC,American Superconductor Corporation,NASDAQ,Consumer Discretionary,small,US
+AMTB,Amerant Bancorp Inc.,NYSE,Financials,small,US
+AMTM,Amentum Holdings Inc.,NYSE,Consumer Discretionary,mid,US
+AN,AutoNation Inc.,NYSE,Consumer Discretionary,mid,US
+ANAB,AnaptysBio Inc.,NASDAQ,Health Care,small,US
+ANDE,Andersons Inc. (The),NASDAQ,Industrials,small,US
+ANDG,Andersen Group Inc.,NYSE,Consumer Discretionary,mid,US
+ANF,Abercrombie & Fitch Company,NYSE,Consumer Discretionary,small,US
+ANIP,ANI Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+ANRO,Alto Neuroscience Inc.,NYSE,Health Care,small,US
+AORT,Artivion Inc.,NYSE,Health Care,small,US
+AOS,A.O. Smith Corporation,NYSE,Consumer Discretionary,mid,US
+APAM,Artisan Partners Asset Management Inc.,NYSE,Financials,small,US
+APG,APi Group Corporation,NYSE,Consumer Discretionary,mid,US
+APGE,Apogee Therapeutics Inc.,NASDAQ,Health Care,mid,US
+APLD,Applied Digital Corporation,NASDAQ,Health Care,mid,US
+APLE,Apple Hospitality REIT Inc.,NYSE,Real Estate,small,US
+APO,Apollo Global Management Inc. (New),NYSE,Financials,large,US
+APP,Applovin Corporation,NASDAQ,Technology,large,US
+APPF,AppFolio Inc.,NASDAQ,Technology,mid,US
+APPN,Appian Corporation,NASDAQ,Technology,small,US
+AR,Antero Resources Corporation,NYSE,Energy,mid,US
+ARCB,ArcBest Corporation,NASDAQ,Industrials,small,US
+ARCC,Ares Capital Corporation,NASDAQ,Financials,mid,US
+ARDT,Ardent Health Inc.,NYSE,Health Care,small,US
+ARDX,Ardelyx Inc.,NASDAQ,Health Care,small,US
+ARES,Ares Management Corporation,NYSE,Financials,mid,US
+ARHS,Arhaus Inc.,NASDAQ,Consumer Discretionary,small,US
+ARLO,Arlo Technologies Inc.,NYSE,Consumer Staples,small,US
+ARMK,Aramark,NYSE,Consumer Discretionary,mid,US
+AROC,Archrock Inc.,NYSE,Utilities,mid,US
+ARQT,Arcutis Biotherapeutics Inc.,NASDAQ,Health Care,small,US
+ARR,ARMOUR Residential REIT Inc.,NYSE,Real Estate,small,US
+ARW,Arrow Electronics Inc.,NYSE,Technology,mid,US
+ARWR,Arrowhead Pharmaceuticals Inc.,NASDAQ,Health Care,mid,US
+ARXS,Arxis Inc.,NASDAQ,Industrials,mid,US
+AS,Amer Sports Inc.,NYSE,Consumer Discretionary,mid,US
+ASAN,Asana Inc.,NYSE,Technology,small,US
+ASB,Associated Banc-Corp,NYSE,Financials,mid,US
+ASH,Ashland Inc.,NYSE,Consumer Discretionary,small,US
+ASIC,Ategrity Specialty Insurance Company Holdings,NYSE,Financials,small,US
+ASML,ASML Holding N.V. New York Registry Shares,NASDAQ,Technology,mega,US
+ASO,Academy Sports and Outdoors Inc.,NASDAQ,Consumer Discretionary,small,US
+ASTE,Astec Industries Inc.,NASDAQ,Industrials,small,US
+ASTH,Astrana Health Inc.,NASDAQ,Consumer Discretionary,small,US
+ASTS,AST SpaceMobile Inc.,NASDAQ,Consumer Discretionary,mid,US
+ATEC,Alphatec Holdings Inc.,NASDAQ,Health Care,small,US
+ATEN,A10 Networks Inc.,NYSE,Communication Services,small,US
+ATEX,Anterix Inc.,NASDAQ,Communication Services,small,US
+ATI,ATI Inc.,NYSE,Industrials,mid,US
+ATKR,Atkore Inc.,NYSE,Industrials,small,US
+ATLC,Atlanticus Holdings Corporation,NASDAQ,Financials,small,US
+ATMU,Atmus Filtration Technologies Inc.,NYSE,Consumer Discretionary,small,US
+ATR,AptarGroup Inc.,NYSE,Industrials,mid,US
+ATRC,AtriCure Inc.,NASDAQ,Health Care,small,US
+ATRO,Astronics Corporation,NASDAQ,Industrials,small,US
+AUB,Atlantic Union Bankshares Corporation,NYSE,Financials,mid,US
+AUGO,Aura Minerals Inc.,NASDAQ,,small,US
+AUR,Aurora Innovation Inc.,NASDAQ,Technology,mid,US
+AVA,Avista Corporation,NYSE,Utilities,small,US
+AVAH,Aveanna Healthcare Holdings Inc.,NASDAQ,Health Care,small,US
+AVAV,AeroVironment Inc.,NASDAQ,Industrials,mid,US
+AVBP,ArriVent BioPharma Inc.,NASDAQ,Health Care,small,US
+AVEX,AEVEX Corp.,NYSE,Industrials,small,US
+AVLN,Avalyn Pharma Inc.,NASDAQ,Health Care,small,US
+AVNT,Avient Corporation,NYSE,Industrials,small,US
+AVO,Mission Produce Inc.,NASDAQ,Consumer Staples,small,US
+AVPT,AvePoint Inc.,NASDAQ,Technology,small,US
+AVT,Avnet Inc.,NASDAQ,Technology,mid,US
+AVTR,Avantor Inc.,NYSE,Industrials,mid,US
+AVTX,Avalo Therapeutics Inc.,NASDAQ,Health Care,small,US
+AWI,Armstrong World Industries Inc,NYSE,Industrials,mid,US
+AWR,American States Water Company,NYSE,Utilities,small,US
+AX,Axos Financial Inc.,NYSE,Financials,mid,US
+AXGN,Axogen Inc.,NASDAQ,Health Care,small,US
+AXON,Axon Enterprise Inc.,NASDAQ,Industrials,mid,US
+AXS,Axis Capital Holdings Limited,NYSE,Financials,mid,US
+AXSM,Axsome Therapeutics Inc.,NASDAQ,Health Care,mid,US
+AXTA,Axalta Coating Systems Ltd.,NYSE,Consumer Discretionary,mid,US
+AXTI,AXT Inc,NASDAQ,Technology,small,US
+AYI,Acuity Inc.,NYSE,Consumer Discretionary,mid,US
+AZN,AstraZeneca PLC,NYSE,Health Care,mega,US
+AZTA,Azenta Inc.,NASDAQ,Technology,small,US
+AZZ,AZZ Inc.,NYSE,Industrials,small,US
+BAH,Booz Allen Hamilton Holding Corporation,NYSE,Consumer Discretionary,mid,US
+BANC,Banc of California Inc.,NYSE,Financials,small,US
+BAND,Bandwidth Inc.,NASDAQ,Technology,small,US
+BANF,BancFirst Corporation,NASDAQ,Financials,small,US
+BANR,Banner Corporation,NASDAQ,Financials,small,US
+BATRA,Atlanta Braves Holdings Inc. Series A,NASDAQ,Consumer Discretionary,small,US
+BATRK,Atlanta Braves Holdings Inc. Series C,NASDAQ,Consumer Discretionary,small,US
+BBAI,BigBear.ai Inc.,NYSE,Technology,small,US
+BBIO,BridgeBio Pharma Inc.,NASDAQ,Health Care,mid,US
+BBSI,Barrett Business Services Inc.,NASDAQ,Consumer Discretionary,small,US
+BBT,Beacon Financial Corporation,NYSE,Financials,small,US
+BBUC,Brookfield Business Corporation,NYSE,Consumer Discretionary,mid,US
+BBWI,Bath & Body Works Inc.,NYSE,Consumer Discretionary,small,US
+BC,Brunswick Corporation,NYSE,Industrials,mid,US
+BCAT,BlackRock Capital Allocation Term Trust Common,NYSE,Financials,small,US
+BCAX,Bicara Therapeutics Inc.,NASDAQ,Health Care,small,US
+BCC,Boise Cascade L.L.C.,NYSE,Consumer Discretionary,small,US
+BCO,Brinks Company (The),NYSE,Industrials,mid,US
+BCPC,Balchem Corporation,NASDAQ,Industrials,mid,US
+BCRX,BioCryst Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+BCS,Barclays PLC,NYSE,Financials,large,US
+BDC,Belden Inc,NYSE,Industrials,small,US
+BDJ,Blackrock Enhanced Equity Dividend Trust,NYSE,Financials,small,US
+BE,Bloom Energy Corporation,NYSE,Energy,mid,US
+BEAM,Beam Therapeutics Inc.,NASDAQ,Health Care,small,US
+BELFB,Bel Fuse Inc.,NASDAQ,,small,US
+BETA,Beta Technologies Inc.,NYSE,Industrials,small,US
+BFAM,Bright Horizons Family Solutions Inc.,NYSE,Consumer Discretionary,small,US
+BFC,Bank First Corporation,NASDAQ,Financials,small,US
+BFH,Bread Financial Holdings Inc.,NYSE,Consumer Discretionary,small,US
+BFLY,Butterfly Network Inc.,NYSE,Health Care,small,US
+BFST,Business First Bancshares Inc.,NASDAQ,Financials,small,US
+BG,Bunge Limited,NYSE,Consumer Staples,mid,US
+BGC,BGC Group Inc.,NASDAQ,Financials,mid,US
+BGR,BlackRock Energy and Resources Trust,NYSE,Financials,small,US
+BHE,Benchmark Electronics Inc.,NYSE,Technology,small,US
+BHF,Brighthouse Financial Inc.,NASDAQ,Financials,small,US
+BHRB,Burke & Herbert Financial Services Corp.,NASDAQ,Financials,small,US
+BHVN,Biohaven Ltd.,NYSE,Health Care,small,US
+BILL,BILL Holdings Inc.,NYSE,Technology,small,US
+BIO,Bio-Rad Laboratories Inc.,NYSE,Industrials,mid,US
+BIRK,Birkenstock Holding plc,NYSE,Consumer Discretionary,mid,US
+BJ,BJ's Wholesale Club Holdings Inc.,NYSE,Consumer Discretionary,mid,US
+BJRI,BJ's Restaurants Inc.,NASDAQ,Consumer Discretionary,small,US
+BKD,Brookdale Senior Living Inc.,NYSE,Health Care,small,US
+BKE,Buckle Inc. (The),NYSE,Consumer Discretionary,small,US
+BKH,Black Hills Corporation,NYSE,Utilities,mid,US
+BKT,BlackRock Income Trust Inc. (The),NYSE,Financials,small,US
+BKU,BankUnited Inc.,NYSE,Financials,small,US
+BKV,BKV Corporation,NYSE,Energy,small,US
+BL,BlackLine Inc.,NASDAQ,Technology,small,US
+BLBD,Blue Bird Corporation,NASDAQ,Consumer Discretionary,small,US
+BLDR,Builders FirstSource Inc.,NYSE,Consumer Discretionary,mid,US
+BLFS,BioLife Solutions Inc.,NASDAQ,Health Care,small,US
+BLKB,Blackbaud Inc.,NASDAQ,Technology,small,US
+BLLN,BillionToOne Inc.,NASDAQ,Health Care,mid,US
+BLSH,Bullish,NYSE,Financials,small,US
+BMI,Badger Meter Inc.,NYSE,Industrials,small,US
+BMNR,BitMine Immersion Technologies Inc.,NYSE,Financials,mid,US
+BMRN,BioMarin Pharmaceutical Inc.,NASDAQ,Health Care,mid,US
+BNL,Broadstone Net Lease Inc.,NYSE,Real Estate,small,US
+BNT,Brookfield Wealth Solutions Ltd. Class A Exchangeable Limited Voting Shares,NYSE,Financials,mid,US
+BNY,The Bank of New York Mellon Corporation,NYSE,Financials,large,US
+BOBS,Bob's Discount Furniture Inc.,NYSE,Consumer Discretionary,small,US
+BOH,Bank of Hawaii Corporation,NYSE,Financials,small,US
+BOKF,BOK Financial Corporation,NASDAQ,Financials,mid,US
+BOOT,Boot Barn Holdings Inc.,NYSE,Consumer Discretionary,small,US
+BORR,Borr Drilling Limited,NYSE,Energy,small,US
+BOW,Bowhead Specialty Holdings Inc.,NYSE,Financials,small,US
+BOX,Box Inc.,NYSE,Technology,small,US
+BP,BP p.l.c.,NYSE,Energy,large,US
+BPOP,Popular Inc.,NASDAQ,Financials,mid,US
+BRBR,BellRing Brands Inc.,NYSE,Consumer Staples,small,US
+BRC,Brady Corporation,NYSE,Consumer Discretionary,small,US
+BRK-A,Berkshire Hathaway Inc.,NYSE,,mega,US
+BRKR,Bruker Corporation,NASDAQ,Industrials,mid,US
+BRO,Brown & Brown Inc.,NYSE,Financials,mid,US
+BROS,Dutch Bros Inc.,NYSE,Consumer Discretionary,mid,US
+BRSL,Brightstar Lottery PLC Trading under the Legal Name to begin at the market open on July 21 2025.,NYSE,Consumer Discretionary,small,US
+BRX,Brixmor Property Group Inc.,NYSE,Real Estate,mid,US
+BRZE,Braze Inc.,NASDAQ,Technology,small,US
+BTI,British American Tobacco  Industries p.l.c. Common Stock ADR,NYSE,Health Care,large,US
+BTSG,BrightSpring Health Services Inc.,NASDAQ,Health Care,mid,US
+BTU,Peabody Energy Corporation,NYSE,Energy,small,US
+BTX,BlackRock Technology and Private Equity Term Trust Common,NYSE,,small,US
+BTZ,BlackRock Credit Allocation Income Trust,NYSE,Financials,small,US
+BULL,Webull Corporation,NASDAQ,Financials,small,US
+BURL,Burlington Stores Inc.,NYSE,Consumer Discretionary,mid,US
+BUSE,First Busey Corporation,NASDAQ,Financials,small,US
+BV,BrightView Holdings Inc.,NYSE,Consumer Discretionary,small,US
+BVS,Bioventus Inc.,NASDAQ,Health Care,small,US
+BW,Babcock & Wilcox Enterprises Inc.,NYSE,Industrials,small,US
+BWIN,The Baldwin Insurance Group Inc.,NASDAQ,Financials,small,US
+BWLP,BW LPG Limited,NYSE,Consumer Discretionary,small,US
+BWXT,BWX Technologies Inc.,NYSE,Industrials,mid,US
+BX,Blackstone Inc.,NYSE,Financials,large,US
+BXBL,BOXABL Inc.,NASDAQ,Consumer Discretionary,small,US
+BXDC,Blackstone Digital Infrastructure Trust Inc.,NYSE,Financials,small,US
+BXMT,Blackstone Mortgage Trust Inc.,NYSE,Real Estate,small,US
+BY,Byline Bancorp Inc.,NYSE,Financials,small,US
+CAAP,Corporacion America Airports SA,NYSE,Consumer Discretionary,small,US
+CACC,Credit Acceptance Corporation,NASDAQ,Financials,mid,US
+CACI,CACI International Inc.,NYSE,Technology,mid,US
+CAI,Caris Life Sciences Inc.,NASDAQ,Health Care,small,US
+CAKE,Cheesecake Factory Incorporated (The),NASDAQ,Consumer Discretionary,mid,US
+CALM,Cal-Maine Foods Inc.,NASDAQ,Consumer Staples,small,US
+CALX,Calix Inc,NYSE,Consumer Discretionary,small,US
+CALY,Callaway Golf Company,NYSE,Consumer Discretionary,small,US
+CAR,Avis Budget Group Inc.,NASDAQ,Consumer Discretionary,mid,US
+CARG,CarGurus Inc.,NASDAQ,Technology,small,US
+CART,Maplebear Inc.,NASDAQ,Consumer Discretionary,mid,US
+CASH,Pathward Financial Inc.,NASDAQ,Financials,small,US
+CASY,Casey's General Stores Inc.,NASDAQ,Consumer Discretionary,mid,US
+CATY,Cathay General Bancorp,NASDAQ,Financials,small,US
+CAVA,CAVA Group Inc.,NYSE,Consumer Discretionary,mid,US
+CBC,Central Bancompany Inc.,NASDAQ,,mid,US
+CBL,CBL & Associates Properties Inc.,NYSE,Real Estate,small,US
+CBRE,CBRE Group Inc Common Stock Class A,NYSE,Financials,mid,US
+CBRL,Cracker Barrel Old Country Store Inc,NASDAQ,Consumer Discretionary,small,US
+CBRS,Cerebras Systems Inc.,NASDAQ,Technology,mid,US
+CBSH,Commerce Bancshares Inc.,NASDAQ,Financials,mid,US
+CBT,Cabot Corporation,NYSE,Industrials,small,US
+CBU,Community Financial System Inc.,NYSE,Financials,small,US
+CBZ,CBIZ Inc.,NYSE,Consumer Discretionary,small,US
+CC,Chemours Company (The),NYSE,Industrials,small,US
+CCB,Coastal Financial Corporation,NASDAQ,Financials,small,US
+CCC,CCC Intelligent Solutions Holdings Inc.,NASDAQ,Technology,small,US
+CCEP,Coca-Cola Europacific Partners plc,NASDAQ,Consumer Staples,large,US
+CCK,Crown Holdings Inc.,NYSE,Industrials,mid,US
+CCNE,CNB Financial Corporation,NASDAQ,Financials,small,US
+CCS,Century Communities Inc.,NYSE,Consumer Discretionary,small,US
+CCZ,Comcast Holdings ZONES,NYSE,Communication Services,large,US
+CDE,Coeur Mining Inc.,NYSE,Materials,mid,US
+CDLR,Cadeler A/S American Depositary Share (each representing four (4) Ordinary Shares),NYSE,Consumer Discretionary,small,US
+CDNA,CareDx Inc.,NASDAQ,Health Care,small,US
+CDNL,Cardinal Infrastructure Group Inc.,NASDAQ,Industrials,small,US
+CDP,COPT Defense Properties Common,NYSE,Real Estate,small,US
+CDRE,Cadre Holdings Inc.,NYSE,Health Care,small,US
+CECO,CECO Environmental Corp.,NASDAQ,Industrials,small,US
+CEG,Constellation Energy Corporation,NASDAQ,Utilities,large,US
+CELC,Celcuity Inc.,NASDAQ,Health Care,small,US
+CELH,Celsius Holdings Inc.,NASDAQ,Consumer Staples,mid,US
+CENT,Central Garden & Pet Company,NASDAQ,Consumer Discretionary,small,US
+CENX,Century Aluminum Company,NASDAQ,Industrials,small,US
+CERT,Certara Inc.,NASDAQ,Technology,small,US
+CET,Central Securities Corporation,AMEX,Financials,mid,US
+CFFN,Capitol Federal Financial Inc.,NASDAQ,Financials,small,US
+CFR,Cullen/Frost Bankers Inc.,NYSE,Financials,mid,US
+CGEM,Cullinan Therapeutics Inc.,NASDAQ,Health Care,small,US
+CGNX,Cognex Corporation,NASDAQ,Industrials,mid,US
+CGON,CG Oncology Inc.,NASDAQ,Health Care,mid,US
+CHCO,City Holding Company,NASDAQ,Financials,small,US
+CHDN,Churchill Downs Incorporated,NASDAQ,Consumer Discretionary,mid,US
+CHE,Chemed Corp,NYSE,Health Care,mid,US
+CHEF,The Chefs' Warehouse Inc.,NASDAQ,Consumer Discretionary,small,US
+CHH,Choice Hotels International Inc.,NYSE,Consumer Discretionary,mid,US
+CHRN,ChronoScale Holdings Corporation,NASDAQ,Industrials,small,US
+CHWY,Chewy Inc.,NYSE,Consumer Discretionary,mid,US
+CHYM,Chime Financial Inc.,NASDAQ,Financials,mid,US
+CIEN,Ciena Corporation,NYSE,Utilities,mid,US
+CIFR,Cipher Digital Inc.,NASDAQ,Financials,mid,US
+CII,BlackRock Enhanced Large Cap Core Fund Inc.,NYSE,Financials,small,US
+CIM,Chimera Investment Corporation,NYSE,Real Estate,small,US
+CINF,Cincinnati Financial Corporation,NASDAQ,Financials,mid,US
+CLBK,Columbia Financial Inc.,NASDAQ,Financials,small,US
+CLDX,Celldex Therapeutics Inc.,NASDAQ,Health Care,small,US
+CLF,Cleveland-Cliffs Inc.,NYSE,Materials,mid,US
+CLH,Clean Harbors Inc.,NYSE,Industrials,mid,US
+CLMT,Calumet Inc.,NASDAQ,Energy,small,US
+CLOV,Clover Health Investments Corp.,NASDAQ,Health Care,small,US
+CLSK,CleanSpark Inc.,NASDAQ,Financials,small,US
+CLVT,Clarivate Plc,NYSE,Technology,small,US
+CMBT,CMB.TECH NV,NYSE,Consumer Discretionary,small,US
+CMC,Commercial Metals Company,NYSE,Industrials,mid,US
+CMP,Compass Minerals Intl Inc,NYSE,Industrials,small,US
+CMPR,Cimpress plc Ordinary Shares (Ireland),NASDAQ,Consumer Discretionary,small,US
+CNA,CNA Financial Corporation,NYSE,Financials,mid,US
+CNH,CNH Industrial N.V.,NYSE,Industrials,mid,US
+CNK,Cinemark Holdings Inc Cinemark Holdings Inc.,NYSE,Consumer Discretionary,small,US
+CNL,Collective Mining Ltd.,AMEX,,small,US
+CNM,Core & Main Inc.,NYSE,Consumer Discretionary,mid,US
+CNMD,CONMED Corporation,NYSE,Health Care,small,US
+CNO,CNO Financial Group Inc.,NYSE,Financials,small,US
+CNOB,ConnectOne Bancorp Inc.,NASDAQ,Financials,small,US
+CNS,Cohen & Steers Inc,NYSE,Financials,small,US
+CNX,CNX Resources Corporation,NYSE,Energy,small,US
+CNXC,Concentrix Corporation,NASDAQ,Technology,small,US
+CNXN,PC Connection Inc.,NASDAQ,Consumer Discretionary,small,US
+COAG,Hemab Therapeutics Holdings Inc.,NASDAQ,Health Care,small,US
+COCO,The Vita Coco Company Inc.,NASDAQ,Consumer Staples,small,US
+COGT,Cogent Biosciences Inc.,NASDAQ,Health Care,mid,US
+COHR,Coherent Corp.,NYSE,Technology,mid,US
+COHU,Cohu Inc.,NASDAQ,Industrials,small,US
+COKE,Coca-Cola Consolidated Inc.,NASDAQ,Consumer Staples,mid,US
+COLB,Columbia Banking System Inc.,NASDAQ,Financials,mid,US
+COLD,Americold Realty Trust Inc.,NYSE,Real Estate,small,US
+COLL,Collegium Pharmaceutical Inc.,NASDAQ,Health Care,small,US
+COLM,Columbia Sportswear Company,NASDAQ,Consumer Discretionary,small,US
+COMP,Compass Inc.,NYSE,Technology,mid,US
+CON,Concentra Group Holdings Parent Inc.,NYSE,Health Care,small,US
+COO,The Cooper Companies Inc.,NASDAQ,Health Care,mid,US
+CORT,Corcept Therapeutics Incorporated,NASDAQ,Health Care,mid,US
+CORZ,Core Scientific Inc.,NASDAQ,Financials,mid,US
+COTY,Coty Inc.,NYSE,Consumer Discretionary,small,US
+COUR,Coursera Inc.,NYSE,Technology,small,US
+CPAY,Corpay Inc.,NYSE,Consumer Discretionary,mid,US
+CPF,Central Pacific Financial Corp New,NYSE,Financials,small,US
+CPK,Chesapeake Utilities Corporation,NYSE,Utilities,small,US
+CPNG,Coupang Inc.,NYSE,Consumer Discretionary,mid,US
+CR,Crane Company,NYSE,Industrials,mid,US
+CRAI,CRA International Inc.,NASDAQ,Consumer Discretionary,small,US
+CRBG,Corebridge Financial Inc.,NYSE,Financials,mid,US
+CRC,California Resources Corporation,NYSE,Energy,small,US
+CRCL,Circle Internet Group Inc.,NYSE,Financials,mid,US
+CRCT,Cricut Inc.,NASDAQ,Technology,small,US
+CRDO,Credo Technology Group Holding Ltd,NASDAQ,Technology,mid,US
+CRGY,Crescent Energy Company,NYSE,Energy,small,US
+CRH,CRH PLC,NYSE,Industrials,large,US
+CRI,Carter's Inc.,NYSE,Consumer Discretionary,small,US
+CRK,Comstock Resources Inc.,NYSE,Energy,small,US
+CRNX,Crinetics Pharmaceuticals Inc.,NASDAQ,Health Care,mid,US
+CROX,Crocs Inc.,NASDAQ,Consumer Discretionary,mid,US
+CRS,Carpenter Technology Corporation,NYSE,Industrials,mid,US
+CRSP,CRISPR Therapeutics AG,NASDAQ,Health Care,small,US
+CRSR,Corsair Gaming Inc.,NASDAQ,Technology,small,US
+CRUS,Cirrus Logic Inc.,NASDAQ,Technology,mid,US
+CRVL,CorVel Corp.,NASDAQ,Financials,small,US
+CRVS,Corvus Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+CRWV,CoreWeave Inc.,NASDAQ,Technology,mid,US
+CSL,Carlisle Companies Incorporated,NYSE,Industrials,mid,US
+CSQ,Calamos Strategic Total Return,NASDAQ,Financials,small,US
+CSQR,Csquare Inc.,NYSE,Technology,small,US
+CSTM,Constellium SE Ordinary Shares (France),NYSE,Industrials,small,US
+CSW,CSW Industrials Inc.,NYSE,Industrials,small,US
+CSWC,Capital Southwest Corporation,NASDAQ,Consumer Discretionary,small,US
+CTBI,Community Trust Bancorp Inc.,NASDAQ,Financials,small,US
+CTOS,Custom Truck One Source Inc.,NYSE,Consumer Discretionary,small,US
+CTRE,CareTrust REIT Inc.,NYSE,Real Estate,mid,US
+CTRI,Centuri Holdings Inc.,NYSE,Utilities,small,US
+CTS,CTS Corporation,NYSE,Technology,small,US
+CTVA,Corteva Inc.,NYSE,Consumer Staples,large,US
+CUBI,Customers Bancorp Inc,NYSE,Financials,small,US
+CURB,Curbline Properties Corp.,NYSE,Financials,small,US
+CUZ,Cousins Properties Incorporated,NYSE,Real Estate,mid,US
+CVBF,CVB Financial Corporation,NASDAQ,Financials,small,US
+CVI,CVR Energy Inc.,NYSE,Energy,small,US
+CVLG,Covenant Logistics Group Inc.,NYSE,Industrials,small,US
+CVLT,Commvault Systems Inc.,NASDAQ,Technology,small,US
+CVNA,Carvana Co.,NYSE,Consumer Discretionary,large,US
+CVSA,Covista Inc.,NYSE,Real Estate,small,US
+CW,Curtiss-Wright Corporation,NYSE,Technology,mid,US
+CWEN,Clearway Energy Inc.,NYSE,Utilities,small,US
+CWK,Cushman & Wakefield Ltd.,NYSE,Financials,small,US
+CWST,Casella Waste Systems Inc.,NASDAQ,Utilities,mid,US
+CWT,California Water Service Group,NYSE,Utilities,small,US
+CXM,Sprinklr Inc.,NYSE,Technology,small,US
+CXT,Crane NXT Co.,NYSE,Industrials,small,US
+CXW,CoreCivic Inc.,NYSE,Real Estate,small,US
+CYTK,Cytokinetics Incorporated,NASDAQ,Health Care,mid,US
+DAN,Dana Incorporated,NYSE,Consumer Discretionary,small,US
+DAR,Darling Ingredients Inc.,NYSE,Consumer Staples,mid,US
+DAVE,Dave Inc.,NASDAQ,Financials,small,US
+DBD,Diebold Nixdorf Incorporated,NYSE,Industrials,small,US
+DBRG,DigitalBridge Group Inc.,NYSE,Real Estate,small,US
+DBX,Dropbox Inc.,NASDAQ,Technology,mid,US
+DCH,Dauch Corporation,NYSE,Consumer Discretionary,small,US
+DCI,Donaldson Company Inc.,NYSE,Industrials,mid,US
+DCO,Ducommun Incorporated,NYSE,Industrials,small,US
+DCOM,Dime Commercial Bancshares Inc.,NYSE,Financials,small,US
+DDS,Dillard's Inc.,NYSE,Consumer Discretionary,mid,US
+DEA,Easterly Government Properties Inc.,NYSE,Real Estate,small,US
+DEC,Diversified Energy Company,NYSE,,small,US
+DECK,Deckers Outdoor Corporation,NYSE,Consumer Discretionary,mid,US
+DEI,Douglas Emmett Inc.,NYSE,Real Estate,small,US
+DEO,Diageo plc,NYSE,Consumer Staples,mid,US
+DFH,Dream Finders Homes Inc.,NYSE,Consumer Discretionary,small,US
+DFIN,Donnelley Financial Solutions Inc.,NYSE,Consumer Discretionary,small,US
+DFTX,Definium Therapeutics Inc.,NASDAQ,Health Care,small,US
+DGII,Digi International Inc.,NASDAQ,Communication Services,small,US
+DHC,Diversified Healthcare Trust Common,NASDAQ,Real Estate,small,US
+DHT,DHT Holdings Inc.,NYSE,Consumer Discretionary,small,US
+DINO,HF Sinclair Corporation,NYSE,Energy,mid,US
+DIOD,Diodes Incorporated,NASDAQ,Technology,small,US
+DJT,Trump Media & Technology Group Corp.,NASDAQ,Technology,small,US
+DK,Delek US Holdings Inc.,NYSE,Energy,small,US
+DKNG,DraftKings Inc.,NASDAQ,Consumer Discretionary,mid,US
+DKS,Dick's Sporting Goods Inc,NYSE,Consumer Discretionary,mid,US
+DLB,Dolby Laboratories,NYSE,Industrials,small,US
+DLX,Deluxe Corporation,NYSE,Consumer Discretionary,small,US
+DMC,Del Monte Corporation,NYSE,,small,US
+DNLI,Denali Therapeutics Inc.,NASDAQ,Health Care,small,US
+DNOW,DNOW Inc.,NYSE,Consumer Discretionary,small,US
+DNTH,Dianthus Therapeutics Inc.,NASDAQ,Health Care,mid,US
+DOCN,DigitalOcean Holdings Inc.,NYSE,Technology,mid,US
+DOCS,Doximity Inc.,NYSE,Technology,small,US
+DOLE,Dole plc,NYSE,Consumer Staples,small,US
+DORM,Dorman Products Inc.,NASDAQ,Consumer Discretionary,small,US
+DPC,DPC Holdings PLC,NYSE,Communication Services,mid,US
+DRH,Diamondrock Hospitality Company,NASDAQ,Real Estate,small,US
+DRVN,Driven Brands Holdings Inc.,NASDAQ,Consumer Discretionary,small,US
+DSGR,Distribution Solutions Group Inc.,NASDAQ,Consumer Discretionary,small,US
+DSL,DoubleLine Income Solutions Fund Common,NYSE,Financials,small,US
+DT,Dynatrace Inc.,NYSE,Technology,mid,US
+DTM,DT Midstream Inc.,NYSE,Utilities,mid,US
+DUOL,Duolingo Inc.,NASDAQ,Technology,mid,US
+DV,DoubleVerify Holdings Inc.,NYSE,Technology,small,US
+DX,Dynex Capital Inc.,NYSE,Real Estate,small,US
+DXPE,DXP Enterprises Inc.,NASDAQ,Industrials,small,US
+DY,Dycom Industries Inc.,NYSE,Industrials,mid,US
+DYN,Dyne Therapeutics Inc.,NASDAQ,Health Care,small,US
+EAI,Entergy Arkansas LLC First Mortgage Bonds 4.875% Series Due September 1 2066,NYSE,Utilities,mid,US
+EAT,Brinker International Inc.,NYSE,Consumer Discretionary,mid,US
+EBC,Eastern Bankshares Inc.,NASDAQ,Financials,mid,US
+ECAT,BlackRock ESG Capital Allocation Term Trust Common,NYSE,Financials,small,US
+ECG,Everus Construction Group Inc.,NYSE,Consumer Discretionary,mid,US
+ECHO,EchoStar  Corporation,NASDAQ,Consumer Discretionary,mid,US
+ECO,Okeanis Eco Tankers Corp.,NYSE,Consumer Discretionary,small,US
+ECPG,Encore Capital Group Inc,NASDAQ,Financials,small,US
+ECVT,Ecovyst Inc.,NYSE,Industrials,small,US
+EE,Excelerate Energy Inc.,NYSE,Utilities,small,US
+EFC,Ellington Financial Inc.,NYSE,Financials,small,US
+EFSC,Enterprise Financial Services Corporation,NASDAQ,Financials,small,US
+EG,Everest Group Ltd.,NYSE,Financials,mid,US
+EHC,Encompass Health Corporation,NYSE,Health Care,mid,US
+ELAN,Elanco Animal Health Incorporated,NYSE,Health Care,mid,US
+ELC,Entergy Louisiana Inc. Collateral Trust Mortgage Bonds 4.875 % Series due September 1 2066,NYSE,Utilities,small,US
+ELF,e.l.f. Beauty Inc.,NYSE,Consumer Discretionary,small,US
+ELS,Equity Lifestyle Properties Inc.,NYSE,Real Estate,mid,US
+ELVN,Enliven Therapeutics Inc.,NASDAQ,Health Care,small,US
+EMAT,Evolution Metals & Technologies Corp.,NASDAQ,Industrials,small,US
+EME,EMCOR Group Inc.,NYSE,Industrials,mid,US
+EMP,Entergy Mississippi LLC First Mortgage Bonds 4.90% Series Due October 1 2066,NYSE,Utilities,mid,US
+ENJ,Entergy New Orleans LLC First Mortgage Bonds 5.0% Series due December 1 2052,NYSE,Utilities,mid,US
+ENO,Entergy New Orleans LLC First Mortgage Bonds 5.50% Series due April 1 2066,NYSE,Utilities,small,US
+ENOV,Enovis Corporation,NYSE,Health Care,small,US
+ENR,Energizer Holdings Inc.,NYSE,Industrials,small,US
+ENS,EnerSys,NYSE,Technology,mid,US
+ENSG,The Ensign Group Inc.,NASDAQ,Health Care,mid,US
+ENVA,Enova International Inc.,NYSE,Financials,mid,US
+EOSE,Eos Energy Enterprises Inc.,NASDAQ,Industrials,small,US
+EPAC,Enerpac Tool Group Corp.,NYSE,Technology,small,US
+EPC,Edgewell Personal Care Company,NYSE,Consumer Discretionary,small,US
+EPD,Enterprise Products Partners L.P.,NYSE,Utilities,large,US
+EPR,EPR Properties,NYSE,Real Estate,small,US
+EPRT,Essential Properties Realty Trust Inc.,NYSE,Real Estate,mid,US
+EQBK,Equity Bancshares Inc.,NYSE,Financials,small,US
+EQH,Equitable Holdings Inc.,NYSE,Financials,mid,US
+EQPT,EquipmentShare.com Inc,NASDAQ,Consumer Discretionary,small,US
+ERAS,Erasca Inc.,NASDAQ,Health Care,mid,US
+ERIE,Erie Indemnity Company,NASDAQ,Financials,mid,US
+EROC,ERock Inc.,NYSE,Energy,small,US
+EROK,EagleRock Land LLC Class A shares representing limited liability company interests,NYSE,Energy,small,US
+ESAB,ESAB Corporation,NYSE,Industrials,mid,US
+ESE,ESCO Technologies Inc.,NYSE,Communication Services,mid,US
+ESI,Element Solutions Inc.,NYSE,Industrials,mid,US
+ESNT,Essent Group Ltd.,NYSE,Financials,mid,US
+ESQ,Esquire Financial Holdings Inc.,NASDAQ,Financials,small,US
+ESRT,Empire State Realty Trust Inc.,NYSE,Real Estate,small,US
+ESTC,Elastic N.V.,NYSE,Technology,mid,US
+ETON,Eton Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+ETV,Eaton Vance Corporation Eaton Vance Tax-Managed Buy-Write Opportunities Fund Common,NYSE,Financials,small,US
+ETW,Eaton Vance Corporation Eaton Vance Tax-Managed Global Buy-Write Opportunites Fund Common,NYSE,Financials,small,US
+EVC,Entravision Communications Corporation,NYSE,Industrials,small,US
+EVCM,EverCommerce Inc.,NASDAQ,Technology,small,US
+EVR,Evercore Inc.,NYSE,Financials,mid,US
+EVRG,Evergy Inc.,NASDAQ,Utilities,mid,US
+EWTX,Edgewise Therapeutics Inc.,NASDAQ,Health Care,small,US
+EXE,Expand Energy Corporation,NASDAQ,Energy,mid,US
+EXEL,Exelixis Inc.,NASDAQ,Health Care,mid,US
+EXLS,ExlService Holdings Inc.,NASDAQ,Consumer Discretionary,mid,US
+EXP,Eagle Materials Inc,NYSE,Industrials,mid,US
+EXPO,Exponent Inc.,NASDAQ,Consumer Discretionary,small,US
+EXTR,Extreme Networks Inc.,NASDAQ,Communication Services,small,US
+EYE,National Vision Holdings Inc.,NASDAQ,Health Care,small,US
+EZPW,EZCORP Inc. Class A Non Voting,NASDAQ,Consumer Discretionary,small,US
+FA,First Advantage Corporation,NASDAQ,Technology,small,US
+FAF,First American Corporation (New),NYSE,Financials,mid,US
+FBIN,Fortune Brands Innovations Inc.,NYSE,Materials,mid,US
+FBK,FB Financial Corporation,NYSE,Financials,small,US
+FBNC,First Bancorp,NASDAQ,Financials,small,US
+FBRX,Forte Biosciences Inc.,NASDAQ,Health Care,small,US
+FBYD,Falcon's Beyond Global Inc.,NASDAQ,Consumer Discretionary,small,US
+FCEL,FuelCell Energy Inc.,NASDAQ,Energy,small,US
+FCF,First Commonwealth Financial Corporation,NYSE,Financials,small,US
+FCFS,FirstCash Holdings Inc.,NASDAQ,Consumer Discretionary,mid,US
+FCN,FTI Consulting Inc.,NYSE,Consumer Discretionary,mid,US
+FCNCA,First Citizens BancShares Inc.,NASDAQ,Financials,mid,US
+FCPT,Four Corners Property Trust Inc.,NYSE,Real Estate,small,US
+FDS,FactSet Research Systems Inc.,NYSE,Technology,mid,US
+FDX,FedEx Corporation,NYSE,Consumer Discretionary,large,US
+FDXF,FedEx Freight Holding Company Inc.,NYSE,Consumer Discretionary,mid,US
+FELE,Franklin Electric Co. Inc.,NASDAQ,Consumer Discretionary,small,US
+FER,Ferrovial N.V.,NASDAQ,Industrials,mid,US
+FERG,Ferguson Enterprises Inc.,NYSE,Industrials,mid,US
+FFBC,First Financial Bancorp.,NASDAQ,Financials,small,US
+FFIN,First Financial Bankshares Inc.,NASDAQ,Financials,mid,US
+FG,F&G Annuities & Life Inc.,NYSE,Financials,small,US
+FHB,First Hawaiian Inc.,NASDAQ,Financials,small,US
+FHI,Federated Hermes Inc.,NYSE,Financials,small,US
+FHN,First Horizon Corporation,NYSE,Financials,mid,US
+FIBK,First Interstate BancSystem Inc. Common Stock (DE),NASDAQ,Financials,small,US
+FIG,Figma Inc.,NYSE,Technology,mid,US
+FIGS,FIGS Inc.,NYSE,Consumer Discretionary,small,US
+FISV,Fiserv Inc.,NASDAQ,Consumer Discretionary,mid,US
+FIVE,Five Below Inc.,NASDAQ,Consumer Discretionary,mid,US
+FIVN,Five9 Inc.,NASDAQ,Technology,small,US
+FIX,Comfort Systems USA Inc.,NYSE,Industrials,large,US
+FIZZ,National Beverage Corp.,NASDAQ,Consumer Staples,small,US
+FLG,Flagstar Bank N.A.,NYSE,Financials,mid,US
+FLNC,Fluence Energy Inc.,NASDAQ,Industrials,small,US
+FLNG,FLEX LNG Ltd.,NYSE,Consumer Discretionary,small,US
+FLO,Flowers Foods Inc.,NYSE,Consumer Staples,small,US
+FLOC,Flowco Holdings Inc.,NYSE,Consumer Discretionary,small,US
+FLR,Fluor Corporation,NYSE,Industrials,mid,US
+FLS,Flowserve Corporation,NYSE,Industrials,mid,US
+FLUT,Flutter Entertainment plc,NYSE,Technology,mid,US
+FLY,Firefly Aerospace Inc.,NASDAQ,Industrials,small,US
+FLYW,Flywire Corporation Voting,NASDAQ,Consumer Discretionary,small,US
+FMBH,First Mid Bancshares Inc.,NASDAQ,Financials,small,US
+FMC,FMC Corporation,NYSE,Industrials,small,US
+FNB,F.N.B. Corporation,NYSE,Financials,mid,US
+FND,Floor & Decor Holdings Inc.,NYSE,Consumer Discretionary,mid,US
+FNF,Fidelity National Financial Inc.,NYSE,Financials,mid,US
+FOR,Forestar Group Inc,NYSE,Financials,small,US
+FORM,FormFactor Inc. FormFactor Inc.,NASDAQ,Technology,mid,US
+FOUR,Shift4 Payments Inc.,NYSE,Consumer Discretionary,small,US
+FOX,Fox Corporation,NASDAQ,Industrials,mid,US
+FPS,Forgent Power Solutions Inc.,NYSE,Energy,mid,US
+FR,First Industrial Realty Trust Inc.,NYSE,Real Estate,mid,US
+FRA,Blackrock Floating Rate Income Strategies Fund Inc,NYSE,Financials,small,US
+FRME,First Merchants Corporation,NASDAQ,Financials,small,US
+FRMI,Fermi Inc.,NASDAQ,Real Estate,small,US
+FRNM,Freenome Inc.,NASDAQ,Health Care,small,US
+FRO,Frontline Plc,NYSE,Consumer Discretionary,mid,US
+FROG,JFrog Ltd.,NASDAQ,Technology,mid,US
+FRPT,Freshpet Inc.,NASDAQ,Consumer Staples,small,US
+FRSH,Freshworks Inc.,NASDAQ,Technology,small,US
+FRVO,Fervo Energy Company,NASDAQ,Utilities,mid,US
+FSBC,Five Star Bancorp,NASDAQ,Financials,small,US
+FSK,FS KKR Capital Corp.,NYSE,Financials,small,US
+FSLY,Fastly Inc.,NASDAQ,Technology,small,US
+FSS,Federal Signal Corporation,NYSE,Industrials,mid,US
+FSUN,FirstSun Capital Bancorp,NASDAQ,Financials,small,US
+FTAI,FTAI Aviation Ltd.,NASDAQ,Industrials,mid,US
+FTDR,Frontdoor Inc.,NASDAQ,Consumer Discretionary,mid,US
+FTI,TechnipFMC plc Ordinary Share,NYSE,Consumer Discretionary,mid,US
+FTRE,Fortrea Holdings Inc.,NASDAQ,Health Care,small,US
+FUL,H. B. Fuller Company,NYSE,Industrials,small,US
+FULT,Fulton Financial Corporation,NASDAQ,Financials,small,US
+FUN,Six Flags Entertainment Corporation Common Stock New,NYSE,Consumer Discretionary,small,US
+FWONA,Liberty Media Corporation Series A Liberty Formula One,NASDAQ,Industrials,mid,US
+FWONK,Liberty Media Corporation Series C Liberty Formula One,NASDAQ,Industrials,mid,US
+G,Genpact Limited,NYSE,Consumer Discretionary,mid,US
+GAB,Gabelli Equity Trust Inc. (The),NYSE,Financials,small,US
+GABC,German American Bancorp Inc.,NASDAQ,Financials,small,US
+GAM,General American Investors Inc.,NYSE,Financials,small,US
+GAP,Gap Inc. (The),NYSE,Consumer Discretionary,mid,US
+GATX,GATX Corporation,NYSE,Consumer Discretionary,mid,US
+GBCI,Glacier Bancorp Inc.,NYSE,Financials,mid,US
+GBDC,Golub Capital BDC Inc.,NASDAQ,Financials,small,US
+GBTG,Global Business Travel Group Inc.,NYSE,Consumer Discretionary,mid,US
+GBX,Greenbrier Companies Inc. (The),NYSE,Industrials,small,US
+GCMG,GCM Grosvenor Inc.,NASDAQ,Financials,small,US
+GCT,GigaCloud Technology Inc,NASDAQ,Consumer Discretionary,small,US
+GDRX,GoodRx Holdings Inc.,NASDAQ,Technology,small,US
+GDV,Gabelli Dividend & Income Trust Common,NYSE,Financials,small,US
+GEF,Greif Inc.,NYSE,,small,US
+GENB,Generate Biomedicines Inc.,NASDAQ,Health Care,small,US
+GEO,Geo Group Inc (The) REIT,NYSE,Consumer Discretionary,small,US
+GEV,GE Vernova Inc.,NYSE,,large,US
+GFF,Griffon Corporation,NYSE,Industrials,small,US
+GFS,GlobalFoundries Inc.,NASDAQ,Technology,mid,US
+GGG,Graco Inc.,NYSE,Industrials,mid,US
+GH,Guardant Health Inc.,NASDAQ,Health Care,mid,US
+GHC,Graham Holdings Company,NYSE,Real Estate,mid,US
+GHM,Graham Corporation,NYSE,Industrials,small,US
+GHRS,GH Research PLC,NASDAQ,Health Care,small,US
+GIC,Global Industrial Company,NYSE,Industrials,small,US
+GIII,G-III Apparel Group LTD.,NASDAQ,Consumer Discretionary,small,US
+GJS,Goldman Sachs Group Securities STRATS Trust for Goldman Sachs Group Securities Series 2006-2,NYSE,Financials,mid,US
+GKOS,Glaukos Corporation,NYSE,Health Care,mid,US
+GL,Globe Life Inc.,NYSE,Financials,mid,US
+GLNG,Golar Lng Ltd,NASDAQ,Consumer Discretionary,small,US
+GLOB,Globant S.A.,NYSE,Technology,small,US
+GLPI,Gaming and Leisure Properties Inc.,NASDAQ,Real Estate,mid,US
+GLUE,Monte Rosa Therapeutics Inc.,NASDAQ,Health Care,small,US
+GLXY,Galaxy Digital Inc.,NASDAQ,Financials,mid,US
+GME,GameStop Corporation,NYSE,Consumer Discretionary,mid,US
+GMED,Globus Medical Inc.,NYSE,Health Care,mid,US
+GNK,Genco Shipping & Trading Limited Ordinary Shares New (Marshall Islands),NYSE,Consumer Discretionary,small,US
+GNL,Global Net Lease Inc.,NYSE,Real Estate,small,US
+GNTX,Gentex Corporation,NASDAQ,Consumer Discretionary,mid,US
+GNW,Genworth Financial Inc,NYSE,Financials,small,US
+GOLD,Gold.com Inc.,NYSE,Industrials,small,US
+GOLF,Acushnet Holdings Corp.,NYSE,Consumer Discretionary,mid,US
+GPGI,GPGI Inc.,NYSE,Financials,small,US
+GPI,Group 1 Automotive Inc.,NYSE,Consumer Discretionary,small,US
+GPK,Graphic Packaging Holding Company,NYSE,Consumer Discretionary,small,US
+GPOR,Gulfport Energy Corporation,NYSE,Energy,small,US
+GPRE,Green Plains Inc.,NASDAQ,Industrials,small,US
+GRAL,GRAIL Inc.,NASDAQ,Health Care,small,US
+GRBK,Green Brick Partners Inc.,NYSE,Consumer Discretionary,small,US
+GRC,Gorman-Rupp Company (The),NYSE,Industrials,small,US
+GRDN,Guardian Pharmacy Services Inc.,NYSE,Consumer Staples,small,US
+GRPN,Groupon Inc.,NASDAQ,Consumer Discretionary,small,US
+GSAT,Globalstar Inc.,NASDAQ,Consumer Discretionary,mid,US
+GSHD,Goosehead Insurance Inc.,NASDAQ,Financials,small,US
+GSL,Global Ship Lease Inc New Class A,NYSE,Consumer Discretionary,small,US
+GT,The Goodyear Tire & Rubber Company,NASDAQ,Consumer Discretionary,small,US
+GTES,Gates Industrial Corporation Ltd.,NYSE,Industrials,mid,US
+GTLB,GitLab Inc.,NASDAQ,Technology,mid,US
+GTM,ZoomInfo Technologies Inc,NASDAQ,Technology,small,US
+GTX,Garrett Motion Inc.,NASDAQ,Consumer Discretionary,mid,US
+GTY,Getty Realty Corporation,NYSE,Financials,small,US
+GVA,Granite Construction Incorporated,NYSE,Industrials,mid,US
+GWRE,Guidewire Software Inc.,NYSE,Technology,mid,US
+GXO,GXO Logistics Inc.,NYSE,Consumer Discretionary,mid,US
+HAE,Haemonetics Corporation,NYSE,Health Care,small,US
+HAFN,Hafnia Limited,NYSE,Consumer Discretionary,small,US
+HALO,Halozyme Therapeutics Inc.,NASDAQ,Health Care,mid,US
+HAPN,Happen Inc.,NASDAQ,Financials,small,US
+HASI,HA Sustainable Infrastructure Capital Inc.,NYSE,Financials,small,US
+HAWK,HawkEye 360 Inc.,NYSE,Technology,small,US
+HAYW,Hayward Holdings Inc.,NYSE,Industrials,small,US
+HBNC,Horizon Bancorp Inc.,NASDAQ,Financials,small,US
+HBT,HBT Financial Inc.,NASDAQ,Financials,small,US
+HCC,Warrior Met Coal Inc.,NYSE,Energy,small,US
+HCI,HCI Group Inc.,NYSE,Financials,small,US
+HCSG,Healthcare Services Group Inc.,NASDAQ,Health Care,small,US
+HE,Hawaiian Electric Industries Inc.,NYSE,Utilities,small,US
+HEI,Heico Corporation,NYSE,Industrials,mid,US
+HESM,Hess Midstream LP Class A Representing Limited Partner Interests,NYSE,Energy,mid,US
+HFWA,Heritage Financial Corporation,NASDAQ,Financials,small,US
+HG,Hamilton Insurance Group Ltd. Class B,NYSE,Financials,small,US
+HGTY,Hagerty Inc.,NYSE,Financials,small,US
+HGV,Hilton Grand Vacations Inc.,NYSE,Consumer Discretionary,small,US
+HHH,Howard Hughes Holdings Inc.,NYSE,Real Estate,small,US
+HIMS,Hims & Hers Health Inc.,NYSE,Health Care,mid,US
+HIW,Highwoods Properties Inc.,NYSE,Real Estate,small,US
+HL,Hecla Mining Company,NYSE,Industrials,mid,US
+HLF,Herbalife Ltd.,NYSE,Health Care,small,US
+HLI,Houlihan Lokey Inc.,NYSE,Financials,mid,US
+HLIO,Helios Technologies Inc.,NYSE,Industrials,small,US
+HLIT,Harmonic Inc.,NASDAQ,Technology,small,US
+HLMN,Hillman Solutions Corp.,NASDAQ,Consumer Discretionary,small,US
+HLNE,Hamilton Lane Incorporated,NASDAQ,Financials,small,US
+HLX,Helix Energy Solutions Group Inc.,NYSE,Energy,small,US
+HMN,Horace Mann Educators Corporation,NYSE,Financials,small,US
+HNGE,Hinge Health Inc.,NYSE,Technology,mid,US
+HNI,HNI Corporation,NYSE,Consumer Discretionary,small,US
+HOG,Harley-Davidson Inc.,NYSE,Consumer Discretionary,small,US
+HOMB,Home BancShares Inc.,NYSE,Financials,mid,US
+HONA,Honeywell Aerospace Inc.,NASDAQ,Industrials,large,US
+HOOD,Robinhood Markets Inc.,NASDAQ,Financials,large,US
+HOPE,Hope Bancorp Inc.,NASDAQ,Financials,small,US
+HP,Helmerich & Payne Inc.,NYSE,Energy,small,US
+HQH,abrdn Healthcare Investors,NYSE,Financials,small,US
+HQY,HealthEquity Inc.,NASDAQ,Consumer Discretionary,mid,US
+HR,Healthcare Realty Trust Incorporated,NYSE,Real Estate,mid,US
+HRB,H&R Block Inc.,NYSE,Consumer Discretionary,mid,US
+HRI,Herc Holdings Inc.,NYSE,Industrials,small,US
+HRMY,Harmony Biosciences Holdings Inc.,NASDAQ,Health Care,small,US
+HROW,Harrow Inc.,NASDAQ,Health Care,small,US
+HSBC,HSBC Holdings plc.,NYSE,Financials,mega,US
+HSIC,Henry Schein Inc.,NASDAQ,Health Care,mid,US
+HTFL,Heartflow Inc.,NASDAQ,Health Care,small,US
+HTGC,Hercules Capital Inc.,NYSE,Financials,small,US
+HTH,Hilltop Holdings Inc.,NYSE,Financials,small,US
+HTLD,Heartland Express Inc.,NASDAQ,Industrials,small,US
+HTO,H2O America,NASDAQ,Utilities,small,US
+HUBB,Hubbell Inc,NYSE,Technology,mid,US
+HUBG,Hub Group Inc.,NASDAQ,Industrials,small,US
+HUN,Huntsman Corporation,NYSE,Industrials,small,US
+HURN,Huron Consulting Group Inc.,NASDAQ,Consumer Discretionary,small,US
+HWC,Hancock Whitney Corporation,NASDAQ,Financials,mid,US
+HWKN,Hawkins Inc.,NASDAQ,Consumer Discretionary,small,US
+HWM,Howmet Aerospace Inc.,NYSE,Industrials,large,US
+HXL,Hexcel Corporation,NYSE,Industrials,mid,US
+HYMC,Hycroft Mining Holding Corporation,NASDAQ,Materials,small,US
+IART,Integra LifeSciences Holdings Corporation,NASDAQ,Health Care,small,US
+IBKR,Interactive Brokers Group Inc.,NASDAQ,Financials,large,US
+IBOC,International Bancshares Corporation,NASDAQ,Financials,small,US
+IBP,Installed Building Products Inc.,NYSE,Consumer Discretionary,mid,US
+IBRX,ImmunityBio Inc.,NASDAQ,Health Care,mid,US
+ICFI,ICF International Inc.,NASDAQ,Consumer Discretionary,small,US
+ICHR,Ichor Holdings,NASDAQ,Technology,small,US
+ICLR,ICON plc,NASDAQ,Health Care,mid,US
+ICUI,ICU Medical Inc.,NASDAQ,Health Care,small,US
+IDCC,InterDigital Inc.,NASDAQ,Industrials,mid,US
+IDT,IDT Corporation,NYSE,Communication Services,small,US
+IDYA,IDEAYA Biosciences Inc.,NASDAQ,Health Care,small,US
+IEP,Icahn Enterprises L.P.,NASDAQ,Consumer Discretionary,mid,US
+IESC,IES Holdings Inc.,NASDAQ,Industrials,mid,US
+IFS,Intercorp Financial Services Inc.,NYSE,Financials,mid,US
+IHS,IHS Holding Limited,NYSE,Communication Services,small,US
+IIPR,Innovative Industrial Properties Inc.,NYSE,Financials,small,US
+IMKTA,Ingles Markets Incorporated,NASDAQ,Consumer Staples,small,US
+IMNM,Immunome Inc.,NASDAQ,Health Care,small,US
+IMVT,Immunovant Inc.,NASDAQ,Health Care,mid,US
+INBX,Inhibrx Biosciences Inc.,NASDAQ,Health Care,small,US
+INDB,Independent Bank Corp.,NASDAQ,Financials,small,US
+INDV,Indivior Pharmaceuticals Inc.,NASDAQ,Health Care,mid,US
+INFQ,Infleqtion Inc.,NYSE,Technology,small,US
+ING,ING Group N.V.,NYSE,Financials,large,US
+INGM,Ingram Micro Holding Corporation,NYSE,Technology,mid,US
+INGR,Ingredion Incorporated,NYSE,Consumer Staples,mid,US
+INNV,InnovAge Holding Corp.,NASDAQ,Health Care,small,US
+INOD,Innodata Inc.,NASDAQ,Technology,small,US
+INSM,Insmed Incorporated,NASDAQ,Health Care,mid,US
+INSP,Inspire Medical Systems Inc.,NYSE,Health Care,small,US
+INSW,International Seaways Inc.,NYSE,Consumer Discretionary,small,US
+INTA,Intapp Inc.,NASDAQ,Technology,small,US
+INVA,Innoviva Inc.,NASDAQ,Health Care,small,US
+INVX,Innovex International Inc.,NYSE,Consumer Discretionary,small,US
+IOND,Ionic Digital Inc.,NASDAQ,Financials,small,US
+IONQ,IonQ Inc.,NYSE,Technology,mid,US
+IONS,Ionis Pharmaceuticals Inc.,NASDAQ,Health Care,mid,US
+IOSP,Innospec Inc.,NASDAQ,Industrials,small,US
+IOT,Samsara Inc.,NYSE,Technology,mid,US
+IOVA,Iovance Biotherapeutics Inc.,NASDAQ,Health Care,small,US
+IPAR,Interparfums Inc.,NASDAQ,Consumer Discretionary,small,US
+IPGP,IPG Photonics Corporation,NASDAQ,Technology,small,US
+IRDM,Iridium Communications Inc,NASDAQ,Communication Services,small,US
+IRMD,iRadimed Corporation,NASDAQ,Health Care,small,US
+IRON,Disc Medicine Inc.,NASDAQ,Health Care,small,US
+IRT,Independence Realty Trust Inc.,NYSE,Real Estate,small,US
+IRTC,iRhythm Holdings Inc.,NASDAQ,Health Care,small,US
+ITG,ITG Inc.,NASDAQ,Industrials,small,US
+ITGR,Integer Holdings Corporation,NYSE,Health Care,small,US
+ITRI,Itron Inc.,NASDAQ,Industrials,small,US
+ITT,ITT Inc.,NYSE,Industrials,mid,US
+IVT,InvenTrust Properties Corp.,NYSE,Real Estate,small,US
+JAN,Janus Living Inc. Class A-1,NYSE,Real Estate,mid,US
+JAZZ,Jazz Pharmaceuticals plc Common Stock (Ireland),NASDAQ,Health Care,mid,US
+JBGS,JBG SMITH Properties,NYSE,Real Estate,small,US
+JBL,Jabil Inc.,NYSE,Technology,mid,US
+JBLU,JetBlue Airways Corporation,NASDAQ,Consumer Discretionary,small,US
+JBS,JBS N.V. Class A,NYSE,Consumer Staples,mid,US
+JBTM,JBT Marel Corporation,NYSE,Industrials,mid,US
+JCAP,Jefferson Capital Inc.,NASDAQ,Financials,small,US
+JEF,Jefferies Financial Group Inc.,NYSE,Financials,mid,US
+JHX,James Hardie Industries plc.,NYSE,Industrials,mid,US
+JJSF,J & J Snack Foods Corp.,NASDAQ,Consumer Staples,small,US
+JLL,Jones Lang LaSalle Incorporated,NYSE,Financials,mid,US
+JOBY,Joby Aviation Inc.,NYSE,Industrials,mid,US
+JOE,St. Joe Company (The),NYSE,Real Estate,small,US
+JXN,Jackson Financial Inc.,NYSE,Financials,mid,US
+KAI,Kadant Inc,NYSE,Industrials,small,US
+KALU,Kaiser Aluminum Corporation,NASDAQ,Industrials,small,US
+KARD,Kardigan Inc.,NASDAQ,Health Care,small,US
+KBH,KB Home,NYSE,Consumer Discretionary,small,US
+KBR,KBR Inc.,NYSE,Industrials,small,US
+KD,Kyndryl Holdings Inc.,NYSE,Technology,small,US
+KEX,Kirby Corporation,NYSE,Consumer Discretionary,mid,US
+KFRC,Kforce Inc.,NYSE,Consumer Discretionary,small,US
+KFY,Korn Ferry,NYSE,Consumer Discretionary,small,US
+KGS,Kodiak Gas Services Inc.,NYSE,Utilities,small,US
+KKR,KKR & Co. Inc.,NYSE,Financials,large,US
+KLAR,Klarna Group plc,NYSE,Financials,mid,US
+KLRA,Kailera Therapeutics Inc.,NASDAQ,Health Care,small,US
+KMPR,Kemper Corporation,NYSE,Financials,small,US
+KMT,Kennametal Inc.,NYSE,Industrials,small,US
+KMTS,Kestra Medical Technologies Ltd.,NASDAQ,Health Care,small,US
+KN,Knowles Corporation,NYSE,Consumer Staples,small,US
+KNF,Knife Riv Holding Co.,NYSE,Industrials,small,US
+KNSA,Kiniksa Pharmaceuticals International plc,NASDAQ,Health Care,mid,US
+KNSL,Kinsale Capital Group Inc.,NYSE,Financials,mid,US
+KNTK,Kinetik Holdings Inc.,NYSE,Utilities,mid,US
+KNX,Knight-Swift Transportation Holdings Inc.,NYSE,Industrials,mid,US
+KOD,Kodiak Sciences Inc,NASDAQ,Health Care,small,US
+KOS,Kosmos Energy Ltd. Common Shares (DE),NYSE,Energy,small,US
+KRC,Kilroy Realty Corporation,NYSE,Real Estate,small,US
+KRG,Kite Realty Group Trust,NYSE,Real Estate,mid,US
+KRMN,Karman Holdings Inc.,NYSE,Industrials,mid,US
+KRYS,Krystal Biotech Inc.,NASDAQ,Health Care,mid,US
+KSS,Kohl's Corporation,NYSE,Consumer Discretionary,small,US
+KTB,Kontoor Brands Inc.,NYSE,Industrials,small,US
+KTOS,Kratos Defense & Security Solutions Inc.,NASDAQ,Industrials,mid,US
+KVUE,Kenvue Inc.,NYSE,Consumer Discretionary,mid,US
+KVYO,Klaviyo Inc. Series A,NYSE,Technology,mid,US
+KWR,Quaker Houghton,NYSE,Industrials,small,US
+KYMR,Kymera Therapeutics Inc.,NASDAQ,Health Care,mid,US
+KYN,Kayne Anderson Energy Infrastructure Fund Inc.,NYSE,Financials,small,US
+LAD,Lithia Motors Inc.,NYSE,Consumer Discretionary,mid,US
+LADR,Ladder Capital Corp,NYSE,Real Estate,small,US
+LAMR,Lamar Advertising Company,NASDAQ,Real Estate,mid,US
+LASR,nLIGHT Inc.,NASDAQ,Technology,small,US
+LAUR,Laureate Education Inc.,NASDAQ,Real Estate,mid,US
+LAZ,Lazard Inc.,NYSE,Financials,small,US
+LBRDK,Liberty Broadband Corporation,NASDAQ,Communication Services,small,US
+LBRT,Liberty Energy Inc.,NYSE,Energy,small,US
+LBRX,LB Pharmaceuticals Inc,NASDAQ,Health Care,small,US
+LBTYB,Liberty Global Ltd. Class B,NASDAQ,Communication Services,small,US
+LCID,Lucid Group Inc.,NASDAQ,Industrials,small,US
+LCII,LCI Industries,NYSE,Consumer Discretionary,small,US
+LCLN,Lincoln International Inc.,NYSE,Financials,small,US
+LDOS,Leidos Holdings Inc.,NYSE,Technology,mid,US
+LEA,Lear Corporation,NYSE,Consumer Discretionary,mid,US
+LECO,Lincoln Electric Holdings Inc.,NASDAQ,Industrials,mid,US
+LEG,Leggett & Platt Incorporated,NYSE,Consumer Discretionary,small,US
+LEU,Centrus Energy Corp.,NYSE,Industrials,small,US
+LEVI,Levi Strauss & Co,NYSE,Consumer Discretionary,mid,US
+LFST,LifeStance Health Group Inc.,NASDAQ,Health Care,small,US
+LFTO,Liftoff Mobile Inc.,NASDAQ,Technology,small,US
+LFUS,Littelfuse Inc.,NASDAQ,Energy,mid,US
+LGIH,LGI Homes Inc.,NASDAQ,Consumer Discretionary,small,US
+LGN,Legence Corp.,NASDAQ,Consumer Discretionary,mid,US
+LGND,Ligand Pharmaceuticals Incorporated,NASDAQ,Health Care,mid,US
+LIF,Life360 Inc.,NASDAQ,Technology,small,US
+LIFE,Ethos Technologies Inc.,NASDAQ,Financials,small,US
+LII,Lennox International Inc.,NYSE,Industrials,mid,US
+LILA,Liberty Latin America Ltd.,NASDAQ,Communication Services,small,US
+LILAP,Liberty Latin America Ltd. 9.0% Fixed Rate Cumulative Perpetual Redeemable Series A Preference Shares,NASDAQ,Communication Services,small,US
+LIME,Neutron Holdings Inc.,NASDAQ,Technology,small,US
+LINC,Lincoln Educational Services Corporation,NASDAQ,Real Estate,small,US
+LIND,Lindblad Expeditions Holdings Inc.,NASDAQ,Consumer Discretionary,small,US
+LINE,Lineage Inc.,NASDAQ,Real Estate,mid,US
+LITE,Lumentum Holdings Inc.,NASDAQ,Communication Services,mid,US
+LIVN,LivaNova PLC,NASDAQ,Health Care,small,US
+LKFN,Lakeland Financial Corporation,NASDAQ,Financials,small,US
+LLYVA,Liberty Live Holdings Inc. Series A Liberty Live Group,NASDAQ,Consumer Discretionary,mid,US
+LLYVK,Liberty Live Holdings Inc. Series C Liberty Live Group,NASDAQ,Consumer Discretionary,mid,US
+LMAT,LeMaitre Vascular Inc.,NASDAQ,Health Care,small,US
+LMND,Lemonade Inc.,NYSE,Financials,small,US
+LNC,Lincoln National Corporation,NYSE,Financials,mid,US
+LNG,Cheniere Energy Inc.,NYSE,Utilities,large,US
+LNN,Lindsay Corporation,NYSE,Industrials,small,US
+LNTH,Lantheus Holdings Inc.,NASDAQ,Health Care,mid,US
+LOAR,Loar Holdings Inc.,NYSE,Industrials,mid,US
+LOB,Live Oak Bancshares Inc.,NYSE,Financials,small,US
+LOGI,Logitech International S.A.,NASDAQ,Technology,mid,US
+LOPE,Grand Canyon Education Inc.,NASDAQ,Real Estate,small,US
+LPG,Dorian LPG Ltd.,NYSE,Consumer Discretionary,small,US
+LPX,Louisiana-Pacific Corporation,NYSE,Materials,mid,US
+LQDA,Liquidia Corporation,NASDAQ,Health Care,mid,US
+LQDT,Liquidity Services Inc.,NASDAQ,Consumer Discretionary,small,US
+LRN,Stride Inc.,NYSE,Real Estate,small,US
+LSTR,Landstar System Inc.,NASDAQ,Industrials,mid,US
+LTC,LTC Properties Inc.,NYSE,Real Estate,small,US
+LTH,Life Time Group Holdings Inc.,NYSE,Consumer Discretionary,mid,US
+LUMN,Lumen Technologies Inc.,NYSE,Communication Services,mid,US
+LUNR,Intuitive Machines Inc.,NASDAQ,Industrials,small,US
+LXP,LXP Industrial Trust Common Stock (Maryland REIT),NYSE,Real Estate,small,US
+LXRX,Lexicon Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+LZ,LegalZoom.com Inc.,NASDAQ,Technology,small,US
+LZB,La-Z-Boy Incorporated,NYSE,Consumer Discretionary,small,US
+M,Macy's Inc,NYSE,Consumer Discretionary,mid,US
+MAC,Macerich Company (The),NYSE,Real Estate,mid,US
+MAIN,Main Street Capital Corporation,NYSE,Financials,mid,US
+MAIR,Madison Air Solutions Corporation,NYSE,Industrials,mid,US
+MAN,ManpowerGroup,NYSE,Consumer Discretionary,small,US
+MANE,Veradermics Incorporated,NYSE,Health Care,small,US
+MANU,Manchester United Ltd.,NYSE,Consumer Discretionary,small,US
+MARA,MARA Holdings Inc.,NASDAQ,Technology,small,US
+MAT,Mattel Inc.,NASDAQ,Consumer Discretionary,small,US
+MATX,Matson Inc.,NYSE,Consumer Discretionary,mid,US
+MAZE,Maze Therapeutics Inc.,NASDAQ,Health Care,small,US
+MBC,MasterBrand Inc.,NYSE,Consumer Discretionary,small,US
+MBGL,Mobility Global Inc.,NYSE,Consumer Discretionary,mid,US
+MBIN,Merchants Bancorp,NASDAQ,Financials,small,US
+MBWM,Mercantile Bank Corporation,NASDAQ,Financials,small,US
+MBX,MBX Biosciences Inc.,NASDAQ,Health Care,small,US
+MC,Moelis & Company,NYSE,Financials,mid,US
+MCB,Metropolitan Bank Holding Corp.,NYSE,Financials,small,US
+MCBS,MetroCity Bankshares Inc.,NASDAQ,Financials,small,US
+MCHB,Mechanics Bancorp,NASDAQ,Financials,small,US
+MCRI,Monarch Casino & Resort Inc.,NASDAQ,Consumer Discretionary,small,US
+MCY,Mercury General Corporation,NYSE,Financials,mid,US
+MD,Pediatrix Medical Group Inc.,NYSE,Health Care,small,US
+MDGL,Madrigal Pharmaceuticals Inc.,NASDAQ,Health Care,mid,US
+MDLN,Medline Inc.,NASDAQ,Health Care,large,US
+MDU,MDU Resources Group Inc. Common Stock (Holding Company),NYSE,Industrials,small,US
+MEDP,Medpace Holdings Inc.,NASDAQ,Health Care,mid,US
+MFP,Midera Food Processing Inc.,NASDAQ,Industrials,small,US
+MGEE,MGE Energy Inc,NASDAQ,Energy,small,US
+MGNI,Magnite Inc.,NASDAQ,Technology,small,US
+MGRC,McGrath RentCorp,NASDAQ,Consumer Discretionary,small,US
+MGTX,MeiraGTx Holdings plc,NASDAQ,Health Care,small,US
+MGY,Magnolia Oil & Gas Corporation,NYSE,Energy,mid,US
+MH,McGraw Hill Inc.,NYSE,Consumer Discretionary,small,US
+MHD,Blackrock MuniHoldings Fund Inc.,NYSE,Financials,small,US
+MHO,M/I Homes Inc.,NYSE,Consumer Discretionary,small,US
+MIAX,Miami International Holdings Inc.,NYSE,Financials,small,US
+MICC,The Magnum Ice Cream Company N.V.,NYSE,Consumer Staples,mid,US
+MIDD,Middleby Corporation (The),NASDAQ,Industrials,mid,US
+MIR,Mirion Technologies Inc.,NYSE,Industrials,small,US
+MIRM,Mirum Pharmaceuticals Inc.,NASDAQ,Health Care,mid,US
+MIY,Blackrock MuniYield Michigan Quality Fund Inc.,NYSE,Financials,small,US
+MKC,McCormick & Company Incorporated,NYSE,Consumer Staples,mid,US
+MKL,Markel Group Inc.,NYSE,Financials,mid,US
+MKSI,MKS Inc.,NASDAQ,Industrials,mid,US
+MLI,Mueller Industries Inc.,NYSE,Industrials,mid,US
+MLKN,MillerKnoll Inc.,NASDAQ,Consumer Discretionary,small,US
+MLTX,MoonLake Immunotherapeutics,NASDAQ,Health Care,small,US
+MLYS,Mineralys Therapeutics Inc.,NASDAQ,Health Care,small,US
+MMED,MiniMed Group Inc.,NASDAQ,Health Care,mid,US
+MMI,Marcus & Millichap Inc.,NYSE,Financials,small,US
+MMS,Maximus Inc.,NYSE,Consumer Discretionary,small,US
+MMSI,Merit Medical Systems Inc.,NASDAQ,Health Care,small,US
+MNKD,MannKind Corporation,NASDAQ,Health Care,small,US
+MOD,Modine Manufacturing Company,NYSE,Consumer Discretionary,mid,US
+MORN,Morningstar Inc.,NASDAQ,Financials,mid,US
+MP,MP Materials Corp.,NYSE,Materials,mid,US
+MPT,Medical Properties Trust Inc.,NYSE,Real Estate,small,US
+MQ,Marqeta Inc.,NASDAQ,Technology,small,US
+MQY,Blackrock MuniYield Quality Fund Inc.,NYSE,Financials,small,US
+MRCY,Mercury Systems Inc,NASDAQ,Technology,mid,US
+MRP,Millrose Properties Inc.,NYSE,Financials,small,US
+MRSH,Marsh,NYSE,Financials,large,US
+MRTN,Marten Transport Ltd.,NASDAQ,Industrials,small,US
+MRVI,Maravai LifeSciences Holdings Inc.,NASDAQ,Health Care,small,US
+MRVL,Marvell Technology Inc.,NASDAQ,Technology,large,US
+MRX,Marex Group Limited,NASDAQ,Financials,small,US
+MSA,MSA Safety Incorporated,NYSE,Health Care,mid,US
+MSCI,MSCI Inc.,NYSE,Consumer Discretionary,mid,US
+MSEX,Middlesex Water Company,NASDAQ,Utilities,small,US
+MSGE,Madison Square Garden Entertainment Corp.,NYSE,Consumer Discretionary,small,US
+MSGS,Madison Square Garden Sports Corp. Class A Common Stock (New),NYSE,Consumer Discretionary,mid,US
+MSM,MSC Industrial Direct Company Inc.,NYSE,Industrials,mid,US
+MSTR,Strategy Inc Common Stock Class A,NASDAQ,Technology,mid,US
+MT,Arcelor Mittal NY Registry Shares NEW,NYSE,Industrials,large,US
+MTDR,Matador Resources Company,NYSE,Energy,mid,US
+MTG,MGIC Investment Corporation,NYSE,Financials,mid,US
+MTH,Meritage Homes Corporation,NYSE,Consumer Discretionary,small,US
+MTN,Vail Resorts Inc.,NYSE,Consumer Discretionary,mid,US
+MTRN,Materion Corporation,NYSE,Industrials,small,US
+MTSI,MACOM Technology Solutions Holdings Inc.,NASDAQ,Technology,mid,US
+MTX,Minerals Technologies Inc.,NYSE,Materials,small,US
+MTZ,MasTec Inc.,NYSE,Industrials,mid,US
+MUA,Blackrock MuniAssets Fund Inc,NYSE,Financials,small,US
+MUC,Blackrock MuniHoldings California Quality Fund Inc.,NYSE,Financials,small,US
+MUJ,Blackrock MuniHoldings New Jersey Quality Fund Inc.,NYSE,Financials,small,US
+MUR,Murphy Oil Corporation,NYSE,Energy,mid,US
+MUSA,Murphy USA Inc.,NYSE,Consumer Discretionary,mid,US
+MWA,MUELLER WATER PRODUCTS,NYSE,Industrials,small,US
+MWH,SOLV Energy Inc.,NASDAQ,Industrials,small,US
+MXL,MaxLinear Inc.,NASDAQ,Technology,mid,US
+MYE,Myers Industries Inc.,NYSE,Industrials,small,US
+MYI,Blackrock MuniYield Quality Fund III Inc,NYSE,Financials,small,US
+MYRG,MYR Group Inc.,NASDAQ,Industrials,mid,US
+MZTI,The Marzetti Company,NASDAQ,Consumer Staples,small,US
+NAMS,NewAmsterdam Pharma Company N.V.,NASDAQ,Health Care,small,US
+NAN,Nuveen New York Quality Municipal Income Fund,NYSE,Financials,small,US
+NAT,Nordic American Tankers Limited,NYSE,Consumer Discretionary,small,US
+NATL,NCR Atleos Corporation,NYSE,Industrials,small,US
+NAVN,Navan Inc.,NASDAQ,Technology,mid,US
+NBBK,NB Bancorp Inc.,NASDAQ,Financials,small,US
+NBHC,National Bank Holdings Corporation,NYSE,Financials,small,US
+NBIS,Nebius Group N.V.,NASDAQ,Technology,mid,US
+NBIX,Neurocrine Biosciences Inc.,NASDAQ,Health Care,mid,US
+NBR,Nabors Industries Ltd.,NYSE,Energy,small,US
+NBTB,NBT Bancorp Inc.,NASDAQ,Financials,small,US
+NCNO,nCino Inc.,NASDAQ,Technology,small,US
+NCV,Virtus Convertible & Income Fund Common,NYSE,Financials,small,US
+NCZ,Virtus Convertible & Income Fund II Common,NYSE,Financials,small,US
+NDSN,Nordson Corporation,NASDAQ,Industrials,mid,US
+NE,Noble Corporation plc A,NYSE,Energy,mid,US
+NEO,NeoGenomics Inc.,NASDAQ,Health Care,small,US
+NEOG,Neogen Corporation,NASDAQ,Health Care,small,US
+NESR,National Energy Services Reunited Corp,NASDAQ,Energy,small,US
+NEU,NewMarket Corp,NYSE,Industrials,mid,US
+NEXA,Nexa Resources S.A.,NYSE,Materials,small,US
+NEXT,NextDecade Corporation,NASDAQ,Utilities,small,US
+NFG,National Fuel Gas Company,NYSE,Utilities,mid,US
+NGVT,Ingevity Corporation,NYSE,Industrials,small,US
+NHC,National HealthCare Corporation,AMEX,Health Care,small,US
+NHI,National Health Investors Inc.,NYSE,Real Estate,small,US
+NHP,National Healthcare Properties Inc.,NASDAQ,Real Estate,small,US
+NIC,Nicolet Bankshares Inc.,NYSE,Financials,small,US
+NIQ,NIQ Global Intelligence plc,NYSE,Technology,small,US
+NJR,NewJersey Resources Corporation,NYSE,Utilities,mid,US
+NKTR,Nektar Therapeutics,NASDAQ,Health Care,small,US
+NLY,Annaly Capital Management Inc.,NYSE,Real Estate,mid,US
+NMIH,NMI Holdings Inc.,NASDAQ,Financials,small,US
+NMRK,Newmark Group Inc.,NASDAQ,Financials,small,US
+NN,NextNav Inc.,NASDAQ,Industrials,small,US
+NNI,Nelnet Inc.,NYSE,Financials,small,US
+NNN,NNN REIT Inc.,NYSE,Real Estate,mid,US
+NOG,Northern Oil and Gas Inc.,NYSE,Energy,small,US
+NOMD,Nomad Foods Limited,NYSE,Consumer Staples,small,US
+NOV,NOV Inc.,NYSE,Consumer Discretionary,mid,US
+NOVT,Novanta Inc.,NASDAQ,Industrials,mid,US
+NP,Neptune Insurance Holdings Inc.,NYSE,Financials,small,US
+NPKI,NPK International Inc.,NYSE,Consumer Discretionary,small,US
+NPO,Enpro Inc.,NYSE,Industrials,mid,US
+NRIX,Nurix Therapeutics Inc.,NASDAQ,Health Care,small,US
+NRP,Natural Resource Partners LP Limited Partnership,NYSE,Energy,small,US
+NSIT,Insight Enterprises Inc.,NASDAQ,Consumer Discretionary,small,US
+NSP,Insperity Inc.,NYSE,Consumer Discretionary,small,US
+NSSC,NAPCO Security Technologies Inc.,NASDAQ,Communication Services,small,US
+NTB,Bank of N.T. Butterfield & Son Limited (The) Voting,NYSE,Financials,small,US
+NTCT,NetScout Systems Inc.,NASDAQ,Technology,small,US
+NTLA,Intellia Therapeutics Inc.,NASDAQ,Health Care,small,US
+NTNX,Nutanix Inc.,NASDAQ,Technology,mid,US
+NTRA,Natera Inc.,NASDAQ,Health Care,mid,US
+NTSK,Netskope Inc.,NASDAQ,Technology,small,US
+NTST,NetSTREIT Corp.,NYSE,Real Estate,small,US
+NU,Nu Holdings Ltd.,NYSE,Financials,large,US
+NUVB,Nuvation Bio Inc.,NYSE,Health Care,small,US
+NVAX,Novavax Inc.,NASDAQ,Health Care,small,US
+NVCR,NovoCure Limited,NASDAQ,Health Care,small,US
+NVRI,Enviri Corporation,NYSE,Utilities,small,US
+NVS,Novartis AG,NYSE,Health Care,mega,US
+NVST,Envista Holdings Corporation,NYSE,Health Care,small,US
+NVT,nVent Electric plc,NYSE,Industrials,mid,US
+NVTS,Navitas Semiconductor Corporation,NASDAQ,Technology,small,US
+NWBI,Northwest Bancshares Inc.,NASDAQ,Financials,small,US
+NWE,NorthWestern Energy Group Inc.,NASDAQ,Utilities,small,US
+NWL,Newell Brands Inc.,NASDAQ,Industrials,small,US
+NWN,Northwest Natural Holding Company,NYSE,Utilities,small,US
+NWPX,NWPX Infrastructure Inc.,NASDAQ,Industrials,small,US
+NWS,News Corporation,NASDAQ,Consumer Discretionary,mid,US
+NXST,Nexstar Media Group Inc.,NASDAQ,Industrials,mid,US
+NXT,Nextpower Inc.,NASDAQ,Industrials,mid,US
+NYT,New York Times Company (The),NYSE,Consumer Discretionary,mid,US
+OBDC,Blue Owl Capital Corporation,NYSE,Financials,mid,US
+OBK,Origin Bancorp Inc.,NYSE,Financials,small,US
+OC,Owens Corning Inc Common Stock New,NYSE,Industrials,mid,US
+OCFC,OceanFirst Financial Corp.,NASDAQ,Financials,small,US
+OCSL,Oaktree Specialty Lending Corporation,NASDAQ,Financials,small,US
+OCTV,Octave Intelligence plc,NASDAQ,Technology,small,US
+OCUL,Ocular Therapeutix Inc.,NASDAQ,Health Care,small,US
+ODC,Oil-Dri Corporation Of America,NYSE,Consumer Discretionary,small,US
+OGC,OceanaGold Corporation,NYSE,,mid,US
+OGN,Organon & Co.,NYSE,Health Care,small,US
+OGS,ONE Gas Inc.,NYSE,Utilities,mid,US
+OHI,Omega Healthcare Investors Inc.,NYSE,Real Estate,mid,US
+OI,O-I Glass Inc.,NYSE,Consumer Discretionary,small,US
+OII,Oceaneering International Inc.,NYSE,Energy,small,US
+OKLO,Oklo Inc.,NYSE,Utilities,mid,US
+OLED,Universal Display Corporation,NASDAQ,Technology,small,US
+OLLI,Ollie's Bargain Outlet Holdings Inc.,NASDAQ,Consumer Discretionary,small,US
+OLN,Olin Corporation,NYSE,Industrials,small,US
+OMCL,Omnicell Inc. Common Stock ($0.001 par value),NASDAQ,Technology,small,US
+OMDA,Omada Health Inc.,NASDAQ,Health Care,small,US
+OMF,OneMain Holdings Inc.,NYSE,Financials,mid,US
+ONB,Old National Bancorp,NASDAQ,Financials,mid,US
+ONDS,Ondas Inc.,NASDAQ,Technology,small,US
+ONON,On Holding AG,NYSE,Consumer Discretionary,mid,US
+ONTO,Onto Innovation Inc.,NYSE,Industrials,mid,US
+OPCH,Option Care Health Inc.,NASDAQ,Health Care,small,US
+OPEN,Opendoor Technologies Inc,NASDAQ,Financials,small,US
+OPI,Office Properties Income Trust Common,NASDAQ,Financials,small,US
+OPK,OPKO Health Inc.,NASDAQ,Health Care,small,US
+OPLN,OPENLANE Inc.,NYSE,Consumer Discretionary,small,US
+OPY,Oppenheimer Holdings Inc. Class A Common Stock (DE),NYSE,Financials,small,US
+ORA,Ormat Technologies Inc.,NYSE,Utilities,mid,US
+ORC,Orchid Island Capital Inc.,NYSE,Real Estate,small,US
+ORI,Old Republic International Corporation,NYSE,Financials,mid,US
+ORIC,Oric Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+ORKA,Oruka Therapeutics Inc.,NASDAQ,Health Care,mid,US
+ORLA,Orla Mining Ltd.,AMEX,Materials,small,US
+OSBC,Old Second Bancorp Inc.,NASDAQ,Financials,small,US
+OSCR,Oscar Health Inc.,NYSE,Health Care,mid,US
+OSIS,OSI Systems Inc. Common Stock (DE),NASDAQ,Technology,small,US
+OSK,Oshkosh Corporation (Holding Company)Common Stock,NYSE,Industrials,mid,US
+OTF,Blue Owl Technology Finance Corp.,NYSE,,small,US
+OTTR,Otter Tail Corporation,NASDAQ,Utilities,small,US
+OUST,Ouster Inc.,NASDAQ,Industrials,small,US
+OUT,OUTFRONT Media Inc.,NYSE,Real Estate,mid,US
+OWL,Blue Owl Capital Inc.,NYSE,Financials,mid,US
+OXLC,Oxford Lane Capital Corp.,NASDAQ,Financials,small,US
+OZK,Bank OZK,NASDAQ,Financials,mid,US
+P,Everpure Inc.,NYSE,Technology,mid,US
+PACS,PACS Group Inc.,NYSE,Health Care,mid,US
+PAG,Penske Automotive Group Inc.,NYSE,Consumer Discretionary,mid,US
+PAGS,PagSeguro Digital Ltd. Class A,NYSE,Technology,small,US
+PAHC,Phibro Animal Health Corporation,NASDAQ,Health Care,small,US
+PARR,Par Pacific Holdings Inc.,NYSE,Energy,small,US
+PATH,UiPath Inc.,NYSE,Technology,mid,US
+PATK,Patrick Industries Inc.,NASDAQ,Consumer Discretionary,small,US
+PAX,Patria Investments Limited Class A,NASDAQ,Financials,small,US
+PAY,Paymentus Holdings Inc.,NYSE,Consumer Discretionary,small,US
+PAYC,Paycom Software Inc.,NYSE,Technology,mid,US
+PAYO,Payoneer Global Inc.,NASDAQ,Consumer Discretionary,small,US
+PB,Prosperity Bancshares Inc.,NYSE,Financials,mid,US
+PBI,Pitney Bowes Inc.,NYSE,Industrials,small,US
+PBLS,Parabilis Medicines Inc.,NASDAQ,Health Care,small,US
+PBT,Permian Basin Royalty Trust,NYSE,Energy,small,US
+PCOR,Procore Technologies Inc.,NYSE,Technology,mid,US
+PCRX,Pacira BioSciences Inc.,NASDAQ,Health Care,small,US
+PCT,PureCycle Technologies Inc.,NASDAQ,Industrials,small,US
+PCVX,Vaxcyte Inc.,NASDAQ,Health Care,mid,US
+PDFS,PDF Solutions Inc.,NASDAQ,Technology,small,US
+PDI,PIMCO Dynamic Income Fund,NYSE,Financials,small,US
+PDM,Piedmont Realty Trust Inc.,NYSE,Real Estate,small,US
+PDO,PIMCO Dynamic Income Opportunities Fund Common,NYSE,Financials,small,US
+PEB,Pebblebrook Hotel Trust Common,NYSE,Real Estate,small,US
+PEBO,Peoples Bancorp Inc.,NASDAQ,Financials,small,US
+PECO,Phillips Edison & Company Inc.,NASDAQ,Real Estate,mid,US
+PEN,Penumbra Inc.,NYSE,Health Care,mid,US
+PENG,Penguin Solutions Inc.,NASDAQ,Technology,small,US
+PENN,PENN Entertainment Inc.,NASDAQ,Consumer Discretionary,small,US
+PFG,Principal Financial Group Inc,NASDAQ,Financials,mid,US
+PFGC,Performance Food Group Company,NYSE,Consumer Discretionary,mid,US
+PFS,Provident Financial Services Inc,NYSE,Financials,small,US
+PFSI,PennyMac Financial Services Inc.,NYSE,Financials,small,US
+PGEN,Precigen Inc.,NASDAQ,Health Care,small,US
+PGNY,Progyny Inc.,NASDAQ,Health Care,small,US
+PGY,Pagaya Technologies Ltd.,NASDAQ,Financials,small,US
+PHG,Koninklijke Philips N.V. NY Registry Shares,NYSE,Health Care,mid,US
+PHIN,PHINIA Inc.,NYSE,Consumer Discretionary,small,US
+PHVS,Pharvaris N.V.,NASDAQ,Health Care,small,US
+PI,Impinj Inc.,NASDAQ,Technology,small,US
+PII,Polaris Inc.,NYSE,Consumer Discretionary,small,US
+PIPR,Piper Sandler Companies,NYSE,Financials,mid,US
+PJT,PJT Partners Inc.,NYSE,Financials,mid,US
+PK,Park Hotels & Resorts Inc.,NYSE,Consumer Discretionary,small,US
+PL,Planet Labs PBC,NYSE,Technology,mid,US
+PLAB,Photronics Inc.,NASDAQ,Technology,small,US
+PLGO,Pelagos Insurance Capital Limited,NYSE,Financials,small,US
+PLMR,Palomar Holdings Inc.,NASDAQ,Financials,small,US
+PLNT,Planet Fitness Inc.,NYSE,Consumer Discretionary,small,US
+PLPC,Preformed Line Products Company,NASDAQ,Industrials,small,US
+PLSE,Pulse Biosciences Inc Common Stock (DE),NASDAQ,Health Care,small,US
+PLTR,Palantir Technologies Inc.,NASDAQ,Technology,mega,US
+PLUG,Plug Power Inc.,NASDAQ,Energy,small,US
+PLUS,ePlus inc.,NASDAQ,Technology,small,US
+PLXS,Plexus Corp.,NASDAQ,Technology,mid,US
+PNFP,Pinnacle Financial Partners Inc.,NYSE,Financials,mid,US
+PNTG,The Pennant Group Inc.,NASDAQ,Health Care,small,US
+POST,Post Holdings Inc.,NYSE,Consumer Staples,small,US
+POWI,Power Integrations Inc.,NASDAQ,Technology,small,US
+POWL,Powell Industries Inc.,NASDAQ,Energy,mid,US
+PPC,Pilgrim's Pride Corporation,NASDAQ,Consumer Staples,mid,US
+PPLI,People Incorporated,NASDAQ,Technology,small,US
+PRAX,Praxis Precision Medicines Inc.,NASDAQ,Health Care,mid,US
+PRCH,Porch Group Inc.,NASDAQ,Technology,small,US
+PRCT,PROCEPT BioRobotics Corporation,NASDAQ,Health Care,small,US
+PRDO,Perdoceo Education Corporation,NASDAQ,Real Estate,small,US
+PRG,PROG Holdings Inc.,NYSE,Consumer Discretionary,small,US
+PRGO,Perrigo Company plc,NYSE,Health Care,small,US
+PRGS,Progress Software Corporation Common Stock (DE),NASDAQ,Technology,small,US
+PRI,Primerica Inc.,NYSE,Financials,mid,US
+PRIM,Primoris Services Corporation,NYSE,Industrials,small,US
+PRK,Park National Corporation,AMEX,Financials,small,US
+PRKS,United Parks & Resorts Inc.,NYSE,Health Care,small,US
+PRLB,Proto Labs Inc.,NYSE,Industrials,small,US
+PRM,Perimeter Solutions SA,NYSE,Industrials,mid,US
+PRMB,Primo Brands Corporation,NYSE,Consumer Staples,mid,US
+PRSU,Pursuit Attractions and Hospitality Inc.,NYSE,Consumer Discretionary,small,US
+PRVA,Privia Health Group Inc.,NASDAQ,Health Care,small,US
+PS,Pershing Square Inc.,NYSE,Financials,mid,US
+PSEC,Prospect Capital Corporation,NASDAQ,Financials,small,US
+PSKY,Paramount Skydance Corporation,NASDAQ,Industrials,mid,US
+PSMT,PriceSmart Inc.,NASDAQ,Consumer Discretionary,mid,US
+PSN,Parsons Corporation,NYSE,Technology,small,US
+PSNL,Personalis Inc.,NASDAQ,Health Care,small,US
+PSO,Pearson Plc,NYSE,Consumer Discretionary,mid,US
+PTCT,PTC Therapeutics Inc.,NASDAQ,Health Care,mid,US
+PTEN,Patterson-UTI Energy Inc.,NASDAQ,Energy,small,US
+PTGX,Protagonist Therapeutics Inc.,NASDAQ,Health Care,mid,US
+PTON,Peloton Interactive Inc.,NASDAQ,Consumer Discretionary,small,US
+PTRN,Pattern Group Inc. Series A,NASDAQ,Consumer Discretionary,small,US
+PUK,Prudential Public Limited Company,NYSE,Financials,mid,US
+PUMP,ProPetro Holding Corp.,NYSE,Energy,small,US
+PURR,Hyperliquid Strategies Inc,NASDAQ,Financials,small,US
+PVLA,Palvella Therapeutics Inc.,NASDAQ,Health Care,small,US
+PWP,Perella Weinberg Partners,NASDAQ,Financials,small,US
+PXED,Phoenix Education Partners Inc.,NYSE,Real Estate,small,US
+PZZA,Papa John's International Inc.,NASDAQ,Consumer Discretionary,small,US
+Q,Qnity Electronics Inc.,NYSE,Technology,mid,US
+QBTS,D-Wave Quantum Inc.,NASDAQ,Technology,mid,US
+QCRH,QCR Holdings Inc.,NASDAQ,Financials,small,US
+QDEL,QuidelOrtho Corporation,NASDAQ,Health Care,small,US
+QGEN,Qiagen N.V.,NYSE,Health Care,mid,US
+QLYS,Qualys Inc.,NASDAQ,Technology,small,US
+QNT,Quantinuum Inc.,NASDAQ,Technology,mid,US
+QS,QuantumScape Corporation,NASDAQ,Industrials,small,US
+QTWO,Q2 Holdings Inc.,NYSE,Technology,small,US
+QUBT,Quantum Computing Inc.,NASDAQ,Technology,small,US
+QURE,uniQure N.V.,NASDAQ,Health Care,small,US
+QXO,QXO Inc.,NYSE,Consumer Discretionary,mid,US
+R,Ryder System Inc.,NYSE,Consumer Discretionary,mid,US
+RAL,Ralliant Corporation,NYSE,Industrials,mid,US
+RAMP,LiveRamp Holdings Inc.,NYSE,Technology,small,US
+RAPP,Rapport Therapeutics Inc.,NASDAQ,Health Care,small,US
+RARE,Ultragenyx Pharmaceutical Inc.,NASDAQ,Health Care,small,US
+RBC,RBC Bearings Incorporated,NYSE,Industrials,mid,US
+RBCAA,Republic Bancorp Inc.,NASDAQ,Financials,small,US
+RBRK,Rubrik Inc.,NYSE,Technology,mid,US
+RCUS,Arcus Biosciences Inc.,NYSE,Health Care,small,US
+RDDT,Reddit Inc.,NYSE,Technology,mid,US
+RDN,Radian Group Inc.,NYSE,Financials,mid,US
+RDNT,RadNet Inc.,NASDAQ,Health Care,small,US
+RDW,Redwire Corporation,NYSE,Industrials,small,US
+REAL,The RealReal Inc.,NASDAQ,Consumer Discretionary,small,US
+RELY,Remitly Global Inc.,NASDAQ,Consumer Discretionary,small,US
+RES,RPC Inc.,NYSE,Energy,small,US
+REX,REX American Resources Corporation,NYSE,Industrials,small,US
+REXR,Rexford Industrial Realty Inc.,NYSE,Real Estate,mid,US
+REYN,Reynolds Consumer Products Inc.,NASDAQ,Consumer Discretionary,mid,US
+REZI,Resideo Technologies Inc.,NYSE,Industrials,mid,US
+RGA,Reinsurance Group of America Incorporated,NYSE,Financials,mid,US
+RGEN,Repligen Corporation,NASDAQ,Health Care,mid,US
+RGLD,Royal Gold Inc.,NASDAQ,Industrials,mid,US
+RGTI,Rigetti Computing Inc.,NASDAQ,Technology,small,US
+RH,RH,NYSE,Consumer Discretionary,small,US
+RHLD,Resolute Holdings Management,NYSE,Financials,small,US
+RHP,Ryman Hospitality Properties Inc. (REIT),NYSE,Real Estate,mid,US
+RIG,Transocean Ltd (Switzerland),NYSE,Energy,mid,US
+RIOT,Riot Platforms Inc.,NASDAQ,Financials,mid,US
+RITM,Rithm Capital Corp.,NYSE,Real Estate,mid,US
+RIVN,Rivian Automotive Inc.,NASDAQ,Industrials,mid,US
+RKLB,Rocket Lab Corporation,NASDAQ,Industrials,mid,US
+RKT,Rocket Companies Inc.,NYSE,Financials,mid,US
+RLAY,Relay Therapeutics Inc.,NASDAQ,Health Care,small,US
+RLI,RLI Corp. Common Stock (DE),NYSE,Financials,mid,US
+RLJ,RLJ Lodging Trust Common,NYSE,Real Estate,small,US
+RMBS,Rambus Inc.,NASDAQ,Technology,mid,US
+RMIX,Suncrete Inc.,NASDAQ,Industrials,small,US
+RNG,RingCentral Inc.,NYSE,Technology,small,US
+RNR,RenaissanceRe Holdings Ltd.,NYSE,Financials,mid,US
+RNST,Renasant Corporation,NYSE,Financials,small,US
+RNW,ReNew Energy Global plc,NASDAQ,Utilities,small,US
+ROAD,Construction Partners Inc.,NASDAQ,Industrials,mid,US
+ROCK,Gibraltar Industries Inc.,NASDAQ,Industrials,small,US
+ROG,Rogers Corporation,NYSE,Industrials,small,US
+ROIV,Roivant Sciences Ltd.,NASDAQ,Health Care,mid,US
+ROKU,Roku Inc.,NASDAQ,Communication Services,mid,US
+RPM,RPM International Inc.,NYSE,Consumer Discretionary,mid,US
+RPRX,Royalty Pharma plc,NASDAQ,Health Care,mid,US
+RQI,Cohen & Steers Quality Income Realty Fund Inc,NYSE,Financials,small,US
+RRC,Range Resources Corporation,NYSE,Energy,mid,US
+RRR,Red Rock Resorts Inc.,NASDAQ,Consumer Discretionary,mid,US
+RRX,Regal Rexnord Corporation,NYSE,Consumer Discretionary,mid,US
+RS,Reliance Inc.,NYSE,Industrials,mid,US
+RSI,Rush Street Interactive Inc.,NYSE,Consumer Discretionary,mid,US
+RUM,RUM Group Inc.,NASDAQ,Technology,small,US
+RUN,Sunrun Inc.,NASDAQ,Industrials,small,US
+RUSHA,Rush Enterprises Inc. Common Stock Cl A,NASDAQ,Consumer Discretionary,mid,US
+RUSHB,Rush Enterprises Inc. Class B,NASDAQ,Consumer Discretionary,mid,US
+RVLV,Revolve Group Inc.,NYSE,Consumer Discretionary,small,US
+RVMD,Revolution Medicines Inc.,NASDAQ,Health Care,mid,US
+RVT,Royce Small-Cap Trust Inc.,NYSE,Financials,small,US
+RVTY,Revvity Inc.,NYSE,Industrials,mid,US
+RXO,RXO Inc.,NYSE,Consumer Discretionary,small,US
+RXRX,Recursion Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+RYAN,Ryan Specialty Holdings Inc.,NYSE,Financials,mid,US
+RYN,Rayonier Inc. REIT,NYSE,Real Estate,mid,US
+RYTM,Rhythm Pharmaceuticals Inc.,NASDAQ,Health Care,mid,US
+RYZ,Ryerson Holding Corporation,NYSE,Industrials,small,US
+S,SentinelOne Inc.,NYSE,Technology,mid,US
+SAFE,Safehold Inc. New,NYSE,Real Estate,small,US
+SAFT,Safety Insurance Group Inc.,NASDAQ,Financials,small,US
+SAH,Sonic Automotive Inc.,NYSE,Consumer Discretionary,small,US
+SAIA,Saia Inc.,NASDAQ,Industrials,mid,US
+SAIC,Science Applications International Corporation,NASDAQ,Technology,small,US
+SAIL,SailPoint Inc.,NASDAQ,Technology,mid,US
+SAM,Boston Beer Company Inc. (The),NYSE,Consumer Staples,small,US
+SANM,Sanmina Corporation,NASDAQ,Technology,mid,US
+SARO,StandardAero Inc.,NYSE,Industrials,mid,US
+SBCF,Seacoast Banking Corporation of Florida,NASDAQ,Financials,small,US
+SBET,Sharplink Inc.,NASDAQ,Technology,small,US
+SBGI,Sinclair Inc.,NASDAQ,Industrials,small,US
+SBH,Sally Beauty Holdings Inc. (Name to be changed from Sally Holdings Inc.),NYSE,Consumer Discretionary,small,US
+SBR,Sabine Royalty Trust,NYSE,Energy,small,US
+SBRA,Sabra Health Care REIT Inc.,NASDAQ,Real Estate,mid,US
+SCCO,Southern Copper Corporation,NYSE,Materials,large,US
+SCI,Service Corporation International,NYSE,Consumer Discretionary,mid,US
+SCL,Stepan Company,NYSE,Consumer Discretionary,small,US
+SCSC,ScanSource Inc.,NASDAQ,Technology,small,US
+SDGR,Schrodinger Inc.,NASDAQ,Health Care,small,US
+SDRL,Seadrill Limited,NYSE,Energy,small,US
+SEB,Seaboard Corporation,AMEX,Industrials,small,US
+SECZ,Securitize Corp.,NYSE,Financials,small,US
+SEI,Solaris Energy Infrastructure Inc.,NYSE,Consumer Discretionary,small,US
+SEIC,SEI Investments Company,NASDAQ,Financials,mid,US
+SENEB,Seneca Foods Corp.,NASDAQ,Consumer Staples,small,US
+SEPN,Septerna Inc.,NASDAQ,Health Care,small,US
+SEZL,Sezzle Inc.,NASDAQ,Financials,mid,US
+SF,Stifel Financial Corporation,NYSE,Financials,mid,US
+SFBS,ServisFirst Bancshares Inc.,NYSE,Financials,small,US
+SFD,Smithfield Foods Inc.,NASDAQ,Consumer Staples,mid,US
+SFL,SFL Corporation Ltd,NYSE,Consumer Discretionary,small,US
+SFM,Sprouts Farmers Market Inc.,NASDAQ,Consumer Staples,mid,US
+SFNC,Simmons First National Corporation,NASDAQ,Financials,small,US
+SGHC,Super Group (SGHC) Limited,NYSE,Consumer Discretionary,mid,US
+SGI,Somnigroup International Inc.,NYSE,Consumer Discretionary,mid,US
+SGRY,Surgery Partners Inc.,NASDAQ,Health Care,small,US
+SHAK,Shake Shack Inc.,NYSE,Consumer Discretionary,small,US
+SHAZ,SharonAI Holdings Inc.,NASDAQ,Technology,small,US
+SHC,Sotera Health Company,NASDAQ,Health Care,small,US
+SHLS,Shoals Technologies Group Inc.,NASDAQ,Technology,small,US
+SHO,Sunstone Hotel Investors Inc. Sunstone Hotel Investors Inc.,NYSE,Consumer Discretionary,small,US
+SHOO,Steven Madden Ltd.,NASDAQ,Consumer Discretionary,small,US
+SIG,Signet Jewelers Limited,NYSE,Consumer Discretionary,small,US
+SIGI,Selective Insurance Group Inc.,NASDAQ,Financials,mid,US
+SII,Sprott Inc.,NYSE,Financials,small,US
+SIND,Sinda Ltd.,NYSE,Materials,small,US
+SION,Sionna Therapeutics Inc.,NASDAQ,Health Care,small,US
+SIRI,SiriusXM Holdings Inc.,NASDAQ,Consumer Discretionary,mid,US
+SITE,SiteOne Landscape Supply Inc.,NYSE,Consumer Discretionary,small,US
+SITM,SiTime Corporation,NASDAQ,Technology,mid,US
+SJM,The J.M. Smucker Company,NYSE,Consumer Staples,mid,US
+SKE,Skeena Resources Limited,NYSE,Materials,small,US
+SKT,Tanger Inc.,NYSE,Real Estate,small,US
+SKWD,Skyward Specialty Insurance Group Inc.,NASDAQ,Financials,small,US
+SKY,Champion Homes Inc.,NYSE,Consumer Discretionary,small,US
+SKYT,SkyWater Technology Inc.,NASDAQ,Technology,small,US
+SKYW,SkyWest Inc.,NASDAQ,Consumer Discretionary,small,US
+SLAB,Silicon Laboratories Inc.,NASDAQ,Technology,mid,US
+SLDE,Slide Insurance Holdings Inc.,NASDAQ,Financials,small,US
+SLG,SL Green Realty Corp,NYSE,Real Estate,small,US
+SLGN,Silgan Holdings Inc.,NYSE,Industrials,small,US
+SLM,SLM Corporation,NASDAQ,Financials,small,US
+SLS,SELLAS Life Sciences Group Inc.,NASDAQ,Health Care,small,US
+SLSR,Solaris Resources Inc.,AMEX,,small,US
+SLVM,Sylvamo Corporation,NYSE,Materials,small,US
+SM,SM Energy Company,NYSE,Energy,mid,US
+SMA,SmartStop Self Storage REIT Inc.,NYSE,Real Estate,small,US
+SMCI,Super Micro Computer Inc.,NASDAQ,Technology,mid,US
+SMG,Scotts Miracle-Gro Company (The),NYSE,Industrials,small,US
+SMMT,Summit Therapeutics Inc.,NASDAQ,Health Care,mid,US
+SMR,NuScale Power Corporation,NYSE,Industrials,small,US
+SMTC,Semtech Corporation,NASDAQ,Technology,mid,US
+SN,SharkNinja Inc.,NYSE,Consumer Discretionary,mid,US
+SNDA,Sonida Senior Living Inc.,NYSE,Health Care,small,US
+SNDK,Sandisk Corporation,NASDAQ,Technology,large,US
+SNDR,Schneider National Inc.,NYSE,Industrials,mid,US
+SNDX,Syndax Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+SNEX,StoneX Group Inc.,NASDAQ,Financials,mid,US
+SNN,Smith & Nephew SNATS Inc.,NYSE,Health Care,mid,US
+SNX,TD SYNNEX Corporation,NYSE,Technology,mid,US
+SOFI,SoFi Technologies Inc.,NASDAQ,Financials,mid,US
+SOLS,Solstice Advanced Materials Inc.,NASDAQ,Industrials,mid,US
+SON,Sonoco Products Company,NYSE,Consumer Discretionary,mid,US
+SONO,Sonos Inc.,NASDAQ,Consumer Staples,small,US
+SOUN,SoundHound AI Inc,NASDAQ,Technology,small,US
+SPB,Spectrum Brands Holdings Inc.,NYSE,Industrials,small,US
+SPCX,Space Exploration Technologies Corp.,NASDAQ,Technology,mega,US
+SPH,Suburban Propane Partners L.P.,NYSE,Consumer Discretionary,small,US
+SPHR,Sphere Entertainment Co.,NYSE,Consumer Discretionary,mid,US
+SPNT,SiriusPoint Ltd.,NYSE,Financials,small,US
+SPSC,SPS Commerce Inc.,NASDAQ,Technology,small,US
+SPTX,Seaport Therapeutics Inc.,NASDAQ,Health Care,small,US
+SPXC,SPX Technologies Inc.,NYSE,Industrials,mid,US
+SR,Spire Inc.,NYSE,Utilities,small,US
+SRAD,Sportradar Group AG,NASDAQ,Technology,small,US
+SRCE,1st Source Corporation,NASDAQ,Financials,small,US
+SRPT,Sarepta Therapeutics Inc. Common Stock (DE),NASDAQ,Health Care,small,US
+SRRK,Scholar Rock Holding Corporation,NASDAQ,Health Care,mid,US
+SSB,SouthState Bank Corporation,NYSE,Financials,mid,US
+SSD,Simpson Manufacturing Company Inc.,NYSE,Consumer Discretionary,mid,US
+SSMR,Sunshine Silver Mining & Refining Company,NYSE,Materials,small,US
+ST,Sensata Technologies Holding plc,NYSE,Industrials,mid,US
+STAA,STAAR Surgical Company,NASDAQ,Health Care,small,US
+STAG,Stag Industrial Inc.,NYSE,Real Estate,mid,US
+STBA,S&T Bancorp Inc.,NASDAQ,Financials,small,US
+STC,Stewart Information Services Corporation,NYSE,Financials,small,US
+STDN,Standard Nuclear Inc.,NYSE,Materials,small,US
+STE,STERIS plc (Ireland),NYSE,Health Care,mid,US
+STEP,StepStone Group Inc.,NASDAQ,Financials,mid,US
+STLA,Stellantis N.V.,NYSE,Industrials,mid,US
+STM,STMicroelectronics N.V.,NYSE,Technology,mid,US
+STOK,Stoke Therapeutics Inc.,NASDAQ,Health Care,small,US
+STRA,Strategic Education Inc.,NASDAQ,Real Estate,small,US
+STRL,Sterling Infrastructure Inc.,NASDAQ,Industrials,mid,US
+STUB,StubHub Holdings Inc.,NYSE,Consumer Discretionary,small,US
+STVN,Stevanato Group S.p.A.,NYSE,Health Care,mid,US
+STWD,STARWOOD PROPERTY TRUST INC. Starwood Property Trust Inc.,NYSE,Real Estate,mid,US
+SUI,Sun Communities Inc.,NYSE,Real Estate,mid,US
+SUNB,Sunbelt Rentals Holdings Inc.,NYSE,Consumer Discretionary,mid,US
+SUPN,Supernus Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+SVC,Service Properties Trust Common,NASDAQ,Real Estate,small,US
+SVRA,Savara Inc.,NASDAQ,Health Care,small,US
+SVV,Savers Value Village Inc.,NYSE,Consumer Discretionary,small,US
+SW,Smurfit WestRock plc,NYSE,Consumer Discretionary,mid,US
+SWX,Southwest Gas Holdings Inc. Common Stock (DE),NYSE,Utilities,mid,US
+SXI,Standex International Corporation,NYSE,Industrials,small,US
+SXT,Sensient Technologies Corporation,NYSE,Industrials,mid,US
+SYBT,Stock Yards Bancorp Inc.,NASDAQ,Financials,small,US
+SYM,Symbotic Inc.,NASDAQ,Industrials,mid,US
+SYNA,Synaptics Incorporated Common Stock $0.001 Par Value,NASDAQ,Technology,small,US
+SYRE,Spyre Therapeutics Inc.,NASDAQ,Health Care,mid,US
+TALO,Talos Energy Inc.,NYSE,Energy,small,US
+TARS,Tarsus Pharmaceuticals Inc.,NASDAQ,Health Care,small,US
+TBBK,The Bancorp Inc,NASDAQ,Financials,small,US
+TCBI,Texas Capital Bancshares Inc.,NASDAQ,Financials,small,US
+TCBK,TriCo Bancshares,NASDAQ,Financials,small,US
+TDAY,USA TODAY Co. Inc.,NYSE,Consumer Discretionary,small,US
+TDC,Teradata Corporation,NYSE,Technology,small,US
+TDOC,Teladoc Health Inc.,NYSE,Health Care,small,US
+TDS,Telephone and Data Systems Inc.,NYSE,Communication Services,small,US
+TDW,Tidewater Inc.,NYSE,Consumer Discretionary,small,US
+TE,T1 Energy Inc.,NYSE,Industrials,small,US
+TEM,Tempus AI Inc.,NASDAQ,Technology,mid,US
+TENB,Tenable Holdings Inc.,NASDAQ,Technology,small,US
+TEX,Terex Corporation,NYSE,Industrials,mid,US
+TFIN,Triumph Financial Inc.,NYSE,Financials,small,US
+TFSL,TFS Financial Corporation,NASDAQ,Financials,mid,US
+TFX,Teleflex Incorporated,NYSE,Health Care,mid,US
+TGTX,TG Therapeutics Inc.,NASDAQ,Health Care,mid,US
+TH,Target Hospitality Corp.,NASDAQ,Consumer Discretionary,small,US
+THC,Tenet Healthcare Corporation,NYSE,Health Care,mid,US
+THG,Hanover Insurance Group Inc,NYSE,Financials,mid,US
+THO,Thor Industries Inc.,NYSE,Industrials,small,US
+THRM,Gentherm Inc,NASDAQ,Consumer Discretionary,small,US
+TIC,TIC Solutions Inc.,NYSE,Consumer Discretionary,small,US
+TIGO,Millicom International Cellular S.A.,NASDAQ,Communication Services,mid,US
+TILE,Interface Inc.,NASDAQ,Consumer Discretionary,small,US
+TKO,TKO Group Holdings Inc.,NYSE,Consumer Discretionary,mid,US
+TKR,Timken Company (The),NYSE,Industrials,mid,US
+TLN,Talen Energy Corporation,NASDAQ,Utilities,mid,US
+TMDX,TransMedics Group Inc.,NASDAQ,Health Care,small,US
+TMP,Tompkins Financial Corporation,AMEX,Financials,small,US
+TNC,Tennant Company,NYSE,Industrials,small,US
+TNDM,Tandem Diabetes Care Inc.,NASDAQ,Health Care,small,US
+TNET,TriNet Group Inc.,NYSE,Consumer Discretionary,small,US
+TNGX,Tango Therapeutics Inc.,NASDAQ,Health Care,small,US
+TNK,Teekay Tankers Ltd.,NYSE,Consumer Discretionary,small,US
+TNL,Travel   Leisure Co. Common  Stock,NYSE,Consumer Discretionary,small,US
+TOL,Toll Brothers Inc.,NYSE,Consumer Discretionary,mid,US
+TOST,Toast Inc.,NYSE,Technology,mid,US
+TOWN,TowneBank,NASDAQ,Financials,small,US
+TPB,Turning Point Brands Inc.,NYSE,Consumer Discretionary,small,US
+TPC,Tutor Perini Corporation,NYSE,Consumer Discretionary,small,US
+TPG,TPG Inc.,NASDAQ,Financials,mid,US
+TPL,Texas Pacific Land Corporation,NYSE,Energy,mid,US
+TR,Tootsie Roll Industries Inc.,NYSE,Consumer Staples,small,US
+TRAX,First Tracks Biotherapeutics Inc.,NASDAQ,Health Care,small,US
+TREX,Trex Company Inc.,NYSE,Materials,small,US
+TRIN,Trinity Capital Inc.,NYSE,Financials,small,US
+TRIP,TripAdvisor Inc.,NASDAQ,Technology,small,US
+TRLV,Trulieve Cannabis Corp.,NYSE,Health Care,small,US
+TRMD,TORM plc,NASDAQ,Consumer Discretionary,small,US
+TRMK,Trustmark Corporation,NASDAQ,Financials,small,US
+TRN,Trinity Industries Inc.,NYSE,Industrials,small,US
+TRNO,Terreno Realty Corporation,NYSE,Financials,mid,US
+TRS,TriMas Corporation,NASDAQ,Industrials,small,US
+TRU,TransUnion,NYSE,Financials,mid,US
+TRUP,Trupanion Inc.,NASDAQ,Health Care,small,US
+TRVI,Trevi Therapeutics Inc.,NASDAQ,Health Care,small,US
+TSHA,Taysha Gene Therapies Inc.,NASDAQ,Health Care,small,US
+TSLX,Sixth Street Specialty Lending Inc.,NYSE,Financials,small,US
+TT,Trane Technologies plc,NYSE,Industrials,large,US
+TTAM,Titan America SA,NYSE,Industrials,small,US
+TTAN,ServiceTitan Inc.,NASDAQ,Technology,mid,US
+TTC,Toro Company (The),NYSE,Consumer Discretionary,mid,US
+TTEK,Tetra Tech Inc.,NASDAQ,Consumer Discretionary,mid,US
+TTMI,TTM Technologies Inc.,NASDAQ,Technology,mid,US
+TVTX,Travere Therapeutics Inc.,NASDAQ,Health Care,mid,US
+TW,Tradeweb Markets Inc.,NASDAQ,Financials,mid,US
+TWFG,TWFG Inc.,NASDAQ,Financials,small,US
+TWO,Two Harbors Investment Corp,NYSE,Real Estate,small,US
+TWST,Twist Bioscience Corporation,NASDAQ,Health Care,mid,US
+TXG,10x Genomics Inc.,NASDAQ,Industrials,mid,US
+TXNM,TXNM Energy Inc.,NYSE,Utilities,mid,US
+TXRH,Texas Roadhouse Inc.,NASDAQ,Consumer Discretionary,mid,US
+TY,Tri Continental Corporation,NYSE,Financials,small,US
+TYRA,Tyra Biosciences Inc.,NASDAQ,Health Care,small,US
+UAA,Under Armour Inc.,NYSE,Consumer Discretionary,small,US
+UBS,UBS Group AG Registered,NYSE,Financials,large,US
+UBSI,United Bankshares Inc.,NASDAQ,Financials,mid,US
+UCB,United Community Banks Inc.,NYSE,Financials,small,US
+UCTT,Ultra Clean Holdings Inc.,NASDAQ,Technology,small,US
+UE,Urban Edge Properties Common,NYSE,Financials,small,US
+UFCS,United Fire Group Inc.,NASDAQ,Financials,small,US
+UFPI,UFP Industries Inc.,NASDAQ,Materials,small,US
+UFPT,UFP Technologies Inc.,NASDAQ,Health Care,small,US
+UGI,UGI Corporation,NYSE,Utilities,mid,US
+UHAL,U-Haul Holding Company,NYSE,Consumer Discretionary,mid,US
+UI,Ubiquiti Inc.,NYSE,Technology,mid,US
+ULCC,Frontier Group Holdings Inc.,NASDAQ,Consumer Discretionary,small,US
+ULS,UL Solutions Inc.,NYSE,Health Care,mid,US
+UMBF,UMB Financial Corporation,NASDAQ,Financials,mid,US
+UMH,UMH Properties Inc.,NYSE,Real Estate,small,US
+UNF,Unifirst Corporation,NYSE,Consumer Discretionary,mid,US
+UNFI,United Natural Foods Inc.,NYSE,Consumer Discretionary,small,US
+UNIT,Uniti Group Inc.,NASDAQ,Real Estate,small,US
+UNM,Unum Group,NYSE,Financials,mid,US
+UPBD,Upbound Group Inc.,NASDAQ,Consumer Discretionary,small,US
+UPST,Upstart Holdings Inc.,NASDAQ,Financials,small,US
+UPWK,Upwork Inc.,NASDAQ,Technology,small,US
+URBN,Urban Outfitters Inc.,NASDAQ,Consumer Discretionary,mid,US
+URI,United Rentals Inc.,NYSE,Consumer Discretionary,large,US
+USAR,USA Rare Earth Inc.,NASDAQ,Materials,small,US
+USFD,US Foods Holding Corp.,NYSE,Consumer Discretionary,mid,US
+USLM,United States Lime & Minerals Inc.,NASDAQ,Industrials,small,US
+USPH,U.S. Physical Therapy Inc.,NYSE,Health Care,small,US
+UTHR,United Therapeutics Corporation,NASDAQ,Health Care,mid,US
+UTI,Universal Technical Institute Inc,NYSE,Real Estate,small,US
+UTZ,Utz Brands Inc,NYSE,Consumer Staples,small,US
+UVE,UNIVERSAL INSURANCE HOLDINGS INC,NYSE,Financials,small,US
+UVSP,Univest Financial Corporation,NASDAQ,Financials,small,US
+UVV,Universal Corporation,NYSE,Industrials,small,US
+UWMC,UWM Holdings Corporation,NYSE,Financials,small,US
+VAC,Marriott Vacations Worldwide Corporation,NYSE,Financials,small,US
+VAL,Valaris Limited,NYSE,Energy,mid,US
+VC,Visteon Corporation,NASDAQ,Consumer Discretionary,small,US
+VCEL,Vericel Corporation,NASDAQ,Health Care,small,US
+VCTR,Victory Capital Holdings Inc.,NASDAQ,Financials,mid,US
+VCYT,Veracyte Inc.,NASDAQ,Health Care,small,US
+VECO,Veeco Instruments Inc.,NASDAQ,Technology,small,US
+VEON,VEON Ltd. ADS,NASDAQ,Communication Services,small,US
+VERA,Vera Therapeutics Inc.,NASDAQ,Health Care,small,US
+VERX,Vertex Inc.,NASDAQ,Technology,small,US
+VG,Venture Global Inc.,NYSE,Utilities,mid,US
+VGNT,Versigent PLC,NYSE,,small,US
+VIA,Via Transportation Inc.,NYSE,Technology,small,US
+VIAV,Viavi Solutions Inc.,NASDAQ,Technology,mid,US
+VICR,Vicor Corporation,NASDAQ,Technology,mid,US
+VIK,Viking Holdings Ltd,NYSE,Consumer Discretionary,mid,US
+VIR,Vir Biotechnology Inc.,NASDAQ,Health Care,small,US
+VIRT,Virtu Financial Inc.,NYSE,Financials,mid,US
+VISN,Vistance Networks Inc.,NASDAQ,Technology,small,US
+VKTX,Viking Therapeutics Inc.,NASDAQ,Health Care,small,US
+VLTO,Veralto Corp,NYSE,Industrials,mid,US
+VLY,Valley National Bancorp,NASDAQ,Financials,mid,US
+VMI,Valmont Industries Inc.,NYSE,Industrials,mid,US
+VNO,Vornado Realty Trust,NYSE,Real Estate,mid,US
+VNOM,Viper Energy Inc.,NASDAQ,Energy,mid,US
+VNT,Vontier Corporation,NYSE,Industrials,small,US
+VOR,Vor Biopharma Inc.,NASDAQ,Health Care,small,US
+VOYA,Voya Financial Inc.,NYSE,Financials,mid,US
+VOYG,Voyager Technologies Inc.,NYSE,Industrials,small,US
+VPG,Vishay Precision Group Inc.,NYSE,Technology,small,US
+VRDN,Viridian Therapeutics Inc.,NASDAQ,Health Care,small,US
+VRNS,Varonis Systems Inc.,NASDAQ,Technology,small,US
+VRT,Vertiv Holdings LLC,NYSE,Technology,large,US
+VRTS,Virtus Investment Partners Inc.,NYSE,Financials,small,US
+VSAT,ViaSat Inc.,NASDAQ,Technology,mid,US
+VSEC,VSE Corporation,NASDAQ,Consumer Discretionary,mid,US
+VSH,Vishay Intertechnology Inc.,NYSE,Technology,small,US
+VSNT,Versant Media Group Inc.,NASDAQ,Industrials,mid,US
+VST,Vistra Corp.,NYSE,Utilities,mid,US
+VSTS,Vestis Corporation,NYSE,Consumer Discretionary,small,US
+VSXY,Victorias Secret & Co.,NYSE,Consumer Discretionary,mid,US
+VTOL,Bristow Group Inc.,NYSE,Consumer Discretionary,small,US
+VVV,Valvoline Inc.,NYSE,Industrials,mid,US
+VVX,V2X Inc.,NYSE,Consumer Discretionary,small,US
+VYX,NCR Voyix Corporation,NYSE,Industrials,small,US
+W,Wayfair Inc.,NYSE,Consumer Discretionary,mid,US
+WABC,Westamerica Bancorporation,NASDAQ,Financials,small,US
+WAFD,WaFd Inc.,NASDAQ,Financials,small,US
+WAL,Western Alliance Bancorporation Common Stock (DE),NYSE,Financials,mid,US
+WAY,Waystar Holding Corp.,NASDAQ,Technology,small,US
+WBI,WaterBridge Infrastructure LLC Class A Shares Representing Limited Liability Company Interests,NYSE,Energy,small,US
+WBTN,WEBTOON Entertainment Inc.,NASDAQ,Consumer Discretionary,small,US
+WCC,WESCO International Inc.,NYSE,Consumer Discretionary,mid,US
+WD,Walker & Dunlop Inc,NYSE,Financials,small,US
+WDFC,WD-40 Company,NASDAQ,Industrials,small,US
+WEN,Wendy's Company (The),NASDAQ,Consumer Discretionary,small,US
+WERN,Werner Enterprises Inc.,NASDAQ,Industrials,small,US
+WFRD,Weatherford International plc,NASDAQ,Consumer Discretionary,mid,US
+WGS,GeneDx Holdings Corp.,NASDAQ,Technology,small,US
+WH,Wyndham Hotels & Resorts Inc.,NYSE,Consumer Discretionary,mid,US
+WHD,Cactus Inc.,NYSE,Consumer Discretionary,small,US
+WINA,Winmark Corporation,NASDAQ,Consumer Discretionary,small,US
+WING,Wingstop Inc.,NASDAQ,Consumer Discretionary,small,US
+WK,Workiva Inc.,NYSE,Technology,small,US
+WKC,World Kinect Corporation,NYSE,Energy,small,US
+WLDN,Willdan Group Inc.,NASDAQ,Consumer Discretionary,small,US
+WLFC,Willis Lease Finance Corporation,NASDAQ,Consumer Discretionary,small,US
+WLK,Westlake Corporation,NYSE,Industrials,mid,US
+WLTH,Wealthfront Corporation,NASDAQ,Financials,small,US
+WLY,John Wiley & Sons Inc.,NYSE,Consumer Discretionary,small,US
+WMG,Warner Music Group Corp.,NASDAQ,Consumer Discretionary,mid,US
+WMK,Weis Markets Inc.,NYSE,Consumer Staples,small,US
+WMS,Advanced Drainage Systems Inc.,NYSE,Consumer Discretionary,mid,US
+WOLF,Wolfspeed Inc. Common Stock New,NYSE,Technology,small,US
+WOR,Worthington Enterprises Inc.,NYSE,Industrials,small,US
+WPC,W. P. Carey Inc. REIT,NYSE,Real Estate,mid,US
+WRB,W.R. Berkley Corporation,NYSE,Financials,mid,US
+WRBY,Warby Parker Inc.,NYSE,Health Care,small,US
+WS,Worthington Steel Inc.,NYSE,Industrials,small,US
+WSBC,WesBanco Inc.,NASDAQ,Financials,small,US
+WSC,WillScot Holdings Corporation,NASDAQ,Industrials,small,US
+WSE,Wise Group plc,NASDAQ,Industrials,mid,US
+WSFS,WSFS Financial Corporation,NASDAQ,Financials,small,US
+WSO,Watsco Inc.,NYSE,Consumer Discretionary,mid,US
+WT,WisdomTree Inc.,NYSE,Financials,small,US
+WTFC,Wintrust Financial Corporation,NASDAQ,Financials,mid,US
+WTM,White Mountains Insurance Group Ltd.,NYSE,Financials,mid,US
+WTRG,Essential Utilities Inc.,NYSE,Utilities,mid,US
+WTS,Watts Water Technologies Inc.,NYSE,Industrials,mid,US
+WTTR,Select Water Solutions Inc.,NYSE,Energy,small,US
+WU,Western Union Company (The),NYSE,Consumer Discretionary,small,US
+WULF,TeraWulf Inc.,NASDAQ,Technology,mid,US
+WWD,Woodward Inc.,NASDAQ,Energy,mid,US
+WWW,Wolverine World Wide Inc.,NYSE,Consumer Discretionary,small,US
+XE,X-Energy Inc.,NASDAQ,Industrials,mid,US
+XERS,Xeris Biopharma Holdings Inc.,NASDAQ,Health Care,small,US
+XHR,Xenia Hotels & Resorts Inc.,NYSE,Consumer Discretionary,small,US
+XMTR,Xometry Inc.,NASDAQ,Consumer Discretionary,small,US
+XNCR,Xencor Inc.,NASDAQ,Health Care,small,US
+XPEL,XPEL Inc.,NASDAQ,Industrials,small,US
+XPO,XPO Inc.,NYSE,Consumer Discretionary,mid,US
+XPRO,Expro Ltd,NYSE,Energy,small,US
+XXI,Twenty One Capital Inc.,NYSE,Financials,small,US
+XYZ,Block Inc.,NYSE,Technology,mid,US
+XZO,Exzeo Group Inc.,NYSE,Financials,small,US
+YELP,Yelp Inc.,NYSE,Consumer Discretionary,small,US
+YETI,YETI Holdings Inc.,NYSE,Consumer Discretionary,small,US
+YOU,Clear Secure Inc.,NYSE,Technology,mid,US
+YSS,York Space Systems Inc.,NYSE,Industrials,small,US
+YSWY,Yesway Inc.,NASDAQ,Consumer Staples,small,US
+YUMC,Yum China Holdings Inc.,NYSE,Consumer Discretionary,mid,US
+ZBIO,Zenas BioPharma Inc.,NASDAQ,Health Care,small,US
+ZD,Ziff Davis Inc.,NASDAQ,Communication Services,small,US
+ZETA,Zeta Global Holdings Corp.,NYSE,Technology,mid,US
+ZG,Zillow Group Inc.,NASDAQ,Consumer Discretionary,mid,US
+ZGN,Ermenegildo Zegna N.V.,NYSE,Consumer Discretionary,small,US
+ZIM,ZIM Integrated Shipping Services Ltd.,NYSE,Consumer Discretionary,small,US
+ZM,Zoom Communications Inc.,NASDAQ,Technology,mid,US
+ZWS,Zurn Elkay Water Solutions Corporation,NYSE,Industrials,mid,US
+ZYME,Zymeworks Inc.,NASDAQ,Health Care,small,US

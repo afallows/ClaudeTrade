@@ -1,10 +1,49 @@
 # generated: 2026-07-30
-# This is a hand-curated SEED universe, not a live index feed. Index
-# constituents drift (additions, removals, mergers, renames); this file will
-# go stale over time. Edit it freely -- add, remove or correct rows -- it is a
-# starting point for the scannable universe, not an authoritative source.
-# market_cap_bucket is an approximate size label (mega/large/mid), not a live
-# market capitalisation figure.
+# This is a hand-curated SEED universe, not a live index feed (ADR-0008
+# Decision 3: the runtime market-cap filter at refresh time is authoritative;
+# this file is bootstrap coverage only). Index constituents drift (additions,
+# removals, mergers, renames); this file will go stale over time. Edit it
+# freely -- add, remove or correct rows. TSX (main board) listings only --
+# TSX Venture (TSXV), CSE and NEO are out of scope and intentionally excluded.
+#
+# Expansion history:
+#   2026-07-30: expanded the original ~114-row hand-curated seed with roughly
+#   110 more well-known, large/mid-cap TSX main-board Canadian companies.
+#   No live, comprehensive, current TSX Composite constituent dataset was
+#   reachable from this sandbox: WebFetch returned HTTP 403 for every host
+#   tried (Wikipedia included, plus a non-Wikipedia control URL, ruling out a
+#   Wikipedia-specific block), and no maintained TSX-constituent mirror was
+#   found on the GitHub hosts (github.com / raw.githubusercontent.com) that
+#   *were* reachable -- see docs/api-providers.md for the full account. These
+#   additions are therefore compiled from trained knowledge rather than
+#   live-fetched, cross-checked for continued real-world existence/scale
+#   against a live NASDAQ/NYSE/AMEX cross-listing dataset where the same
+#   company is also US-cross-listed (see us_default.csv's own banner). Rows
+#   whose exact current TSX ticker could not be stated with confidence were
+#   left out rather than guessed.
+#
+#   Cross-listing rule: a Canada-domiciled company dual-listed on TSX and a
+#   US exchange is represented ONCE, here, under its TSX ticker; it is
+#   excluded from us_default.csv (see that file's country="Canada" exclusion
+#   note). Where a symbol collides with a different, unrelated company
+#   already on the US side (e.g. Canadian "T" = TELUS vs US "T" = AT&T; see
+#   the pre-existing collision note below), the Canadian name is omitted
+#   here rather than risk one silently shadowing the other -- see inline
+#   NOTE comments in this file's generation script for the specific
+#   per-symbol judgement calls made.
+#
+# market_cap_bucket is an approximate size label (mega/large/mid/small), not
+# a live market capitalisation figure -- see providers/market/yahoo.py and
+# data/universe.py for the real, runtime market-cap floor
+# (universe.min_market_cap_usd) that is authoritative at refresh time.
+#
+# Known cross-market symbol collisions: a handful of well-known tickers are
+# used by *different* companies on the US and Canadian markets (e.g. T is
+# AT&T on NYSE and TELUS on TSX; K is Kellanova on NYSE and Kinross Gold on
+# TSX). Because the universe is keyed by bare symbol, this file deliberately
+# omits the Canadian side of each such collision rather than have one
+# silently overwrite the other -- an accuracy trade-off documented here
+# rather than hidden.
 symbol,name,exchange,sector,market_cap_bucket,country
 RY,Royal Bank of Canada,TSX,Financials,mega,CA
 TD,The Toronto-Dominion Bank,TSX,Financials,large,CA
@@ -120,3 +159,112 @@ OTEX,Open Text Corporation,TSX,Technology,mid,CA
 LSPD,Lightspeed Commerce Inc.,TSX,Technology,mid,CA
 NVEI,Nuvei Corporation,TSX,Technology,mid,CA
 ENGH,Enghouse Systems Limited,TSX,Technology,mid,CA
+CIX,CI Financial Corp.,TSX,Financials,mid,CA
+FSZ,Fiera Capital Corporation,TSX,Financials,small,CA
+AGF-B,AGF Management Limited (Class B),TSX,Financials,small,CA
+DFY,Definity Financial Corporation,TSX,Financials,mid,CA
+TSU,Trisura Group Ltd.,TSX,Financials,small,CA
+MIC,Sagen MI Canada Inc.,TSX,Financials,small,CA
+ECN,ECN Capital Corp.,TSX,Financials,small,CA
+VBNK,VersaBank,TSX,Financials,small,CA
+ALA,AltaGas Ltd.,TSX,Utilities,mid,CA
+PKI,Parkland Corporation,TSX,Energy,mid,CA
+CJ,Cardinal Energy Ltd.,TSX,Energy,small,CA
+FRU,Freehold Royalties Ltd.,TSX,Energy,small,CA
+PSK,PrairieSky Royalty Ltd.,TSX,Energy,mid,CA
+TPZ,Topaz Energy Corp.,TSX,Energy,mid,CA
+AAV,Advantage Energy Ltd.,TSX,Energy,small,CA
+POU,Paramount Resources Ltd.,TSX,Energy,small,CA
+NVA,NuVista Energy Ltd.,TSX,Energy,small,CA
+HWX,Headwater Exploration Inc.,TSX,Energy,small,CA
+KEL,Kelt Exploration Ltd.,TSX,Energy,small,CA
+BIR,Birchcliff Energy Ltd.,TSX,Energy,small,CA
+SES,Secure Energy Services Inc.,TSX,Energy,small,CA
+VRN,Veren Inc.,TSX,Energy,mid,CA
+GTE,Gran Tierra Energy Inc.,TSX,Energy,small,CA
+OBE,Obsidian Energy Ltd.,TSX,Energy,small,CA
+CEU,CES Energy Solutions Corp.,TSX,Energy,small,CA
+PSI,Pason Systems Inc.,TSX,Energy,small,CA
+TA,TransAlta Corporation,TSX,Utilities,small,CA
+LUG,Lundin Gold Inc.,TSX,Materials,mid,CA
+EDV,Endeavour Mining plc,TSX,Materials,large,CA
+BTO,B2Gold Corp.,TSX,Materials,mid,CA
+EQX,Equinox Gold Corp.,TSX,Materials,mid,CA
+SVM,Silvercorp Metals Inc.,TSX,Materials,small,CA
+AYA,Aya Gold & Silver Inc.,TSX,Materials,small,CA
+SSRM,SSR Mining Inc.,TSX,Materials,mid,CA
+NGD,New Gold Inc.,TSX,Materials,small,CA
+DML,Denison Mines Corp.,TSX,Materials,small,CA
+NXE,NexGen Energy Ltd.,TSX,Materials,mid,CA
+WDO,Wesdome Gold Mines Ltd.,TSX,Materials,small,CA
+LAC,Lithium Americas Corp.,TSX,Materials,small,CA
+ERO,Ero Copper Corp.,TSX,Materials,small,CA
+FVI,Fortuna Mining Corp.,TSX,Materials,small,CA
+SSL,Sandstorm Gold Ltd.,TSX,Materials,small,CA
+DPM,Dundee Precious Metals Inc.,TSX,Materials,small,CA
+ARIS,Aris Mining Corporation,TSX,Materials,small,CA
+TFPM,Triple Flag Precious Metals Corp.,TSX,Materials,small,CA
+NG,NovaGold Resources Inc.,TSX,Materials,small,CA
+MAG,MAG Silver Corp.,TSX,Materials,small,CA
+RBA,RB Global Inc.,TSX,Industrials,mid,CA
+BDT,Bird Construction Inc.,TSX,Industrials,small,CA
+MDA,MDA Space Ltd.,TSX,Industrials,small,CA
+BLDP,Ballard Power Systems Inc.,TSX,Industrials,small,CA
+GDI,GDI Integrated Facility Services Inc.,TSX,Industrials,small,CA
+TCL-A,Transcontinental Inc. (Class A),TSX,Industrials,small,CA
+WTE,Westshore Terminals Investment Corporation,TSX,Industrials,small,CA
+HRX,Heroux-Devtek Inc.,TSX,Industrials,small,CA
+EIF,Exchange Income Corporation,TSX,Industrials,mid,CA
+MTL,Mullen Group Ltd.,TSX,Industrials,small,CA
+LNR,Linamar Corporation,TSX,Industrials,mid,CA
+MRE,Martinrea International Inc.,TSX,Industrials,small,CA
+RCH,Richelieu Hardware Ltd.,TSX,Industrials,small,CA
+WCN,Waste Connections Inc.,TSX,Industrials,large,CA
+AC,Air Canada,TSX,Industrials,mid,CA
+CJT,Cargojet Inc.,TSX,Industrials,small,CA
+GFL,GFL Environmental Inc.,TSX,Industrials,large,CA
+QSR,Restaurant Brands International Inc.,TSX,Consumer Discretionary,large,CA
+ATZ,Aritzia Inc.,TSX,Consumer Discretionary,mid,CA
+MTY,MTY Food Group Inc.,TSX,Consumer Discretionary,small,CA
+TOY,Spin Master Corp.,TSX,Consumer Discretionary,small,CA
+GIL,Gildan Activewear Inc.,TSX,Consumer Discretionary,mid,CA
+CGX,Cineplex Inc.,TSX,Consumer Discretionary,small,CA
+PET,Pet Valu Holdings Ltd.,TSX,Consumer Discretionary,small,CA
+NWC,The North West Company Inc.,TSX,Consumer Staples,small,CA
+MFI,Maple Leaf Foods Inc.,TSX,Consumer Staples,mid,CA
+QBR-B,Quebecor Inc. (Class B),TSX,Communication Services,small,CA
+NPI,Northland Power Inc.,TSX,Utilities,small,CA
+INE,Innergex Renewable Energy Inc.,TSX,Utilities,small,CA
+BEP-UN,Brookfield Renewable Partners L.P.,TSX,Utilities,large,CA
+BIP-UN,Brookfield Infrastructure Partners L.P.,TSX,Utilities,large,CA
+ACO-X,ATCO Ltd. (Class I),TSX,Utilities,small,CA
+CLS,Celestica Inc.,TSX,Technology,large,CA
+BB,BlackBerry Limited,TSX,Technology,small,CA
+TIXT,TELUS International (Cda) Inc.,TSX,Technology,small,CA
+DCBO,Docebo Inc.,TSX,Technology,small,CA
+CVO,Coveo Solutions Inc.,TSX,Technology,small,CA
+BITF,Bitfarms Ltd.,TSX,Technology,small,CA
+DND,Dye & Durham Limited,TSX,Technology,small,CA
+REI-UN,RioCan Real Estate Investment Trust,TSX,Real Estate,mid,CA
+CAR-UN,Canadian Apartment Properties Real Estate Investment Trust,TSX,Real Estate,mid,CA
+SRU-UN,SmartCentres Real Estate Investment Trust,TSX,Real Estate,mid,CA
+AP-UN,Allied Properties Real Estate Investment Trust,TSX,Real Estate,small,CA
+FCR-UN,First Capital Real Estate Investment Trust,TSX,Real Estate,small,CA
+GRT-UN,Granite Real Estate Investment Trust,TSX,Real Estate,mid,CA
+DIR-UN,Dream Industrial Real Estate Investment Trust,TSX,Real Estate,small,CA
+CHP-UN,Choice Properties Real Estate Investment Trust,TSX,Real Estate,mid,CA
+HR-UN,H&R Real Estate Investment Trust,TSX,Real Estate,small,CA
+KMP-UN,Killam Apartment Real Estate Investment Trust,TSX,Real Estate,small,CA
+IIP-UN,InterRent Real Estate Investment Trust,TSX,Real Estate,small,CA
+MRC,Morguard Corporation,TSX,Real Estate,small,CA
+CSH-UN,Chartwell Retirement Residences,TSX,Real Estate,small,CA
+SIA,Sienna Senior Living Inc.,TSX,Real Estate,small,CA
+NWH-UN,NorthWest Healthcare Properties Real Estate Investment Trust,TSX,Real Estate,small,CA
+MI-UN,Minto Apartment Real Estate Investment Trust,TSX,Real Estate,small,CA
+FSV,FirstService Corporation,TSX,Real Estate,mid,CA
+BEI-UN,Boardwalk Real Estate Investment Trust,TSX,Real Estate,small,CA
+AX-UN,Artis Real Estate Investment Trust,TSX,Real Estate,small,CA
+BHC,Bausch Health Companies Inc.,TSX,Health Care,small,CA
+BLCO,Bausch + Lomb Corporation,TSX,Health Care,mid,CA
+GUD,Knight Therapeutics Inc.,TSX,Health Care,small,CA
+CRON,Cronos Group Inc.,TSX,Health Care,small,CA
