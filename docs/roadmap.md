@@ -30,6 +30,33 @@ ClaudeTrade is under active development. This roadmap outlines planned features 
 
 ## Near-term
 
+**Next UI rendition — ticker page modelled on CIBC Investor's Edge (owner TO-DO, 2026-07-30)**:
+
+The owner's reference is the Investor's Edge stock snapshot page (GOOGL example
+reviewed). Target a single rich ticker-detail view combining:
+
+- **Chart controls**: timeframe pills (Intraday/1W/1M/3M/6M/YTD/1Y/3Y/5Y/Max)
+  over the price chart, with a full-history range-brush mini-chart beneath —
+  the specific control style the owner called out as good
+- **Statistics panel**: prev close, open, day/52-week range, volume,
+  market cap, P/E TTM, EPS TTM, beta, currency
+- **Financial events sidebar**: dated timeline of upcoming earnings (with EPS
+  estimate) and dividends (amount, yield)
+- **Dividends block**: yield, TTM/forward amounts, ex-div/pay dates, payout ratio
+- **Analyst consensus**: buy/hold/sell donut with rating count, average price
+  target with % upside, and the low/avg/high 12-month projection fan chart
+- **Headlines feed** with thumbnails
+- **Sentiment alongside**: our differentiator — the Reddit/Stocktwits/news
+  sentiment series and mention volume displayed next to the above, which
+  Investor's Edge does not have
+
+Data availability note: the TipRanks `dataForTicker` payload we now consume as
+primary already carries most of this (analyst consensus + price targets +
+projection series via `ptConsensus`/`consensusOverTime`, earnings via
+`portfolioHoldingData`, dividends via `nextDividendDate`/`yearlyDividend*`,
+market cap, company description). Close-only prices limit candlesticks to the
+OHLCV chain; the range-brush works fine on closes.
+
 **Remaining CLI/UI gaps**:
 - `claudetrade validate-config` — Check configuration syntax (not implemented)
 - Wire the UI's export buttons to the existing `backtest.reporting.export_csv`/`export_excel`
