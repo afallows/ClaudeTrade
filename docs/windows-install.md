@@ -201,6 +201,17 @@ from, instead of your real per-OS default. Leaving it out uses the correct
 Reddit's official OAuth API is free but requires a client ID and secret.
 
 1. Log into Reddit and go to https://www.reddit.com/prefs/apps
+
+   **If that page fails** (blank page, dead "create app" button, 500 errors,
+   or a CAPTCHA loop — all known problems with the redesigned page as of
+   2026), use the legacy frontend for the same form:
+   https://old.reddit.com/prefs/apps. Also check, in order: your account
+   email is verified (an unverified account gets a silently-dead create
+   button); try an incognito window with ad/privacy blockers off (the form
+   POST is often eaten with no visible error); and fill *every* field
+   including the ones marked optional. Note that `developers.reddit.com`
+   (the "Developer Platform"/Devvit) is a different product and cannot
+   issue these credentials.
 2. Click "are you a developer? create an app..." (or "create another app...")
 3. Fill in a name (e.g. "claudetrade-research"), select **"script"** as the app
    type, and put any placeholder URL in "redirect uri" (e.g.
