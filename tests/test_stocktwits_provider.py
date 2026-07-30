@@ -244,3 +244,43 @@ class TestFailClosed:
             StocktwitsProvider(config).fetch_posts(
                 since=NOW - dt.timedelta(days=1), symbols=["AAPL"]
             )
+
+
+class TestBrowserStyleHeaders:
+    """Requests use browser-style headers, not the descriptive app UA (probe
+    evidence: the edge 403s .NET/generic clients but accepts a browser tab)."""
+
+    def test_sends_browser_user_agent_not_descriptive_app_ua(self, config, monkeypatch):
+        stub = _StocktwitsStub({"AAPL": {"messages": [_message(1)]}})
+        _install(monkeypatch, stub)
+
+        StocktwitsProvider(config).fetch_posts(since=NOW - dt.timedelta(days=1), symbols=["AAPL"])
+
+        assert len(stub.requests) == 1
+        headers = stub.requests[0].headers
+        assert headers.get("user-agent") != config.user_agent
+        assert "Mozilla" in headers.get("user-agent", "")
+        assert "Chrome" in headers.get("user-agent", "")
+
+    def test_sends_browser_accept_and_accept_language_headers(self, config, monkeypatch):
+        stub = _StocktwitsStub({"AAPL": {"messages": [_message(1)]}})
+        _install(monkeypatch, stub)
+
+        StocktwitsProvider(config).fetch_posts(since=NOW - dt.timedelta(days=1), symbols=["AAPL"])
+
+        headers = stub.requests[0].headers
+        assert headers.get("accept") == "application/json"
+        assert headers.get("accept-language") == "en-US,en;q=0.9"
+
+    def test_still_fails_closed_when_edge_blocks_despite_browser_headers(self, monkeypatch):
+        """Best-effort only: if the edge still 403s (e.g. TLS fingerprinting
+        defeats the header swap), the existing fail-closed path still applies."""
+        config = StocktwitsConfig(enabled=True, rate_limit_per_minute=60)
+        stub = _StocktwitsStub({"AAPL": {"messages": [_message(1)]}})
+        stub.override_response["AAPL"] = httpx.Response(403, json={"errors": [{"message": "blocked"}]})
+        _install(monkeypatch, stub)
+
+        with pytest.raises(SourceBlockedError):
+            StocktwitsProvider(config).fetch_posts(
+                since=NOW - dt.timedelta(days=1), symbols=["AAPL"]
+            )

@@ -75,11 +75,16 @@ estimated_date_uncertainty_days = 3       # Widen estimated dates by this many d
 request_timeout_s = 20.0
 
 [reddit]
-# Official Reddit OAuth API. Disabled by default; enable only when credentials are configured.
+# Official Reddit OAuth API, an owner cookie-session mode, or an opt-in
+# unauthenticated fallback (see docs/api-providers.md). Disabled by default;
+# enable only when credentials (or a session cookie) are configured.
 enabled = false
-provider = "synthetic"                    # Options: synthetic (offline), reddit (requires OAuth)
+provider = "synthetic"                    # Options: synthetic (offline), reddit (requires OAuth, cookie session, or public JSON)
 client_id_credential = "reddit_client_id"         # Environment variable or keyring lookup name
 client_secret_credential = "reddit_client_secret"
+# Owner's own reddit_session browser cookie (personal use only, ADR-0008 Decision 1);
+# see docs/api-providers.md for how to export it from Chrome/Edge devtools.
+session_cookie_credential = "reddit_session_cookie"
 user_agent = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
 subreddits = [
   "stocks", "investing", "StockMarket", "SecurityAnalysis",

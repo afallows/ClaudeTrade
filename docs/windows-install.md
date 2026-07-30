@@ -283,8 +283,30 @@ Reddit's official OAuth API is free but requires a client ID and secret.
    enabled = true
    provider = "reddit"
    ```
-   See [docs/api-providers.md](api-providers.md#reddit-live-oauth) for the full
-   set of Reddit options (subreddits, lookback window, rate limits).
+   See [docs/api-providers.md](api-providers.md#reddit-live-oauth-owner-cookie-session-or-an-opt-in-unauthenticated-fallback)
+   for the full set of Reddit options (subreddits, lookback window, rate limits).
+
+**Alternative: cookie-session mode (no script app needed)**. If creating a
+script app is inconvenient, or the `/prefs/apps` page is misbehaving (see the
+note above), Reddit sentiment can instead authenticate with your own
+logged-in browser session's `reddit_session` cookie:
+
+1. Log in to reddit.com in Chrome/Edge, open devtools (F12) -> **Application**
+   tab -> **Storage** -> **Cookies** -> `https://www.reddit.com`, and copy
+   the **Value** of the cookie named `reddit_session`.
+2. Store it the same way as any other credential:
+   ```
+   claudetrade secrets set reddit_session_cookie
+   ```
+3. Turn Reddit on (`enabled = true`, `provider = "reddit"`) as in step 7
+   above -- no other config change is needed; this mode is picked up
+   automatically once the client id/secret and username/password are absent
+   and the cookie resolves.
+
+This is your own personal Reddit session, for personal use only -- see
+[docs/api-providers.md](api-providers.md#reddit-cookie-session-mode-owners-own-personal-session-adr-0008-decision-1)
+for the full ToS-posture caveat and fail-closed behaviour before relying on
+it.
 
 X/Twitter sentiment requires a **paid** API tier and is off by default; see
 [docs/api-providers.md](api-providers.md#xtwitter-paid-api-v2) if you have one.

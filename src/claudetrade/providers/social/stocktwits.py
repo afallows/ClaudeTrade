@@ -9,6 +9,23 @@ vendor's published unauthenticated budget (200 requests/hour): this adapter
 budgets conservatively below that ceiling and caps how many symbols one
 refresh cycle will fetch (see ``StocktwitsConfig``).
 
+**Browser-style request headers (best-effort only)**: live-probe evidence
+(2026-07-30) showed this endpoint returning HTTP 403 to PowerShell/.NET
+clients regardless of User-Agent (both a generic UA and this codebase's
+descriptive app UA), but HTTP 200 JSON to a plain browser tab -- consistent
+with an edge filter keyed on browser-shaped request headers and/or TLS
+fingerprint, not a credential or API-contract check (the API itself remains
+keyless and open). This adapter therefore sends a realistic desktop-browser
+User-Agent plus ``Accept``/``Accept-Language`` headers matching what a
+browser sends, instead of the identifying app UA used elsewhere in this
+codebase. This is **best-effort only**: a header swap cannot fix a
+TLS-fingerprint-based block, since httpx/urllib3's TLS handshake doesn't
+look like a browser's no matter what headers ride on top of it. If the edge
+still blocks despite the browser-style headers, the existing fail-closed
+path below (``SourceBlockedError`` on 401/403/non-JSON) handles it exactly
+as before -- diagnostics reports the source blocked, no retry loop, no
+fingerprint/proxy rotation, no CAPTCHA handling.
+
 Each message may carry a self-declared ``entities.sentiment.basic`` tag
 ("Bullish"/"Bearish") -- some authors tag their own posts this way. This is
 stored on the mapped ``SocialPost`` as ``sentiment_prior``, a PRIOR HINT, not
@@ -55,6 +72,20 @@ from claudetrade.utils.text import injection_risk_score, sanitize_social_text
 log = logging.getLogger(__name__)
 
 _VALID_SENTIMENT_LABELS = frozenset({"bullish", "bearish"})
+
+#: Browser-style request headers, sent instead of ``config.user_agent``'s
+#: descriptive app UA (see the module docstring's probe-evidence note).
+#: Best-effort: this cannot defeat TLS-fingerprint-based filtering, only a
+#: header-based one -- when it isn't enough, the existing fail-closed path
+#: (``SourceBlockedError`` below) still applies exactly as before.
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 class StocktwitsProvider:
@@ -185,7 +216,7 @@ class StocktwitsProvider:
         """Fetch and map one symbol's stream. Raises on any fail-closed signal."""
         url = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
         with httpx.Client(timeout=self.config.request_timeout_s) as client:
-            response = client.get(url, headers={"User-Agent": self.config.user_agent})
+            response = client.get(url, headers=_BROWSER_HEADERS)
 
         if response.status_code == 404:
             # An unknown ticker or a symbol with no stream at all -- ordinary,

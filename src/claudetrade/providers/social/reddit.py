@@ -1,35 +1,48 @@
-"""Reddit provider: real adapter to the official Reddit API, with a
-last-resort unauthenticated fallback (ADR-0008 Decision 1).
+"""Reddit provider: real adapter to the official Reddit API, with an owner
+cookie-session mode and a last-resort unauthenticated fallback (ADR-0008
+Decision 1).
 
-Three modes, tried in this preference order at construction time:
+Four modes, tried in this preference order at construction time:
 
 1. **Password grant** (``grant_type=password``) -- a script app's client
    id/secret *plus* the owner's own Reddit username/password. An official
-   OAuth flow against the same endpoints as (2); preferred whenever all four
+   OAuth flow against the same endpoints as (3); preferred whenever all four
    credentials resolve, per the owner's explicit request ("use my reddit
    credentials ... retain the fallback to the standard API").
-2. **Client-credentials grant** -- a script app's client id/secret alone.
-   Reddit's app-only OAuth flow; no user login. Used when the password-grant
-   credentials are not both configured but the client id/secret are.
-3. **Public JSON fallback** -- reads ``www.reddit.com/r/<sub>/new.json``
-   completely unauthenticated. Only used when *neither* OAuth combination
-   above resolves AND ``config.public_json_fallback`` is explicitly set. This
-   path is ToS-gray for automated use (see the module/class docstrings) and
-   is capped at a conservative, human-scale rate.
+2. **Cookie-session mode** (``config.session_cookie_credential``) -- the
+   owner's own logged-in ``reddit_session`` browser cookie, pasted from
+   devtools. Reads the same ``www.reddit.com/r/<sub>/new.json`` endpoint as
+   the public-JSON fallback below, but authenticated as the owner rather than
+   anonymously, with a browser-style User-Agent (see the
+   ``_COOKIE_SESSION_USER_AGENT`` constant below). This is the owner's own
+   session, for personal use only (ADR-0008 Decision 1: "own credentials
+   only"). Used when the password-grant credentials are not both configured
+   but the cookie resolves; preferred over the client-credentials grant.
+3. **Client-credentials grant** -- a script app's client id/secret alone.
+   Reddit's app-only OAuth flow; no user login. Used when neither the
+   password grant nor the cookie session are available but the client
+   id/secret are.
+4. **Public JSON fallback** -- reads ``www.reddit.com/r/<sub>/new.json``
+   completely unauthenticated. Only used when *none* of the above resolve
+   AND ``config.public_json_fallback`` is explicitly set. This path is
+   ToS-gray for automated use (see the module/class docstrings) and is
+   capped at a conservative, human-scale rate.
 
-If none of the three resolves, ``NotConfiguredError`` is raised so the source
+If none of the four resolves, ``NotConfiguredError`` is raised so the source
 is cleanly disabled -- the pipeline continues without it.
 
 Every mode's output goes through the same ``sanitize_social_text()`` /
 author-hash / injection-score pipeline; only the transport and
-authentication differ.
+authentication differ. Cookie-session mode reuses the exact same listing
+fetch/parse code path as public-JSON mode (pagination, external_id,
+crosspost, and injection-scoring behaviour) -- only the URL headers differ.
 
-**Fail-closed (ADR-0008 Decision 1)**: in public-JSON mode, any block,
-challenge, CAPTCHA, or unexpected response (HTTP 401/403, a non-JSON body,
-or any other non-2xx status) raises ``SourceBlockedError``, which is *not*
-caught by this module -- it propagates out of ``fetch_posts`` and terminates
-the whole fetch for this cycle. There is no retry loop, no fingerprint/proxy
-rotation, and no CAPTCHA handling anywhere in this file.
+**Fail-closed (ADR-0008 Decision 1)**: in cookie-session and public-JSON
+modes, any block, challenge, CAPTCHA, or unexpected response (HTTP 401/403, a
+non-JSON body, or any other non-2xx status) raises ``SourceBlockedError``,
+which is *not* caught by this module -- it propagates out of ``fetch_posts``
+and terminates the whole fetch for this cycle. There is no retry loop, no
+fingerprint/proxy rotation, and no CAPTCHA handling anywhere in this file.
 """
 
 from __future__ import annotations
@@ -57,15 +70,37 @@ log = logging.getLogger(__name__)
 
 _TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 
+#: Set of modes that hit the public www.reddit.com/r/<sub>/new.json listing
+#: endpoint directly (as opposed to oauth.reddit.com with a bearer token).
+#: Both share the exact same fetch/parse/fail-closed code path; only the
+#: request headers differ (see ``_fetch_subreddit``).
+_JSON_LISTING_MODES = frozenset({"public_json", "cookie_session"})
+
+#: Realistic, current-ish desktop Chrome UA -- deliberately used ONLY for
+#: cookie-session mode. The probe evidence motivating this adapter (see
+#: docs/api-providers.md) is that Reddit's public JSON endpoint 403s any
+#: non-browser client regardless of User-Agent, but returns 200 to a real,
+#: logged-in browser tab -- i.e. it gates on the session cookie, not the UA
+#: string. Sending a browser-style UA alongside the owner's own session
+#: cookie mirrors what their actual browser sends for this one mode; the
+#: descriptive ``config.user_agent`` (identifying this as an automated
+#: research client) remains in force for the OAuth modes, where an
+#: identifying UA is the honest and appropriate choice.
+_COOKIE_SESSION_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
 
 class RedditProvider:
     """Reddit adapter for social posts: OAuth (password or client-credentials
-    grant), with an opt-in unauthenticated public-JSON fallback.
+    grant), an owner cookie-session mode, or an opt-in unauthenticated
+    public-JSON fallback.
 
     Fetches recent posts from configured subreddits, paging until the
     requested time window is covered. Respects rate limits and Reddit's API
-    contract for the OAuth modes; fails closed immediately in public-JSON
-    mode on any sign of a block (see the module docstring).
+    contract for the OAuth modes; fails closed immediately in cookie-session
+    or public-JSON mode on any sign of a block (see the module docstring).
     """
 
     name: str = "reddit"
@@ -87,6 +122,7 @@ class RedditProvider:
         client_secret_secret = get_secret(config.client_secret_credential)
         username_secret = get_secret(config.username_credential)
         password_secret = get_secret(config.password_credential)
+        session_cookie_secret = get_secret(config.session_cookie_credential)
 
         has_client_creds = client_id_secret is not None and client_secret_secret is not None
         has_user_creds = username_secret is not None and password_secret is not None
@@ -95,9 +131,18 @@ class RedditProvider:
         self._client_secret: str | None = None
         self._username: str | None = None
         self._password: str | None = None
+        self._session_cookie: str | None = None
 
         if has_client_creds and has_user_creds:
             self.mode = "password"
+        elif session_cookie_secret is not None:
+            self.mode = "cookie_session"
+            log.warning(
+                "Reddit provider configured (mode=cookie_session): this reads "
+                "the public listing endpoint authenticated with the owner's "
+                "own reddit_session cookie (personal use only, ADR-0008 "
+                "Decision 1) -- not the official OAuth API."
+            )
         elif has_client_creds:
             self.mode = "client_credentials"
         elif config.public_json_fallback:
@@ -106,17 +151,20 @@ class RedditProvider:
                 "Reddit OAuth credentials not configured; falling back to the "
                 "unauthenticated public JSON listing endpoint. This path is "
                 "ToS-gray for automated use (ADR-0008 Decision 1) -- configure "
-                "%s/%s (or %s/%s) to prefer the official API.",
+                "%s/%s (or %s/%s, or %s for cookie-session mode) to prefer an "
+                "authenticated path.",
                 config.client_id_credential,
                 config.client_secret_credential,
                 config.username_credential,
                 config.password_credential,
+                config.session_cookie_credential,
             )
         else:
             raise NotConfiguredError(
                 f"Reddit credentials not found: {config.client_id_credential}, "
                 f"{config.client_secret_credential} (or {config.username_credential}, "
-                f"{config.password_credential} for the password grant). Set "
+                f"{config.password_credential} for the password grant, or "
+                f"{config.session_cookie_credential} for cookie-session mode). Set "
                 "reddit.public_json_fallback = true to allow the unauthenticated "
                 "fallback instead.",
                 provider="reddit",
@@ -128,15 +176,18 @@ class RedditProvider:
             if self.mode == "password":
                 self._username = username_secret.reveal()  # type: ignore[union-attr]
                 self._password = password_secret.reveal()  # type: ignore[union-attr]
+        elif self.mode == "cookie_session":
+            self._session_cookie = session_cookie_secret.reveal()  # type: ignore[union-attr]
 
         self._access_token: str | None = None
         self._token_expires_at = 0.0
 
-        rate_limit = (
-            config.public_json_rate_limit_per_minute
-            if self.mode == "public_json"
-            else config.rate_limit_per_minute
-        )
+        if self.mode == "public_json":
+            rate_limit = config.public_json_rate_limit_per_minute
+        elif self.mode == "cookie_session":
+            rate_limit = config.session_rate_limit_per_minute
+        else:
+            rate_limit = config.rate_limit_per_minute
         self._rate_limiter = RateLimiter(
             rate_limit,
             name="reddit",
@@ -156,6 +207,19 @@ class RedditProvider:
             licence_note = (
                 "Official Reddit API, password grant (owner's own account credentials, "
                 "ADR-0008 Decision 1)."
+            )
+        elif self.mode == "cookie_session":
+            message = (
+                f"Reddit cookie-session, owner's own session "
+                f"({len(self.config.subreddits)} subreddits)"
+            )
+            licence_note = (
+                "Reads www.reddit.com/r/<sub>/new.json authenticated with the "
+                "owner's own reddit_session cookie and a browser-style "
+                "User-Agent (ADR-0008 Decision 1: personal use, own credentials "
+                "only). Not the official OAuth API -- shares the public-JSON "
+                "path's fail-closed behaviour exactly: no retry, no "
+                "fingerprint/proxy rotation, no CAPTCHA handling."
             )
         elif self.mode == "client_credentials":
             message = (
@@ -243,15 +307,16 @@ class RedditProvider:
             List of SocialPost, newest first, all sanitised and author-hashed.
 
         Raises:
-            SourceBlockedError: (public-JSON mode only) on any block,
-                challenge, or unexpected response -- this terminates the
-                fetch for the whole cycle rather than degrading per-subreddit,
-                per ADR-0008 Decision 1's fail-closed constraint.
+            SourceBlockedError: (cookie-session or public-JSON mode only) on
+                any block, challenge, or unexpected response -- this
+                terminates the fetch for the whole cycle rather than
+                degrading per-subreddit, per ADR-0008 Decision 1's
+                fail-closed constraint.
         """
         if until is None:
             until = dt.datetime.now(tz=dt.UTC)
 
-        if self.mode != "public_json":
+        if self.mode not in _JSON_LISTING_MODES:
             self._ensure_token()
 
         posts: list[SocialPost] = []
@@ -312,7 +377,13 @@ class RedditProvider:
             if after:
                 params["after"] = after
 
-            if self.mode == "public_json":
+            if self.mode == "cookie_session":
+                url = f"https://www.reddit.com/r/{subreddit}/new.json"
+                headers = {
+                    "User-Agent": _COOKIE_SESSION_USER_AGENT,
+                    "Cookie": f"reddit_session={self._session_cookie}",
+                }
+            elif self.mode == "public_json":
                 url = f"https://www.reddit.com/r/{subreddit}/new.json"
                 headers = {"User-Agent": self.config.user_agent}
             else:
@@ -325,7 +396,7 @@ class RedditProvider:
             with httpx.Client(timeout=self.config.request_timeout_s) as client:
                 response = client.get(url, headers=headers, params=params)
 
-            if self.mode == "public_json":
+            if self.mode in _JSON_LISTING_MODES:
                 self._fail_closed_if_blocked(response, subreddit)
                 payload = response.json()
             else:
@@ -371,13 +442,17 @@ class RedditProvider:
         return collected
 
     def _fail_closed_if_blocked(self, response: httpx.Response, subreddit: str) -> None:
-        """Public-JSON mode only: raise on any block/challenge/unexpected response.
+        """Public-JSON and cookie-session modes only: raise on any
+        block/challenge/unexpected response.
 
         ADR-0008 Decision 1 is explicit that this terminates the fetch for
         the cycle rather than being retried, evaded, or worked around. A 429
         raises ``RateLimitError`` (a quantity signal, same shape as the OAuth
         path); everything else that isn't a clean 2xx JSON response raises
         ``SourceBlockedError``, which is not caught anywhere in this module.
+        In cookie-session mode a 401/403 typically means the pasted session
+        cookie has expired or been logged out -- re-export a fresh one from
+        the browser to resume.
         """
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After", "60")

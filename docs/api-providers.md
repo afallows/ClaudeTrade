@@ -737,27 +737,42 @@ enabled = false
 - Posts are generated, not scraped
 - Cannot research real discussion
 
-### Reddit (Live OAuth, with an opt-in unauthenticated fallback)
+### Reddit (Live OAuth, owner cookie-session, or an opt-in unauthenticated fallback)
 
 **Module**: `src/claudetrade/providers/social/reddit.py`
 
-Three modes, tried in this order at construction time (ADR-0008 Decision 1):
+Four modes, tried in this order at construction time (ADR-0008 Decision 1):
 
 1. **Password grant** -- a script app's client id/secret *plus* the owner's
    own Reddit username/password. An official OAuth flow, preferred whenever
    all four credentials resolve.
-2. **Client-credentials grant** -- a script app's client id/secret alone
-   (app-only, no user login). Used when the password-grant credentials
-   aren't both configured but the client id/secret are.
-3. **Public JSON fallback** (`reddit.public_json_fallback = true`) --
+2. **Cookie-session mode** (`reddit.session_cookie_credential`) -- the
+   owner's own logged-in `reddit_session` browser cookie, pasted from
+   devtools. Reads the same `www.reddit.com/r/<sub>/new.json` endpoint as the
+   public-JSON fallback below, but authenticated as the owner with a
+   browser-style User-Agent instead of anonymously. **Live-probe evidence
+   (2026-07-30)**: Reddit's public JSON endpoint returns HTTP 403 to any
+   non-browser client regardless of User-Agent, but 200 JSON to a real,
+   logged-in browser tab -- i.e. it gates on the session cookie, not on the
+   UA string. Used when the password-grant credentials aren't both
+   configured but the cookie is; preferred over the client-credentials
+   grant. This is the owner's own session for personal use only (ADR-0008
+   Decision 1: "own credentials only" -- never a shared/default account or
+   someone else's cookie), and shares the public-JSON path's fail-closed
+   behaviour exactly. See below for how to export the cookie.
+3. **Client-credentials grant** -- a script app's client id/secret alone
+   (app-only, no user login). Used when neither the password grant nor the
+   cookie session are available but the client id/secret are.
+4. **Public JSON fallback** (`reddit.public_json_fallback = true`) --
    unauthenticated reads of `www.reddit.com/r/<sub>/new.json`. Only used when
-   *neither* OAuth combination above resolves. **Honest ToS status**: this is
-   not a sanctioned integration path the way OAuth is -- reading Reddit's
-   public listing JSON without authentication is ToS-gray for
-   automated/scheduled use, tolerated in practice for casual, low-volume,
-   identifying-UA traffic. It exists only as a last resort, is off by
-   default, and is hard-capped at 30 requests/minute regardless of config.
-   The moment OAuth credentials work, this class prefers them automatically.
+   *none* of the above resolve. **Honest ToS status**: this is not a
+   sanctioned integration path the way OAuth is -- reading Reddit's public
+   listing JSON without authentication is ToS-gray for automated/scheduled
+   use, tolerated in practice for casual, low-volume, identifying-UA
+   traffic. It exists only as a last resort, is off by default, and is
+   hard-capped at 30 requests/minute regardless of config. The moment OAuth
+   credentials or a session cookie work, this class prefers them
+   automatically.
 
 **Setup (OAuth, either grant)**:
 
@@ -807,26 +822,70 @@ claudetrade secrets set reddit_username
 claudetrade secrets set reddit_password
 ```
 
-**Fail-closed behaviour (public-JSON mode only, ADR-0008 Decision 1)**: any
-HTTP 401/403, a non-JSON response body, or any other unexpected/non-2xx
-response immediately disables the source **for the rest of that fetch
-cycle** -- no retry loop, no fingerprint or proxy rotation, no CAPTCHA
-handling. The next scheduled cycle tries again from scratch. A 429 is
-handled the same way as the OAuth path (a `RateLimitError` carrying
-`Retry-After`, also ending the cycle). This is exercised in
-`tests/test_reddit_provider.py`.
+#### Reddit cookie-session mode (owner's own personal session, ADR-0008 Decision 1)
+
+Reads the same public listing endpoint as the public-JSON fallback, but
+authenticated with the owner's own `reddit_session` cookie -- copied from a
+logged-in browser -- plus a browser-style User-Agent, instead of anonymous
+requests with the descriptive app UA. **Live-probe evidence (2026-07-30)**
+showed Reddit's public JSON endpoint 403ing every non-browser client tested
+(both a generic UA and this codebase's descriptive app UA) while a
+logged-in Chrome tab got a clean 200 -- the gate is the session cookie, not
+the User-Agent string.
+
+**This is the owner's own personal Reddit session, for personal use only**
+(ADR-0008 Decision 1: "own credentials only" -- never a shared/default
+account or someone else's cookie). It automates reading Reddit while
+authenticated as a real logged-in account rather than through the sanctioned
+OAuth API, so treat it the same way as the public-JSON fallback's ToS
+posture above: tolerated for personal, low-volume use, not a sanctioned
+integration path.
+
+**How to get your `reddit_session` cookie value** (Chrome/Edge devtools):
+
+1. Log in to reddit.com in your browser as normal.
+2. Open devtools (F12) -> **Application** tab -> **Storage** -> **Cookies**
+   -> `https://www.reddit.com` (Firefox: **Storage** tab instead of
+   **Application**).
+3. Find the cookie named `reddit_session`; copy its **Value**.
+4. Store it via the credential store, never in `config.toml`:
+
+```bash
+claudetrade secrets set reddit_session_cookie
+# or, environment variable:
+export CLAUDETRADE_SECRET_REDDIT_SESSION_COOKIE="..."
+```
+
+No separate enable flag is needed -- like the password and client-credentials
+grants above, this mode is picked up automatically the moment the cookie
+resolves and the password-grant credentials do not (see the mode order
+above). `reddit.session_rate_limit_per_minute` (default 30) governs its
+pace, same conservative, human-scale budget as the public-JSON fallback.
+
+**Fail-closed behaviour (cookie-session and public-JSON modes, ADR-0008
+Decision 1)**: any HTTP 401/403 (a 401/403 here usually means the pasted
+cookie has expired or been logged out -- re-export a fresh one), a non-JSON
+response body, or any other unexpected/non-2xx response immediately disables
+the source **for the rest of that fetch cycle** -- no retry loop, no
+fingerprint or proxy rotation, no CAPTCHA handling. The next scheduled cycle
+tries again from scratch. A 429 is handled the same way as the OAuth path (a
+`RateLimitError` carrying `Retry-After`, also ending the cycle). This is
+exercised in `tests/test_reddit_provider.py`.
 
 **Limitations**:
 
 - OAuth grants are rate limited to 60 calls/minute (public tier); the
-  public-JSON fallback is capped at 30/minute regardless of configuration
+  cookie-session and public-JSON paths are conservatively capped (see above)
 - Posts are searchable only in the last 6 months (API limitation)
 - Engagement counts (score, num_comments) are mutable at the source; historical sentiment cannot be perfectly reconstructed
 - Author names are stored as salted hashes only (never plaintext), per config `store_author_names = false`
+- Cookie-session mode carries no delivery guarantee at all -- it can be
+  throttled or blocked by Reddit at any time with no notice, and the pasted
+  cookie will eventually expire and need re-exporting
 - The public-JSON fallback carries no delivery guarantee at all -- it can be
   throttled or blocked by Reddit at any time with no notice, by design
 
-**Licence**: Reddit data is subject to Reddit's API terms and user agreement. Commercial use of aggregated social data may require permission. The public-JSON fallback is additionally ToS-gray for automated use -- see above.
+**Licence**: Reddit data is subject to Reddit's API terms and user agreement. Commercial use of aggregated social data may require permission. The cookie-session and public-JSON paths are additionally ToS-gray for automated use -- see above.
 
 ### X/Twitter (Paid API v2, or an opt-in cookie-session mode)
 
@@ -973,6 +1032,25 @@ hint only -- the ensemble sentiment classifier still runs on the post's text
 unconditionally for every post, Stocktwits included. Treating a self-declared
 label as truth would let anyone paint their own post's sentiment without the
 classifier ever checking it against the actual content.
+
+**Browser-style request headers (best-effort only)**: **live-probe evidence
+(2026-07-30)** showed this endpoint returning HTTP 403 to PowerShell/.NET
+clients regardless of User-Agent (both a generic UA and this codebase's
+descriptive app UA), but HTTP 200 JSON to a plain browser tab -- consistent
+with an edge filter keyed on browser-shaped request headers and/or TLS
+fingerprint, not a credential or API-contract check (the API itself remains
+keyless and open, per the vendor's own documentation). This adapter
+therefore sends a realistic desktop-browser User-Agent plus
+`Accept`/`Accept-Language` headers matching what a browser sends, instead of
+the descriptive app UA used elsewhere in this codebase. **This is
+best-effort only**: a header swap cannot fix a TLS-fingerprint-based block,
+since the HTTP client's TLS handshake doesn't look like a browser's no
+matter what headers ride on top of it. If the edge still blocks despite the
+browser-style headers, the existing fail-closed path below
+(`SourceBlockedError` on 401/403/non-JSON) handles it exactly as before, and
+`claudetrade diagnostics`/the Diagnostics screen report the source blocked
+-- no cookie support is added for this source, unlike Reddit's cookie-session
+mode above.
 
 **Configuration**:
 

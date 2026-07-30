@@ -442,6 +442,153 @@ class TestPublicJsonFallback:
             RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
 
 
+@pytest.fixture
+def cookie_credentials(monkeypatch):
+    """Provide only a Reddit session cookie -- no OAuth credentials at all."""
+    monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", raising=False)
+    monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_SESSION_COOKIE", "owner-cookie-value")
+
+
+class TestCookieSessionMode:
+    """Cookie-session mode: fetches with the owner's cookie + browser UA,
+    reuses the public-JSON code path, and fails closed identically."""
+
+    def test_mode_selected_when_only_cookie_resolves(
+        self, reddit_config, cookie_credentials, monkeypatch
+    ):
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        provider = RedditProvider(reddit_config)
+        assert provider.mode == "cookie_session"
+
+    def test_fetches_with_cookie_header_and_browser_user_agent(
+        self, reddit_config, cookie_credentials, monkeypatch
+    ):
+        stub = _RedditStub({"stocks": [_listing([_child("cookie1", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        posts = RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+
+        assert len(posts) == 1
+        listing_calls = [r for r in stub.requests if "new.json" in r.url.path]
+        assert len(listing_calls) == 1
+        request = listing_calls[0]
+        assert request.headers.get("cookie") == "reddit_session=owner-cookie-value"
+        # A descriptive/API-identifying UA must NOT be used for this mode --
+        # only the dedicated browser-style constant.
+        assert request.headers.get("user-agent") != reddit_config.user_agent
+        assert "Mozilla" in request.headers.get("user-agent", "")
+        assert "Chrome" in request.headers.get("user-agent", "")
+        assert "authorization" not in request.headers
+
+    def test_pagination_and_field_mapping_reuse_public_json_path(
+        self, reddit_config, cookie_credentials, monkeypatch
+    ):
+        page1 = _listing(
+            [_child(f"p{i}", created=NOW - dt.timedelta(minutes=i)) for i in range(3)],
+            after="t3_p2",
+        )
+        page2 = _listing([_child("old", created=NOW - dt.timedelta(days=5))], after="t3_old")
+        stub = _RedditStub({"stocks": [page1, page2]})
+        _install(monkeypatch, stub)
+
+        posts = RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+
+        assert len(posts) == 3
+        assert posts[0].external_id.startswith("t3_")
+        listing_calls = [r for r in stub.requests if "new.json" in r.url.path]
+        assert len(listing_calls) == 2
+        assert "after=t3_p2" in str(listing_calls[1].url)
+
+    def test_403_fails_closed(self, reddit_config, cookie_credentials, monkeypatch):
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        stub.blocked_response = httpx.Response(403, json={"error": "blocked"})
+        _install(monkeypatch, stub)
+
+        with pytest.raises(SourceBlockedError):
+            RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+
+    def test_html_challenge_fails_closed(self, reddit_config, cookie_credentials, monkeypatch):
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        stub.blocked_response = httpx.Response(
+            200, headers={"content-type": "text/html"}, text="<html>login required</html>"
+        )
+        _install(monkeypatch, stub)
+
+        with pytest.raises(SourceBlockedError):
+            RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+
+    def test_429_raises_rate_limit_error(self, reddit_config, cookie_credentials, monkeypatch):
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        stub.rate_limit_next = True
+        _install(monkeypatch, stub)
+
+        with pytest.raises(RateLimitError) as exc:
+            RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+        assert exc.value.retry_after_s == 17.0
+
+    def test_no_token_endpoint_call_in_cookie_mode(
+        self, reddit_config, cookie_credentials, monkeypatch
+    ):
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+        assert stub.token_calls == 0
+
+
+class TestModePriorityWithCookie:
+    """Cookie session sits between password grant and client-credentials in
+    the preference order (ADR-0008 Decision 1)."""
+
+    def test_password_preferred_over_cookie_when_both_resolve(
+        self, reddit_config, password_credentials, monkeypatch
+    ):
+        monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_SESSION_COOKIE", "owner-cookie-value")
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        provider = RedditProvider(reddit_config)
+        assert provider.mode == "password"
+
+    def test_cookie_preferred_over_client_credentials_when_both_resolve(
+        self, reddit_config, credentials, cookie_credentials, monkeypatch
+    ):
+        """``credentials`` sets client id/secret; ``cookie_credentials`` sets
+        the session cookie and clears client id/secret -- reapply client
+        creds afterwards so both are present for this test."""
+        monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", "test-client-id")
+        monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", "test-client-secret")
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        provider = RedditProvider(reddit_config)
+        assert provider.mode == "cookie_session"
+
+    def test_client_credentials_used_when_no_cookie_and_no_user_creds(
+        self, reddit_config, credentials, monkeypatch
+    ):
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_SESSION_COOKIE", raising=False)
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        provider = RedditProvider(reddit_config)
+        assert provider.mode == "client_credentials"
+
+    def test_public_json_used_only_when_nothing_else_resolves(
+        self, reddit_config, monkeypatch
+    ):
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", raising=False)
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_SESSION_COOKIE", raising=False)
+        reddit_config.public_json_fallback = True
+
+        provider = RedditProvider(reddit_config)
+        assert provider.mode == "public_json"
+
+
 def _install(monkeypatch, stub: _RedditStub) -> None:
     """Route every httpx.Client created by the provider at the stub."""
     real_client = httpx.Client

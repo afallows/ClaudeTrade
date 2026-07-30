@@ -261,12 +261,24 @@ class RedditConfig(BaseModel):
 
     Prefers the official OAuth API, in decreasing order of preference: the
     password grant (script app + the owner's own username/password -- an
-    official Reddit flow), then the client-credentials grant (script app
-    alone), then -- only if ``public_json_fallback`` is explicitly opted
-    into -- an unauthenticated read of Reddit's public ``.json`` listing
-    endpoint. Disabled unless *some* path resolves, in which case the
-    pipeline continues without this source rather than failing (ADR-0008
-    Decision 1).
+    official Reddit flow), then cookie-session mode (the owner's own
+    logged-in browser session, ``session_cookie_credential``), then the
+    client-credentials grant (script app alone), then -- only if
+    ``public_json_fallback`` is explicitly opted into -- an unauthenticated
+    read of Reddit's public ``.json`` listing endpoint. Disabled unless
+    *some* path resolves, in which case the pipeline continues without this
+    source rather than failing (ADR-0008 Decision 1).
+
+    **Cookie-session mode**: reads the same public ``.json`` listing endpoint
+    as the public-JSON fallback below, but authenticated with the owner's own
+    ``reddit_session`` cookie (pasted from a logged-in browser's devtools) and
+    a browser-style User-Agent, rather than anonymously. This is the owner's
+    own session, for personal use only (ADR-0008 Decision 1: "own credentials
+    only" -- never a shared/default account or someone else's cookie). It is
+    automatically preferred over the client-credentials grant whenever the
+    cookie resolves and the password-grant credentials do not, and shares the
+    public-JSON path's fail-closed behaviour exactly (no retry, no
+    fingerprint/proxy rotation, no CAPTCHA handling).
 
     **Honest status of the public-JSON fallback**: reading
     ``www.reddit.com/r/<sub>/new.json`` without authentication is not
@@ -296,6 +308,20 @@ class RedditConfig(BaseModel):
     #: API"). Both are official OAuth flows against the same endpoints.
     username_credential: str = "reddit_username"
     password_credential: str = "reddit_password"
+    #: Cookie-session mode (ADR-0008 Decision 1: the owner's own personal
+    #: session, pasted from their browser's devtools -- never a shared or
+    #: default cookie). Holds the value of the ``reddit_session`` cookie.
+    #: Consulted only when the password-grant credentials above do not both
+    #: resolve; preferred over the client-credentials grant when it does
+    #: resolve. See ``docs/api-providers.md`` for how to export it (F12 ->
+    #: Application -> Cookies -> reddit.com -> reddit_session).
+    session_cookie_credential: str = "reddit_session_cookie"
+    #: Cookie-session mode shares the same public listing endpoint as the
+    #: public-JSON fallback below (an unauthenticated-by-design endpoint,
+    #: just authenticated here via the owner's own cookie rather than
+    #: anonymously), so it is held to the same conservative, human-scale
+    #: pace rather than the OAuth budget.
+    session_rate_limit_per_minute: int = 30
     user_agent: str = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
     subreddits: list[str] = Field(
         default_factory=lambda: [
@@ -427,6 +453,12 @@ class StocktwitsConfig(BaseModel):
     #: right up against the published ceiling.
     rate_limit_per_minute: int = 3
     request_timeout_s: float = 20.0
+    #: Kept for config-file backwards compatibility, but no longer sent:
+    #: live-probe evidence (2026-07-30) showed this endpoint's edge rejecting
+    #: this descriptive app UA (and generic non-browser UAs) with HTTP 403
+    #: while accepting a real browser tab, so the provider now sends a fixed
+    #: browser-style User-Agent instead -- see
+    #: ``providers.social.stocktwits._BROWSER_HEADERS``.
     user_agent: str = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
     store_author_names: bool = False
 

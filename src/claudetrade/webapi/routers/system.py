@@ -29,6 +29,7 @@ def _credential_catalog(config: AppConfig) -> list[tuple[str, str, str]]:
         (config.reddit.client_secret_credential, "Reddit client secret", "sentiment"),
         (config.reddit.username_credential, "Reddit username", "sentiment"),
         (config.reddit.password_credential, "Reddit password", "sentiment"),
+        (config.reddit.session_cookie_credential, "Reddit session cookie", "sentiment"),
         (config.x.bearer_credential, "X bearer token", "sentiment"),
         (config.x.auth_token_credential, "X session auth token", "sentiment"),
         (config.x.ct0_credential, "X session CSRF token", "sentiment"),
@@ -103,14 +104,72 @@ def _pipeline(name: str, kind: Literal["sentiment", "stock_price"], provider: st
     }
 
 
+_REDDIT_MODE_LABELS = {
+    "password": "OAuth password grant",
+    "cookie_session": "Cookie session",
+    "client_credentials": "OAuth client-credentials grant",
+    "public_json": "Public JSON fallback",
+}
+
+
+def _reddit_pipeline(config: AppConfig) -> dict[str, object]:
+    """Reddit diagnostics, mirroring ``RedditProvider``'s own mode-selection
+    order (password grant -> cookie session -> client-credentials ->
+    opt-in public-JSON) without making any vendor request, so the reported
+    mode always matches what a real refresh would pick.
+    """
+    reddit = config.reddit
+    if reddit.provider != "reddit":
+        # Not pointed at the live adapter at all (e.g. still "synthetic").
+        return _pipeline("Reddit", "sentiment", reddit.provider, reddit.enabled,
+                          False)
+
+    has_client_creds = bool(
+        get_secret(reddit.client_id_credential) and get_secret(reddit.client_secret_credential)
+    )
+    has_user_creds = bool(
+        get_secret(reddit.username_credential) and get_secret(reddit.password_credential)
+    )
+    has_cookie = get_secret(reddit.session_cookie_credential) is not None
+
+    if has_client_creds and has_user_creds:
+        mode: str | None = "password"
+    elif has_cookie:
+        mode = "cookie_session"
+    elif has_client_creds:
+        mode = "client_credentials"
+    elif reddit.public_json_fallback:
+        mode = "public_json"
+    else:
+        mode = None
+
+    configured = reddit.enabled and mode is not None
+    if not reddit.enabled:
+        detail = "Disabled in configuration"
+    elif mode is None:
+        detail = (
+            "Credential required (client ID/secret, username/password, or a "
+            "session cookie)"
+        )
+    else:
+        detail = (
+            f"{_REDDIT_MODE_LABELS[mode]} configured; network reachability is "
+            "checked during refresh"
+        )
+    return {
+        "name": "Reddit", "kind": "sentiment", "provider": reddit.provider,
+        "status": "not_configured" if not configured else "configured",
+        "configured": configured, "reachable": None,
+        "detail": detail,
+    }
+
+
 @router.get("/diagnostics")
 def diagnostics(config: AppConfig = Depends(get_config)) -> dict[str, object]:
     pipelines = [
         _pipeline("Market prices", "stock_price", config.market_data.provider, True,
                   bool(config.market_data.credential), config.market_data.credential),
-        _pipeline("Reddit", "sentiment", config.reddit.provider, config.reddit.enabled,
-                  config.reddit.provider == "reddit",
-                  config.reddit.client_id_credential),
+        _reddit_pipeline(config),
         _pipeline("X", "sentiment", config.x.provider, config.x.enabled,
                   config.x.provider != "synthetic", config.x.bearer_credential),
         _pipeline("Stocktwits", "sentiment", config.stocktwits.provider,
