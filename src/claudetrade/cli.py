@@ -174,6 +174,28 @@ def init(config: ConfigOption = None) -> None:
     typer.echo(f"logs dir:  {cfg.paths.resolve('logs_dir')}")
     typer.echo(f"config hash: {cfg.config_hash[:16]}")
 
+    packaged = ", ".join(cfg.universe.packaged_universes) or "none"
+    typer.echo(
+        f"\nuniverse:    source={cfg.universe.source}, packaged defaults={packaged} "
+        f"(seed lists shipped with the app; used until a database of stored "
+        f"securities exists, then merged with it -- see docs/api-providers.md)"
+    )
+    typer.echo(
+        f"market data: provider={cfg.market_data.provider} "
+        + (
+            "(offline synthetic data -- zero API keys, zero network, the default)"
+            if cfg.market_data.provider == "synthetic"
+            else "(live)"
+        )
+    )
+    if cfg.market_data.provider == "synthetic":
+        typer.echo(
+            "  to switch on real US + Canadian daily bars: set "
+            'market_data.provider = "stooq" in config.toml, run `claudetrade probe` '
+            "to confirm this machine can reach stooq.com, then `claudetrade refresh`. "
+            "The default stays synthetic/offline; this is opt-in."
+        )
+
 
 @app.command()
 def status(config: ConfigOption = None) -> None:
@@ -314,12 +336,18 @@ def refresh(
     end: Annotated[str | None, typer.Option(help="ISO end date.")] = None,
     symbols: Annotated[str | None, typer.Option(help="Comma-separated symbols.")] = None,
 ) -> None:
-    """Pull data from every configured provider and store it."""
+    """Pull data from every configured provider and store it.
+
+    With no ``--start``/``--end`` this covers the last 90 calendar days ending
+    today -- enough recent history for the scan/backtest indicators without a
+    new install's first real-data refresh pulling years of history for
+    hundreds of symbols before showing anything.
+    """
     cfg = _load(config)
     from claudetrade.pipeline import Pipeline
 
     end_date = _parse_date(end, _today())
-    start_date = _parse_date(start, end_date - dt.timedelta(days=730))
+    start_date = _parse_date(start, end_date - dt.timedelta(days=90))
     symbol_list = [s.strip().upper() for s in symbols.split(",")] if symbols else None
 
     pipeline = Pipeline.bootstrap(cfg)

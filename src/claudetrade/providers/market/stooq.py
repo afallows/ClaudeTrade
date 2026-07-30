@@ -10,6 +10,14 @@ Limitations:
 - No delisted security coverage.
 - Rate limited to reasonable frequency.
 - Requires active network access (will fail offline).
+- No bulk reference-data/universe endpoint in the free tier: ``list_universe``
+  serves the packaged seed universes (see ``data.universe.load_packaged_universe``)
+  rather than a live listing from stooq itself.
+- Canadian (TSX/TSXV) coverage is real but partial and unverified from this
+  sandbox: stooq mirrors TSX-listed names under a ``.to`` suffix for many, but
+  not all, tickers. Run ``claudetrade probe`` and a small ``claudetrade refresh``
+  to confirm coverage for the specific symbols you care about before relying on
+  it -- see docs/api-providers.md.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ import logging
 from typing import Any
 
 from claudetrade.config import MarketDataConfig
+from claudetrade.data.universe import load_packaged_universe
 from claudetrade.domain import Bar, SecurityInfo
 from claudetrade.providers.base import (
     MarketDataProvider,
@@ -38,10 +47,59 @@ DEFAULT_RATE_LIMIT = 30  # Calls per minute
 #: Stooq namespaces its symbols by market. US listings carry a ``.us`` suffix,
 #: so a bare ``AAPL`` resolves to nothing.
 US_SUFFIX = ".us"
+#: Canadian (TSX/TSXV) listings carry a ``.to`` suffix on stooq.
+CA_SUFFIX = ".to"
+#: Exchanges routed to the Canadian suffix. Matched case-insensitively against
+#: ``SecurityInfo.exchange`` / the ``exchange`` kwarg passed to ``stooq_symbol``.
+CA_EXCHANGES = frozenset({"TSX", "TSXV"})
 
 #: Stooq answers a request it cannot serve with this literal body rather than an
 #: HTTP error, so it has to be detected in the payload.
 _NO_DATA_MARKERS = ("N/D", "No data", "Exceeded the daily hits limit")
+
+
+class SymbolNotFoundError(ProviderError):
+    """Stooq has no data for this specific symbol (unknown ticker or exhausted
+    quota, both signalled by the same HTTP-200 plain-text body).
+
+    Deliberately narrower than ``ProviderError``: raised only for the one
+    symbol affected, so ``get_daily_bars`` can skip it and keep fetching the
+    rest of the batch rather than aborting every symbol in the request over
+    one bad ticker.
+    """
+
+
+class _StooqNoDataError(ValueError):
+    """Internal: the parsed response says stooq has nothing for this symbol.
+
+    Distinct from a genuinely malformed/unexpected response shape (wrong
+    header, corrupt rows), which stays a hard failure -- that indicates a
+    parser/endpoint mismatch bug, not an ordinary "unknown ticker" outcome.
+    """
+
+
+_EXCHANGE_MAP_CACHE: dict[str, str] | None = None
+
+
+def _default_exchange_map() -> dict[str, str]:
+    """Symbol -> exchange, derived from the packaged seed universes.
+
+    Used to decide the stooq suffix (``.us`` vs ``.to``) for a bare symbol when
+    the caller does not pass ``exchange`` explicitly -- which is the normal
+    path, since ``MarketDataProvider.get_daily_bars`` takes plain ticker
+    strings with no exchange context. Built once per process and cached; a
+    failure to load the packaged files degrades to an empty map (every symbol
+    then falls back to the ``.us`` default), not an exception.
+    """
+    global _EXCHANGE_MAP_CACHE
+    if _EXCHANGE_MAP_CACHE is None:
+        try:
+            securities = load_packaged_universe()
+        except Exception:
+            log.warning("could not load packaged universe for stooq's exchange map", exc_info=True)
+            securities = []
+        _EXCHANGE_MAP_CACHE = {s.symbol.upper(): s.exchange.upper() for s in securities if s.exchange}
+    return _EXCHANGE_MAP_CACHE
 
 
 class StooqMarketProvider(MarketDataProvider):
@@ -64,6 +122,10 @@ class StooqMarketProvider(MarketDataProvider):
         self._calls = 0
         self._last_error: str | None = None
         self._last_success: dt.datetime | None = None
+        #: Symbols that came back "no data" (unknown ticker / quota) on the
+        #: most recent call(s), for callers/tests that want to introspect the
+        #: per-symbol degrade without it having failed the whole batch.
+        self._not_found: set[str] = set()
 
     def status(self) -> ProviderStatus:
         """Health and capability report.
@@ -104,7 +166,16 @@ class StooqMarketProvider(MarketDataProvider):
         *,
         adjusted: bool = True,  # noqa: ARG002
     ) -> dict[str, list[Bar]]:
-        """Fetch daily bars. May raise ProviderError on network failure."""
+        """Fetch daily bars. May raise ProviderError on network failure.
+
+        An unknown symbol (or a per-symbol quota message) degrades that one
+        symbol to an empty bar list and continues with the rest of the batch
+        rather than aborting -- ``SymbolNotFoundError`` is the one exception
+        this loop treats as "skip and carry on"; every other ``ProviderError``
+        (network failure, rate limit, malformed response) still aborts the
+        whole call, since those affect every symbol in the batch identically
+        and retrying the same request piecemeal would not help.
+        """
         self._calls += 1
         out: dict[str, list[Bar]] = {}
 
@@ -114,6 +185,12 @@ class StooqMarketProvider(MarketDataProvider):
                 bars = self._fetch_symbol(symbol, start, end)
                 out[symbol] = bars
                 self._last_success = dt.datetime.now(tz=dt.UTC)
+            except SymbolNotFoundError as exc:
+                log.info("stooq has no data for %s: %s", symbol, exc)
+                self._last_error = str(exc)
+                self._not_found.add(symbol)
+                out[symbol] = []
+                continue
             except ProviderError:
                 self._last_error = f"failed to fetch {symbol}"
                 raise
@@ -133,7 +210,8 @@ class StooqMarketProvider(MarketDataProvider):
         """Fetch bars for one symbol from stooq CSV endpoint.
 
         Raises:
-            ProviderError: on network failure or malformed response.
+            SymbolNotFoundError: stooq has no data for this specific symbol.
+            ProviderError: on network failure or a malformed response.
         """
         try:
             import httpx
@@ -196,6 +274,8 @@ class StooqMarketProvider(MarketDataProvider):
         try:
             bars = self._parse_csv_response(response.text, symbol, start, end)
             return bars
+        except _StooqNoDataError as exc:
+            raise SymbolNotFoundError(str(exc), provider=self.name, retryable=False) from exc
         except Exception as exc:
             raise ProviderError(
                 f"malformed stooq response for {symbol}: {exc}",
@@ -204,15 +284,29 @@ class StooqMarketProvider(MarketDataProvider):
             ) from exc
 
     @staticmethod
-    def stooq_symbol(symbol: str) -> str:
+    def stooq_symbol(symbol: str, exchange: str | None = None) -> str:
         """Map an exchange ticker to stooq's namespaced form.
 
-        Stooq expects ``aapl.us``; a bare ``AAPL`` returns no data. A symbol that
-        already carries a market suffix is passed through untouched so non-US
-        listings still work.
+        Stooq expects ``aapl.us`` for US listings and ``shop.to`` for Canadian
+        (TSX/TSXV) ones; a bare ``AAPL`` returns no data. A symbol that already
+        carries a market suffix (a dot anywhere in it) is passed through
+        untouched, so an explicit non-US/CA suffix (e.g. ``BMW.DE``) still
+        works.
+
+        The US/CA choice is driven by the exchange: pass ``exchange``
+        explicitly when the caller has it, otherwise this falls back to the
+        packaged seed universes' symbol -> exchange mapping (see
+        ``_default_exchange_map``) and defaults to ``.us`` for anything not
+        found there -- ``MarketDataProvider.get_daily_bars`` receives only bare
+        ticker strings with no exchange context, so that fallback is the
+        common path in practice.
         """
         lowered = symbol.strip().lower()
-        return lowered if "." in lowered else f"{lowered}{US_SUFFIX}"
+        if "." in lowered:
+            return lowered
+        exch = (exchange or _default_exchange_map().get(symbol.strip().upper(), "")).upper()
+        suffix = CA_SUFFIX if exch in CA_EXCHANGES else US_SUFFIX
+        return f"{lowered}{suffix}"
 
     @staticmethod
     def _parse_csv_response(
@@ -232,21 +326,29 @@ class StooqMarketProvider(MarketDataProvider):
             Bars in ascending date order, restricted to ``[start, end]``.
 
         Raises:
-            ValueError: on an empty response or a recognised no-data marker.
+            _StooqNoDataError: an empty response or a recognised no-data
+                marker -- stooq has nothing for this symbol (unknown ticker or
+                exhausted quota). A ``ValueError`` subclass, so callers that
+                only catch the base class (existing tests included) still see
+                it; ``_fetch_symbol`` catches the subclass specifically to
+                degrade per-symbol rather than failing the whole batch.
+            ValueError: an unexpected/malformed shape (e.g. the last-quote
+                endpoint's header) -- a real parser/endpoint mismatch, not an
+                ordinary "no data" outcome.
         """
         text = csv_text.strip()
         if not text:
-            raise ValueError("empty response from stooq")
+            raise _StooqNoDataError("empty response from stooq")
         for marker in _NO_DATA_MARKERS:
             if text.startswith(marker):
                 # Stooq signals "unknown symbol" and "quota exhausted" with a
                 # 200 response and a plain-text body, so this is not an
                 # HTTP-level error and must be caught here.
-                raise ValueError(f"stooq returned no data for {symbol}: {text[:60]!r}")
+                raise _StooqNoDataError(f"stooq returned no data for {symbol}: {text[:60]!r}")
 
         lines = text.split("\n")
         if len(lines) < 2:
-            raise ValueError(f"stooq returned no rows for {symbol}: {text[:60]!r}")
+            raise _StooqNoDataError(f"stooq returned no rows for {symbol}: {text[:60]!r}")
 
         header = [h.strip().lower() for h in lines[0].split(",")]
         # The last-quote endpoint's header is a superset of the history one
@@ -320,9 +422,12 @@ class StooqMarketProvider(MarketDataProvider):
         )
 
     def get_security_info(self, symbols: list[str]) -> dict[str, SecurityInfo]:
-        # Stooq doesn't provide a bulk reference data endpoint in the free tier.
-        # Return minimal stubs.
-        return {s: SecurityInfo(symbol=s) for s in symbols}
+        # Stooq doesn't provide a bulk reference data endpoint in the free
+        # tier. Fill in what the packaged seed universes know (name, exchange,
+        # sector) for symbols that are in them; anything else gets a minimal
+        # stub rather than being omitted.
+        by_symbol = {s.symbol: s for s in load_packaged_universe()}
+        return {s: by_symbol.get(s.upper(), SecurityInfo(symbol=s)) for s in symbols}
 
     def get_corporate_actions(
         self, symbols: list[str], start: dt.date, end: dt.date  # noqa: ARG002
@@ -330,9 +435,19 @@ class StooqMarketProvider(MarketDataProvider):
         # Stooq doesn't cover corporate actions.
         return {s: [] for s in symbols}
 
-    def list_universe(
-        self, *, as_of: dt.date | None = None  # noqa: ARG002
-    ) -> list[SecurityInfo]:
-        # Stooq doesn't provide a universe list in the free endpoint.
-        # Caller must supply symbols explicitly.
-        return []
+    def list_universe(self, *, as_of: dt.date | None = None) -> list[SecurityInfo]:
+        """The packaged US + Canadian seed universes (see module docstring).
+
+        Stooq's free endpoint has no bulk reference-data/universe listing of
+        its own, so without this a real-data refresh (``market_data.provider =
+        "stooq"``) would have nothing to fetch unless symbols were supplied
+        explicitly on the command line -- exactly the "very limited" out-of-box
+        experience this seed exists to fix. The packaged lists carry no
+        listing/delisting dates, so ``as_of`` never excludes anything; that is
+        an honest reflection of what a hand-curated *current* seed list can
+        promise, not point-in-time coverage.
+        """
+        securities = load_packaged_universe()
+        if as_of is None:
+            return securities
+        return [s for s in securities if s.is_active_on(as_of)]

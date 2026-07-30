@@ -1,0 +1,517 @@
+# generated: 2026-07-30
+# This is a hand-curated SEED universe, not a live index feed. Index
+# constituents drift (additions, removals, mergers, renames); this file will
+# go stale over time. Edit it freely -- add, remove or correct rows -- it is a
+# starting point for the scannable universe, not an authoritative source.
+# market_cap_bucket is an approximate size label (mega/large/mid), not a live
+# market capitalisation figure.
+symbol,name,exchange,sector,market_cap_bucket,country
+AAPL,Apple Inc.,NASDAQ,Technology,mega,US
+MSFT,Microsoft Corporation,NASDAQ,Technology,mega,US
+NVDA,NVIDIA Corporation,NASDAQ,Technology,mega,US
+AVGO,Broadcom Inc.,NASDAQ,Technology,mega,US
+ORCL,Oracle Corporation,NYSE,Technology,mega,US
+CRM,Salesforce Inc.,NYSE,Technology,large,US
+ADBE,Adobe Inc.,NASDAQ,Technology,large,US
+CSCO,Cisco Systems Inc.,NASDAQ,Technology,large,US
+ACN,Accenture plc,NYSE,Technology,large,US
+IBM,International Business Machines Corporation,NYSE,Technology,large,US
+INTC,Intel Corporation,NASDAQ,Technology,large,US
+AMD,Advanced Micro Devices Inc.,NASDAQ,Technology,large,US
+QCOM,Qualcomm Incorporated,NASDAQ,Technology,large,US
+TXN,Texas Instruments Incorporated,NASDAQ,Technology,large,US
+INTU,Intuit Inc.,NASDAQ,Technology,large,US
+NOW,ServiceNow Inc.,NYSE,Technology,large,US
+AMAT,Applied Materials Inc.,NASDAQ,Technology,large,US
+LRCX,Lam Research Corporation,NASDAQ,Technology,large,US
+KLAC,KLA Corporation,NASDAQ,Technology,large,US
+SNPS,Synopsys Inc.,NASDAQ,Technology,large,US
+CDNS,Cadence Design Systems Inc.,NASDAQ,Technology,large,US
+PANW,Palo Alto Networks Inc.,NASDAQ,Technology,large,US
+ADI,Analog Devices Inc.,NASDAQ,Technology,large,US
+MU,Micron Technology Inc.,NASDAQ,Technology,large,US
+FTNT,Fortinet Inc.,NASDAQ,Technology,large,US
+MSI,Motorola Solutions Inc.,NYSE,Technology,large,US
+HPQ,HP Inc.,NYSE,Technology,mid,US
+DELL,Dell Technologies Inc.,NYSE,Technology,large,US
+HPE,Hewlett Packard Enterprise Company,NYSE,Technology,mid,US
+ANSS,Ansys Inc.,NASDAQ,Technology,mid,US
+CTSH,Cognizant Technology Solutions Corporation,NASDAQ,Technology,mid,US
+IT,Gartner Inc.,NYSE,Technology,mid,US
+ROP,Roper Technologies Inc.,NASDAQ,Technology,large,US
+TEL,TE Connectivity Ltd.,NYSE,Technology,large,US
+GLW,Corning Incorporated,NYSE,Technology,mid,US
+APH,Amphenol Corporation,NYSE,Technology,large,US
+TDY,Teledyne Technologies Incorporated,NYSE,Technology,mid,US
+KEYS,Keysight Technologies Inc.,NYSE,Technology,mid,US
+NXPI,NXP Semiconductors N.V.,NASDAQ,Technology,large,US
+MCHP,Microchip Technology Incorporated,NASDAQ,Technology,mid,US
+ON,ON Semiconductor Corporation,NASDAQ,Technology,mid,US
+SWKS,Skyworks Solutions Inc.,NASDAQ,Technology,mid,US
+ENPH,Enphase Energy Inc.,NASDAQ,Technology,mid,US
+FSLR,First Solar Inc.,NASDAQ,Technology,mid,US
+TER,Teradyne Inc.,NASDAQ,Technology,mid,US
+ZBRA,Zebra Technologies Corporation,NASDAQ,Technology,mid,US
+TYL,Tyler Technologies Inc.,NYSE,Technology,mid,US
+PTC,PTC Inc.,NASDAQ,Technology,mid,US
+GEN,Gen Digital Inc.,NASDAQ,Technology,mid,US
+AKAM,Akamai Technologies Inc.,NASDAQ,Technology,mid,US
+JNPR,Juniper Networks Inc.,NYSE,Technology,mid,US
+NTAP,NetApp Inc.,NASDAQ,Technology,mid,US
+WDC,Western Digital Corporation,NASDAQ,Technology,mid,US
+STX,Seagate Technology Holdings plc,NASDAQ,Technology,mid,US
+VRSN,Verisign Inc.,NASDAQ,Technology,mid,US
+EPAM,EPAM Systems Inc.,NYSE,Technology,mid,US
+GDDY,GoDaddy Inc.,NYSE,Technology,mid,US
+DXC,DXC Technology Company,NYSE,Technology,mid,US
+FFIV,F5 Inc.,NASDAQ,Technology,mid,US
+TRMB,Trimble Inc.,NASDAQ,Technology,mid,US
+CDW,CDW Corporation,NASDAQ,Technology,mid,US
+WDAY,Workday Inc.,NASDAQ,Technology,large,US
+DDOG,Datadog Inc.,NASDAQ,Technology,mid,US
+CRWD,CrowdStrike Holdings Inc.,NASDAQ,Technology,large,US
+ZS,Zscaler Inc.,NASDAQ,Technology,mid,US
+SNOW,Snowflake Inc.,NYSE,Technology,mid,US
+MDB,MongoDB Inc.,NASDAQ,Technology,mid,US
+TEAM,Atlassian Corporation,NASDAQ,Technology,large,US
+HUBS,HubSpot Inc.,NYSE,Technology,mid,US
+NET,Cloudflare Inc.,NYSE,Technology,mid,US
+ANET,Arista Networks Inc.,NYSE,Technology,large,US
+ADSK,Autodesk Inc.,NASDAQ,Technology,large,US
+VEEV,Veeva Systems Inc.,NYSE,Technology,mid,US
+TTD,The Trade Desk Inc.,NASDAQ,Technology,mid,US
+U,Unity Software Inc.,NYSE,Technology,mid,US
+DOCU,DocuSign Inc.,NASDAQ,Technology,mid,US
+OKTA,Okta Inc.,NASDAQ,Technology,mid,US
+TWLO,Twilio Inc.,NYSE,Technology,mid,US
+ARM,Arm Holdings plc,NASDAQ,Technology,large,US
+CPRT,Copart Inc.,NASDAQ,Technology,large,US
+FICO,Fair Isaac Corporation,NYSE,Technology,mid,US
+MPWR,Monolithic Power Systems Inc.,NASDAQ,Technology,mid,US
+ENTG,Entegris Inc.,NASDAQ,Technology,mid,US
+LSCC,Lattice Semiconductor Corporation,NASDAQ,Technology,mid,US
+QRVO,Qorvo Inc.,NASDAQ,Technology,mid,US
+DAY,Dayforce Inc.,NYSE,Technology,mid,US
+PCTY,Paylocity Holding Corporation,NASDAQ,Technology,mid,US
+BR,Broadridge Financial Solutions Inc.,NYSE,Technology,mid,US
+WEX,WEX Inc.,NYSE,Technology,mid,US
+EEFT,Euronet Worldwide Inc.,NASDAQ,Technology,mid,US
+FLT,Corpay Inc.,NYSE,Technology,large,US
+JKHY,Jack Henry & Associates Inc.,NASDAQ,Technology,mid,US
+SSNC,SS&C Technologies Holdings Inc.,NASDAQ,Technology,mid,US
+MANH,Manhattan Associates Inc.,NASDAQ,Technology,mid,US
+BSY,Bentley Systems Incorporated,NASDAQ,Technology,mid,US
+PEGA,Pegasystems Inc.,NASDAQ,Technology,mid,US
+CSGP,CoStar Group Inc.,NASDAQ,Technology,mid,US
+WSM,Williams-Sonoma Inc.,NYSE,Consumer Discretionary,mid,US
+GOOGL,Alphabet Inc. (Class A),NASDAQ,Communication Services,mega,US
+GOOG,Alphabet Inc. (Class C),NASDAQ,Communication Services,mega,US
+META,Meta Platforms Inc.,NASDAQ,Communication Services,mega,US
+NFLX,Netflix Inc.,NASDAQ,Communication Services,mega,US
+DIS,The Walt Disney Company,NYSE,Communication Services,large,US
+CMCSA,Comcast Corporation,NASDAQ,Communication Services,large,US
+T,AT&T Inc.,NYSE,Communication Services,large,US
+VZ,Verizon Communications Inc.,NYSE,Communication Services,large,US
+TMUS,T-Mobile US Inc.,NASDAQ,Communication Services,large,US
+CHTR,Charter Communications Inc.,NASDAQ,Communication Services,mid,US
+EA,Electronic Arts Inc.,NASDAQ,Communication Services,mid,US
+TTWO,Take-Two Interactive Software Inc.,NASDAQ,Communication Services,mid,US
+WBD,Warner Bros. Discovery Inc.,NASDAQ,Communication Services,mid,US
+OMC,Omnicom Group Inc.,NYSE,Communication Services,mid,US
+IPG,The Interpublic Group of Companies Inc.,NYSE,Communication Services,mid,US
+LYV,Live Nation Entertainment Inc.,NYSE,Communication Services,mid,US
+MTCH,Match Group Inc.,NASDAQ,Communication Services,mid,US
+PARA,Paramount Global,NASDAQ,Communication Services,mid,US
+FOXA,Fox Corporation (Class A),NASDAQ,Communication Services,mid,US
+NWSA,News Corporation (Class A),NASDAQ,Communication Services,mid,US
+PINS,Pinterest Inc.,NYSE,Communication Services,mid,US
+SNAP,Snap Inc.,NYSE,Communication Services,mid,US
+RBLX,Roblox Corporation,NYSE,Communication Services,mid,US
+SPOT,Spotify Technology S.A.,NYSE,Communication Services,large,US
+JPM,JPMorgan Chase & Co.,NYSE,Financials,mega,US
+BAC,Bank of America Corporation,NYSE,Financials,large,US
+WFC,Wells Fargo & Company,NYSE,Financials,large,US
+C,Citigroup Inc.,NYSE,Financials,large,US
+GS,The Goldman Sachs Group Inc.,NYSE,Financials,large,US
+MS,Morgan Stanley,NYSE,Financials,large,US
+SCHW,The Charles Schwab Corporation,NYSE,Financials,large,US
+BLK,BlackRock Inc.,NYSE,Financials,large,US
+SPGI,S&P Global Inc.,NYSE,Financials,large,US
+MCO,Moody's Corporation,NYSE,Financials,large,US
+CME,CME Group Inc.,NASDAQ,Financials,large,US
+ICE,Intercontinental Exchange Inc.,NYSE,Financials,large,US
+CB,Chubb Limited,NYSE,Financials,large,US
+PGR,The Progressive Corporation,NYSE,Financials,large,US
+TRV,The Travelers Companies Inc.,NYSE,Financials,mid,US
+ALL,The Allstate Corporation,NYSE,Financials,mid,US
+AIG,American International Group Inc.,NYSE,Financials,mid,US
+MET,MetLife Inc.,NYSE,Financials,mid,US
+PRU,Prudential Financial Inc.,NYSE,Financials,mid,US
+AFL,Aflac Incorporated,NYSE,Financials,mid,US
+HIG,The Hartford Financial Services Group Inc.,NYSE,Financials,mid,US
+AON,Aon plc,NYSE,Financials,large,US
+MMC,Marsh & McLennan Companies Inc.,NYSE,Financials,large,US
+AJG,Arthur J. Gallagher & Co.,NYSE,Financials,mid,US
+WTW,Willis Towers Watson Public Limited Company,NASDAQ,Financials,mid,US
+AXP,American Express Company,NYSE,Financials,large,US
+COF,Capital One Financial Corporation,NYSE,Financials,mid,US
+DFS,Discover Financial Services,NYSE,Financials,mid,US
+SYF,Synchrony Financial,NYSE,Financials,mid,US
+USB,U.S. Bancorp,NYSE,Financials,mid,US
+PNC,The PNC Financial Services Group Inc.,NYSE,Financials,mid,US
+TFC,Truist Financial Corporation,NYSE,Financials,mid,US
+FITB,Fifth Third Bancorp,NASDAQ,Financials,mid,US
+RF,Regions Financial Corporation,NYSE,Financials,mid,US
+KEY,KeyCorp,NYSE,Financials,mid,US
+HBAN,Huntington Bancshares Incorporated,NASDAQ,Financials,mid,US
+MTB,M&T Bank Corporation,NYSE,Financials,mid,US
+CFG,Citizens Financial Group Inc.,NYSE,Financials,mid,US
+ZION,Zions Bancorporation,NASDAQ,Financials,mid,US
+CMA,Comerica Incorporated,NYSE,Financials,mid,US
+NTRS,Northern Trust Corporation,NASDAQ,Financials,mid,US
+STT,State Street Corporation,NYSE,Financials,mid,US
+BK,The Bank of New York Mellon Corporation,NYSE,Financials,large,US
+FIS,Fidelity National Information Services Inc.,NYSE,Financials,mid,US
+FI,Fiserv Inc.,NYSE,Financials,large,US
+GPN,Global Payments Inc.,NYSE,Financials,mid,US
+PYPL,PayPal Holdings Inc.,NASDAQ,Financials,large,US
+V,Visa Inc.,NYSE,Financials,mega,US
+MA,Mastercard Incorporated,NYSE,Financials,mega,US
+AMP,Ameriprise Financial Inc.,NYSE,Financials,mid,US
+IVZ,Invesco Ltd.,NYSE,Financials,mid,US
+BEN,Franklin Resources Inc.,NYSE,Financials,mid,US
+TROW,T. Rowe Price Group Inc.,NASDAQ,Financials,mid,US
+RJF,Raymond James Financial Inc.,NYSE,Financials,mid,US
+LPLA,LPL Financial Holdings Inc.,NASDAQ,Financials,mid,US
+NDAQ,Nasdaq Inc.,NASDAQ,Financials,mid,US
+MKTX,MarketAxess Holdings Inc.,NASDAQ,Financials,mid,US
+CBOE,Cboe Global Markets Inc.,NYSE,Financials,mid,US
+WBS,Webster Financial Corporation,NYSE,Financials,mid,US
+EWBC,East West Bancorp Inc.,NASDAQ,Financials,mid,US
+SNV,Synovus Financial Corp.,NYSE,Financials,mid,US
+BRK-B,Berkshire Hathaway Inc. (Class B),NYSE,Financials,mega,US
+SQ,Block Inc.,NYSE,Financials,mid,US
+COIN,Coinbase Global Inc.,NASDAQ,Financials,mid,US
+UNH,UnitedHealth Group Incorporated,NYSE,Health Care,mega,US
+JNJ,Johnson & Johnson,NYSE,Health Care,mega,US
+LLY,Eli Lilly and Company,NYSE,Health Care,mega,US
+ABBV,AbbVie Inc.,NYSE,Health Care,mega,US
+MRK,Merck & Co. Inc.,NYSE,Health Care,large,US
+PFE,Pfizer Inc.,NYSE,Health Care,large,US
+TMO,Thermo Fisher Scientific Inc.,NYSE,Health Care,large,US
+ABT,Abbott Laboratories,NYSE,Health Care,large,US
+DHR,Danaher Corporation,NYSE,Health Care,large,US
+BMY,Bristol-Myers Squibb Company,NYSE,Health Care,large,US
+AMGN,Amgen Inc.,NASDAQ,Health Care,large,US
+MDT,Medtronic plc,NYSE,Health Care,large,US
+GILD,Gilead Sciences Inc.,NASDAQ,Health Care,large,US
+CVS,CVS Health Corporation,NYSE,Health Care,large,US
+ELV,Elevance Health Inc.,NYSE,Health Care,large,US
+CI,The Cigna Group,NYSE,Health Care,large,US
+HUM,Humana Inc.,NYSE,Health Care,mid,US
+ISRG,Intuitive Surgical Inc.,NASDAQ,Health Care,large,US
+SYK,Stryker Corporation,NYSE,Health Care,large,US
+BSX,Boston Scientific Corporation,NYSE,Health Care,large,US
+ZBH,Zimmer Biomet Holdings Inc.,NYSE,Health Care,mid,US
+BDX,"Becton, Dickinson and Company",NYSE,Health Care,mid,US
+EW,Edwards Lifesciences Corporation,NYSE,Health Care,mid,US
+IDXX,IDEXX Laboratories Inc.,NASDAQ,Health Care,mid,US
+DXCM,DexCom Inc.,NASDAQ,Health Care,mid,US
+ALGN,Align Technology Inc.,NASDAQ,Health Care,mid,US
+HOLX,Hologic Inc.,NASDAQ,Health Care,mid,US
+RMD,ResMed Inc.,NYSE,Health Care,mid,US
+VRTX,Vertex Pharmaceuticals Incorporated,NASDAQ,Health Care,large,US
+REGN,Regeneron Pharmaceuticals Inc.,NASDAQ,Health Care,large,US
+BIIB,Biogen Inc.,NASDAQ,Health Care,mid,US
+MRNA,Moderna Inc.,NASDAQ,Health Care,mid,US
+ILMN,Illumina Inc.,NASDAQ,Health Care,mid,US
+INCY,Incyte Corporation,NASDAQ,Health Care,mid,US
+BAX,Baxter International Inc.,NYSE,Health Care,mid,US
+A,Agilent Technologies Inc.,NYSE,Health Care,mid,US
+WAT,Waters Corporation,NYSE,Health Care,mid,US
+MTD,Mettler-Toledo International Inc.,NYSE,Health Care,mid,US
+IQV,IQVIA Holdings Inc.,NYSE,Health Care,mid,US
+CRL,Charles River Laboratories International Inc.,NYSE,Health Care,mid,US
+CAH,Cardinal Health Inc.,NYSE,Health Care,mid,US
+MCK,McKesson Corporation,NYSE,Health Care,large,US
+COR,Cencora Inc.,NYSE,Health Care,large,US
+WST,West Pharmaceutical Services Inc.,NYSE,Health Care,mid,US
+PODD,Insulet Corporation,NASDAQ,Health Care,mid,US
+TECH,Bio-Techne Corporation,NASDAQ,Health Care,mid,US
+VTRS,Viatris Inc.,NASDAQ,Health Care,mid,US
+ZTS,Zoetis Inc.,NYSE,Health Care,large,US
+HCA,HCA Healthcare Inc.,NYSE,Health Care,large,US
+UHS,Universal Health Services Inc.,NYSE,Health Care,mid,US
+DVA,DaVita Inc.,NYSE,Health Care,mid,US
+MOH,Molina Healthcare Inc.,NYSE,Health Care,mid,US
+CNC,Centene Corporation,NYSE,Health Care,mid,US
+GEHC,GE HealthCare Technologies Inc.,NASDAQ,Health Care,large,US
+SOLV,Solventum Corporation,NYSE,Health Care,mid,US
+DGX,Quest Diagnostics Incorporated,NYSE,Health Care,mid,US
+LH,Labcorp Holdings Inc.,NYSE,Health Care,mid,US
+XRAY,Dentsply Sirona Inc.,NASDAQ,Health Care,mid,US
+AMZN,Amazon.com Inc.,NASDAQ,Consumer Discretionary,mega,US
+TSLA,Tesla Inc.,NASDAQ,Consumer Discretionary,mega,US
+HD,The Home Depot Inc.,NYSE,Consumer Discretionary,mega,US
+MCD,McDonald's Corporation,NYSE,Consumer Discretionary,large,US
+NKE,NIKE Inc.,NYSE,Consumer Discretionary,large,US
+LOW,Lowe's Companies Inc.,NYSE,Consumer Discretionary,large,US
+SBUX,Starbucks Corporation,NASDAQ,Consumer Discretionary,large,US
+TJX,The TJX Companies Inc.,NYSE,Consumer Discretionary,large,US
+BKNG,Booking Holdings Inc.,NASDAQ,Consumer Discretionary,large,US
+ORLY,O'Reilly Automotive Inc.,NASDAQ,Consumer Discretionary,large,US
+AZO,AutoZone Inc.,NYSE,Consumer Discretionary,large,US
+ROST,Ross Stores Inc.,NASDAQ,Consumer Discretionary,mid,US
+YUM,Yum! Brands Inc.,NYSE,Consumer Discretionary,mid,US
+CMG,Chipotle Mexican Grill Inc.,NYSE,Consumer Discretionary,large,US
+MAR,Marriott International Inc.,NASDAQ,Consumer Discretionary,mid,US
+HLT,Hilton Worldwide Holdings Inc.,NYSE,Consumer Discretionary,large,US
+RCL,Royal Caribbean Cruises Ltd.,NYSE,Consumer Discretionary,mid,US
+CCL,Carnival Corporation & plc,NYSE,Consumer Discretionary,mid,US
+NCLH,Norwegian Cruise Line Holdings Ltd.,NYSE,Consumer Discretionary,mid,US
+EXPE,Expedia Group Inc.,NASDAQ,Consumer Discretionary,mid,US
+DHI,D.R. Horton Inc.,NYSE,Consumer Discretionary,mid,US
+LEN,Lennar Corporation,NYSE,Consumer Discretionary,mid,US
+PHM,PulteGroup Inc.,NYSE,Consumer Discretionary,mid,US
+NVR,NVR Inc.,NYSE,Consumer Discretionary,mid,US
+GM,General Motors Company,NYSE,Consumer Discretionary,mid,US
+F,Ford Motor Company,NYSE,Consumer Discretionary,mid,US
+APTV,Aptiv PLC,NYSE,Consumer Discretionary,mid,US
+BWA,BorgWarner Inc.,NYSE,Consumer Discretionary,mid,US
+LKQ,LKQ Corporation,NASDAQ,Consumer Discretionary,mid,US
+GRMN,Garmin Ltd.,NYSE,Consumer Discretionary,mid,US
+WHR,Whirlpool Corporation,NYSE,Consumer Discretionary,mid,US
+POOL,Pool Corporation,NASDAQ,Consumer Discretionary,mid,US
+TSCO,Tractor Supply Company,NASDAQ,Consumer Discretionary,mid,US
+BBY,Best Buy Co. Inc.,NYSE,Consumer Discretionary,mid,US
+DPZ,Domino's Pizza Inc.,NYSE,Consumer Discretionary,mid,US
+DRI,Darden Restaurants Inc.,NYSE,Consumer Discretionary,mid,US
+ULTA,Ulta Beauty Inc.,NASDAQ,Consumer Discretionary,mid,US
+TPR,Tapestry Inc.,NYSE,Consumer Discretionary,mid,US
+RL,Ralph Lauren Corporation,NYSE,Consumer Discretionary,mid,US
+VFC,V.F. Corporation,NYSE,Consumer Discretionary,mid,US
+PVH,PVH Corp.,NYSE,Consumer Discretionary,mid,US
+HAS,Hasbro Inc.,NASDAQ,Consumer Discretionary,mid,US
+MHK,Mohawk Industries Inc.,NYSE,Consumer Discretionary,mid,US
+EBAY,eBay Inc.,NASDAQ,Consumer Discretionary,mid,US
+ETSY,Etsy Inc.,NASDAQ,Consumer Discretionary,mid,US
+KMX,CarMax Inc.,NYSE,Consumer Discretionary,mid,US
+CZR,Caesars Entertainment Inc.,NASDAQ,Consumer Discretionary,mid,US
+MGM,MGM Resorts International,NYSE,Consumer Discretionary,mid,US
+WYNN,Wynn Resorts Limited,NASDAQ,Consumer Discretionary,mid,US
+LVS,Las Vegas Sands Corp.,NYSE,Consumer Discretionary,mid,US
+GPC,Genuine Parts Company,NYSE,Consumer Discretionary,mid,US
+AAP,Advance Auto Parts Inc.,NYSE,Consumer Discretionary,mid,US
+QSR,Restaurant Brands International Inc.,NYSE,Consumer Discretionary,mid,US
+UBER,Uber Technologies Inc.,NYSE,Consumer Discretionary,large,US
+LYFT,Lyft Inc.,NASDAQ,Consumer Discretionary,mid,US
+ABNB,Airbnb Inc.,NASDAQ,Consumer Discretionary,large,US
+DASH,DoorDash Inc.,NASDAQ,Consumer Discretionary,mid,US
+PG,The Procter & Gamble Company,NYSE,Consumer Staples,mega,US
+KO,The Coca-Cola Company,NYSE,Consumer Staples,mega,US
+PEP,PepsiCo Inc.,NASDAQ,Consumer Staples,mega,US
+COST,Costco Wholesale Corporation,NASDAQ,Consumer Staples,mega,US
+WMT,Walmart Inc.,NYSE,Consumer Staples,mega,US
+PM,Philip Morris International Inc.,NYSE,Consumer Staples,large,US
+MO,Altria Group Inc.,NYSE,Consumer Staples,mid,US
+MDLZ,Mondelez International Inc.,NASDAQ,Consumer Staples,large,US
+CL,Colgate-Palmolive Company,NYSE,Consumer Staples,large,US
+KMB,Kimberly-Clark Corporation,NYSE,Consumer Staples,mid,US
+GIS,General Mills Inc.,NYSE,Consumer Staples,mid,US
+K,Kellanova,NYSE,Consumer Staples,mid,US
+HSY,The Hershey Company,NYSE,Consumer Staples,mid,US
+STZ,Constellation Brands Inc.,NYSE,Consumer Staples,mid,US
+TAP,Molson Coors Beverage Company,NYSE,Consumer Staples,mid,US
+KDP,Keurig Dr Pepper Inc.,NASDAQ,Consumer Staples,mid,US
+MNST,Monster Beverage Corporation,NASDAQ,Consumer Staples,mid,US
+KHC,The Kraft Heinz Company,NASDAQ,Consumer Staples,mid,US
+SYY,Sysco Corporation,NYSE,Consumer Staples,mid,US
+ADM,Archer-Daniels-Midland Company,NYSE,Consumer Staples,mid,US
+TSN,Tyson Foods Inc.,NYSE,Consumer Staples,mid,US
+HRL,Hormel Foods Corporation,NYSE,Consumer Staples,mid,US
+CAG,Conagra Brands Inc.,NYSE,Consumer Staples,mid,US
+CPB,The Campbell's Company,NASDAQ,Consumer Staples,mid,US
+CHD,Church & Dwight Co. Inc.,NYSE,Consumer Staples,mid,US
+CLX,The Clorox Company,NYSE,Consumer Staples,mid,US
+KR,The Kroger Co.,NYSE,Consumer Staples,mid,US
+ACI,Albertsons Companies Inc.,NYSE,Consumer Staples,mid,US
+DG,Dollar General Corporation,NYSE,Consumer Staples,mid,US
+DLTR,Dollar Tree Inc.,NASDAQ,Consumer Staples,mid,US
+TGT,Target Corporation,NYSE,Consumer Staples,large,US
+EL,The Estee Lauder Companies Inc.,NYSE,Consumer Staples,mid,US
+BF-B,Brown-Forman Corporation (Class B),NYSE,Consumer Staples,mid,US
+WBA,Walgreens Boots Alliance Inc.,NASDAQ,Consumer Staples,mid,US
+LW,Lamb Weston Holdings Inc.,NYSE,Consumer Staples,mid,US
+GE,GE Aerospace,NYSE,Industrials,mega,US
+HON,Honeywell International Inc.,NASDAQ,Industrials,large,US
+CAT,Caterpillar Inc.,NYSE,Industrials,large,US
+RTX,RTX Corporation,NYSE,Industrials,large,US
+LMT,Lockheed Martin Corporation,NYSE,Industrials,large,US
+BA,The Boeing Company,NYSE,Industrials,large,US
+UPS,United Parcel Service Inc.,NYSE,Industrials,large,US
+UNP,Union Pacific Corporation,NYSE,Industrials,large,US
+CSX,CSX Corporation,NASDAQ,Industrials,mid,US
+NSC,Norfolk Southern Corporation,NYSE,Industrials,mid,US
+DE,Deere & Company,NYSE,Industrials,large,US
+MMM,3M Company,NYSE,Industrials,mid,US
+ETN,Eaton Corporation plc,NYSE,Industrials,large,US
+EMR,Emerson Electric Co.,NYSE,Industrials,mid,US
+ITW,Illinois Tool Works Inc.,NYSE,Industrials,large,US
+PH,Parker-Hannifin Corporation,NYSE,Industrials,large,US
+ROK,Rockwell Automation Inc.,NYSE,Industrials,mid,US
+DOV,Dover Corporation,NYSE,Industrials,mid,US
+XYL,Xylem Inc.,NYSE,Industrials,mid,US
+AME,AMETEK Inc.,NYSE,Industrials,large,US
+IEX,IDEX Corporation,NYSE,Industrials,mid,US
+FTV,Fortive Corporation,NYSE,Industrials,mid,US
+GD,General Dynamics Corporation,NYSE,Industrials,large,US
+NOC,Northrop Grumman Corporation,NYSE,Industrials,large,US
+LHX,L3Harris Technologies Inc.,NYSE,Industrials,mid,US
+TXT,Textron Inc.,NYSE,Industrials,mid,US
+TDG,TransDigm Group Incorporated,NYSE,Industrials,large,US
+HII,Huntington Ingalls Industries Inc.,NYSE,Industrials,mid,US
+WAB,Westinghouse Air Brake Technologies Corporation,NYSE,Industrials,mid,US
+PCAR,PACCAR Inc.,NASDAQ,Industrials,large,US
+CMI,Cummins Inc.,NYSE,Industrials,large,US
+PWR,Quanta Services Inc.,NYSE,Industrials,large,US
+JCI,Johnson Controls International plc,NYSE,Industrials,large,US
+CARR,Carrier Global Corporation,NYSE,Industrials,large,US
+OTIS,Otis Worldwide Corporation,NYSE,Industrials,mid,US
+IR,Ingersoll Rand Inc.,NYSE,Industrials,mid,US
+SNA,Snap-on Incorporated,NYSE,Industrials,mid,US
+SWK,Stanley Black & Decker Inc.,NYSE,Industrials,mid,US
+ALLE,Allegion plc,NYSE,Industrials,mid,US
+GNRC,Generac Holdings Inc.,NYSE,Industrials,mid,US
+FAST,Fastenal Company,NASDAQ,Industrials,mid,US
+GWW,W.W. Grainger Inc.,NYSE,Industrials,large,US
+PAYX,Paychex Inc.,NASDAQ,Industrials,mid,US
+ADP,Automatic Data Processing Inc.,NASDAQ,Industrials,large,US
+CTAS,Cintas Corporation,NASDAQ,Industrials,large,US
+RSG,Republic Services Inc.,NYSE,Industrials,large,US
+WM,Waste Management Inc.,NYSE,Industrials,large,US
+WCN,Waste Connections Inc.,NYSE,Industrials,large,US
+VRSK,Verisk Analytics Inc.,NASDAQ,Industrials,mid,US
+EFX,Equifax Inc.,NYSE,Industrials,mid,US
+RHI,Robert Half Inc.,NYSE,Industrials,mid,US
+MAS,Masco Corporation,NYSE,Industrials,mid,US
+PNR,Pentair plc,NYSE,Industrials,mid,US
+J,Jacobs Solutions Inc.,NYSE,Industrials,mid,US
+EXPD,Expeditors International of Washington Inc.,NASDAQ,Industrials,mid,US
+CHRW,C.H. Robinson Worldwide Inc.,NASDAQ,Industrials,mid,US
+JBHT,J.B. Hunt Transport Services Inc.,NASDAQ,Industrials,mid,US
+ODFL,Old Dominion Freight Line Inc.,NASDAQ,Industrials,large,US
+LUV,Southwest Airlines Co.,NYSE,Industrials,mid,US
+DAL,Delta Air Lines Inc.,NYSE,Industrials,mid,US
+UAL,United Airlines Holdings Inc.,NASDAQ,Industrials,mid,US
+AAL,American Airlines Group Inc.,NASDAQ,Industrials,mid,US
+ALK,Alaska Air Group Inc.,NYSE,Industrials,mid,US
+ROL,Rollins Inc.,NYSE,Industrials,mid,US
+XOM,Exxon Mobil Corporation,NYSE,Energy,mega,US
+CVX,Chevron Corporation,NYSE,Energy,mega,US
+COP,ConocoPhillips,NYSE,Energy,large,US
+EOG,EOG Resources Inc.,NYSE,Energy,large,US
+SLB,SLB,NYSE,Energy,large,US
+MPC,Marathon Petroleum Corporation,NYSE,Energy,large,US
+PSX,Phillips 66,NYSE,Energy,large,US
+VLO,Valero Energy Corporation,NYSE,Energy,mid,US
+OXY,Occidental Petroleum Corporation,NYSE,Energy,mid,US
+WMB,Williams Companies Inc.,NYSE,Energy,large,US
+KMI,Kinder Morgan Inc.,NYSE,Energy,large,US
+OKE,ONEOK Inc.,NYSE,Energy,large,US
+HAL,Halliburton Company,NYSE,Energy,mid,US
+BKR,Baker Hughes Company,NASDAQ,Energy,mid,US
+DVN,Devon Energy Corporation,NYSE,Energy,mid,US
+FANG,Diamondback Energy Inc.,NASDAQ,Energy,large,US
+HES,Hess Corporation,NYSE,Energy,large,US
+CTRA,Coterra Energy Inc.,NYSE,Energy,mid,US
+EQT,EQT Corporation,NYSE,Energy,mid,US
+TRGP,Targa Resources Corp.,NYSE,Energy,large,US
+APA,APA Corporation,NASDAQ,Energy,mid,US
+CHRD,Chord Energy Corporation,NASDAQ,Energy,mid,US
+PR,Permian Resources Corporation,NYSE,Energy,mid,US
+PBF,PBF Energy Inc.,NYSE,Energy,mid,US
+NEE,NextEra Energy Inc.,NYSE,Utilities,mega,US
+DUK,Duke Energy Corporation,NYSE,Utilities,large,US
+SO,The Southern Company,NYSE,Utilities,large,US
+D,Dominion Energy Inc.,NYSE,Utilities,mid,US
+AEP,American Electric Power Company Inc.,NASDAQ,Utilities,mid,US
+EXC,Exelon Corporation,NASDAQ,Utilities,mid,US
+XEL,Xcel Energy Inc.,NASDAQ,Utilities,mid,US
+ED,Consolidated Edison Inc.,NYSE,Utilities,mid,US
+WEC,WEC Energy Group Inc.,NYSE,Utilities,mid,US
+ES,Eversource Energy,NYSE,Utilities,mid,US
+PEG,Public Service Enterprise Group Incorporated,NYSE,Utilities,mid,US
+SRE,Sempra,NYSE,Utilities,large,US
+PCG,PG&E Corporation,NYSE,Utilities,mid,US
+EIX,Edison International,NYSE,Utilities,mid,US
+FE,FirstEnergy Corp.,NASDAQ,Utilities,mid,US
+AEE,Ameren Corporation,NYSE,Utilities,mid,US
+CMS,CMS Energy Corporation,NYSE,Utilities,mid,US
+DTE,DTE Energy Company,NYSE,Utilities,mid,US
+ETR,Entergy Corporation,NYSE,Utilities,mid,US
+PPL,PPL Corporation,NYSE,Utilities,mid,US
+CNP,CenterPoint Energy Inc.,NYSE,Utilities,mid,US
+NI,NiSource Inc.,NYSE,Utilities,mid,US
+LNT,Alliant Energy Corporation,NASDAQ,Utilities,mid,US
+ATO,Atmos Energy Corporation,NYSE,Utilities,mid,US
+NRG,NRG Energy Inc.,NYSE,Utilities,mid,US
+AWK,American Water Works Company Inc.,NYSE,Utilities,mid,US
+PNW,Pinnacle West Capital Corporation,NASDAQ,Utilities,mid,US
+OGE,OGE Energy Corp.,NYSE,Utilities,mid,US
+IDA,IDACORP Inc.,NYSE,Utilities,mid,US
+POR,Portland General Electric Company,NYSE,Utilities,mid,US
+PLD,Prologis Inc.,NYSE,Real Estate,large,US
+AMT,American Tower Corporation,NYSE,Real Estate,large,US
+EQIX,Equinix Inc.,NASDAQ,Real Estate,large,US
+PSA,Public Storage,NYSE,Real Estate,large,US
+WELL,Welltower Inc.,NYSE,Real Estate,large,US
+DLR,Digital Realty Trust Inc.,NYSE,Real Estate,large,US
+O,Realty Income Corporation,NYSE,Real Estate,mid,US
+SPG,Simon Property Group Inc.,NYSE,Real Estate,mid,US
+VICI,VICI Properties Inc.,NYSE,Real Estate,mid,US
+CCI,Crown Castle Inc.,NYSE,Real Estate,mid,US
+AVB,AvalonBay Communities Inc.,NYSE,Real Estate,mid,US
+EQR,Equity Residential,NYSE,Real Estate,mid,US
+MAA,Mid-America Apartment Communities Inc.,NYSE,Real Estate,mid,US
+ESS,Essex Property Trust Inc.,NYSE,Real Estate,mid,US
+CPT,Camden Property Trust,NYSE,Real Estate,mid,US
+UDR,UDR Inc.,NYSE,Real Estate,mid,US
+INVH,Invitation Homes Inc.,NYSE,Real Estate,mid,US
+ARE,Alexandria Real Estate Equities Inc.,NYSE,Real Estate,mid,US
+BXP,BXP Inc.,NYSE,Real Estate,mid,US
+VTR,Ventas Inc.,NYSE,Real Estate,mid,US
+HST,Host Hotels & Resorts Inc.,NASDAQ,Real Estate,mid,US
+KIM,Kimco Realty Corporation,NYSE,Real Estate,mid,US
+REG,Regency Centers Corporation,NASDAQ,Real Estate,mid,US
+FRT,Federal Realty Investment Trust,NYSE,Real Estate,mid,US
+EXR,Extra Space Storage Inc.,NYSE,Real Estate,mid,US
+CUBE,CubeSmart,NYSE,Real Estate,mid,US
+IRM,Iron Mountain Incorporated,NYSE,Real Estate,mid,US
+WY,Weyerhaeuser Company,NYSE,Real Estate,mid,US
+SBAC,SBA Communications Corporation,NASDAQ,Real Estate,mid,US
+DOC,Healthpeak Properties Inc.,NYSE,Real Estate,mid,US
+LIN,Linde plc,NASDAQ,Materials,mega,US
+APD,Air Products and Chemicals Inc.,NYSE,Materials,large,US
+SHW,The Sherwin-Williams Company,NYSE,Materials,large,US
+ECL,Ecolab Inc.,NYSE,Materials,large,US
+FCX,Freeport-McMoRan Inc.,NYSE,Materials,mid,US
+NEM,Newmont Corporation,NYSE,Materials,mid,US
+DOW,Dow Inc.,NYSE,Materials,mid,US
+DD,DuPont de Nemours Inc.,NYSE,Materials,mid,US
+LYB,LyondellBasell Industries N.V.,NYSE,Materials,mid,US
+PPG,PPG Industries Inc.,NYSE,Materials,mid,US
+NUE,Nucor Corporation,NYSE,Materials,mid,US
+STLD,Steel Dynamics Inc.,NASDAQ,Materials,mid,US
+VMC,Vulcan Materials Company,NYSE,Materials,mid,US
+MLM,Martin Marietta Materials Inc.,NYSE,Materials,large,US
+ALB,Albemarle Corporation,NYSE,Materials,mid,US
+CE,Celanese Corporation,NYSE,Materials,mid,US
+IFF,International Flavors & Fragrances Inc.,NYSE,Materials,mid,US
+EMN,Eastman Chemical Company,NYSE,Materials,mid,US
+MOS,The Mosaic Company,NYSE,Materials,mid,US
+CF,CF Industries Holdings Inc.,NYSE,Materials,mid,US
+AVY,Avery Dennison Corporation,NYSE,Materials,mid,US
+PKG,Packaging Corporation of America,NYSE,Materials,mid,US
+IP,International Paper Company,NYSE,Materials,mid,US
+BALL,Ball Corporation,NYSE,Materials,mid,US
+AMCR,Amcor plc,NYSE,Materials,mid,US

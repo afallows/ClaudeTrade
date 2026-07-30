@@ -189,6 +189,19 @@ provider = "stooq"
 fallbacks = ["csv", "synthetic"]
 ```
 
+Setting the provider is the only step needed to get both US and Canadian
+coverage: the app ships with a packaged seed universe (~500 US names, roughly
+the S&P 500, and ~110 Canadian TSX names — see
+[docs/api-providers.md#universe-selection](api-providers.md#universe-selection))
+that is used automatically for the first `claudetrade refresh` once no
+database of securities exists yet. You do not need to list symbols by hand.
+Canadian coverage on stooq's free endpoint is real but partial and was not
+independently verified while writing this guide (no network access from the
+authoring environment); run `claudetrade probe` and check `claudetrade status`
+for `data_quality` findings against the specific TSX symbols you care about.
+This does **not** change the default: `market_data.provider` stays
+`"synthetic"` until you edit `config.toml` yourself.
+
 **If you copy `config.example.toml`**: delete or comment out the line
 `app_dir = "~/.claudetrade"` under `[paths]` before saving it. That value is
 taken literally rather than expanded — on Windows it would create data under a
@@ -258,7 +271,16 @@ claudetrade refresh --start 2024-01-01 --end 2024-12-31
 This is a realistic first date range: about a year of daily bars, which is
 enough for the technical indicators (which need roughly 200 trading days of
 history) to have real values without waiting on a much longer pull. With the
-default synthetic providers this runs quickly and needs no network. Expected
+default synthetic providers this runs quickly and needs no network.
+
+If you omit `--start`/`--end` entirely, `refresh` defaults to the last 90
+calendar days ending today — enough for a quick look with a real provider
+(Step 7) without pulling years of history for hundreds of symbols on the first
+run. Indicators with a longer lookback (e.g. a 200-day moving average) will not
+have enough history from a 90-day pull alone; pass explicit `--start`/`--end`
+for backtesting or anything that needs deeper history.
+
+Expected
 output is a JSON summary, for example:
 ```json
 {

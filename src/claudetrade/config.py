@@ -271,9 +271,23 @@ class UniverseConfig(BaseModel):
     source: Literal["database", "csv", "static"] = "database"
     csv_path: Path | None = None
     static_symbols: list[str] = Field(default_factory=list)
-    permitted_exchanges: list[str] = Field(default_factory=lambda: ["NYSE", "NASDAQ", "AMEX"])
+    #: TSX/TSXV are permitted alongside the US exchanges by default so a
+    #: real-data refresh (``market_data.provider = "stooq"``) covers both
+    #: markets out of the box; see ``data.universe.load_packaged_universe``.
+    permitted_exchanges: list[str] = Field(
+        default_factory=lambda: ["NYSE", "NASDAQ", "AMEX", "TSX", "TSXV"]
+    )
     max_symbols: int = 2000
     include_etfs: bool = False
+    #: Packaged seed universes (see ``data/universes/*.csv``) used to fill the
+    #: scannable universe when ``source == "database"`` and the database has no
+    #: stored securities yet -- i.e. before the first ``claudetrade refresh``.
+    #: Set to ``[]`` to disable this fallback and start from a genuinely empty
+    #: universe. See ``data.universe.load_packaged_universe`` for what each
+    #: name covers and its honest coverage caveats.
+    packaged_universes: list[str] = Field(
+        default_factory=lambda: ["us_default", "ca_default"]
+    )
 
 
 class FilterConfig(BaseModel):

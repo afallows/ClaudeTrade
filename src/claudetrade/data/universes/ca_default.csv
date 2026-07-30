@@ -1,0 +1,122 @@
+# generated: 2026-07-30
+# This is a hand-curated SEED universe, not a live index feed. Index
+# constituents drift (additions, removals, mergers, renames); this file will
+# go stale over time. Edit it freely -- add, remove or correct rows -- it is a
+# starting point for the scannable universe, not an authoritative source.
+# market_cap_bucket is an approximate size label (mega/large/mid), not a live
+# market capitalisation figure.
+symbol,name,exchange,sector,market_cap_bucket,country
+RY,Royal Bank of Canada,TSX,Financials,mega,CA
+TD,The Toronto-Dominion Bank,TSX,Financials,large,CA
+BNS,The Bank of Nova Scotia,TSX,Financials,large,CA
+BMO,Bank of Montreal,TSX,Financials,large,CA
+CM,Canadian Imperial Bank of Commerce,TSX,Financials,large,CA
+NA,National Bank of Canada,TSX,Financials,mid,CA
+MFC,Manulife Financial Corporation,TSX,Financials,large,CA
+SLF,Sun Life Financial Inc.,TSX,Financials,large,CA
+GWO,Great-West Lifeco Inc.,TSX,Financials,mid,CA
+IFC,Intact Financial Corporation,TSX,Financials,large,CA
+POW,Power Corporation of Canada,TSX,Financials,mid,CA
+IAG,iA Financial Corporation Inc.,TSX,Financials,mid,CA
+FFH,Fairfax Financial Holdings Limited,TSX,Financials,large,CA
+X,TMX Group Limited,TSX,Financials,mid,CA
+BAM,Brookfield Asset Management Ltd.,TSX,Financials,large,CA
+BN,Brookfield Corporation,TSX,Financials,large,CA
+BIPC,Brookfield Infrastructure Corporation,TSX,Financials,mid,CA
+BEPC,Brookfield Renewable Corporation,TSX,Financials,mid,CA
+ONEX,Onex Corporation,TSX,Financials,mid,CA
+EFN,Element Fleet Management Corp.,TSX,Financials,mid,CA
+GSY,goeasy Ltd.,TSX,Financials,mid,CA
+EQB,EQB Inc.,TSX,Financials,mid,CA
+LB,Laurentian Bank of Canada,TSX,Financials,mid,CA
+TRI,Thomson Reuters Corporation,TSX,Financials,large,CA
+IGM,IGM Financial Inc.,TSX,Financials,mid,CA
+CIGI,Colliers International Group Inc.,TSX,Financials,mid,CA
+FN,First National Financial Corporation,TSX,Financials,mid,CA
+SU,Suncor Energy Inc.,TSX,Energy,large,CA
+CNQ,Canadian Natural Resources Limited,TSX,Energy,large,CA
+IMO,Imperial Oil Limited,TSX,Energy,large,CA
+CVE,Cenovus Energy Inc.,TSX,Energy,mid,CA
+TOU,Tourmaline Oil Corp.,TSX,Energy,mid,CA
+ARX,ARC Resources Ltd.,TSX,Energy,mid,CA
+VET,Vermilion Energy Inc.,TSX,Energy,mid,CA
+WCP,Whitecap Resources Inc.,TSX,Energy,mid,CA
+MEG,MEG Energy Corp.,TSX,Energy,mid,CA
+PXT,Parex Resources Inc.,TSX,Energy,mid,CA
+ENB,Enbridge Inc.,TSX,Energy,large,CA
+TRP,TC Energy Corporation,TSX,Energy,large,CA
+GEI,Gibson Energy Inc.,TSX,Energy,mid,CA
+TVE,Tamarack Valley Energy Ltd.,TSX,Energy,mid,CA
+OVV,Ovintiv Inc.,TSX,Energy,mid,CA
+PEY,Peyto Exploration & Development Corp.,TSX,Energy,mid,CA
+BTE,Baytex Energy Corp.,TSX,Energy,mid,CA
+ABX,Barrick Gold Corporation,TSX,Materials,large,CA
+AEM,Agnico Eagle Mines Limited,TSX,Materials,large,CA
+FM,First Quantum Minerals Ltd.,TSX,Materials,mid,CA
+TECK-B,Teck Resources Limited (Class B),TSX,Materials,mid,CA
+NTR,Nutrien Ltd.,TSX,Materials,large,CA
+FNV,Franco-Nevada Corporation,TSX,Materials,large,CA
+WPM,Wheaton Precious Metals Corp.,TSX,Materials,large,CA
+PAAS,Pan American Silver Corp.,TSX,Materials,mid,CA
+IMG,IAMGOLD Corporation,TSX,Materials,mid,CA
+LUN,Lundin Mining Corporation,TSX,Materials,mid,CA
+CS,Capstone Copper Corp.,TSX,Materials,mid,CA
+ELD,Eldorado Gold Corporation,TSX,Materials,mid,CA
+OR,Osisko Gold Royalties Ltd.,TSX,Materials,mid,CA
+CCO,Cameco Corporation,TSX,Materials,large,CA
+MX,Methanex Corporation,TSX,Materials,mid,CA
+SJ,Stella-Jones Inc.,TSX,Materials,mid,CA
+WFG,West Fraser Timber Co. Ltd.,TSX,Materials,mid,CA
+CFP,Canfor Corporation,TSX,Materials,mid,CA
+AGI,Alamos Gold Inc.,TSX,Materials,mid,CA
+CG,Centerra Gold Inc.,TSX,Materials,mid,CA
+HBM,Hudbay Minerals Inc.,TSX,Materials,mid,CA
+CCL-B,CCL Industries Inc. (Class B),TSX,Materials,mid,CA
+IVN,Ivanhoe Mines Ltd.,TSX,Materials,mid,CA
+WPK,Winpak Ltd.,TSX,Materials,mid,CA
+CNR,Canadian National Railway Company,TSX,Industrials,large,CA
+CP,Canadian Pacific Kansas City Limited,TSX,Industrials,large,CA
+TFII,TFI International Inc.,TSX,Industrials,mid,CA
+WSP,WSP Global Inc.,TSX,Industrials,large,CA
+STN,Stantec Inc.,TSX,Industrials,mid,CA
+FTT,Finning International Inc.,TSX,Industrials,mid,CA
+TIH,Toromont Industries Ltd.,TSX,Industrials,mid,CA
+CAE,CAE Inc.,TSX,Industrials,mid,CA
+BBD-B,Bombardier Inc. (Class B),TSX,Industrials,mid,CA
+MG,Magna International Inc.,TSX,Industrials,mid,CA
+ATA,ATS Corporation,TSX,Industrials,mid,CA
+GIB-A,CGI Inc. (Class A),TSX,Industrials,large,CA
+ATRL,AtkinsRealis Group Inc.,TSX,Industrials,mid,CA
+DOO,BRP Inc.,TSX,Industrials,mid,CA
+RUS,Russel Metals Inc.,TSX,Industrials,mid,CA
+NFI,NFI Group Inc.,TSX,Industrials,mid,CA
+L,Loblaw Companies Limited,TSX,Consumer Staples,large,CA
+ATD,Alimentation Couche-Tard Inc.,TSX,Consumer Staples,large,CA
+DOL,Dollarama Inc.,TSX,Consumer Discretionary,large,CA
+WN,George Weston Limited,TSX,Consumer Staples,mid,CA
+MRU,Metro Inc.,TSX,Consumer Staples,mid,CA
+EMP-A,Empire Company Limited (Class A),TSX,Consumer Staples,mid,CA
+CTC-A,Canadian Tire Corporation Limited (Class A),TSX,Consumer Discretionary,mid,CA
+LNF,Leon's Furniture Limited,TSX,Consumer Discretionary,mid,CA
+GOOS,Canada Goose Holdings Inc.,TSX,Consumer Discretionary,mid,CA
+SAP,Saputo Inc.,TSX,Consumer Staples,mid,CA
+BYD,Boyd Group Services Inc.,TSX,Consumer Discretionary,mid,CA
+PBH,Premium Brands Holdings Corporation,TSX,Consumer Staples,mid,CA
+BCE,BCE Inc.,TSX,Communication Services,large,CA
+RCI-B,Rogers Communications Inc. (Class B),TSX,Communication Services,large,CA
+CCA,Cogeco Communications Inc.,TSX,Communication Services,mid,CA
+FTS,Fortis Inc.,TSX,Utilities,large,CA
+EMA,Emera Incorporated,TSX,Utilities,mid,CA
+CU,Canadian Utilities Limited,TSX,Utilities,mid,CA
+AQN,Algonquin Power & Utilities Corp.,TSX,Utilities,mid,CA
+H,Hydro One Limited,TSX,Utilities,large,CA
+CPX,Capital Power Corporation,TSX,Utilities,mid,CA
+BLX,Boralex Inc.,TSX,Utilities,mid,CA
+SHOP,Shopify Inc.,TSX,Technology,large,CA
+CSU,Constellation Software Inc.,TSX,Technology,large,CA
+DSG,Descartes Systems Group Inc.,TSX,Technology,mid,CA
+KXS,Kinaxis Inc.,TSX,Technology,mid,CA
+OTEX,Open Text Corporation,TSX,Technology,mid,CA
+LSPD,Lightspeed Commerce Inc.,TSX,Technology,mid,CA
+NVEI,Nuvei Corporation,TSX,Technology,mid,CA
+ENGH,Enghouse Systems Limited,TSX,Technology,mid,CA

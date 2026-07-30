@@ -58,7 +58,7 @@ Documentation = "https://github.com/afallows/claudetrade/tree/main/docs"
 where = ["src"]
 
 [tool.setuptools.package-data]
-claudetrade = ["py.typed", "resources/*.json", "resources/*.csv"]
+claudetrade = ["py.typed", "resources/*.json", "resources/*.csv", "data/universes/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

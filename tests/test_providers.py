@@ -91,6 +91,27 @@ def test_stooq_symbol_mapping_adds_us_suffix():
     assert StooqMarketProvider.stooq_symbol("BMW.DE") == "bmw.de"
 
 
+def test_stooq_symbol_mapping_uses_ca_suffix_for_explicit_tsx_exchange():
+    """Canadian (TSX/TSXV) listings get '.to', not '.us'."""
+    assert StooqMarketProvider.stooq_symbol("SHOP", exchange="TSX") == "shop.to"
+    assert StooqMarketProvider.stooq_symbol("XYZ", exchange="TSXV") == "xyz.to"
+    assert StooqMarketProvider.stooq_symbol("SHOP", exchange="tsx") == "shop.to"
+
+
+def test_stooq_symbol_mapping_defaults_to_us_for_unknown_exchange():
+    assert StooqMarketProvider.stooq_symbol("XYZ", exchange="LSE") == "xyz.us"
+    assert StooqMarketProvider.stooq_symbol("XYZ", exchange=None) == "xyz.us"
+
+
+def test_stooq_symbol_mapping_is_driven_by_the_packaged_exchange_column():
+    """With no explicit exchange, the suffix is looked up from the packaged
+    seed universe's exchange column -- a known US name gets '.us', a known
+    Canadian name gets '.to', with no exchange passed by the caller."""
+    assert StooqMarketProvider.stooq_symbol("AAPL") == "aapl.us"  # NASDAQ in us_default.csv
+    assert StooqMarketProvider.stooq_symbol("SHOP") == "shop.to"  # TSX in ca_default.csv
+    assert StooqMarketProvider.stooq_symbol("RY") == "ry.to"  # TSX (Royal Bank of Canada)
+
+
 def test_stooq_parses_real_daily_history():
     """The daily endpoint's six-column CSV yields one Bar per session."""
     bars = StooqMarketProvider._parse_csv_response(
@@ -194,6 +215,74 @@ def test_stooq_network_failure_is_a_retryable_provider_error(monkeypatch):
     with pytest.raises(ProviderError) as excinfo:
         provider.get_daily_bars(["AAPL"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
     assert excinfo.value.retryable is True
+
+
+def test_stooq_unknown_symbol_degrades_per_symbol_not_the_whole_batch(monkeypatch):
+    """One unknown ticker in a batch must not take down every other symbol's
+    fetch -- the bug this deliverable exists to fix."""
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            if params["s"] == "nosuch.us":
+                return _FakeResponse(STOOQ_NO_DATA)
+            return _FakeResponse(STOOQ_DAILY_CSV)
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    result = provider.get_daily_bars(
+        ["AAPL", "NOSUCH", "MSFT"], dt.date(2024, 1, 1), dt.date(2024, 1, 31)
+    )
+
+    assert result["AAPL"], "a good symbol in the same batch must still be fetched"
+    assert result["MSFT"], "a good symbol *after* the bad one must still be fetched"
+    assert result["NOSUCH"] == [], "the unknown symbol degrades to an empty series, not a raise"
+    assert "NOSUCH" in provider._not_found
+
+
+def test_stooq_quota_message_also_degrades_per_symbol(monkeypatch):
+    """The exhausted-quota body is textually identical in shape to 'unknown
+    symbol' (HTTP 200, plain text) and must degrade the same way."""
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None):
+            return _FakeResponse(STOOQ_QUOTA)
+
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    provider = StooqMarketProvider(MarketDataConfig())
+    result = provider.get_daily_bars(["AAPL", "MSFT"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+    assert result == {"AAPL": [], "MSFT": []}
+
+
+def test_stooq_list_universe_returns_packaged_seed():
+    """Stooq's free tier has no bulk reference endpoint; list_universe must
+    fall back to the packaged seed universe rather than an empty list, or a
+    real-data refresh has nothing to fetch on a fresh install."""
+    provider = StooqMarketProvider(MarketDataConfig())
+    securities = provider.list_universe()
+    symbols = {s.symbol for s in securities}
+    assert len(securities) > 500
+    assert "AAPL" in symbols
+    assert "SHOP" in symbols  # Canadian (TSX)
 
 
 def test_stooq_status_declares_its_real_limitations():

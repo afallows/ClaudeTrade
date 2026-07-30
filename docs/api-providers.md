@@ -128,14 +128,99 @@ fallbacks = ["csv"]
 
 **Credentials**: None required (no authentication).
 
+**Symbol mapping**: Stooq namespaces every symbol by market. A bare ticker is
+mapped automatically -- US listings get a `.us` suffix (`AAPL` -> `aapl.us`);
+Canadian listings (`exchange = "TSX"` or `"TSXV"`) get a `.to` suffix (`SHOP`
+-> `shop.to`). The exchange is looked up from the packaged seed universe (see
+[Universe Selection](#universe-selection) below) when it isn't supplied
+explicitly. A symbol that already carries its own suffix (e.g. `BMW.DE`) is
+passed through untouched.
+
+**What to expect from Canadian (TSX/TSXV) coverage**: it is real but partial
+and this repository cannot verify it from a sandboxed environment with no
+network access -- coverage was not (and could not be) confirmed against the
+live endpoint while writing this. Stooq mirrors many, but not all, TSX-listed
+names. Before relying on a specific Canadian symbol, run:
+
+```bash
+claudetrade probe
+claudetrade refresh --symbols SHOP,RY --start 2024-01-01
+claudetrade status
+```
+
+and check `claudetrade status` for `data_quality` warnings/errors against
+those symbols (an empty bar series for a requested symbol shows up there, not
+as a crash -- see "Unknown or uncovered symbols" below).
+
+**Unknown or uncovered symbols**: a symbol stooq has no data for (unknown
+ticker, or its free-tier daily quota exhausted) degrades that one symbol to an
+empty bar series and the rest of the requested batch continues -- it does not
+fail the whole refresh. The gap shows up as a `data_quality` finding
+(`api_data_gap`, and per-symbol `missing_bars`) rather than an exception.
+
 **Limitations**:
 
 - Free data; no commercial redistribution rights
 - Rate limited (public API, shared across users)
 - Stale data possible if the service is under load
 - Delisting information may be incomplete
+- No bulk universe/reference-data endpoint in the free tier -- `list_universe`
+  serves the packaged seed universe described below, not a live listing from
+  stooq itself
 
 **Licence**: Stooq data is free for personal research only. Commercial use requires a paid licence.
+
+---
+
+## Universe Selection
+
+**Module**: `src/claudetrade/data/universe.py`, seed data under
+`src/claudetrade/data/universes/*.csv`
+
+By default the scannable universe is built from two packaged CSV files shipped
+inside the application:
+
+| File | Coverage | Rows |
+| --- | --- | --- |
+| `us_default.csv` | Roughly the S&P 500 plus some liquid mid-caps, US exchanges (NASDAQ/NYSE/AMEX) | ~500 |
+| `ca_default.csv` | TSX 60 plus other liquid TSX names | ~110 |
+
+**These are hand-curated seed lists, not a live index feed.** Index
+constituents drift constantly -- additions, removals, mergers, renames -- and
+these files will go stale over time; each carries a generation-date comment at
+the top. Edit them freely (add, remove, or correct rows) if you want a
+different starting universe; the column format matches the CSV universe source
+below (`symbol,name,exchange,sector,market_cap_bucket,country`).
+`market_cap_bucket` (`mega`/`large`/`mid`) is an approximate size label, not a
+live market capitalisation figure -- do not treat it as current.
+
+**When they apply**: with `universe.source = "database"` (the default), the
+packaged universes are used to seed the scannable universe only while the
+database has no stored securities yet -- i.e. before the first
+`claudetrade refresh` completes. Once securities are stored, those take
+precedence and are merged with any packaged symbol not yet stored, so newly
+added packaged names remain visible even after a refresh. This is also what
+`StooqMarketProvider.list_universe()` returns, since stooq's free tier has no
+bulk reference-data endpoint of its own -- it is why a fresh install pointed at
+`market_data.provider = "stooq"` has hundreds of US and Canadian symbols to
+pull on the very first `claudetrade refresh` instead of an empty universe.
+
+**Configuration**:
+
+```toml
+[universe]
+source = "database"                          # default
+packaged_universes = ["us_default", "ca_default"]  # set to [] to disable the fallback
+permitted_exchanges = ["NYSE", "NASDAQ", "AMEX", "TSX", "TSXV"]  # TSX/TSXV on by default
+```
+
+**Known cross-market symbol collisions**: a handful of well-known tickers are
+used by *different* companies on the US and Canadian markets (e.g. `T` is
+AT&T on NYSE and Telus on TSX; `K` is Kellanova on NYSE and Kinross Gold on
+TSX). Because the universe is keyed by bare symbol, the packaged CSVs
+deliberately omit the Canadian side of each such collision rather than have
+one silently overwrite the other -- an accuracy trade-off documented here
+rather than hidden.
 
 ---
 
