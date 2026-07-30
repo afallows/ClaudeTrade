@@ -10,7 +10,17 @@ import pytest
 from claudetrade.config import AppConfig, reset_config_cache
 from claudetrade.db.migrations import init_database
 from claudetrade.db.session import Database, reset_database_cache
-from claudetrade.domain import Bar, SocialPost, SocialSource
+from claudetrade.domain import (
+    Bar,
+    ComponentScores,
+    Direction,
+    MarketRegime,
+    Signal,
+    SignalStatus,
+    SocialPost,
+    SocialSource,
+    TradePlan,
+)
 
 
 @pytest.fixture
@@ -142,6 +152,63 @@ def make_bar():
             close=c,
             volume=volume,
             adj_close=ac,
+        )
+
+    return factory
+
+
+@pytest.fixture
+def make_signal():
+    """Factory for creating domain ``Signal`` objects, for UI-layer tests.
+
+    Signals produced this way are never persisted -- callers that need a
+    ledger row should pass the result to ``SignalLedger.record``.
+    """
+    counter = [0]
+
+    def factory(
+        symbol: str = "TEST",
+        strategy: str = "sentiment_breakout",
+        direction: Direction = Direction.LONG,
+        overall_score: float = 65.0,
+        confidence: float = 0.6,
+        session: dt.date | None = None,
+        entry_low: float = 24.0,
+        entry_high: float = 26.0,
+        stop_loss: float = 22.0,
+        targets: list[float] | None = None,
+        status: SignalStatus = SignalStatus.ACTIONABLE,
+        regime: MarketRegime = MarketRegime.BULL_QUIET,
+        days_to_earnings: int | None = None,
+    ) -> Signal:
+        counter[0] += 1
+        session_date = session or dt.date(2024, 1, 3)
+        created_at = dt.datetime(
+            session_date.year, session_date.month, session_date.day, 15, 0, 0, tzinfo=dt.UTC
+        )
+        return Signal(
+            signal_id=f"{session_date.isoformat()}-{symbol}-{strategy}-{counter[0]:04d}",
+            created_at=created_at,
+            session=session_date,
+            symbol=symbol,
+            company_name=f"{symbol} Inc",
+            strategy=strategy,
+            direction=direction,
+            status=status,
+            reference_price=(entry_low + entry_high) / 2.0,
+            price_as_of=created_at,
+            overall_score=overall_score,
+            confidence=confidence,
+            components=ComponentScores(),
+            plan=TradePlan(
+                entry_low=entry_low,
+                entry_high=entry_high,
+                stop_loss=stop_loss,
+                targets=targets if targets is not None else [entry_high * 1.1, entry_high * 1.2],
+                shares=100,
+            ),
+            regime=regime,
+            days_to_earnings=days_to_earnings,
         )
 
     return factory

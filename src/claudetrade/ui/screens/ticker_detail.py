@@ -1,165 +1,231 @@
-"""Ticker Detail page: technical analysis, sentiment, signals, and levels.
+"""Ticker Detail: the centrepiece screen -- full technical + sentiment picture.
 
-Shows candlestick chart with technical indicators, sentiment timeline,
-earnings dates, and historical signals with outcomes.
+Candlestick with volume, entry/stop/target levels for the active signal,
+earnings-date markers, an indicator-driven RSI panel, and a sentiment +
+mention-volume timeline built from ``symbol_sentiment_daily`` -- all on one
+shared time axis.
 """
 
 from __future__ import annotations
 
+import datetime as dt
+
 import streamlit as st
 
-from claudetrade.ui.formatting import (
-    format_confidence,
-    format_date,
-    format_price,
-    format_status,
-    show_disclaimer,
-)
+from claudetrade.domain import SignalStatus
+from claudetrade.ui import theme
+from claudetrade.ui.charts import create_ticker_chart
+from claudetrade.ui.components.layout import page_header
+from claudetrade.ui.components.tables import empty_state
+from claudetrade.ui.data_access import earnings_dates, known_symbols, price_bars, sentiment_timeline
+from claudetrade.ui.formatting import format_confidence, format_date, format_price, format_status
 from claudetrade.ui.state import get_config, get_pipeline
+
+
+def active_signal(signals):
+    """The signal to draw entry/stop/target levels for: the newest tradable one.
+
+    Falls back to the newest signal overall if none is currently tradable, so
+    the chart still shows the most recent thesis's levels even after it has
+    triggered or expired. Pure helper -- unit-testable without Streamlit.
+    """
+    if not signals:
+        return None
+    tradable = [s for s in signals if s.is_tradable]
+    pool = tradable or signals
+    return max(pool, key=lambda s: s.created_at)
 
 
 def page_ticker_detail() -> None:
     """Render the ticker detail page."""
-    st.set_page_config(page_title="Ticker Detail", layout="wide")
-    st.title("📈 Ticker Detail")
-    show_disclaimer()
-
     config = get_config()
     pipeline = get_pipeline(config)
+    theme.inject_css()
+    page_header("📈", "Ticker Detail", "Full technical, signal, and sentiment picture for one symbol.")
 
-    # --- Symbol Selection ---
-    st.subheader("Select Symbol")
-    symbol = st.text_input(
-        "Enter ticker symbol",
-        value="",
-        placeholder="e.g., AAPL",
-        key="ticker_input",
-    ).upper()
-
-    if not symbol:
-        st.info("Enter a ticker symbol to view details")
+    try:
+        symbols = known_symbols(pipeline.db)
+    except Exception as exc:
+        st.error(f"Could not load the symbol list: {exc}")
         return
 
-    # --- Fetch Symbol Signals ---
+    if not symbols:
+        empty_state(
+            "No symbols with stored price history yet.",
+            "claudetrade refresh",
+        )
+        return
+
+    default_symbol = _default_symbol(pipeline, symbols)
+    symbol = st.selectbox(
+        "Symbol",
+        options=symbols,
+        index=symbols.index(default_symbol) if default_symbol in symbols else 0,
+        key="ticker_symbol_select",
+    )
+
     try:
         signals = pipeline.ledger.for_symbol(symbol, limit=50)
-    except Exception as e:
-        st.error(f"Error loading signals: {e}")
+    except Exception as exc:
+        st.error(f"Error loading signals for {symbol}: {exc}")
         signals = []
 
-    if not signals:
-        st.warning(f"No signals found for {symbol}")
+    _render_current_signal(pipeline, symbol, signals)
+    _render_chart(config, pipeline, symbol, signals)
+    _render_signal_history(pipeline, signals)
+
+
+def _default_symbol(pipeline, symbols: list[str]) -> str | None:
+    try:
+        recent = pipeline.ledger.recent(limit=50)
+    except Exception:
+        return symbols[0] if symbols else None
+    if not recent:
+        return symbols[0] if symbols else None
+    best = max(recent, key=lambda s: s.overall_score)
+    return best.symbol
+
+
+def _render_current_signal(pipeline, symbol: str, signals) -> None:
+    st.subheader(f"Current Signal: {symbol}")
+    sig = active_signal(signals)
+    if sig is None:
+        empty_state(
+            f"No signals recorded for {symbol} yet.",
+            "claudetrade scan",
+        )
         return
 
-    # --- Current Signal (if any) ---
-    latest_signal = signals[0] if signals else None
-    if latest_signal:
-        st.subheader(f"Current Signal: {symbol}")
-        col1, col2, col3 = st.columns(3)
+    status = pipeline.ledger.current_status(sig.signal_id)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Score", f"{sig.overall_score:.0f}")
+        st.metric("Confidence", format_confidence(sig.confidence))
+    with col2:
+        st.metric("Status", format_status(status.value if status else "unknown"))
+        st.metric("Direction", theme.direction_label(str(sig.direction)))
+    with col3:
+        st.metric("Entry Zone", f"{format_price(sig.plan.entry_low)} - {format_price(sig.plan.entry_high)}")
+        st.metric("Stop Loss", format_price(sig.plan.stop_loss))
 
-        with col1:
-            st.metric("Score", f"{latest_signal.overall_score:.0f}")
-            st.metric("Confidence", format_confidence(latest_signal.confidence))
-
-        with col2:
-            status = pipeline.ledger.current_status(latest_signal.signal_id)
-            st.metric("Status", format_status(status.value if status else "unknown"))
-            st.metric("Strategy", latest_signal.strategy)
-
-        with col3:
-            st.metric("Entry Range",
-                     f"${latest_signal.plan.entry_low:.2f} - ${latest_signal.plan.entry_high:.2f}")
-            st.metric("Stop Loss", format_price(latest_signal.plan.stop_loss))
-
-        # Proposed Levels
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.write("**Entry Target**")
-            st.write(f"Low: {format_price(latest_signal.plan.entry_low)}")
-            st.write(f"High: {format_price(latest_signal.plan.entry_high)}")
-
-        with col2:
-            st.write("**Stop Loss**")
-            st.write(format_price(latest_signal.plan.stop_loss))
-            st.write(f"Risk: {format_price(latest_signal.plan.risk_per_share)}")
-
-        with col3:
-            st.write("**Targets**")
-            if latest_signal.plan.targets:
-                for i, target in enumerate(latest_signal.plan.targets):
-                    st.write(f"T{i+1}: {format_price(target)}")
-            else:
-                st.write("No targets")
-
-        # Thesis & Invalidation
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("**Thesis**")
-            st.write(latest_signal.thesis if latest_signal.thesis else "No thesis available")
-
-        with col2:
-            st.write("**Invalidation Conditions**")
-            if latest_signal.invalidation:
-                for cond in latest_signal.invalidation:
-                    st.write(f"- {cond}")
-            else:
-                st.write("No invalidation conditions")
-
-        # Component Breakdown
-        st.subheader("Component Scores")
-        components = latest_signal.components.as_dict()
+    with st.expander("Thesis, invalidation and component scores", expanded=False):
+        st.write(f"**Thesis**: {sig.thesis or 'No thesis available'}")
+        st.write(
+            "**Invalidation**: "
+            + (", ".join(sig.invalidation) if sig.invalidation else "none recorded")
+        )
         cols = st.columns(4)
-        for i, (name, score) in enumerate(components.items()):
-            with cols[i % 4]:
-                st.metric(name, f"{score:.0f}")
+        for i, (name, score) in enumerate(sig.components.as_dict().items()):
+            cols[i % 4].metric(name.replace("_", " ").title(), f"{score:.0f}")
 
-    # --- Signal History ---
-    st.subheader("Signal History")
-    try:
-        if signals:
-            history_data = []
-            for sig in signals[:20]:
-                status = pipeline.ledger.current_status(sig.signal_id)
-                history_data.append({
-                    "Date": format_date(sig.session),
-                    "Strategy": sig.strategy,
-                    "Direction": "📈 LONG" if str(sig.direction) == "long" else "📉 SHORT",
-                    "Score": f"{sig.overall_score:.0f}",
-                    "Status": format_status(status.value if status else "unknown"),
-                    "Entry Range": f"${sig.plan.entry_low:.2f}-${sig.plan.entry_high:.2f}",
-                })
-            st.dataframe(history_data, use_container_width=True)
-        else:
-            st.info("No signal history available")
-    except Exception as e:
-        st.error(f"Error loading signal history: {e}")
 
-    # --- Sentiment Timeline ---
-    st.subheader("Sentiment Timeline")
-    try:
-        # Placeholder: sentiment data would come from the sentiment aggregation
-        st.info("Sentiment timeline data not yet available in this view")
-    except Exception as e:
-        st.warning(f"Could not load sentiment data: {e}")
-
-    # --- Earnings Dates ---
-    st.subheader("Earnings Calendar")
-    try:
-        if latest_signal and latest_signal.next_earnings_date:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write(f"**Next Earnings**: {format_date(latest_signal.next_earnings_date)}")
-            with col2:
-                if latest_signal.days_to_earnings is not None:
-                    st.write(f"**Days to Earnings**: {latest_signal.days_to_earnings}")
-        else:
-            st.info("No upcoming earnings date found")
-    except Exception as e:
-        st.warning(f"Could not load earnings data: {e}")
-
-    # --- Technical Chart ---
+def _render_chart(config, pipeline, symbol: str, signals) -> None:
     st.subheader("Price Action")
+
+    ctl1, ctl2, ctl3, ctl4 = st.columns(4)
+    with ctl1:
+        lookback_days = st.slider(
+            "Lookback (days)", min_value=60, max_value=1000,
+            value=int(config.ui.chart_lookback_days), step=30,
+        )
+    with ctl2:
+        sma_choices = st.multiselect(
+            "Moving averages", options=[20, 50, 200], default=[20, 50],
+            format_func=lambda w: f"SMA {w}",
+        )
+    with ctl3:
+        show_bollinger = st.checkbox("Bollinger Bands (20, 2 stdev)", value=False)
+    with ctl4:
+        show_rsi = st.checkbox("RSI panel", value=True)
+
+    end = dt.datetime.now(dt.UTC).date()
+    start = end - dt.timedelta(days=lookback_days)
     try:
-        st.info("Candlestick chart rendering requires market data integration")
-    except Exception as e:
-        st.error(f"Error loading chart data: {e}")
+        bars = price_bars(pipeline.db, symbol, start=start, end=end)
+    except Exception as exc:
+        st.error(f"Could not load price history: {exc}")
+        return
+
+    if not bars:
+        empty_state(
+            f"No price history stored for {symbol} in the last {lookback_days} days.",
+            "claudetrade refresh",
+        )
+        return
+
+    sig = active_signal(signals)
+    entry_low = entry_high = stop_loss = None
+    targets: list[float] = []
+    if sig is not None and sig.status not in (SignalStatus.EXPIRED, SignalStatus.REJECTED):
+        entry_low, entry_high = sig.plan.entry_low, sig.plan.entry_high
+        stop_loss = sig.plan.stop_loss
+        targets = list(sig.plan.targets)
+
+    try:
+        report_dates = earnings_dates(pipeline.db, symbol)
+    except Exception:
+        report_dates = []
+
+    try:
+        sentiment = sentiment_timeline(pipeline.db, symbol)
+        sentiment = [p for p in sentiment if start <= p.session <= end]
+    except Exception:
+        sentiment = []
+
+    fig = create_ticker_chart(
+        bars,
+        title=f"{symbol} -- {len(bars)} sessions",
+        sma_windows=tuple(sorted(sma_choices)),
+        show_bollinger=show_bollinger,
+        show_rsi=show_rsi,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        stop_loss=stop_loss,
+        targets=targets,
+        earnings_dates=report_dates,
+        sentiment=sentiment,
+    )
+    st.plotly_chart(fig, theme=None, config={"displayModeBar": True, "displaylogo": False})
+
+    if not sentiment:
+        st.caption(
+            "No sentiment/mention data for this symbol in the selected window -- run "
+            "`claudetrade refresh` with social sources enabled to populate it."
+        )
+    upcoming = [d for d in report_dates if d >= end]
+    if upcoming:
+        st.caption(f"Next earnings: {format_date(upcoming[0])} ({(upcoming[0] - end).days} days out)")
+    else:
+        st.caption("No upcoming earnings date on file for this symbol.")
+
+
+def _render_signal_history(pipeline, signals) -> None:
+    st.subheader("Signal History")
+    if not signals:
+        empty_state("No signal history for this symbol yet.", "claudetrade scan")
+        return
+    rows = []
+    for sig in signals[:25]:
+        status = pipeline.ledger.current_status(sig.signal_id)
+        rows.append(
+            {
+                "Session": sig.session,
+                "Strategy": sig.strategy,
+                "Direction": theme.direction_label(str(sig.direction)),
+                "Score": sig.overall_score,
+                "Status": format_status(status.value if status else "unknown"),
+                "Entry Low": sig.plan.entry_low,
+                "Entry High": sig.plan.entry_high,
+            }
+        )
+    st.dataframe(
+        rows,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
+            "Entry Low": st.column_config.NumberColumn(format="$%.2f"),
+            "Entry High": st.column_config.NumberColumn(format="$%.2f"),
+            "Session": st.column_config.DateColumn(),
+        },
+    )
