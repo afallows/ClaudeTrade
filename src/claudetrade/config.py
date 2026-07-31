@@ -389,6 +389,12 @@ class RedditConfig(BaseModel):
             "SecurityAnalysis",
             "options",
             "swingtrading",
+            # Highest-volume hype venue; strategies A (sentiment breakout)
+            # and D (hype-failure short) need visibility into it.
+            "wallstreetbets",
+            # Half the universe is TSX-listed; US-centric subreddits barely
+            # mention Canadian names.
+            "CanadianInvestor",
         ]
     )
     #: Reddit caps a listing page at 100 items, so a busy subreddit needs
