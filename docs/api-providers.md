@@ -20,7 +20,7 @@ Then in config:
 
 ```toml
 [ai]
-api_key_credential = "anthropic_api_key"
+anthropic_api_key_credential = "anthropic_api_key"
 ```
 
 The system looks up `CLAUDETRADE_SECRET_ANTHROPIC_API_KEY` at runtime.
@@ -1005,17 +1005,30 @@ exercised in `tests/test_reddit_provider.py`.
 
 **Licence**: Reddit data is subject to Reddit's API terms and user agreement. Commercial use of aggregated social data may require permission. The cookie-session and public-JSON paths are additionally ToS-gray for automated use -- see above.
 
-### X/Twitter (Paid API v2, or an opt-in cookie-session mode)
+### X/Twitter (Paid API v2, or the owner's own session -- on by default when credentialed)
 
 **Module**: `src/claudetrade/providers/social/x_provider.py`
+
+**Auto-enabled (owner directive, 2026-07-31)**: mirroring Reddit's
+cookie-session self-selection, both `x.enabled` and `x.session_enabled`
+default to `true` -- "use if credentialed", not "on unconditionally". With
+no bearer token and no session cookies configured, this source stays
+disabled cleanly exactly as before; the moment either resolves from the
+secrets store, it activates on the next refresh with no separate flag to
+flip. Both remain explicit, operator-settable disable knobs: `x.enabled =
+false` turns X off outright regardless of credentials, and
+`x.session_enabled = false` keeps the official-API path (if configured)
+while refusing to ever attempt the ToS-risking cookie-session path even if
+`x_auth_token`/`x_ct0` are stored.
 
 Two independent live paths, tried in this order at construction time:
 
 1. **Official API v2** (`bearer_credential`). Requires a paid tier for
    meaningful search volume. Always preferred when configured -- ADR-0008
    Decision 1 requires the official API remain first-choice.
-2. **Cookie-session mode** (`x.session_enabled = true`), only reached when
-   no bearer token is configured. See below.
+2. **Cookie-session mode** (`x.session_enabled`, default `true`), only
+   reached when no bearer token is configured and both session cookies
+   resolve. See below.
 
 **Setup (official API)**:
 
@@ -1056,7 +1069,7 @@ claudetrade secrets set x_bearer_token
 
 **Licence**: X/Twitter data is subject to X's API terms. Redistribution restrictions apply.
 
-#### X cookie-session mode (opt-in, off by default -- ADR-0008 Decision 1)
+#### X cookie-session mode (auto-enabled when credentialed -- ADR-0008 Decision 1)
 
 **PLAIN ACCOUNT-RISK STATEMENT**: this mode automates the owner's own
 logged-in x.com session against the internal, unversioned GraphQL endpoints
@@ -1065,17 +1078,30 @@ can lead to suspension of that X account.** This application never bundles
 or defaults these credentials, never solves a CAPTCHA or challenge, and
 never rotates a fingerprint or proxy to work around a block -- it disables
 the source for the rest of the cycle instead. The owner accepts this risk
-for their own account; this mode is off by default
-(`x.session_enabled = false`) and must be explicitly turned on.
+for their own account, for personal use only, and per the owner's explicit
+2026-07-31 directive this mode now **auto-activates** the moment both
+session cookies resolve from the secrets store -- `x.session_enabled`
+defaults to `true` (an explicit disable knob, not a required opt-in), the
+same posture Reddit's cookie-session mode already has. Set
+`x.session_enabled = false` to refuse this path outright regardless of
+whether the cookies are configured.
 
-**How to export your session cookies** (Chrome/Edge/Firefox devtools):
+**How to export your session cookies** (Chrome/Edge/Firefox devtools -- this
+is also exactly what the Configuration screen's inline instructions and the
+"Test" button next to the X credential fields expect):
 
-1. Log in to x.com in your browser as normal.
+1. Log in to x.com in your browser as normal, using your own account.
 2. Open devtools (F12) -> **Application** tab (Chrome/Edge) or **Storage**
    tab (Firefox) -> **Cookies** -> `https://x.com`.
-3. Find the cookie named `auth_token`; copy its **Value**.
+3. Find the cookie named `auth_token`; copy its **Value**. This cookie is
+   **long-lived** (weeks), similar to Reddit's `reddit_session` cookie.
 4. Find the cookie named `ct0` (the CSRF token cookie); copy its **Value**.
-5. Store both via the credential store, never in `config.toml`:
+   `ct0` is the CSRF token paired with `auth_token` for this same session --
+   both are sent together on every session-mode request (see
+   `x_provider.py`'s `_fetch_session_query`), so re-export both together if
+   session mode starts failing after a while.
+5. Store both via the credential store, never in `config.toml`, or via the
+   Configuration screen's X credential fields:
 
 ```bash
 claudetrade secrets set x_auth_token
@@ -1085,11 +1111,17 @@ export CLAUDETRADE_SECRET_X_AUTH_TOKEN="..."
 export CLAUDETRADE_SECRET_X_CT0="..."
 ```
 
-**Configuration**:
+6. Use the Configuration screen's **Test** button next to the X credential
+   fields (or `POST /api/system/credentials/x/test`) to confirm the
+   cookies work -- see "Validating the internal endpoint constants" below.
+
+**Configuration** (only `session_symbols` needs setting -- the rest are the
+defaults):
 
 ```toml
 [x]
-session_enabled = true
+enabled = true                         # default; explicit disable knob
+session_enabled = true                 # default; explicit disable knob
 auth_token_credential = "x_auth_token"
 ct0_credential = "x_ct0"
 session_symbols = ["AAPL", "MSFT"]     # cashtag-searched; leading $ added automatically
@@ -1097,6 +1129,20 @@ session_max_results_per_query = 40
 session_rate_limit_per_minute = 6      # deliberately stricter than the official API default
 session_request_timeout_s = 20.0
 ```
+
+**Validating the internal endpoint constants (`x_provider.py`'s "expected
+maintenance" note)**: session mode calls x.com's internal, unversioned
+GraphQL API, whose path and query ID (`_SEARCH_GRAPHQL_QUERY_ID` in
+`x_provider.py`) x.com changes without notice -- see the "Endpoint
+stability" note below for the full explanation and why this sandbox could
+not verify a live query ID while building this adapter. The
+Configuration screen's **Test** button (`POST
+/api/system/credentials/x/test`) is the owner's fast, low-risk way to
+validate those constants against the real API: it makes exactly one small
+live fetch using the configured mode and reports pass/fail plus a short
+detail string, without waiting for a full scheduled refresh to discover the
+same failure. A `SourceBlockedError` result there is the first, fastest
+signal that the constants block needs a fresh browser capture.
 
 **Endpoint stability (read before relying on this mode)**: the GraphQL
 endpoint path and query ID this adapter calls are internal to x.com's web
@@ -1420,9 +1466,17 @@ point of a stub.
 
 ## AI Providers
 
-### Null (Default, Rules-Based)
+**Full setup walkthrough (key creation, cost caps, privacy, what AI does and
+does not influence): see [`docs/ai-setup.md`](ai-setup.md).** This section
+is the provider-adapter reference; that guide is the operator-facing
+how-to, including the Configuration screen's "AI Analysis" section and its
+Test button.
 
-**Module**: `src/claudetrade/providers/ai/null_provider.py`
+AI is an **opt-in ensemble adjunct** for sentiment classification, never
+the decision-maker -- `sentiment.classifiers.RuleSentimentClassifier` is
+the mandatory, always-on rule-based floor regardless of `ai.provider`.
+
+### None (Default, Rules-Based)
 
 No external AI calls. Sentiment is computed deterministically using rule-based classifiers.
 
@@ -1430,7 +1484,7 @@ No external AI calls. Sentiment is computed deterministically using rule-based c
 
 ```toml
 [ai]
-provider = "null"
+provider = "none"
 ```
 
 **Characteristics**:
@@ -1444,23 +1498,37 @@ provider = "null"
 
 **Module**: `src/claudetrade/providers/ai/anthropic_provider.py`
 
-Uses Claude (Sonnet, Haiku, Opus) for sentiment classification.
+Uses the **official `anthropic` Python SDK** (an optional dependency --
+`pip install claudetrade[anthropic]`, lazy-imported so the base install
+never needs it; a clear, actionable error is raised only if you select
+`provider = "anthropic"` without it installed). Calls
+`client.messages.create(...)` with **structured outputs**
+(`output_config.format`, a JSON Schema) so the per-post sentiment JSON
+parses reliably; `temperature`/`top_p`/`top_k` are never sent (removed on
+current Claude models -- sending them returns an error). Thinking is
+explicitly disabled for this call (a short, bounded classification task
+does not benefit from it). Typed SDK exceptions
+(`anthropic.RateLimitError`, `anthropic.APIStatusError`,
+`anthropic.APIConnectionError`) are all mapped into the same
+degrade-to-rules contract every other failure mode uses -- this module
+never raises into the pipeline.
 
 **Setup**:
 
-1. Go to https://console.anthropic.com/
-2. Create an account and generate an API key
-3. Note your **API Key** (starts with `sk-ant-`)
+1. Go to **platform.claude.com** (formerly console.anthropic.com)
+2. Create an account (or sign in) and open **API Keys**
+3. Create a new key -- it starts with `sk-ant-`
+4. Paste it into the Configuration screen's "Anthropic (Claude) API key"
+   field, or store it via the credential store (below)
 
 **Configuration**:
 
 ```toml
 [ai]
 provider = "anthropic"
-model = "claude-sonnet-5"
-api_key_credential = "anthropic_api_key"
-max_output_tokens = 900
-temperature = 0.0
+model = ""                                # blank = "claude-opus-5" (the built-in default)
+anthropic_api_key_credential = "anthropic_api_key"
+max_output_tokens = 1024
 request_timeout_s = 45.0
 max_calls_per_run = 250
 daily_cost_limit_usd = 5.0
@@ -1477,11 +1545,17 @@ export CLAUDETRADE_SECRET_ANTHROPIC_API_KEY="sk-ant-..."
 claudetrade secrets set anthropic_api_key
 ```
 
+**Model choice**: the built-in default is `claude-opus-5` ($5.00/$25.00 per
+million input/output tokens). `claude-haiku-4-5` ($1.00/$5.00 per million
+tokens) is the economical choice for high-volume per-post classification --
+set `model = "claude-haiku-4-5"` explicitly. This tradeoff is an operator
+decision this module does not make for you.
+
 **Cost Tracking**:
 
 ```toml
-input_cost_per_mtok_usd = 3.0    # Update to current pricing
-output_cost_per_mtok_usd = 15.0
+input_cost_per_mtok_usd = 5.0     # Claude Opus 5's published rate; update to match your model
+output_cost_per_mtok_usd = 25.0   # e.g. 1.0 / 5.0 for claude-haiku-4-5
 daily_cost_limit_usd = 5.0
 ```
 
@@ -1489,10 +1563,11 @@ The system tracks costs locally and refuses requests once the daily limit is exc
 
 **Limitations**:
 
-- Requires API key and account
+- Requires the `anthropic` package installed (`pip install
+  claudetrade[anthropic]`) and an API key/account
 - Token usage is billable
 - No real-time rate limiting on the server; respect the configured limits
-- LLM outputs are non-deterministic (even with `temperature=0.0`, precision varies)
+- LLM outputs are non-deterministic
 
 **Licence**: Subject to Anthropic's API terms and privacy policy.
 
@@ -1500,23 +1575,30 @@ The system tracks costs locally and refuses requests once the daily limit is exc
 
 **Module**: `src/claudetrade/providers/ai/openai_provider.py`
 
-Uses GPT-4, GPT-3.5, etc.
+Uses the **official `openai` Python SDK** (an optional dependency -- `pip
+install claudetrade[openai]`, lazy-imported the same way as the Anthropic
+adapter). Calls `client.chat.completions.create(...)` with JSON-schema
+structured output mode against the same sentiment schema the Anthropic
+adapter uses. The same typed-exception degrade contract applies
+(`openai.RateLimitError`, `openai.APIStatusError`,
+`openai.APIConnectionError`).
 
 **Setup**:
 
-1. Go to https://platform.openai.com/
-2. Create an account and generate an API key
-3. Note your **API Key** (starts with `sk-`)
+1. Go to **platform.openai.com**
+2. Create an account (or sign in), add a payment method, and open **API keys**
+3. Create a new key -- it starts with `sk-`
+4. Paste it into the Configuration screen's "OpenAI (ChatGPT) API key"
+   field, or store it via the credential store (below)
 
 **Configuration**:
 
 ```toml
 [ai]
 provider = "openai"
-model = "gpt-4"
-api_key_credential = "openai_api_key"
-max_output_tokens = 900
-temperature = 0.0
+model = ""                                # blank = the built-in default; verify at platform.openai.com
+openai_api_key_credential = "openai_api_key"
+max_output_tokens = 1024
 request_timeout_s = 45.0
 max_calls_per_run = 250
 daily_cost_limit_usd = 5.0
@@ -1534,17 +1616,21 @@ claudetrade secrets set openai_api_key
 
 **Cost Tracking**:
 
-Update the per-token costs to match OpenAI's current pricing (changes frequently):
+OpenAI's model lineup and pricing move faster than this document can track
+-- check https://platform.openai.com before relying on the built-in default
+model name, and update the per-token costs to match whichever model you
+configure:
 
 ```toml
-input_cost_per_mtok_usd = 0.005    # GPT-4 example; check OpenAI's pricing
-output_cost_per_mtok_usd = 0.015
+input_cost_per_mtok_usd = 0.15    # example only -- check current pricing
+output_cost_per_mtok_usd = 0.60
 daily_cost_limit_usd = 5.0
 ```
 
 **Limitations**:
 
-- Requires API key and account with payment method
+- Requires the `openai` package installed (`pip install
+  claudetrade[openai]`) and an API key/account with a payment method
 - Token usage is billable
 - LLM outputs are non-deterministic
 
@@ -1572,7 +1658,7 @@ provider = "synthetic"
 provider = "synthetic"
 
 [ai]
-provider = "null"
+provider = "none"
 ```
 
 Everything runs offline, deterministically, and requires no credentials.
@@ -1598,7 +1684,7 @@ provider = "synthetic"
 provider = "synthetic"
 
 [ai]
-provider = "null"
+provider = "none"
 ```
 
 This lets you test with real bars but still runs offline.
@@ -1623,7 +1709,7 @@ provider = "reddit"
 enabled = false
 
 [ai]
-provider = "null"
+provider = "none"
 ```
 
 This costs nothing and provides real data + social sentiment.
@@ -1710,6 +1796,7 @@ Market data is older than `market_data.stale_after_hours`.
 - **Social media**: Posts are sanitised; usernames are hashed. Raw text is not logged.
 - **News**: Item text is sanitised the same way; there is no username to hash, so the author hash is a salted digest of the feed's own domain (publisher-level, not personal data).
 - **Sentiment**: Aggregated; individual posts are not visible in output.
+- **AI providers** (`ai.provider != "none"`): the sanitised post text and target symbol -- never usernames, author ids, karma, follower counts, or post history -- are sent to the configured provider's API (Anthropic or OpenAI). See [docs/ai-setup.md](ai-setup.md) for the full privacy note. With the default `ai.provider = "none"`, nothing is ever sent to an external AI provider.
 - **Audit log**: Credential access is logged but not the value.
 - **Database**: Market and earnings data is retained indefinitely for backtesting.
 

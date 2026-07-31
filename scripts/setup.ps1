@@ -220,6 +220,16 @@ function Exit-Setup {
     Write-Host ""
     if ($Code -eq 0) {
         Write-Host "Setup finished (exit code 0). Transcript: $LogPath" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "-----------------------------------------------------------------" -ForegroundColor Cyan
+        Write-Host "Optional: enable AI-assisted sentiment." -ForegroundColor Cyan
+        Write-Host "  Open the Configuration screen -> AI Analysis and follow the" -ForegroundColor Cyan
+        Write-Host "  instructions there to connect Claude or ChatGPT. This is purely" -ForegroundColor Cyan
+        Write-Host "  optional and setup does not block on it -- rules-based sentiment" -ForegroundColor Cyan
+        Write-Host "  always runs on its own; AI, if configured, is an ensemble adjunct" -ForegroundColor Cyan
+        Write-Host "  on top of it, never the sole basis of a signal." -ForegroundColor Cyan
+        Write-Host "  Details: docs\ai-setup.md" -ForegroundColor Cyan
+        Write-Host "-----------------------------------------------------------------" -ForegroundColor Cyan
     } else {
         Write-Host "Setup stopped early (exit code $Code). Transcript: $LogPath" -ForegroundColor Red
     }

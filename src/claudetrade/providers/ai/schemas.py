@@ -151,6 +151,70 @@ class ThesisSummary(StrictSchema):
     )
 
 
+#: Raw JSON Schema for the Anthropic/OpenAI structured-output request
+#: (``output_config.format`` / ``response_format``), mirroring
+#: ``SentimentClassification`` above field-for-field. Deliberately omits
+#: ``minimum``/``maximum`` on every numeric field -- current structured-output
+#: implementations do NOT support numerical range constraints in the schema
+#: (see ``claude-api`` skill's Structured Outputs -> JSON Schema Limitations:
+#: "Not supported: Numerical constraints (minimum, maximum, multipleOf)").
+#: Range enforcement instead happens locally, twice: ``validate_ai_payload``
+#: above (via the ``ge=0.0, le=1.0`` Pydantic ``Field`` constraints on
+#: ``SentimentClassification`` itself) and, redundantly,
+#: ``sentiment.ai_classifier._validate_schema``. A response that is
+#: syntactically valid JSON matching this schema but semantically
+#: out-of-range (a model bug, not something ``additionalProperties: false``
+#: can catch) is rejected by those checks, not this schema.
+SENTIMENT_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "bullish": {"type": "number", "description": "Upside bias or confidence in price increase"},
+        "bearish": {"type": "number", "description": "Downside bias or price decline signal"},
+        "neutral": {"type": "number", "description": "Factual or analytical without directional bias"},
+        "uncertainty": {"type": "number", "description": "Expresses doubt or conditional phrasing"},
+        "sarcasm": {"type": "number", "description": "Ironic or sarcastic tone, surface meaning inverted"},
+        "fear": {"type": "number", "description": "Anxiety, risk, or catastrophe signal"},
+        "hype": {"type": "number", "description": "Exaggerated enthusiasm or pump language"},
+        "fomo": {"type": "number", "description": "Fear of missing out, urgency to act"},
+        "capitulation": {"type": "number", "description": "Surrender or giving up after losses"},
+        "earnings_speculation": {"type": "number", "description": "Guessing or predicting earnings outcomes"},
+        "product_catalyst": {"type": "number", "description": "Product launch, release or feature news"},
+        "regulatory_catalyst": {"type": "number", "description": "Regulatory, legal or compliance event"},
+        "rumour": {"type": "number", "description": "Unconfirmed report or hearsay"},
+        "short_squeeze": {"type": "number", "description": "Reference to short covering or squeeze dynamics"},
+        "pump_and_dump": {"type": "number", "description": "Coordinated promotion or artificial hype"},
+        "position_disclosure": {"type": "number", "description": "Disclosure or claim of personal position"},
+        "confidence": {"type": "number", "description": "Confidence in this classification"},
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "0-5 short quoted spans supporting the labels",
+        },
+    },
+    "required": [
+        "bullish",
+        "bearish",
+        "neutral",
+        "uncertainty",
+        "sarcasm",
+        "fear",
+        "hype",
+        "fomo",
+        "capitulation",
+        "earnings_speculation",
+        "product_catalyst",
+        "regulatory_catalyst",
+        "rumour",
+        "short_squeeze",
+        "pump_and_dump",
+        "position_disclosure",
+        "confidence",
+        "evidence",
+    ],
+    "additionalProperties": False,
+}
+
+
 # --- Registry and validation -----------------------------------------------
 
 
@@ -160,6 +224,16 @@ SCHEMA_REGISTRY: dict[str, type[BaseModel]] = {
     "CatalystExtraction": CatalystExtraction,
     "SpamAssessment": SpamAssessment,
     "ThesisSummary": ThesisSummary,
+    # Alias: sentiment.ai_classifier.SCHEMA_NAME ("sentiment_classification_v1")
+    # is the schema_name every AIRequest for sentiment classification is
+    # actually built with (see AISentimentClassifier.classify_batch) -- and
+    # is also the value stamped into the cache key and the "ai:<model>"
+    # classifier tag on SentimentScores, so it is not free to rename. Without
+    # this alias, validate_ai_payload's lookup by that exact string always
+    # missed (falling through to "unknown schema: ..."), so every real
+    # Anthropic/OpenAI classification call silently failed schema validation
+    # regardless of how well-formed the model's JSON was.
+    "sentiment_classification_v1": SentimentClassification,
 }
 
 

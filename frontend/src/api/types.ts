@@ -325,6 +325,21 @@ export interface CredentialTestResult {
   status_detail: string;
 }
 
+export interface AIConfig {
+  provider: 'anthropic' | 'openai' | 'none';
+  model: string;
+  anthropic_default_model: string;
+  openai_default_model: string;
+  anthropic_api_key_credential: string;
+  openai_api_key_credential: string;
+}
+export interface AIConfigUpdateResult {
+  provider: string;
+  model: string;
+  persisted: boolean;
+  note: string;
+}
+
 export interface RefreshStatus {
   running: boolean;
   phase: string;

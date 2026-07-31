@@ -98,10 +98,17 @@ request_timeout_s = 20.0
 store_author_names = false                # Store only salted hashes of usernames, never plaintext
 
 [x]
-# X (Twitter) API v2. Requires a paid tier for meaningful search volume.
-# Disabled by default; enable only with valid credentials.
-enabled = false
-provider = "synthetic"                    # Options: synthetic (offline), x (requires API v2)
+# X (Twitter): official API v2 (requires a paid tier for meaningful search
+# volume) or an opt-in cookie-session mode using the owner's own logged-in
+# x.com session (auth_token/ct0 cookies -- see docs/api-providers.md for how
+# to export them). Auto-enabled (owner directive, 2026-07-31): both
+# `enabled` and `session_enabled` default to true, mirroring Reddit's
+# cookie-session self-selection -- "use if credentialed", not "on
+# unconditionally". With no bearer token and no session cookies configured,
+# this source stays cleanly disabled exactly as before. Set either flag to
+# false to explicitly opt out.
+enabled = true
+provider = "synthetic"                    # Options: synthetic (offline), x (requires API v2 or session cookies)
 bearer_credential = "x_bearer_token"      # Environment variable or keyring lookup name
 query_terms = []                          # Search terms, e.g. ["$AAPL", "Apple earnings"]
 max_results_per_query = 100
@@ -109,17 +116,28 @@ lookback_hours = 48
 rate_limit_per_minute = 15                # Paid tier is stricter; adjust if using higher tier
 request_timeout_s = 20.0
 store_author_names = false
+# --- Cookie-session mode (owner's own personal session; ToS-risking) ------
+session_enabled = true                    # Explicit disable knob; auto-activates when auth_token/ct0 resolve
+auth_token_credential = "x_auth_token"
+ct0_credential = "x_ct0"
+session_symbols = []                      # Cashtag-searched watchlist, e.g. ["AAPL", "MSFT"]
+session_max_results_per_query = 40
+session_rate_limit_per_minute = 6
+session_request_timeout_s = 20.0
 
 [ai]
-# Optional LLM assistance for sentiment classification.
-# The system is fully functional with provider = "null" (default).
-# All AI output is subject to hard risk controls that it cannot relax.
-provider = "null"                         # Options: null (rules only), openai, anthropic
-model = "claude-sonnet-5"                 # Model identifier (selected provider's naming)
-api_key_credential = "anthropic_api_key"  # Environment variable or keyring lookup name
+# Optional LLM-assisted sentiment classification -- an ensemble ADJUNCT,
+# never the decision-maker. The system is fully functional with
+# provider = "none" (default); the rules-based classifier is the mandatory
+# floor whether or not AI is configured. See docs/ai-setup.md for the full
+# setup walkthrough (Claude and ChatGPT key creation, cost caps, privacy).
+provider = "none"                         # Options: none (rules only), anthropic, openai
+model = ""                                # Empty = provider's own default (claude-opus-5 / see openai_provider.py)
+anthropic_api_key_credential = "anthropic_api_key"  # Environment variable or keyring lookup name
+openai_api_key_credential = "openai_api_key"        # Environment variable or keyring lookup name
 base_url = ""                             # Custom API endpoint (if any)
-max_output_tokens = 900                   # Maximum response length
-temperature = 0.0                         # 0 = deterministic; keep low for classification
+max_output_tokens = 1024                  # Maximum response length
+temperature = 0.0                         # Reserved, currently unused by either shipped adapter -- see AIConfig.temperature
 request_timeout_s = 45.0
 max_calls_per_run = 250                   # Cap API calls per scan/backtest run
 daily_cost_limit_usd = 5.0                # Refuse requests once daily cost exceeds this
@@ -128,8 +146,12 @@ cache_ttl_hours = 168                     # Cache validity (1 week)
 injection_block_threshold = 0.4           # Posts scoring above this on injection heuristic are never sent to AI
 batch_size = 12                           # Posts per classification batch
 prompt_version = "v1"                     # Prompt template version
-input_cost_per_mtok_usd = 3.0             # Local cost tracking (update to current pricing)
-output_cost_per_mtok_usd = 15.0
+# Local cost tracking; defaults are Claude Opus 5's published rate ($5/$25
+# per MTok in/out). claude-haiku-4-5 is $1/$5 per MTok -- the economical
+# choice for high-volume per-post classification; update these two lines to
+# match whichever model you actually configure above.
+input_cost_per_mtok_usd = 5.0
+output_cost_per_mtok_usd = 25.0
 
 [universe]
 # Which securities are eligible for scanning and trading.

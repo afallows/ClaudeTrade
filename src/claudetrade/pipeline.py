@@ -337,7 +337,7 @@ class Pipeline:
             providers={
                 "market": getattr(self.market, "name", "unknown"),
                 "earnings": getattr(self.earnings, "name", "unknown"),
-                "ai": getattr(self.ai, "name", "null"),
+                "ai": getattr(self.ai, "name", "none"),
             },
             universe_size=len(candidates),
         )

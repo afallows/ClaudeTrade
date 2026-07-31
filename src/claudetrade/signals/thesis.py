@@ -143,7 +143,7 @@ def polish_thesis(
         normal path, not an error.
     """
     metadata: dict[str, object] = {"ai_used": False}
-    if config.ai.provider == "null":
+    if config.ai.provider == "none":
         metadata["reason"] = "ai disabled"
         return original, metadata
 

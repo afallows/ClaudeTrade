@@ -479,7 +479,7 @@ def get_ai_provider(config: AppConfig) -> AIProvider:
     Returns:
         An AIProvider instance.
     """
-    if config.ai.provider == "null":
+    if config.ai.provider == "none":
         return _NullAIProvider()
 
     if config.ai.provider == "openai":
@@ -582,7 +582,7 @@ class _NullAIProvider:
     so callers fall back to deterministic rule-based fallbacks.
     """
 
-    name = "null"
+    name = "none"
     model = "none"
 
     def status(self) -> ProviderStatus:

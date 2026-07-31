@@ -43,6 +43,16 @@ ml = ["scikit-learn>=1.4"]
 # httpx2/httpcore2 fork, opentelemetry, etc.) that this local stdio-only use
 # case does not need.
 mcp = ["mcp>=1.6,<2.0"]
+# Official Anthropic Python SDK, used only by
+# claudetrade.providers.ai.anthropic_provider.AnthropicProvider when
+# ai.provider = "anthropic" -- lazy-imported (see that module's
+# _require_anthropic_sdk), so the base install never needs this.
+anthropic = ["anthropic>=0.40"]
+# Official OpenAI Python SDK, used only by
+# claudetrade.providers.ai.openai_provider.OpenAIProvider when
+# ai.provider = "openai" -- lazy-imported (see that module's
+# _require_openai_sdk), so the base install never needs this.
+openai = ["openai>=1.50"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
@@ -52,7 +62,7 @@ dev = [
     "types-python-dateutil",
 ]
 build = ["pyinstaller>=6.6"]
-all = ["claudetrade[ui,ml,dev,build,mcp]"]
+all = ["claudetrade[ui,ml,dev,build,mcp,anthropic,openai]"]
 
 [project.scripts]
 claudetrade = "claudetrade.cli:main"

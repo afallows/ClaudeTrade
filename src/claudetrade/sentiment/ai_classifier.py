@@ -1,7 +1,7 @@
 """AI-assisted sentiment classification, wrapping ``providers.base.AIProvider``.
 
 This module is entirely optional in the running system: with
-``AIConfig.provider == "null"`` (the default) nothing here is ever invoked, and
+``AIConfig.provider == "none"`` (the default) nothing here is ever invoked, and
 ``sentiment.classifiers.RuleSentimentClassifier`` carries the full pipeline on
 its own. Every failure mode here -- no credential, a malformed response, a
 schema violation, hitting the cost cap, or the post being blocked outright on

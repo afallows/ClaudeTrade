@@ -460,9 +460,26 @@ class XConfig(BaseModel):
 
     When neither path is configured the source is disabled cleanly and the
     remaining sources continue to operate.
+
+    **Auto-enable (owner directive, 2026-07-31)**: mirroring
+    ``RedditConfig.enabled``, both ``enabled`` and ``session_enabled`` now
+    default to ``True`` -- "use if credentialed", not "on unconditionally".
+    Nothing changes for an operator with no X credentials configured at all:
+    both live paths still resolve nothing, ``XProvider.__init__`` still
+    raises ``NotConfiguredError``, and ``get_social_providers`` still catches
+    that and continues without X, exactly as it did when ``enabled`` was
+    ``False`` by default. What changes is that the *moment* the owner's own
+    ``x_auth_token``/``x_ct0`` cookies (or a bearer token) resolve from the
+    secrets store, the source activates on the next refresh with no
+    additional flag to flip -- the same self-selecting posture
+    ``RedditProvider`` already has for its cookie-session mode. Both fields
+    remain explicit, operator-settable disable knobs (``enabled = false``
+    turns the whole source off regardless of credentials; ``session_enabled
+    = false`` keeps the official-API path while refusing the ToS-risking
+    cookie-session path even if cookies are configured).
     """
 
-    enabled: bool = False
+    enabled: bool = True
     provider: str = "synthetic"
     bearer_credential: str = "x_bearer_token"
     query_terms: list[str] = Field(default_factory=list)
@@ -473,9 +490,14 @@ class XConfig(BaseModel):
     store_author_names: bool = False
 
     # --- Cookie-session mode (ADR-0008 Decision 1; owner-accepted risk) -----
-    #: Off by default. Only consulted when ``bearer_credential`` does not
-    #: resolve -- the official API path is always preferred when available.
-    session_enabled: bool = False
+    #: Auto-enabled (owner directive, 2026-07-31): consulted whenever
+    #: ``bearer_credential`` does not resolve -- the official API path is
+    #: always preferred when available -- AND the two session cookies below
+    #: resolve from the secrets store. Set to ``False`` to keep the official
+    #: API path (if configured) while refusing to ever attempt the
+    #: ToS-risking cookie-session path, no matter what is stored under
+    #: ``auth_token_credential``/``ct0_credential``.
+    session_enabled: bool = True
     #: Exported from the browser's devtools -> Application/Storage -> Cookies
     #: for x.com, after logging in as the owner: ``auth_token`` and ``ct0``
     #: (the CSRF token cookie). See docs/api-providers.md for the exact
@@ -593,18 +615,55 @@ class NewsConfig(BaseModel):
 
 
 class AIConfig(BaseModel):
-    """Optional LLM assistance.
+    """Optional LLM sentiment assistance -- an ensemble ADJUNCT, never the
+    decision-maker.
 
-    The system is fully functional with ``provider = "null"``: sentiment falls
-    back to the deterministic rule ensemble and theses are template-generated.
-    AI output can never relax a risk control.
+    The system is fully functional with ``provider = "none"`` (the default):
+    sentiment falls back entirely to the deterministic RULES-based ensemble
+    (``sentiment.classifiers.RuleSentimentClassifier``), which remains the
+    MANDATORY floor whether or not AI is configured -- see
+    ``sentiment.ai_classifier``'s module docstring. AI is strictly opt-in
+    (owner directive, 2026-07-31: "configuration for Claude or ChatGPT, user
+    prompted to set one up at setup" -- see ``scripts/setup.ps1``'s
+    end-of-run prompt and ``docs/ai-setup.md``); AI output can never relax a
+    risk control and a malformed/failed AI response always degrades to the
+    rule classifier, never raises into the pipeline.
+
+    **Provider choice and cost**: ``model`` is empty by default, which each
+    provider adapter resolves to its own sensible default (see
+    ``providers.ai.anthropic_provider.AnthropicProvider`` and
+    ``providers.ai.openai_provider.OpenAIProvider``) -- set it explicitly to
+    override. For Anthropic, the default is ``"claude-opus-5"``
+    ($5/$25 per MTok input/output); ``"claude-haiku-4-5"`` ($1/$5 per MTok)
+    is the economical choice for high-volume PER-POST classification at a
+    real quality/cost tradeoff -- the owner picks based on post volume and
+    budget, this module does not choose for them. For OpenAI, check current
+    model names/pricing at platform.openai.com before relying on the default
+    here (OpenAI's lineup and pricing move faster than this comment).
     """
 
-    provider: Literal["null", "openai", "anthropic"] = "null"
-    model: str = "claude-sonnet-5"
-    api_key_credential: str = "anthropic_api_key"
+    provider: Literal["anthropic", "openai", "none"] = "none"
+    #: Empty means "use the provider adapter's own default" -- see the class
+    #: docstring. Set explicitly to pin a specific model.
+    model: str = ""
+    #: Credential name for the Anthropic API key (see ``claudetrade.secrets``).
+    #: Consulted only when ``provider == "anthropic"``.
+    anthropic_api_key_credential: str = "anthropic_api_key"
+    #: Credential name for the OpenAI API key. Consulted only when
+    #: ``provider == "openai"``.
+    openai_api_key_credential: str = "openai_api_key"
+    #: Non-Anthropic-default base URL override (Anthropic-compatible proxy,
+    #: self-hosted gateway, etc.). ``None`` uses each SDK's own default.
     base_url: str | None = None
-    max_output_tokens: int = 900
+    max_output_tokens: int = 1024
+    #: Reserved, currently unused by either shipped adapter: NOT sent to
+    #: Anthropic (temperature/top_p/top_k are removed on current Claude
+    #: models -- Opus 5/Sonnet 5 return 400 -- see
+    #: ``providers.ai.anthropic_provider``), and deliberately not sent to
+    #: OpenAI either -- reasoning-tier OpenAI models reject non-default
+    #: sampling parameters the same way current Claude models do, and this
+    #: field's default model is reasoning-tier. Kept on the config for a
+    #: future non-reasoning-model path; not wired into either request today.
     temperature: float = 0.0
     request_timeout_s: float = 45.0
     max_calls_per_run: int = 250
@@ -616,10 +675,27 @@ class AIConfig(BaseModel):
     #: Batch size for classification requests.
     batch_size: int = 12
     prompt_version: str = "v1"
-    #: Per-1M-token prices used only for local cost accounting; update to match
-    #: the provider's current published pricing.
-    input_cost_per_mtok_usd: float = 3.0
-    output_cost_per_mtok_usd: float = 15.0
+    #: Per-1M-token prices used only for local cost accounting; defaults are
+    #: Claude Opus 5's published rate. Update to match the configured model's
+    #: current pricing -- e.g. claude-haiku-4-5 is $1.00/$5.00 per MTok, not
+    #: $5.00/$25.00. Check platform.openai.com for current OpenAI pricing.
+    input_cost_per_mtok_usd: float = 5.0
+    output_cost_per_mtok_usd: float = 25.0
+
+    @property
+    def api_key_credential(self) -> str:
+        """Credential name for the currently-selected provider.
+
+        Convenience accessor (not a model field, so it never round-trips
+        through ``model_dump``/TOML) for callers that just want "the one
+        relevant AI credential name" without branching on ``provider``
+        themselves -- e.g. ``cli.py``'s ``probe``/``secrets list`` commands.
+        Defaults to the Anthropic credential name when ``provider ==
+        "none"``, matching this class's Anthropic-first historical default.
+        """
+        if self.provider == "openai":
+            return self.openai_api_key_credential
+        return self.anthropic_api_key_credential
 
 
 class UniverseConfig(BaseModel):
@@ -1178,7 +1254,7 @@ class AppConfig(BaseSettings):
             "x": self.x.enabled,
             "stocktwits": self.stocktwits.enabled,
             "news": self.news.enabled,
-            "ai": self.ai.provider != "null",
+            "ai": self.ai.provider != "none",
             "notifications": self.notifications.enabled,
             "scheduler": self.scheduler.enabled,
         }

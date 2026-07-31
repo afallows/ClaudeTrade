@@ -523,6 +523,7 @@ def test_synthetic_reddit_provider_is_reachable_without_credentials():
     config.reddit.enabled = True
     config.reddit.provider = "synthetic"
     config.news.enabled = False  # news_rss is on by default; isolate reddit here
+    config.x.enabled = False  # X is auto-enabled by default too; isolate reddit here
     providers = get_social_providers(config)
     assert len(providers) == 1
     assert providers[0].source is SocialSource.REDDIT
@@ -582,6 +583,46 @@ def test_x_status_states_the_paid_tier_requirement():
     config = AppConfig()
     reports = {r.kind: r for r in provider_status_report(config)}
     assert reports, "status report must not be empty"
+
+
+def test_x_auto_activates_via_registry_once_session_credentialed(monkeypatch):
+    """Owner directive (2026-07-31): mirroring Reddit's cookie-session
+    self-selection, X activates through ``get_social_providers`` the moment
+    its credentials resolve -- no separate opt-in flag beyond pointing
+    ``provider`` at the live adapter."""
+    from claudetrade.config import AppConfig
+    from claudetrade.providers.registry import get_social_providers
+    from claudetrade.providers.social.x_provider import XProvider
+
+    monkeypatch.delenv("CLAUDETRADE_SECRET_X_BEARER_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDETRADE_SECRET_X_AUTH_TOKEN", "owner-auth-token")
+    monkeypatch.setenv("CLAUDETRADE_SECRET_X_CT0", "owner-ct0")
+
+    config = AppConfig()
+    config.x.provider = "x"
+    config.x.session_symbols = ["AAPL"]
+    config.reddit.enabled = False
+    config.news.enabled = False
+
+    providers = get_social_providers(config)
+    assert len(providers) == 1
+    assert isinstance(providers[0], XProvider)
+    assert providers[0].mode == "session"
+
+
+def test_x_skipped_cleanly_via_registry_when_not_credentialed():
+    """The flip side: with no credentials at all, X is still skipped
+    cleanly (``NotConfiguredError`` swallowed) rather than crashing the
+    refresh, exactly like it was when ``enabled`` defaulted to ``False``."""
+    from claudetrade.config import AppConfig
+    from claudetrade.providers.registry import get_social_providers
+
+    config = AppConfig()
+    config.x.provider = "x"
+    config.reddit.enabled = False
+    config.news.enabled = False
+
+    assert get_social_providers(config) == []
 
 
 # --------------------------------------------------------------------------

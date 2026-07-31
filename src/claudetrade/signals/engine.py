@@ -693,7 +693,7 @@ class SignalEngine:
                 reward_risk=plan.reward_risk_ratio,
                 shares=plan.shares,
             )
-            if self.ai_provider is not None and self.config.ai.provider != "null":
+            if self.ai_provider is not None and self.config.ai.provider != "none":
                 thesis, ai_metadata = polish_thesis(
                     ai=self.ai_provider,
                     config=self.config,

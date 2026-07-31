@@ -210,6 +210,7 @@ See [docs/api-providers.md](docs/api-providers.md) for credential setup.
 | [docs/requirements-specification.md](docs/requirements-specification.md) | Functional and non-functional requirements with implementation status |
 | [docs/architecture.md](docs/architecture.md) | System design, layering, data flow, and PostgreSQL migration path |
 | [docs/api-providers.md](docs/api-providers.md) | Setup guide for each data provider (credentials, rate limits, limitations) |
+| [docs/ai-setup.md](docs/ai-setup.md) | Connecting Claude or ChatGPT for AI-assisted sentiment: key creation, model choice, cost caps, privacy |
 | [docs/strategy-methodology.md](docs/strategy-methodology.md) | Five strategies: entry/exit logic, stops, and documented weaknesses |
 | [docs/security-and-privacy.md](docs/security-and-privacy.md) | Credential handling, log redaction, audit logging, formula-injection defence |
 | [docs/database-schema.md](docs/database-schema.md) | Schema overview: tables, append-only guarantees, reproducibility columns |

@@ -245,6 +245,39 @@ class TickerDetailOut(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# AI Analysis configuration (Configuration screen's "AI Analysis" section)
+# --------------------------------------------------------------------------
+
+
+class AIConfigOut(BaseModel):
+    """Current effective AI-provider selection, plus enough to render the
+    Configuration screen's "AI Analysis" section without a second round trip:
+    each provider's operator-configurable default model (shown as the model
+    field's placeholder when ``model`` is empty) and per-provider credential
+    names (already present in ``/api/system/credentials`` too, repeated here
+    for convenience).
+
+    ``persisted`` is always ``false`` from this endpoint's own GET/PUT --
+    see ``PUT /api/system/ai-config``'s docstring for why a selection here
+    is honestly scoped to "takes effect immediately, for this running
+    server process" rather than a config.toml rewrite.
+    """
+
+    provider: str
+    model: str
+    anthropic_default_model: str
+    openai_default_model: str
+    anthropic_api_key_credential: str
+    openai_api_key_credential: str
+
+
+class AIConfigUpdate(BaseModel):
+    provider: str = Field(pattern="^(anthropic|openai|none)$")
+    #: Empty string means "use the selected provider's own default".
+    model: str = ""
+
+
+# --------------------------------------------------------------------------
 # Dashboard
 # --------------------------------------------------------------------------
 
@@ -366,6 +399,8 @@ class PaperOpenResponse(BaseModel):
 
 
 __all__ = [
+    "AIConfigOut",
+    "AIConfigUpdate",
     "BarOut",
     "ClosedTradeOut",
     "ComponentScoresOut",

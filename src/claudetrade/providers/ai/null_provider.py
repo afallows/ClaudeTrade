@@ -22,8 +22,8 @@ class NullAIProvider:
     should use deterministic rule-based sentiment instead.
     """
 
-    name: str = "null"
-    model: str = "null"
+    name: str = "none"
+    model: str = "none"
 
     def __init__(self, config: AIConfig | None = None):
         """Initialize the null provider.

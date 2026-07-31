@@ -3,7 +3,7 @@
 ``RuleSentimentClassifier`` is the load-bearing component: it must produce a
 usable ``SentimentScores`` for every post with **no** network access and no AI
 credential configured, because that is the default operating mode of this
-application (``AIConfig.provider == "null"``). ``EnsembleSentimentClassifier``
+application (``AIConfig.provider == "none"``). ``EnsembleSentimentClassifier``
 layers an optional AI opinion on top, weighted by relative confidence, and
 degrades to rules-only whenever the AI classifier has nothing to contribute.
 

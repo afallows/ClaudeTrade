@@ -143,9 +143,14 @@ class TestModeSelection:
         provider = XProvider(session_config)
         assert provider.mode == "session"
 
-    def test_session_disabled_by_default_raises_without_bearer(self, monkeypatch):
+    def test_no_credentials_at_all_raises_cleanly(self, monkeypatch):
+        """No bearer, no cookies: cleanly disabled regardless of the
+        (now-default-True) ``enabled``/``session_enabled`` flags -- this is
+        exactly what lets ``get_social_providers`` skip X without a crash."""
         monkeypatch.delenv("CLAUDETRADE_SECRET_X_BEARER_TOKEN", raising=False)
-        config = XConfig(enabled=True)  # session_enabled defaults to False
+        monkeypatch.delenv("CLAUDETRADE_SECRET_X_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDETRADE_SECRET_X_CT0", raising=False)
+        config = XConfig(enabled=True)
         with pytest.raises(NotConfiguredError):
             XProvider(config)
 
@@ -156,6 +161,51 @@ class TestModeSelection:
         config = XConfig(enabled=True, session_enabled=True)
         with pytest.raises(NotConfiguredError):
             XProvider(config)
+
+    def test_auto_enable_defaults_are_true(self):
+        """Owner directive (2026-07-31): X mirrors Reddit's self-selecting
+        posture -- both ``enabled`` and ``session_enabled`` default to
+        ``True`` ("use if credentialed"), not an extra opt-in flag."""
+        config = XConfig()
+        assert config.enabled is True
+        assert config.session_enabled is True
+
+    def test_session_mode_auto_activates_with_no_explicit_session_enabled_flag(
+        self, monkeypatch
+    ):
+        """The whole point of the auto-enable change: an operator who has
+        only ever set the two session cookies (never touched
+        ``session_enabled``) gets a working session-mode provider, exactly
+        like ``RedditProvider``'s cookie-session self-selection."""
+        monkeypatch.delenv("CLAUDETRADE_SECRET_X_BEARER_TOKEN", raising=False)
+        monkeypatch.setenv("CLAUDETRADE_SECRET_X_AUTH_TOKEN", "owner-auth-token")
+        monkeypatch.setenv("CLAUDETRADE_SECRET_X_CT0", "owner-ct0")
+
+        config = XConfig(session_symbols=["AAPL"])  # enabled/session_enabled left at their defaults
+        provider = XProvider(config)
+        assert provider.mode == "session"
+
+    def test_explicit_disable_knob_prevents_session_mode_even_when_credentialed(
+        self, monkeypatch
+    ):
+        """The auto-enable change does not remove the ability to opt out:
+        ``session_enabled = false`` must still refuse the ToS-risking
+        cookie-session path even when both cookies resolve."""
+        monkeypatch.delenv("CLAUDETRADE_SECRET_X_BEARER_TOKEN", raising=False)
+        monkeypatch.setenv("CLAUDETRADE_SECRET_X_AUTH_TOKEN", "owner-auth-token")
+        monkeypatch.setenv("CLAUDETRADE_SECRET_X_CT0", "owner-ct0")
+
+        config = XConfig(session_enabled=False)
+        with pytest.raises(NotConfiguredError):
+            XProvider(config)
+
+    def test_enabled_false_is_still_an_explicit_top_level_disable(self):
+        """``enabled = false`` keeps X off the ``get_social_providers`` list
+        outright, regardless of any credentials -- verified at the registry
+        layer in ``tests/test_providers.py``; this only checks the config
+        default/override still exists and is settable."""
+        config = XConfig(enabled=False)
+        assert config.enabled is False
 
 
 class TestSessionHappyPath:
