@@ -83,6 +83,16 @@ class SentimentPullbackStrategy(Strategy):
     W_CONFIRMATION = 10.0
     W_SENTIMENT_POSITIVE = 8.0
     W_SENTIMENT_COOLING = 8.0
+    #: Market-signal adoption package item 3: a small confluence bonus when
+    #: several independent methods (clustered swings, pivots, Fibonacci,
+    #: round-number, moving averages -- see ``patterns.level_confluence_count``)
+    #: agree on a level near price. Kept below W_NEAR_MA, which already scores
+    #: proximity to a single moving average -- confluence corroborates that
+    #: read, it does not replace it.
+    W_LEVEL_CONFLUENCE = 6.0
+    #: level_confluence_count ramps from 1 method (no real confluence) to 3
+    #: independent methods for full W_LEVEL_CONFLUENCE credit.
+    LEVEL_CONFLUENCE_FULL_CREDIT_COUNT = 3.0
 
     def evaluate(self, ctx: StrategyContext) -> StrategyProposal | None:
         # --- hard vetoes ---------------------------------------------------
@@ -169,6 +179,16 @@ class SentimentPullbackStrategy(Strategy):
         near_ma = min(dist_20, dist_50)
         score.add("near_support_ma", ramp_down(near_ma, 7.0, 3.0), self.W_NEAR_MA)
 
+        # Market-signal adoption package item 3: small bonus when several
+        # independent methods agree on a level near price. Absent feature
+        # defaults to 0 (no confluence), degrading to zero contribution.
+        level_confluence = ctx.feature("level_confluence_count", 0.0)
+        score.add(
+            "level_confluence",
+            ramp_up(level_confluence, 1.0, self.LEVEL_CONFLUENCE_FULL_CREDIT_COUNT),
+            self.W_LEVEL_CONFLUENCE,
+        )
+
         last, prior = ctx.bars[-1], ctx.bars[-2]
         confirmed = last.close > last.open and last.close > prior.close
         confirmation_fraction = 0.5 * ramp_up(
@@ -183,6 +203,11 @@ class SentimentPullbackStrategy(Strategy):
             f"RSI {rsi:.0f} ({rsi_pctl:.0%} percentile of its own trailing history)",
         ]
         risks: list[str] = []
+        if level_confluence >= 2:
+            evidence.append(
+                f"{level_confluence:.0f} independent methods (swings/pivots/Fibonacci/round-number/MA) "
+                "agree on a nearby level"
+            )
         if confirmed:
             evidence.append(f"Confirmation bar: up close at {last.close:.2f} above the prior {prior.close:.2f}")
         else:

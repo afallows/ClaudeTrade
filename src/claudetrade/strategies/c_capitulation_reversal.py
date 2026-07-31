@@ -87,6 +87,15 @@ class CapitulationReversalStrategy(Strategy):
     W_ATTENTION = 10.0
     W_CAPITULATION_LABEL = 12.0
     BONUS_DISPERSION = 4.0
+    #: Market-signal adoption package item 1(c): a gap-down on the washout
+    #: bar is additional capitulation evidence -- a scored component, kept
+    #: below W_REVERSAL_BAR/W_CLIMAX_VOLUME since the reversal bar and climax
+    #: volume are the strategy's primary exhaustion evidence; a gap corroborates
+    #: them, it does not replace them.
+    W_GAP_DOWN = 8.0
+    #: A gap of this size or larger earns full W_GAP_DOWN credit; smaller
+    #: gaps ramp linearly from zero.
+    GAP_DOWN_FULL_CREDIT_PCT = -4.0
 
     def evaluate(self, ctx: StrategyContext) -> StrategyProposal | None:
         # --- hard vetoes ---------------------------------------------------
@@ -163,6 +172,18 @@ class CapitulationReversalStrategy(Strategy):
         )
         score.add("reversal_bar_evidence", reversal_fraction, self.W_REVERSAL_BAR)
 
+        # Market-signal adoption package item 1(c): a gap-down on the washout
+        # bar (today's own overnight gap -- see patterns.gap_analysis) is
+        # additional capitulation evidence, scored alongside the reversal bar
+        # rather than gating on it. Absent gap_pct defaults to 0.0 (no gap),
+        # which ramp_down scores as zero credit, not a crash or a veto.
+        gap_pct = ctx.feature("gap_pct", 0.0)
+        score.add(
+            "gap_down_capitulation",
+            ramp_down(gap_pct, 0.0, self.GAP_DOWN_FULL_CREDIT_PCT),
+            self.W_GAP_DOWN,
+        )
+
         score.add(
             "sentiment_negative", ramp_down(sentiment.raw_sentiment, 0.05, -0.25), self.W_SENTIMENT_NEGATIVE
         )
@@ -194,6 +215,8 @@ class CapitulationReversalStrategy(Strategy):
             f"Sentiment {sentiment.raw_sentiment:+.2f} with capitulation language at {capitulation:.2f}",
             f"Attention {sentiment.mention_acceleration:+.0%} ({mention_pctl:.0%} percentile)",
         ]
+        if gap_pct < 0:
+            evidence.append(f"Gapped down {gap_pct:+.1f}% into the washout")
         risks = [
             "Mean-reversion entries fail hardest when the decline is fundamental",
             "Position size is halved for this strategy because of the wide outcome distribution",

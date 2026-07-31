@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+import numpy as np
 import pytest
 
 from claudetrade.config import AppConfig
@@ -13,6 +14,7 @@ from claudetrade.domain import (
     SecurityInfo,
     SymbolSentiment,
 )
+from claudetrade.features.feature_builder import FeatureBuilder
 from claudetrade.strategies.base import LookaheadError, StrategyContext
 
 
@@ -60,7 +62,7 @@ class TestContextNoLookahead:
             post_count=5,
         )
 
-        with pytest.raises(LookaheadError, match="sentiment dated .* exceeds session"):
+        with pytest.raises(LookaheadError, match=r"sentiment dated .* exceeds session"):
             StrategyContext(
                 session=session,
                 symbol="TEST",
@@ -197,3 +199,114 @@ class TestEarningsWithConfirmation:
         estimated_range = estimated.effective_risk_date_range(uncertainty_days=3)
         assert estimated_range[0] == dt.date(2023, 1, 17)  # 3 days before
         assert estimated_range[1] == dt.date(2023, 1, 23)  # 3 days after
+
+
+class TestNewMarketSignalFeaturesNoLookahead:
+    """Market-signal adoption package items 1-4: the new engineered feature
+    columns (gap_filled, gap_continuation_up/down, pivot points, Fibonacci
+    levels, round_number_level, level_confluence_count, volume_divergence)
+    must be reproducible from a point-in-time truncated bar history -- the
+    same end-to-end guarantee ``TestContextNoLookahead`` proves for raw bars/
+    sentiment/earnings, extended through ``FeatureBuilder`` for the newly
+    wired columns.
+
+    Mirrors ``features.indicators.assert_causal``'s technique (recompute on a
+    truncated prefix, compare the truncated run's last row against the full
+    run's row at the same session) but exercised through the actual
+    ``FeatureBuilder`` pipeline these strategies read from, not a bare
+    pattern function in isolation.
+    """
+
+    NEW_FEATURE_COLUMNS = (
+        "gap_pct",
+        "gap_filled",
+        "gap_continuation_up",
+        "gap_continuation_down",
+        "pivot",
+        "pivot_r1",
+        "pivot_s1",
+        "pivot_r2",
+        "pivot_s2",
+        "fib_23_6",
+        "fib_38_2",
+        "fib_50_0",
+        "fib_61_8",
+        "fib_78_6",
+        "round_number_level",
+        "level_confluence_count",
+        "volume_divergence",
+    )
+
+    @staticmethod
+    def _synthetic_bars(n: int, *, seed: int = 11) -> list[Bar]:
+        rng = np.random.default_rng(seed)
+        bars: list[Bar] = []
+        day = dt.date(2023, 1, 3)
+        price = 100.0
+        for _ in range(n):
+            while day.weekday() >= 5:
+                day += dt.timedelta(days=1)
+            open_ = price * (1 + rng.normal(0, 0.006))
+            close = open_ * (1 + rng.normal(0, 0.018))
+            high = max(open_, close) * (1 + abs(rng.normal(0, 0.006)))
+            low = min(open_, close) * (1 - abs(rng.normal(0, 0.006)))
+            volume = 1_000_000 * (1 + abs(rng.normal(0, 0.5)))
+            bars.append(Bar("TEST", day, open_, high, low, close, volume, close))
+            price = close
+            day += dt.timedelta(days=1)
+        return bars
+
+    def test_truncated_recomputation_matches_full_series_at_the_session(self):
+        """A feature frame built from bars ending at session T must equal,
+        column-for-column at T, the same feature built from a much longer
+        bar history that happens to also include T -- i.e. nothing about a
+        later bar (T+1, T+2, ...) can have influenced the value stamped at T.
+        """
+        full_bars = self._synthetic_bars(160)
+        cutoff_index = 110
+        session = full_bars[cutoff_index].session
+        truncated_bars = full_bars[: cutoff_index + 1]
+        assert truncated_bars[-1].session == session
+
+        builder = FeatureBuilder(symbol="TEST")
+        full_df = builder.build(bars=full_bars)
+        truncated_df = builder.build(bars=truncated_bars)
+
+        full_row = full_df.loc[session]
+        truncated_row = truncated_df.iloc[-1]
+
+        for column in self.NEW_FEATURE_COLUMNS:
+            full_value = float(full_row[column])
+            truncated_value = float(truncated_row[column])
+            full_nan = full_value != full_value
+            truncated_nan = truncated_value != truncated_value
+            if full_nan and truncated_nan:
+                continue
+            assert full_nan == truncated_nan, (
+                f"{column}: the two runs disagree about whether session {session} "
+                f"is knowable yet (full={full_value!r}, truncated={truncated_value!r})"
+            )
+            assert np.isclose(full_value, truncated_value, atol=1e-6, rtol=1e-6), (
+                f"{column}: look-ahead bias at session {session} -- full-series value "
+                f"{full_value!r} != truncated-series value {truncated_value!r}"
+            )
+
+    def test_gap_continuation_columns_never_true_before_their_own_confirmation_bar(self):
+        """A cross-check specific to items 1/2: the deferred-confirmation
+        columns must never be True earlier than the session on which they are
+        knowable. Built from a StrategyContext at an early session, both
+        gap_continuation columns must be exactly 0.0 (unmarked) -- there has
+        not been enough history yet for any breakout, let alone a confirmed
+        continuation of one.
+        """
+        bars = self._synthetic_bars(40)
+        # detect_breakout's own level (prior_high, lookback=20) is not even
+        # defined until row 20 -- before that, no breakout is possible by
+        # construction, so no continuation can be confirmed either, regardless
+        # of what the random walk happens to do.
+        early_session = bars[15].session
+        builder = FeatureBuilder(symbol="TEST")
+        features = builder.build_point_in_time(bars=[b for b in bars if b.session <= early_session])
+
+        assert features.get("gap_continuation_up", 0.0) == 0.0
+        assert features.get("gap_continuation_down", 0.0) == 0.0

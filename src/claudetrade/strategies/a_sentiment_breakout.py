@@ -91,6 +91,23 @@ class SentimentBreakoutStrategy(Strategy):
     W_UNIQUE_AUTHORS = 6.0
     PENALTY_EXTENSION = -15.0
     PENALTY_HYPE = -10.0
+    #: Market-signal adoption package items 1/2/3/4 -- modest, contributing
+    #: (never dominant) gap/level/volume-quality components. Each weight sits
+    #: below every "core" breakout component above (W_BREAKOUT/
+    #: W_ADX_PERCENTILE/W_VOLUME_PERCENTILE), by design: gaps and level
+    #: confluence are corroborating evidence for a breakout already
+    #: established by price and volume, not a replacement for it.
+    W_GAP_UP = 6.0
+    W_GAP_CONTINUATION = 5.0
+    W_LEVEL_CONFLUENCE = 6.0
+    PENALTY_VOLUME_DIVERGENCE = -6.0
+    #: A gap of this size or larger earns full credit for W_GAP_UP; smaller
+    #: gaps ramp linearly from zero.
+    GAP_UP_FULL_CREDIT_PCT = 2.5
+    #: level_confluence_count ramps from 1 method (no real confluence -- the
+    #: candidate's own breakout level trivially "agrees" with itself) to 3
+    #: independent methods for full W_LEVEL_CONFLUENCE credit.
+    LEVEL_CONFLUENCE_FULL_CREDIT_COUNT = 3.0
 
     def evaluate(self, ctx: StrategyContext) -> StrategyProposal | None:
         # --- hard vetoes ---------------------------------------------------
@@ -165,6 +182,28 @@ class SentimentBreakoutStrategy(Strategy):
             self.W_RS_PERCENTILE,
         )
 
+        # --- gap / level-confluence / volume-quality (market-signal adoption
+        # package items 1, 2, 3, 4) -- corroborating evidence, not gates.
+        # Absent features default to 0 (no gap, no confluence, not flagged),
+        # so this degrades to zero contribution rather than crashing when a
+        # candidate's feature frame predates these columns.
+        gap_pct = ctx.feature("gap_pct", 0.0)
+        score.add("gap_up", ramp_up(gap_pct, 0.0, self.GAP_UP_FULL_CREDIT_PCT), self.W_GAP_UP)
+
+        gap_continuation_up = ctx.feature("gap_continuation_up", 0.0) > 0
+        score.add("gap_continuation", 1.0 if gap_continuation_up else 0.0, self.W_GAP_CONTINUATION)
+
+        level_confluence = ctx.feature("level_confluence_count", 0.0)
+        score.add(
+            "level_confluence",
+            ramp_up(level_confluence, 1.0, self.LEVEL_CONFLUENCE_FULL_CREDIT_COUNT),
+            self.W_LEVEL_CONFLUENCE,
+        )
+
+        volume_divergence = ctx.feature("volume_divergence", 0.0) > 0
+        if volume_divergence:
+            score.penalty("volume_divergence", self.PENALTY_VOLUME_DIVERGENCE)
+
         if extension_atr > self.EXTENSION_PENALTY_START_ATR:
             score.penalty(
                 "extension",
@@ -180,6 +219,20 @@ class SentimentBreakoutStrategy(Strategy):
             f"ADX {ctx.feature('adx_14'):.0f} ({adx_pctl:.0%} percentile of its own trailing history)",
         ]
         risks: list[str] = []
+        if gap_pct > 0:
+            evidence.append(f"Gapped up {gap_pct:+.1f}% into the move")
+        if gap_continuation_up:
+            evidence.append("A later session gapped further beyond the level, extending the breakout")
+        if level_confluence >= 2:
+            evidence.append(
+                f"{level_confluence:.0f} independent methods (swings/pivots/Fibonacci/round-number/MA) "
+                "agree on a nearby level"
+            )
+        if volume_divergence:
+            risks.append(
+                "Elevated volume with little same-day price follow-through "
+                "(possible absorption, not yet resolved)"
+            )
 
         # --- sentiment confirmation (soft: absent costs points, not the trade) ---
         if self.sentiment_available(ctx) and sentiment is not None:

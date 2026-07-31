@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from claudetrade.features.indicators import rolling_percentile, slope
+from claudetrade.features.indicators import roc, rolling_percentile, slope
 
 # --------------------------------------------------------------------------
 # Swing points
@@ -463,3 +463,310 @@ def gap_analysis(bars: pd.DataFrame, fill_lookahead_bars: int = 10) -> pd.DataFr
                 gap_filled[j] = True
                 break
     return pd.DataFrame({"gap_pct": gap_pct, "gap_filled": gap_filled}, index=bars.index)
+
+
+def gap_continuation(
+    bars: pd.DataFrame,
+    direction: str = "up",
+    lookback: int = 20,
+    volume_mult: float = 1.5,
+    confirm_within_bars: int = 3,
+) -> pd.Series:
+    """Gap-and-go confirmation: does a LATER session open beyond the broken
+    level with an actual overnight gap, extending a breakout ("up") or a
+    failed-breakout breakdown ("down") rather than merely drifting through it.
+
+    Idea from daily_stock_analysis ``strategies/volume_breakout.yaml`` (MIT):
+    "next day's open should be above the breakout level, to separate real
+    breakouts from fake ones" -- reimplemented here from scratch, causally,
+    and generalised to the mirror-image breakdown case. Nothing beyond that
+    one-sentence rule is reused; the confirmation-delay mechanics below mirror
+    this module's own :func:`detect_failed_breakout`, not the source repo.
+
+    ``direction="up"`` anchors on :func:`detect_breakout` days: the level is
+    the same strictly-prior ``lookback``-day high ``detect_breakout`` itself
+    compares against. ``direction="down"`` anchors on
+    :func:`detect_failed_breakout` days -- a breakout that already failed
+    back below the level -- and re-derives "the level" as the strictly-prior
+    ``lookback``-day high AS OF the failure-confirmation bar (a simplification
+    documented here: this can differ slightly from the original breakout
+    day's level if the rolling window has moved on in the few bars between
+    breakout and failure, but with the small default ``confirm_within_bars``
+    detect_failed_breakout itself uses, the two are almost always identical).
+
+    For each event day ``b``, later sessions ``j`` in
+    ``(b, b + confirm_within_bars]`` are checked in order; the first ``j``
+    whose open clears the level in ``direction`` AND whose ``gap_pct`` (see
+    :func:`gap_analysis`) has the matching sign is marked True -- a level
+    cleared by drift alone, with no overnight gap, does not count. This is
+    exactly :func:`detect_failed_breakout`'s confirmation-delay shape: the
+    event day is knowable same-day, but whether a continuation gap follows it
+    can only be known once (and if) a later session actually opens that way.
+    The boolean is marked True on the CONFIRMATION session, never on the
+    event day itself; an event never followed by a continuation gap within
+    the window is not marked at all.
+
+    Requires ``bars`` to have ``open``, ``high``, ``close`` and ``volume``
+    columns. Warm-up: False for at least the first ``lookback + 1`` rows
+    (inherited from the underlying event detector).
+    """
+    if direction not in ("up", "down"):
+        raise ValueError(f"direction must be 'up' or 'down', got {direction!r}")
+
+    open_ = bars["open"].astype(float)
+    high = bars["high"].astype(float)
+    gap_pct = gap_analysis(bars)["gap_pct"]
+    prior_high = high.shift(1).rolling(window=lookback, min_periods=lookback).max()
+
+    event = (
+        detect_breakout(bars, lookback=lookback, volume_mult=volume_mult)
+        if direction == "up"
+        else detect_failed_breakout(bars, lookback=lookback, volume_mult=volume_mult)
+    )
+
+    n = len(bars)
+    open_vals = open_.to_numpy()
+    gap_vals = gap_pct.to_numpy()
+    level_vals = prior_high.to_numpy()
+    event_vals = event.to_numpy()
+
+    continuation = np.zeros(n, dtype=bool)
+    for b in np.where(event_vals)[0]:
+        lvl = level_vals[b]
+        if np.isnan(lvl):
+            continue
+        end = min(n, b + 1 + confirm_within_bars)
+        for j in range(b + 1, end):
+            if np.isnan(open_vals[j]) or np.isnan(gap_vals[j]):
+                continue
+            if direction == "up":
+                confirmed = open_vals[j] > lvl and gap_vals[j] > 0
+            else:
+                confirmed = open_vals[j] < lvl and gap_vals[j] < 0
+            if confirmed:
+                continuation[j] = True
+                break
+    return pd.Series(continuation, index=bars.index, name="gap_continuation")
+
+
+# --------------------------------------------------------------------------
+# Pivot points / Fibonacci / round-number levels
+# --------------------------------------------------------------------------
+
+
+def pivot_points(bars: pd.DataFrame) -> pd.DataFrame:
+    """Classic floor-trader pivot points, computed from the PRIOR session's
+    high/low/close only (every column below is built with ``.shift(1)``, so
+    today's pivot/support/resistance levels are fully determined before
+    today's bar prints -- no look-ahead is possible by construction).
+
+    Standard formulas (public domain, not any vendor's IP)::
+
+        pivot = (prior_high + prior_low + prior_close) / 3
+        r1 = 2 * pivot - prior_low
+        s1 = 2 * pivot - prior_high
+        r2 = pivot + (prior_high - prior_low)
+        s2 = pivot - (prior_high - prior_low)
+
+    Idea/aggregation shape (using pivots as one of several candidate S/R
+    inputs) from tradingview-mcp ``core/services/indicators.py::
+    compute_trade_setup`` (MIT); the pivot formulas themselves are standard
+    floor-trader arithmetic, not TradingView's IP, and are reimplemented here
+    from scratch.
+
+    Requires ``bars`` to have ``high``, ``low`` and ``close`` columns.
+    Warm-up: row 0 has no prior session and is NaN throughout.
+    """
+    prior_high = bars["high"].astype(float).shift(1)
+    prior_low = bars["low"].astype(float).shift(1)
+    prior_close = bars["close"].astype(float).shift(1)
+    pivot = (prior_high + prior_low + prior_close) / 3.0
+    return pd.DataFrame(
+        {
+            "pivot": pivot,
+            "pivot_r1": 2.0 * pivot - prior_low,
+            "pivot_s1": 2.0 * pivot - prior_high,
+            "pivot_r2": pivot + (prior_high - prior_low),
+            "pivot_s2": pivot - (prior_high - prior_low),
+        },
+        index=bars.index,
+    )
+
+
+#: Standard Fibonacci retracement ratios (public domain).
+FIBONACCI_RATIOS: tuple[float, ...] = (0.236, 0.382, 0.500, 0.618, 0.786)
+
+
+def fibonacci_levels(swing_high: pd.Series, swing_low: pd.Series) -> pd.DataFrame:
+    """Fibonacci retracement levels spanning ``swing_high``/``swing_low``.
+
+    Callers are expected to pass already CONFIRMED, forward-filled swing
+    series (e.g. ``recent_swing_level(high, find_swing_highs(high))`` and its
+    low-side mirror, or the ``swing_high_recent``/``swing_low_recent``
+    features built from them) -- this function itself performs no temporal
+    lookups of any kind, only row-wise arithmetic on its inputs, so it adds no
+    look-ahead of its own beyond whatever its inputs already carry.
+
+    Levels are anchored at ``swing_low`` and expressed as a fraction of the
+    ``swing_high - swing_low`` range (public-domain Fibonacci ratios, not any
+    vendor's IP): ``fib_23_6`` .. ``fib_78_6``, ascending as the ratio rises,
+    regardless of whether the high or the low was confirmed more recently --
+    a retracement level is a property of the RANGE, not of trade direction.
+
+    Idea from tradingview-mcp ``core/services/indicators.py::
+    compute_fibonacci_levels`` (MIT) -- using retracement levels as candidate
+    S/R inputs; the ratios and the arithmetic are standard and reimplemented
+    here from scratch.
+
+    Returns a DataFrame with one column per ratio, aligned to
+    ``swing_high``'s index. NaN wherever either input is NaN (i.e. before any
+    swing has been confirmed).
+    """
+    rng = swing_high - swing_low
+    return pd.DataFrame(
+        {
+            "fib_23_6": swing_low + FIBONACCI_RATIOS[0] * rng,
+            "fib_38_2": swing_low + FIBONACCI_RATIOS[1] * rng,
+            "fib_50_0": swing_low + FIBONACCI_RATIOS[2] * rng,
+            "fib_61_8": swing_low + FIBONACCI_RATIOS[3] * rng,
+            "fib_78_6": swing_low + FIBONACCI_RATIOS[4] * rng,
+        },
+        index=swing_high.index,
+    )
+
+
+#: Round-number rounding increments by price tier -- a classic, cheap S/R
+#: proxy (round-dollar levels attract resting limit orders). Config-free
+#: constants: this is a fixed price-scale convention, not a tunable strategy
+#: parameter, so it lives here rather than in ``config.calibration``.
+_ROUND_NUMBER_LOW_PRICE = 20.0
+_ROUND_NUMBER_MID_PRICE = 100.0
+_ROUND_NUMBER_LOW_INCREMENT = 1.0
+_ROUND_NUMBER_MID_INCREMENT = 5.0
+_ROUND_NUMBER_HIGH_INCREMENT = 10.0
+
+
+def round_number_level(price: pd.Series) -> pd.Series:
+    """Nearest 'round' price level to ``price`` -- a classic, cheap S/R proxy.
+
+    The rounding increment scales with price magnitude so a $3 stock and a
+    $300 stock each get a sensibly-sized round level rather than the same
+    flat $1 grid: increments are $1 below $20, $5 from $20-100, $10 above
+    $100 (see the module-level constants above). Pure same-bar arithmetic on
+    ``price`` alone -- no window, no look-ahead of any kind.
+    """
+    price_vals = price.to_numpy(dtype=float)
+    increment = np.where(
+        price_vals < _ROUND_NUMBER_LOW_PRICE,
+        _ROUND_NUMBER_LOW_INCREMENT,
+        np.where(price_vals < _ROUND_NUMBER_MID_PRICE, _ROUND_NUMBER_MID_INCREMENT, _ROUND_NUMBER_HIGH_INCREMENT),
+    )
+    with np.errstate(invalid="ignore"):
+        rounded = np.round(price_vals / increment) * increment
+    return pd.Series(rounded, index=price.index, name="round_number_level")
+
+
+def level_confluence_count(
+    price: pd.Series,
+    levels: dict[str, list[pd.Series]],
+    tolerance_pct: float = 1.0,
+) -> pd.Series:
+    """How many independent METHODS place a candidate level within
+    ``tolerance_pct`` percent of ``price``, at each bar.
+
+    ``levels`` maps a method name (e.g. ``"swings"``, ``"pivots"``, ``"fib"``,
+    ``"round_number"``, ``"ma"``) to the list of candidate level series that
+    method offers simultaneously (a pivot method typically offers several:
+    pivot/R1/S1/R2/S2). A method counts ONCE per bar if ANY of its candidate
+    levels is within tolerance -- this counts agreeing METHODS, not raw
+    levels, so a method that happens to emit five nearby numbers cannot
+    outweigh a method that emits one.
+
+    Pure per-bar arithmetic on already-computed level series -- introduces no
+    temporal logic of its own, so it is causal at bar ``t`` whenever every
+    series passed in ``levels`` already is (clustered support/resistance,
+    floor pivots, Fibonacci retracements off confirmed swings, moving
+    averages, and the round-number proxy are all already causal features
+    computed elsewhere in this module / ``feature_builder``).
+
+    Idea/aggregation shape from tradingview-mcp ``core/services/
+    indicators.py::compute_trade_setup`` (MIT), which deduplicates several
+    S/R methods (pivots, EMAs, Bollinger bands, Parabolic SAR) into one
+    supports/resistances list; the specific methods and the counting
+    mechanics here are our own.
+
+    Returns a float Series (bar-level agreement count) aligned to ``price``'s
+    index.
+    """
+    price_vals = price.to_numpy(dtype=float)
+    n = len(price)
+    count = np.zeros(n, dtype=float)
+    for candidates in levels.values():
+        method_hit = np.zeros(n, dtype=bool)
+        for level_series in candidates:
+            level_vals = level_series.to_numpy(dtype=float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                pct_dist = np.abs(price_vals - level_vals) / np.abs(price_vals) * 100.0
+            hit = np.nan_to_num(pct_dist, nan=np.inf) <= tolerance_pct
+            method_hit |= hit
+        count += method_hit.astype(float)
+    return pd.Series(count, index=price.index, name="level_confluence_count")
+
+
+# --------------------------------------------------------------------------
+# Volume / price relationship
+# --------------------------------------------------------------------------
+
+#: Elevated-volume threshold for the divergence flag: relative volume (see
+#: ``indicators.relative_volume`` -- today's volume over the MEAN of the
+#: prior 20 sessions, today excluded) at or above this multiple counts as
+#: "loud". Matches ``detect_breakout``'s own ``volume_mult`` default, so
+#: "loud" means the same thing here as it does everywhere else in this
+#: module. Config-free constant, documented here rather than pulled from
+#: ``config.calibration``, since this is a fixed feature-level convention
+#: shared by every strategy that reads the flag, not a per-strategy tunable.
+VOLUME_DIVERGENCE_REL_VOLUME_THRESHOLD = 1.5
+#: "No follow-through" ceiling: an absolute same-day (close-vs-prior-close)
+#: price change below this percent, on volume that cleared the threshold
+#: above, is the absorption/distribution warning -- heavy participation that
+#: did not move the price.
+VOLUME_DIVERGENCE_PRICE_CHANGE_PCT = 1.0
+
+
+def volume_divergence(
+    bars: pd.DataFrame,
+    rel_volume: pd.Series,
+    rel_volume_threshold: float = VOLUME_DIVERGENCE_REL_VOLUME_THRESHOLD,
+    price_change_threshold_pct: float = VOLUME_DIVERGENCE_PRICE_CHANGE_PCT,
+) -> pd.Series:
+    """Volume-divergence warning: elevated relative volume with little
+    same-day price follow-through -- a possible absorption/distribution
+    signature (heavy participation that did not move the price).
+
+    True when ``rel_volume`` is at or above ``rel_volume_threshold`` AND the
+    day's own close-vs-prior-close percent change (``indicators.roc`` with a
+    1-bar window) is smaller in magnitude than ``price_change_threshold_pct``.
+    Both inputs are knowable the instant the bar prints, so this needs no
+    forward-looking confirmation delay -- it is causal same-bar.
+
+    Idea from tradingview-mcp ``core/services/scanner_service.py::
+    volume_confirmation_analyze`` (MIT): ``vol_ratio>=1.5 AND
+    abs(price_change)<1.0``. Reimplemented from scratch against this
+    codebase's own ``rel_volume`` convention (mean-based 20-day baseline that
+    explicitly EXCLUDES today via ``.shift(1)`` -- see
+    ``indicators.relative_volume``), not TradingView's own today-inclusive
+    ``volume.SMA20`` ratio, which the market-signal assessment flags as a
+    biased baseline.
+
+    Requires ``bars`` to have a ``close`` column. ``rel_volume`` is passed in
+    (not recomputed) so callers reuse the same series already computed
+    elsewhere -- mirrors ``volatility_contraction``'s ``bandwidth`` parameter.
+
+    Warm-up: False wherever ``rel_volume`` or the price-change series is NaN
+    -- degrades to "no divergence flagged" rather than raising or crashing.
+    """
+    close = bars["close"].astype(float)
+    price_change_pct = roc(close, 1)
+    loud = rel_volume >= rel_volume_threshold
+    quiet_move = price_change_pct.abs() < price_change_threshold_pct
+    return (loud & quiet_move).fillna(False).rename("volume_divergence")
