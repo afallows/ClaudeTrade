@@ -177,6 +177,7 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -492,6 +493,14 @@ class TipRanksProvider(MarketDataProvider):
         #: drained by ``drain_quality_warnings()``. Always logged too, so a
         #: caller that never drains this still sees the degrade in the logs.
         self._quality_warnings: list[DataQualityIssue] = []
+        #: Optional per-symbol progress hook ``(done, total) -> None``, set by
+        #: the caller that owns a user-visible progress surface (see
+        #: ``DataIngestor.ingest_securities``). The every-100-symbols log
+        #: above it is for the console; without this hook the webapi's
+        #: refresh-status endpoint only ever saw a phase's 0% and 100%,
+        #: which is what left the UI banner stuck at 0/N for a 40-minute
+        #: securities pass while the console counted normally.
+        self.on_symbol_progress: Callable[[int, int], None] | None = None
 
     # --- status -------------------------------------------------------------
 
@@ -774,6 +783,12 @@ class TipRanksProvider(MarketDataProvider):
                         "market data: %d/%d symbols (%d fetched, %d cached, %d unknown)",
                         counts["done"], total, counts["fetched"], counts["cached"], counts["unknown"],
                     )
+                hook = self.on_symbol_progress
+                if hook is not None:
+                    try:
+                        hook(counts["done"], total)
+                    except Exception:  # progress must never fail a fetch
+                        log.debug("symbol-progress hook raised; continuing", exc_info=True)
             return resolution
 
         return parallel_map(symbols, _resolve_one, max_workers=self._max_workers)

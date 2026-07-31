@@ -81,3 +81,52 @@ def test_ingest_prices_does_not_duplicate_an_already_present_benchmark(memory_db
     # Deduped -- SPY appears exactly once per fetch batch, not twice.
     for batch in provider.requested_batches:
         assert batch.count("SPY") == 1
+
+
+class _FakeCapProviderWithProgressHook:
+    """get_market_caps provider that honours the duck-typed
+    ``on_symbol_progress`` contract the way ``TipRanksProvider`` does:
+    one hook call per symbol resolved."""
+
+    name = "fake_cap_provider"
+
+    def __init__(self):
+        self.on_symbol_progress = None
+
+    def get_market_caps(self, symbols):
+        caps = {}
+        for i, symbol in enumerate(symbols, start=1):
+            caps[symbol] = 5e9
+            if self.on_symbol_progress is not None:
+                self.on_symbol_progress(i, len(symbols))
+        return caps
+
+
+def test_securities_phase_reports_per_symbol_progress(memory_db):
+    """The securities phase must report intermediate progress, not just its
+    0% and 100% endpoints -- a live run showed the UI banner stuck at
+    ``0/2417 (0%)`` for the entire ~40-minute cap-enrichment pass while the
+    provider's console log counted up normally."""
+    from claudetrade.domain import SecurityInfo
+
+    config = AppConfig()
+    provider = _FakeCapProviderWithProgressHook()
+    events: list[tuple[str, int, int]] = []
+    ingestor = DataIngestor(
+        config,
+        memory_db,
+        market_provider=provider,
+        progress_callback=lambda phase, done, total: events.append((phase, done, total)),
+    )
+    securities = [SecurityInfo(symbol=f"SYM{i}", name=f"Sym {i} Inc") for i in range(5)]
+
+    ingestor.ingest_securities(securities, IngestReport())
+
+    securities_events = [e for e in events if e[0] == "securities"]
+    dones = [done for _, done, _ in securities_events]
+    # Intermediate values between the 0% start and 100% end, one per symbol.
+    assert dones[0] == 0
+    assert dones[-1] == 5
+    assert {1, 2, 3, 4} <= set(dones)
+    # The hook must be unhooked once the phase is over.
+    assert provider.on_symbol_progress is None

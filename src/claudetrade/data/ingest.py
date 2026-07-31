@@ -270,7 +270,28 @@ class DataIngestor:
         Decision 3 ">= $1B" floor against.
         """
         self._report_progress("securities", 0, len(securities))
-        securities = self.enrich_market_caps(securities, report)
+        # The cap-enrichment pass below is the ~40-minute part of a first
+        # refresh, and enrich_market_caps only returns when it is entirely
+        # done -- so without a per-symbol hook the progress surface (webapi
+        # refresh-status, hence the UI banner) sits at 0/N the whole time
+        # while the provider's own console log counts up normally. Providers
+        # that expose ``on_symbol_progress`` (currently TipRanksProvider)
+        # get wired to the same callback for the duration of this phase.
+        hooked = [
+            p for p in self._market_cap_sources() if hasattr(p, "on_symbol_progress")
+        ]
+        total = len(securities)
+
+        def _symbol_progress(done: int, _provider_total: int) -> None:
+            self._report_progress("securities", min(done, total), total)
+
+        for provider in hooked:
+            provider.on_symbol_progress = _symbol_progress
+        try:
+            securities = self.enrich_market_caps(securities, report)
+        finally:
+            for provider in hooked:
+                provider.on_symbol_progress = None
         self._report_progress("securities", len(securities), len(securities))
         with self.db.session() as session:
             for info in securities:

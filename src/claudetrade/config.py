@@ -188,7 +188,10 @@ class MarketDataConfig(BaseModel):
     #: so raising this overlaps request *latency* across symbols; it does not
     #: raise the enforced calls/minute ceiling, which is what
     #: ``rate_limit_per_minute``/``yahoo_rate_limit_per_minute`` control.
-    max_workers: int = 8
+    #: 12 gives enough in-flight requests to actually saturate the 300/min
+    #: tipranks budget at ~1-2 s per response; the limiter, not this, is the
+    #: throughput ceiling.
+    max_workers: int = 12
     benchmark_symbol: str = "SPY"
     #: Sector ETF proxies used for relative-strength comparisons.
     sector_etfs: dict[str, str] = Field(
@@ -256,7 +259,13 @@ class TipRanksConfig(BaseModel):
     #: symbol_count / rate_limit_per_minute at that rate); see also
     #: ``MarketDataConfig.max_workers``, which overlaps request latency across
     #: symbols but does not itself raise this ceiling.
-    rate_limit_per_minute: int = 60
+    #:
+    #: Raised 60 -> 300 at the owner's explicit direction ("we should be able
+    #: to hit tipranks way harder and faster"): ~2,400 symbols now pace out
+    #: at roughly 8 minutes instead of 40. Still self-imposed; if TipRanks
+    #: ever pushes back the adapter's 429/403 handling backs off and fails
+    #: closed rather than hammering on.
+    rate_limit_per_minute: int = 300
     request_timeout_s: float = 20.0
     #: Cached ``overview`` responses are reused until this many trading
     #: sessions have elapsed since they were fetched (see
