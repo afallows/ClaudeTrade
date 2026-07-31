@@ -457,6 +457,8 @@ class DataIngestor:
         # single-symbol call is the actual guarantee.
         self._ensure_benchmark_bars(benchmark, start, end, collected, report)
 
+        self._merge_current_session_bars(symbols, collected)
+
         self.checker.check_provider_gap(
             getattr(self.market, "name", "market"),
             expected=len(symbols),
@@ -538,6 +540,89 @@ class DataIngestor:
             "every session in this run",
             benchmark,
         )
+
+    def _merge_current_session_bars(
+        self, symbols: list[str], collected: dict[str, list[Bar]]
+    ) -> None:
+        """Fill in today's daily bar from TipRanks GetQuotes for any symbol
+        whose already-collected series (Yahoo's historical chart, primarily
+        -- see ``providers.market.yahoo``) has nothing for today yet.
+
+        **Merge rule -- deliberately CONSERVATIVE (owner-directed; see this
+        change's own report for why)**: this only ever APPENDS a
+        GetQuotes-derived bar for a session date that is not already present
+        in ``collected[symbol]``. It never replaces, overwrites, or prefers
+        the GetQuotes bar over an existing one, even for today's own session
+        -- e.g. it does NOT implement "prefer GetQuotes over Yahoo when the
+        market is open or GetQuotes is newer" at all. Getting that richer
+        rule right (avoiding look-ahead, avoiding a downstream signal being
+        computed from one value and then silently recomputed from a
+        different one later in the same run) was judged not worth the risk
+        for this change; the safe subset -- "fill in today's bar only when
+        NOTHING else has any bar for that exact session at all" -- already
+        eliminates the common gap this exists for (Yahoo's chart endpoint
+        typically lagging by one session until after that day's close)
+        without any chance of silently overwriting a value a quality check
+        or a strategy signal may already have read earlier in this same run.
+
+        Deduped by exact session-date equality: a GetQuotes bar is appended
+        for symbol X only if ``collected[X]`` has no existing bar whose
+        ``.session`` matches it -- true whether that existing bar came from
+        Yahoo, TipRanks' own close-only last-resort bars, or a prior call
+        within this same run. A pre-filter (only symbols with no bar dated
+        exactly "today" per this process's own UTC clock) limits which
+        symbols GetQuotes is even queried for, purely to save calls; a
+        symbol wrongly included by that heuristic (e.g. a timezone edge
+        case) is still perfectly safe -- the dedupe check above is exact and
+        catches it regardless.
+
+        A no-op with zero network calls when there is no ``tipranks``
+        provider in the configured chain, or when it does not expose
+        ``get_current_session_bars`` (e.g. an older/foreign stand-in used in
+        a test), or when ``TipRanksConfig.use_getquotes_batch`` is off (in
+        which case ``get_current_session_bars`` itself already returns
+        nothing without any HTTP call -- see
+        ``providers.market.tipranks.TipRanksProvider.get_quotes``).
+        """
+        tipranks = self._market_provider_named("tipranks")
+        get_current = getattr(tipranks, "get_current_session_bars", None)
+        if not callable(get_current):
+            return
+
+        today = utc_now().date()
+        missing_today = [
+            symbol
+            for symbol in symbols
+            if not any(b.session == today for b in (collected.get(symbol) or []))
+        ]
+        if not missing_today:
+            return
+
+        try:
+            current_bars = get_current(missing_today)
+        except ProviderError as exc:
+            log.debug("tipranks current-session bar merge failed: %s", exc)
+            return
+        except Exception:
+            log.debug("tipranks current-session bar merge raised unexpectedly", exc_info=True)
+            return
+
+        filled = 0
+        for symbol, bar in (current_bars or {}).items():
+            existing = collected.setdefault(symbol, [])
+            if any(b.session == bar.session for b in existing):
+                continue  # dedupe by session date -- never a duplicate/overwrite
+            existing.append(bar)
+            existing.sort(key=lambda b: b.session)
+            filled += 1
+
+        if filled:
+            log.info(
+                "current-session bars: filled %d symbol(s) from tipranks GetQuotes "
+                "(conservative merge -- appended only where the daily-history source had "
+                "no bar for that exact session at all)",
+                filled,
+            )
 
     def _market_provider_named(self, name: str) -> object | None:
         """Find a provider instance by ``.name`` within ``self.market``.

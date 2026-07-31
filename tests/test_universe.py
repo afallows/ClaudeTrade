@@ -249,10 +249,12 @@ class TestUniverseConfigDefaults:
         report = selector.for_session(dt.date(2024, 6, 3), securities=[shop])
         assert "SHOP" in report.symbols
 
-    def test_min_market_cap_usd_default_is_one_billion(self):
-        """ADR-0008 Decision 3's literal ask: the owner's floor is $1B, not
-        the older, lower FilterConfig.min_market_cap_usd (500M) screen."""
-        assert AppConfig().universe.min_market_cap_usd == 1_000_000_000.0
+    def test_min_market_cap_usd_default_is_five_hundred_million(self):
+        """The universe eligibility floor, lowered from $1B to $500M at the
+        owner's direction (2026-07-31) to widen the net to mid-caps. Still a
+        separate, higher-or-equal field from FilterConfig.min_market_cap_usd's
+        scoring-time screen (also 500M); illiquidity is vetoed at that layer."""
+        assert AppConfig().universe.min_market_cap_usd == 500_000_000.0
 
     def test_default_capacity_holds_complete_us_and_tsx_inventory(self):
         from claudetrade.data.universe import load_stooq_universe
@@ -271,7 +273,7 @@ class TestRuntimeMarketCapFloor:
         config = AppConfig()
         selector = UniverseSelector(config, memory_db)
         tiny = SecurityInfo(symbol="TINY", name="Tiny Corp", exchange="NASDAQ",
-                             market_cap_usd=999_999_999.0)
+                             market_cap_usd=499_999_999.0)
         report = selector.for_session(dt.date(2024, 6, 3), securities=[tiny])
         assert "TINY" not in report.symbols
         assert "TINY" in report.excluded.get("below_min_market_cap", [])

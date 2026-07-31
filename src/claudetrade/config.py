@@ -289,20 +289,34 @@ class TipRanksConfig(BaseModel):
     #: only ``historicalprices`` can serve): that gap is no more likely to
     #: close from one day to the next than a fully unknown ticker is.
     unknown_ticker_ttl_days: int = 30
-    #: OPTIONAL, UNVERIFIED batching optimisation for Canadian market caps via
-    #: ``marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=TSE:A,TSE:B,...``
-    #: (the CIBC-app endpoint, not the widget). Off by default: this sandbox
-    #: never obtained a real response body for this endpoint, so the parser
-    #: is defensive-but-unverified (see
-    #: ``providers.market.tipranks._parse_getquotes_response``). Canadian cap
-    #: coverage never depends on this -- ``dataForTicker`` (with the
-    #: ``TSE:SYMBOL`` ticker notation) is the primary path for every symbol,
-    #: US and Canadian alike; this is purely a call-count optimisation for a
-    #: large TSX universe, and any failure here falls straight back to the
-    #: per-symbol ``dataForTicker`` path with no user-visible effect beyond
-    #: one extra batch of calls.
-    use_getquotes_batch: bool = False
-    getquotes_batch_size: int = 25
+    #: PRIMARY market-data batching path (owner directive, confirmed by live
+    #: probes): ``marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=A,B,C``
+    #: (the CIBC-app endpoint, not the widget) returns a real-time quote
+    #: snapshot -- current-session OHLCV plus caps -- for every ticker in one
+    #: HTTP call, confirmed envelope shape ``{"quotes": [...], "errors":
+    #: [...], "metadata": {...}}`` (see
+    #: ``providers.market.tipranks._parse_getquotes_envelope`` and the module
+    #: docstring's GetQuotes section). ``TipRanksProvider.get_market_caps``
+    #: tries this for the WHOLE requested symbol list first -- turning what
+    #: used to be one ``dataForTicker`` call per symbol (~2,400 calls for a
+    #: full universe refresh) into roughly a dozen batch calls -- before
+    #: falling back to the pre-existing per-symbol ``dataForTicker`` path for
+    #: anything GetQuotes did not cover. Was ``False`` (an off-by-default,
+    #: Canadian-only, UNVERIFIED optimisation) before this confirmation;
+    #: flipped to ``True`` now that GetQuotes is the primary path, not an
+    #: opt-in extra. Market-cap coverage never depends on this succeeding
+    #: regardless -- ``dataForTicker`` remains the fallback for every symbol,
+    #: US and Canadian alike, and any GetQuotes failure (bad shape, network
+    #: error, a chunk failing outright) is caught and logged, degrading to
+    #: that pre-existing per-symbol path with no user-visible effect beyond
+    #: the wasted batch call(s).
+    use_getquotes_batch: bool = True
+    #: Symbols per GetQuotes HTTP call. 200 is conservative-but-batched: the
+    #: owner's own brokerage integration batches far more heavily than this
+    #: without issue, but this stays deliberately smaller and fully
+    #: operator-configurable rather than matching that ceiling exactly, per
+    #: this module's self-imposed-limits posture (ADR-0008 Decision 1).
+    getquotes_batch_size: int = 200
 
 
 class RedditConfig(BaseModel):
@@ -738,7 +752,13 @@ class UniverseConfig(BaseModel):
     #: again later at signal-scoring time (see ``signals.scoring``). Raising
     #: or lowering this one changes who is even eligible to be scanned at
     #: all; it does not touch the scoring-time gate.
-    min_market_cap_usd: float = 1_000_000_000.0
+    #:
+    #: Lowered $1B -> $500M at the owner's direction (2026-07-31) to widen the
+    #: net to mid-caps. Safe because this is only *eligibility*: the thin-name
+    #: guardrails (``FilterConfig.min_avg_dollar_volume_usd``, ``min_price``,
+    #: ``exclude_penny_stocks``, ``min_atr_pct``) live at the filter/scoring
+    #: layer and are unchanged, so illiquid 500M-1B names are still vetoed there.
+    min_market_cap_usd: float = 500_000_000.0
     #: What to do with a security for which NO configured market-data
     #: provider could establish a market cap at all (as opposed to one priced
     #: below the floor above). "include" (default) keeps it in the universe --

@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 
+import pytest
 from sqlalchemy import select
 
 from claudetrade.config import AppConfig
@@ -410,6 +411,191 @@ def test_ingest_securities_never_clobbers_an_existing_deactivation(memory_db):
     with memory_db.read_session() as session:
         row = session.get(Security, "WBA")
     assert row.delisted_date == today
+
+
+# ----------------------------------------------------------------------------
+# Current-session bar merge (TipRanks GetQuotes) -- conservative, append-only
+# ----------------------------------------------------------------------------
+
+
+class _YahooLikeBars:
+    """A ``get_daily_bars`` provider that only ever has SOME symbols'
+    history -- used to simulate Yahoo's chart endpoint lagging by a session
+    (no bar for "today" yet)."""
+
+    name = "yahoo"
+
+    def __init__(self, bars_by_symbol):
+        self._bars_by_symbol = bars_by_symbol
+
+    def get_daily_bars(self, symbols, start, end, *, adjusted=True):
+        return {s: list(self._bars_by_symbol.get(s, [])) for s in symbols}
+
+
+class _TipRanksWithCurrentBars:
+    """Duck-types the pieces of ``TipRanksProvider`` this feature reads:
+    ``.name == "tipranks"``, a (deliberately empty) ``get_daily_bars``, and
+    ``get_current_session_bars``."""
+
+    name = "tipranks"
+
+    def __init__(self, current_bars_by_symbol):
+        self._current_bars = current_bars_by_symbol
+        self.requested: list[list[str]] = []
+
+    def get_daily_bars(self, symbols, start, end, *, adjusted=True):
+        return {s: [] for s in symbols}
+
+    def get_current_session_bars(self, symbols):
+        self.requested.append(list(symbols))
+        return {s: self._current_bars[s] for s in symbols if s in self._current_bars}
+
+
+def test_merge_appends_current_session_bar_when_daily_history_lacks_today(memory_db):
+    """The core conservative-merge behaviour: Yahoo's chart has nothing for
+    today yet, so the TipRanks GetQuotes current-session bar is appended."""
+    config = AppConfig()
+    config.market_data.benchmark_symbol = "SPY"
+    today = dt.datetime.now(tz=dt.UTC).date()
+    yesterday = today - dt.timedelta(days=1)
+
+    yahoo_like = _YahooLikeBars({
+        "AAPL": [
+            Bar(symbol="AAPL", session=yesterday, open=1, high=1, low=1, close=1,
+                volume=1, source="yahoo"),
+        ],
+    })
+    current_bar = Bar(
+        symbol="AAPL", session=today, open=2.0, high=3.0, low=1.5, close=2.5,
+        volume=100.0, source="tipranks_getquotes",
+    )
+    tipranks_like = _TipRanksWithCurrentBars({"AAPL": current_bar})
+    wrapper = _CascadeLike(primary=tipranks_like, fallbacks=[yahoo_like])
+
+    ingestor = DataIngestor(config, memory_db, market_provider=wrapper)
+    report = IngestReport()
+    collected = ingestor.ingest_prices(["AAPL"], yesterday, today, report)
+
+    sessions = {b.session for b in collected["AAPL"]}
+    assert sessions == {yesterday, today}
+    appended = next(b for b in collected["AAPL"] if b.session == today)
+    assert appended.source == "tipranks_getquotes"
+    assert appended.close == pytest.approx(2.5)
+
+    # Persisted too, via the normal bars-persist path.
+    with memory_db.read_session() as session:
+        rows = session.execute(
+            select(PriceBar).where(PriceBar.symbol == "AAPL", PriceBar.session == today)
+        ).scalars().all()
+    assert rows
+
+
+def test_merge_never_overwrites_an_existing_today_bar(memory_db):
+    """CONSERVATIVE by design: even though the GetQuotes bar might be
+    "fresher", an already-present bar for today's session is never replaced
+    or duplicated -- this merge only ever fills a session that has NOTHING
+    at all yet."""
+    config = AppConfig()
+    config.market_data.benchmark_symbol = "SPY"
+    today = dt.datetime.now(tz=dt.UTC).date()
+
+    yahoo_like = _YahooLikeBars({
+        "AAPL": [
+            Bar(symbol="AAPL", session=today, open=10.0, high=10.0, low=10.0,
+                close=10.0, volume=10.0, source="yahoo"),
+        ],
+    })
+    getquotes_bar = Bar(
+        symbol="AAPL", session=today, open=999.0, high=999.0, low=999.0,
+        close=999.0, volume=999.0, source="tipranks_getquotes",
+    )
+    tipranks_like = _TipRanksWithCurrentBars({"AAPL": getquotes_bar})
+    wrapper = _CascadeLike(primary=tipranks_like, fallbacks=[yahoo_like])
+
+    ingestor = DataIngestor(config, memory_db, market_provider=wrapper)
+    report = IngestReport()
+    collected = ingestor.ingest_prices(["AAPL"], today, today, report)
+
+    assert len(collected["AAPL"]) == 1
+    assert collected["AAPL"][0].close == pytest.approx(10.0)
+    assert collected["AAPL"][0].source == "yahoo"
+    # The pre-filter must have skipped AAPL entirely -- it already had a bar
+    # for today, so GetQuotes was never even queried for it.
+    requested_symbols = {s for batch in tipranks_like.requested for s in batch}
+    assert "AAPL" not in requested_symbols
+
+
+def test_merge_is_noop_without_a_tipranks_provider_in_the_chain(memory_db):
+    """No provider named "tipranks" anywhere in the configured chain -- a
+    plain fake bars provider -- must never raise; the merge silently does
+    nothing and the run proceeds exactly as it did before this feature."""
+    config = AppConfig()
+    provider = _FakeBarsProvider()  # .name == "fake_bars_provider"
+    ingestor = DataIngestor(config, memory_db, market_provider=provider)
+    report = IngestReport()
+
+    collected = ingestor.ingest_prices(
+        ["AAPL"], dt.date(2024, 1, 2), dt.date(2024, 1, 2), report
+    )
+    assert collected["AAPL"]  # bars still fetched normally
+
+
+def test_merge_current_session_bars_dedupes_by_exact_session_date():
+    """Direct unit test of the merge's own safety net: even for a symbol the
+    "today" pre-filter let through, an exact session-date match against
+    what's already collected is never duplicated or overwritten -- this is
+    what makes the merge safe regardless of how precisely the pre-filter's
+    notion of "today" lines up with the exchange's own trading day."""
+    config = AppConfig()
+    ingestor = DataIngestor(config, None, market_provider=None)
+
+    existing_bar = Bar(
+        symbol="AAPL", session=dt.date(2024, 1, 5), open=1.0, high=1.0, low=1.0,
+        close=1.0, volume=1.0, source="yahoo",
+    )
+    collected = {"AAPL": [existing_bar]}
+
+    class _Tip:
+        name = "tipranks"
+
+        def get_current_session_bars(self, symbols):
+            return {
+                "AAPL": Bar(
+                    symbol="AAPL", session=dt.date(2024, 1, 5), open=99.0, high=99.0,
+                    low=99.0, close=99.0, volume=99.0, source="tipranks_getquotes",
+                )
+            }
+
+    ingestor.market = _Tip()
+    ingestor._merge_current_session_bars(["AAPL"], collected)
+
+    assert len(collected["AAPL"]) == 1
+    assert collected["AAPL"][0] is existing_bar  # untouched, never replaced
+
+
+def test_merge_current_session_bars_appends_for_a_brand_new_symbol_key():
+    """A symbol with NO entry at all yet in ``collected`` (not even an empty
+    list) is still handled -- the merge creates the list rather than
+    assuming every symbol already has a (possibly empty) entry."""
+    config = AppConfig()
+    ingestor = DataIngestor(config, None, market_provider=None)
+    collected: dict[str, list[Bar]] = {}
+
+    bar = Bar(
+        symbol="NEW", session=dt.date(2024, 1, 5), open=1.0, high=1.0, low=1.0,
+        close=1.0, volume=1.0, source="tipranks_getquotes",
+    )
+
+    class _Tip:
+        name = "tipranks"
+
+        def get_current_session_bars(self, symbols):
+            return {"NEW": bar}
+
+    ingestor.market = _Tip()
+    ingestor._merge_current_session_bars(["NEW"], collected)
+
+    assert collected["NEW"] == [bar]
 
 
 def test_persist_bars_reactivates_a_symbol_that_produces_real_bars_again(memory_db):

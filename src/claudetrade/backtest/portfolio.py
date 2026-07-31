@@ -509,7 +509,7 @@ class BacktestPortfolio:
         )
         return trade
 
-    def accrue_daily_borrow_costs(self, as_of_session: dt.date) -> None:
+    def accrue_daily_borrow_costs(self, as_of_session: dt.date) -> None:  # noqa: ARG002 -- engine calls with the session date; kept for audit-log symmetry
         """Charge one day of stock-borrow cost against every open short.
 
         Called once per session by the engine for positions still open at

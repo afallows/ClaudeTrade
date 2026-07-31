@@ -136,36 +136,93 @@ invalidates on the next real trading session) -- this is what keeps a
 scan-universe refresh of thousands of symbols to one call per symbol per
 trading day rather than one call per symbol per *capability* per run.
 
-**GetQuotes batching (optional, off by default)**: TipRanks' CIBC integration
+**GetQuotes batching -- CONFIRMED, and now the PRIMARY market-cap path
+(owner directive, confirmed by live probes)**: TipRanks' CIBC integration
 also exposes
-``https://marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=TSE:A,TSE:B,...``
--- a batch quote lookup that can reduce Canadian cap enrichment to a handful
-of calls instead of one per symbol. A real probe from the owner's machine
-(a batch of 7 mixed US/TSX tickers) confirmed the endpoint works and that
-requested tickers are echoed back exactly as sent (``TSE:`` notation
-included), but this repository still has no committed fixture of the raw
-response body, so ``_parse_getquotes_response`` stays a defensive,
-best-effort parser (every field access wrapped, any unexpected shape returns
-an empty result rather than raising) and the feature stays gated behind
-``TipRanksConfig.use_getquotes_batch`` (default ``False``).
+``https://marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=A,B,C,...``
+-- a genuinely batched quote lookup (one HTTP call serves every ticker in
+the request, unlike ``dataForTicker``'s one-call-per-symbol) that returns a
+real-time snapshot per ticker: current-session OHLCV plus caps, not
+history. The envelope shape is now CONFIRMED from the owner's own probes,
+not guessed:
 
-**Confirmed currency trap (do not "fix" this without re-checking the real
-probe first)**: GetQuotes' own ``marketCap`` field is in the listing's
-*local* currency, not USD -- the probe showed ``TSE:TECK.B`` reporting
-``marketCap`` 40,620,412,377 (CAD) alongside an ``exchangeRate`` of
-~0.712, while ``dataForTicker`` gives ``marketCapUSD`` 28,913,081,465 (USD),
-and ``40,620,412,377 * 0.712 ~= 28.9B`` -- consistent. A US entry's
-``exchangeRate`` is 1. Consequently ``_parse_getquotes_response`` never
-returns a raw, un-converted ``marketCap`` for a non-USD listing: it uses
-``marketCapUSD`` when present, else ``marketCap * exchangeRate`` when both
-are present and positive, and contributes nothing for a row missing both.
-Canadian market-cap coverage never depends on this succeeding regardless:
-``dataForTicker`` (with the ``TSE:SYMBOL`` notation) is the primary path for
-every symbol, US and Canadian alike; GetQuotes is purely a call-count
-optimisation layered on top, and any failure in it -- a bad response shape,
-a network error, anything -- is caught and logged, falling straight back to
-the per-symbol ``dataForTicker`` path with no user-visible effect beyond one
-extra batch call having been wasted.
+* Top level: ``{"quotes": [...], "errors": [...], "metadata": {"count",
+  "success", "errors"}}``.
+* Each ``quotes[]`` row: ``{ticker, currency, exchangeRate, isomic,
+  marketName, price, open, low, high, volume, changeAmount, changePercent,
+  lastTradeDate, lastClose, marketCap, realTimeMarketCap, isRealTime,
+  isMarketOpen, isPremarket, isAfterMarket, prePostMarket,
+  lastCacheUpdate}``.
+* Requested tickers are echoed back exactly as sent, including ``TSE:``
+  notation for Canadian names -- the same ``tipranks_ticker`` mapping
+  ``dataForTicker`` uses (see above) is reused for GetQuotes' ``tickers``
+  parameter, comma-joined per chunk.
+* A ticker TipRanks has nothing for comes back either in ``errors[]`` or
+  simply absent from ``quotes[]`` -- both are treated identically by this
+  adapter: skip that one symbol, never fatal to the rest of the batch (see
+  ``_parse_getquotes_envelope``).
+
+This repository still has no committed fixture of a *raw* captured response
+body (the owner's probe output was relayed as a confirmed field list/shape,
+not pasted verbatim) -- see each ``tests/fixtures/tipranks/getquotes_*.json``
+file's own ``_fixture_note`` for that provenance distinction. Every field
+access below stays defensive regardless (any unexpected shape degrades to
+"contributes nothing" rather than raising), the same posture as every other
+parser in this module.
+
+``get_quotes(symbols)`` is the shared batched primitive two capabilities are
+built on:
+
+1. **Market caps (the speed win)** -- ``get_market_caps`` tries
+   ``get_quotes`` for the WHOLE requested symbol list first (chunked at
+   ``TipRanksConfig.getquotes_batch_size``, default 200 -- so a ~2,400-symbol
+   universe refresh costs roughly a dozen GetQuotes calls instead of one
+   ``dataForTicker`` call per symbol), then falls back to the existing
+   per-symbol ``dataForTicker`` path (via ``_resolve_map``) for only
+   whatever GetQuotes did not cover. ``TipRanksConfig.use_getquotes_batch``
+   defaults to ``True`` now -- GetQuotes is the primary path, not an opt-in
+   optimisation layered on top of it, per the owner's explicit direction
+   ("make TipRanks the primary market-data workhorse via its BATCHED
+   GetQuotes endpoint"). Setting it ``False`` disables ``get_quotes``
+   entirely (a single flag check inside ``get_quotes`` itself, so every
+   caller -- market caps and the current-session bar below -- is gated
+   uniformly): the adapter then behaves exactly as it did before this
+   change, one ``dataForTicker`` call per symbol.
+2. **Current-session bar** -- ``get_current_session_bars`` turns each
+   resolved quote into one ``Bar`` for *today's* (or the most recently
+   completed) session, using ``price`` as the close. This is a distinct
+   capability from ``get_daily_bars`` (which stays close-only/last-resort,
+   unaffected by any of this): callers that want a fresher "today" bar than
+   Yahoo's historical chart typically offers call this directly and merge
+   it in themselves -- see ``data.ingest.DataIngestor.ingest_prices``'s
+   conservative merge (append-only, dedupe-by-session-date, documented
+   there in full).
+
+**CONFIRMED currency trap (do not "fix" this without re-checking the real
+probe first)**: GetQuotes has no ``marketCapUSD`` field at all (unlike
+``dataForTicker``'s ``overview``) -- ``marketCap``/``realTimeMarketCap`` are
+always in the listing's *local* currency. The probe showed ``TSE:TECK.B``
+reporting a CAD ``marketCap`` alongside a non-1 ``exchangeRate``, and that
+``local_cap * exchangeRate`` recovers the same USD figure
+``dataForTicker.marketCapUSD`` reports directly; a US entry's
+``exchangeRate`` is confirmed to be 1. The exact rule this adapter applies,
+in ``_getquotes_market_cap_usd``:
+
+1. Prefer ``realTimeMarketCap`` over ``marketCap`` when both are present and
+   positive (the fresher of the two current-session figures).
+2. If ``currency`` is ``"USD"`` (or absent, treated as USD) -> use that raw
+   cap as-is.
+3. Otherwise (non-USD currency) -> multiply by ``exchangeRate`` if it is
+   present and positive; if not, this row contributes **nothing** -- a raw,
+   un-normalised non-USD cap is never returned by this adapter, from either
+   endpoint.
+
+Market-cap coverage never depends on GetQuotes succeeding: ``dataForTicker``
+(with the ``TSE:SYMBOL`` notation) remains the fallback path for every
+symbol, US and Canadian alike, for whatever GetQuotes did not resolve; any
+failure in the GetQuotes sweep -- a bad response shape, a network error, a
+whole chunk failing -- is caught and logged, falling straight back to the
+per-symbol path with no user-visible effect beyond the wasted batch call(s).
 """
 
 from __future__ import annotations
@@ -213,8 +270,9 @@ WIDGET_BASE_URL = "https://widgets.tipranks.com/api/etoro/dataForTicker"
 #: owner-captured response committed at
 #: ``tests/fixtures/tipranks/historicalprices_MHD.json`` (a closed-end fund).
 HISTORICALPRICES_BASE_URL = "https://widgets.tipranks.com/api/etoro/historicalprices"
-#: Optional batching path -- see the module docstring's GetQuotes section.
-#: UNVERIFIED response shape; off by default.
+#: Batched real-time quote lookup -- see the module docstring's GetQuotes
+#: section. Envelope shape CONFIRMED by the owner's live probes; primary
+#: market-cap path by default (``TipRanksConfig.use_getquotes_batch``).
 GETQUOTES_BASE_URL = "https://marketsv3.tipranks.com/api/quotes/GetQuotes"
 
 DEFAULT_RATE_LIMIT = 60  # Calls per minute -- see TipRanksConfig.rate_limit_per_minute.
@@ -308,11 +366,6 @@ def tipranks_ticker(symbol: str, exchange: str | None = None) -> str:
     return stripped
 
 
-def _is_ca_symbol(symbol: str, exchange: str | None = None) -> bool:
-    exch = (exchange or _default_exchange_map().get(symbol.strip().upper(), "")).upper()
-    return exch in CA_EXCHANGES
-
-
 def _safe_cache_key(ticker_param: str) -> str:
     """Filesystem-safe cache filename stem for a TipRanks ticker parameter."""
     return re.sub(r"[^A-Za-z0-9_-]", "_", ticker_param)
@@ -361,55 +414,138 @@ def _tipranks_exchange_to_internal(market_field: str) -> str:
     return normalised
 
 
-def _parse_getquotes_response(payload: Any, requested_tickers: list[str]) -> dict[str, float]:
-    """Defensive parser for the optional GetQuotes batch endpoint.
+def _parse_getquotes_envelope(
+    payload: Any, requested_params: list[str]
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    """Parse the CONFIRMED GetQuotes envelope: ``{"quotes": [...], "errors":
+    [...], "metadata": {...}}`` -- see the module docstring's GetQuotes
+    section for the full confirmed field list.
 
-    The endpoint's reachability and rough field set (ticker, marketCap,
-    exchangeRate, ...) were confirmed against a real probe (see the module
-    docstring), but this repository has no committed fixture of the exact
-    response body, so every field access here stays defensive; any shape
-    that does not match the confirmed/guessed structure yields an empty
-    result rather than raising, so a wrong guess degrades to "this
-    optimisation contributed nothing" rather than breaking the caller.
-
-    CONFIRMED currency trap: ``marketCap`` is in the listing's own local
-    currency, not USD -- ``marketCapUSD`` is preferred when present;
-    otherwise ``marketCap * exchangeRate`` is used (both must be present and
-    positive). A row with neither usable combination contributes nothing --
-    a raw, un-converted non-USD ``marketCap`` is never returned.
+    Returns ``(quotes_by_ticker_param, errored_ticker_params)``. A ticker
+    param present in neither ``quotes`` nor ``errors`` is simply not covered
+    by this response -- the caller treats that identically to an explicit
+    error (skip that one symbol, never fatal to the rest of the batch).
+    Every access stays defensive: an unexpected shape (wrong type at any
+    level, a row that isn't a dict, ...) degrades to that row/response
+    contributing nothing rather than raising, per ADR-0008 Decision 1 -- a
+    surprising field must never be able to break the caller's own fallback
+    path.
     """
-    out: dict[str, float] = {}
+    quotes: dict[str, dict[str, Any]] = {}
+    errors: set[str] = set()
     if not isinstance(payload, dict):
-        return out
-    rows = payload.get("quotes") or payload.get("result") or payload.get("data")
-    if not isinstance(rows, list):
-        return out
-    requested = set(requested_tickers)
-    for row in rows:
-        try:
-            if not isinstance(row, dict):
-                continue
-            ticker = row.get("ticker") or row.get("symbol")
-            if ticker not in requested:
+        return quotes, errors
+    requested = set(requested_params)
+
+    rows = payload.get("quotes")
+    if isinstance(rows, list):
+        for row in rows:
+            try:
+                if not isinstance(row, dict):
+                    continue
+                ticker = row.get("ticker")
+                if not isinstance(ticker, str) or ticker not in requested:
+                    continue
+                quotes[ticker] = row
+            except Exception:
                 continue
 
-            cap_usd = row.get("marketCapUSD")
-            if isinstance(cap_usd, (int, float)) and cap_usd > 0:
-                out[ticker] = float(cap_usd)
+    error_rows = payload.get("errors")
+    if isinstance(error_rows, list):
+        for row in error_rows:
+            try:
+                if isinstance(row, str):
+                    if row in requested:
+                        errors.add(row)
+                elif isinstance(row, dict):
+                    ticker = row.get("ticker")
+                    if isinstance(ticker, str) and ticker in requested:
+                        errors.add(ticker)
+            except Exception:
                 continue
 
-            cap_local = row.get("marketCap")
-            rate = row.get("exchangeRate")
-            if (
-                isinstance(cap_local, (int, float))
-                and cap_local > 0
-                and isinstance(rate, (int, float))
-                and rate > 0
-            ):
-                out[ticker] = float(cap_local) * float(rate)
-        except Exception:
-            continue
-    return out
+    return quotes, errors
+
+
+def _getquotes_market_cap_usd(quote: dict[str, Any]) -> float | None:
+    """USD-normalised market cap from one GetQuotes row -- see the module
+    docstring's "CONFIRMED currency trap" section for the full rationale.
+
+    Exact rule, in order:
+
+    1. Prefer ``realTimeMarketCap`` over ``marketCap`` when both are present
+       and positive (the fresher current-session figure).
+    2. ``currency == "USD"`` (or the field is absent, treated as USD) -> the
+       raw cap is already USD, used as-is.
+    3. Any other ``currency`` -> multiply by ``exchangeRate`` if it is
+       present and positive.
+    4. Non-USD with no usable ``exchangeRate`` -> contributes nothing. A raw,
+       un-normalised non-USD cap is never returned.
+    """
+    cap = quote.get("realTimeMarketCap")
+    if not (isinstance(cap, (int, float)) and cap > 0):
+        cap = quote.get("marketCap")
+    if not (isinstance(cap, (int, float)) and cap > 0):
+        return None
+
+    currency = quote.get("currency")
+    is_usd = currency is None or (isinstance(currency, str) and currency.strip().upper() == "USD")
+    if is_usd:
+        return float(cap)
+
+    rate = quote.get("exchangeRate")
+    if isinstance(rate, (int, float)) and rate > 0:
+        return float(cap) * float(rate)
+    return None
+
+
+def _getquotes_session_bar(symbol: str, quote: dict[str, Any]) -> Bar | None:
+    """Build one current-session ``Bar`` from a GetQuotes row -- see the
+    module docstring's "current-session bar" section.
+
+    The session date comes from ``lastTradeDate`` (parsed to a date), never
+    from ``utc_now()`` -- deriving it from wall-clock time would misdate a
+    bar for an exchange in a different timezone, or during a pre/post-market
+    snapshot. ``price`` is GetQuotes' own field for the latest traded print
+    and is used as this bar's close -- a live intraday value while the
+    market is open, the final close once it isn't; either way it belongs to
+    the session ``lastTradeDate`` names, never assumed to be a prior day's.
+    Missing/unparseable open, high, low, price, or date -> ``None`` (no bar
+    synthesised from a partial row).
+    """
+    date_str = quote.get("lastTradeDate")
+    if not isinstance(date_str, str) or not date_str:
+        return None
+    try:
+        session = dt.datetime.fromisoformat(date_str).date()
+    except ValueError:
+        return None
+
+    o, h, low_, price = quote.get("open"), quote.get("high"), quote.get("low"), quote.get("price")
+    if any(v is None for v in (o, h, low_, price)):
+        return None
+    try:
+        o_f, h_f, l_f, c_f = float(o), float(h), float(low_), float(price)
+    except (TypeError, ValueError):
+        return None
+
+    volume = quote.get("volume")
+    try:
+        vol_f = float(volume) if volume is not None else 0.0
+    except (TypeError, ValueError):
+        vol_f = 0.0
+
+    return Bar(
+        symbol=symbol,
+        session=session,
+        open=round(o_f, 4),
+        high=round(h_f, 4),
+        low=round(l_f, 4),
+        close=round(c_f, 4),
+        volume=round(vol_f, 1),
+        adj_close=None,
+        source="tipranks_getquotes",
+    )
 
 
 @dataclass(slots=True)
@@ -533,6 +669,7 @@ class TipRanksProvider(MarketDataProvider):
                 "earnings": True,
                 "corporate_actions": False,
                 "getquotes_batch_enabled": self._config.use_getquotes_batch,
+                "getquotes_current_bar": self._config.use_getquotes_batch,
             },
         )
 
@@ -749,16 +886,35 @@ class TipRanksProvider(MarketDataProvider):
         neither has analyst/overview data)."""
         return self._resolve(symbol, exchange).overview
 
-    def _resolve_map(self, symbols: list[str]) -> dict[str, _Resolution]:
+    def _resolve_map(
+        self,
+        symbols: list[str],
+        *,
+        progress_offset: int = 0,
+        progress_total: int | None = None,
+    ) -> dict[str, _Resolution]:
         """Resolve every symbol in ``symbols`` -- in parallel, see
         ``providers.base.parallel_map`` -- logging progress every
         ``_PROGRESS_LOG_EVERY_N`` symbols or ``_PROGRESS_LOG_EVERY_S``
         seconds, whichever comes first (item 6), so a long refresh across a
         whole universe never looks hung.
+
+        ``progress_offset``/``progress_total`` let a caller that already
+        completed other work before this call (``get_market_caps``'s
+        GetQuotes sweep, resolving most of the universe before this
+        per-symbol ``dataForTicker`` fallback pass even starts) keep the
+        EXTERNAL ``on_symbol_progress`` hook's ``done`` value monotonically
+        increasing across both phases, rather than resetting to 0 and making
+        the caller's progress surface (the webapi refresh-status banner)
+        visibly jump backwards partway through a refresh. The console log
+        line below is unaffected -- it always describes this call's own
+        ``symbols`` count, which stays accurate for what is actually
+        happening in this pass.
         """
         total = len(symbols)
         if total == 0:
             return {}
+        hook_total = progress_total if progress_total is not None else total
         counts = {"done": 0, "fetched": 0, "cached": 0, "unknown": 0}
         last_log = time.monotonic()
         progress_lock = threading.Lock()
@@ -786,14 +942,32 @@ class TipRanksProvider(MarketDataProvider):
                 hook = self.on_symbol_progress
                 if hook is not None:
                     try:
-                        hook(counts["done"], total)
+                        hook(progress_offset + counts["done"], hook_total)
                     except Exception:  # progress must never fail a fetch
                         log.debug("symbol-progress hook raised; continuing", exc_info=True)
             return resolution
 
         return parallel_map(symbols, _resolve_one, max_workers=self._max_workers)
 
-    def _get(self, ticker_param: str, *, base_url: str = WIDGET_BASE_URL) -> httpx.Response:
+    def _get(
+        self,
+        ticker_param: str,
+        *,
+        base_url: str = WIDGET_BASE_URL,
+        params: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """Perform one GET, translating expected failure modes into
+        ``ProviderError`` subclasses per the module docstring's fail-closed
+        rules.
+
+        ``ticker_param`` is used verbatim as the ``?ticker=`` query value for
+        every ``dataForTicker``/``historicalprices`` call (the default), and
+        purely as a LABEL for logging/error messages when the caller passes
+        its own ``params`` (GetQuotes' ``?tickers=A,B,C`` batch parameter --
+        see ``_fetch_getquotes_chunk``): the same status-code handling below
+        applies identically to both endpoints, since none of it is specific
+        to what the request parameters actually are.
+        """
         try:
             with httpx.Client(
                 timeout=self._config.request_timeout_s,
@@ -801,7 +975,7 @@ class TipRanksProvider(MarketDataProvider):
                 follow_redirects=True,
                 headers={"User-Agent": _USER_AGENT},
             ) as client:
-                response = client.get(base_url, params={"ticker": ticker_param})
+                response = client.get(base_url, params=params or {"ticker": ticker_param})
         except httpx.ConnectError as exc:
             self._last_error = str(exc)
             raise ProviderError(
@@ -1080,28 +1254,174 @@ class TipRanksProvider(MarketDataProvider):
             provider=self.name,
         )
 
+    # --- GetQuotes (batched real-time quotes) ------------------------------------
+
+    def get_quotes(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        """Batched real-time quote snapshot via GetQuotes, keyed by the
+        CALLER's own symbol (not the TipRanks ticker param) -- see the
+        module docstring's GetQuotes section for the confirmed envelope
+        shape and the two capabilities built on top of this
+        (``get_market_caps``, ``get_current_session_bars``).
+
+        A no-op (returns ``{}`` without any HTTP call) when
+        ``TipRanksConfig.use_getquotes_batch`` is ``False`` -- the single
+        place this flag is checked, so every caller of this method is gated
+        by it uniformly. ``symbols`` is chunked into batches of
+        ``TipRanksConfig.getquotes_batch_size`` (default 200); each chunk's
+        symbols are mapped to TipRanks' ticker notation with the same
+        ``tipranks_ticker`` helper ``dataForTicker`` uses (TSX ->
+        ``TSE:SYMBOL``), comma-joined into one ``?tickers=`` request. A
+        symbol GetQuotes has no data for (in ``errors[]`` or simply absent
+        from ``quotes[]``) is omitted from the result -- never fatal to the
+        rest of the batch or to this method's own caller. Progress is
+        reported through ``on_symbol_progress`` after each chunk completes,
+        same mechanism as ``_resolve_map`` (item 6).
+        """
+        out: dict[str, dict[str, Any]] = {}
+        if not symbols or not self._config.use_getquotes_batch:
+            return out
+
+        batch_size = max(1, self._config.getquotes_batch_size)
+        unique_symbols = list(dict.fromkeys(symbols))  # de-dup, preserve order
+        param_by_symbol = {s: tipranks_ticker(s) for s in unique_symbols}
+        total = len(unique_symbols)
+        done = 0
+
+        for i in range(0, total, batch_size):
+            chunk_symbols = unique_symbols[i : i + batch_size]
+            param_to_symbol: dict[str, str] = {
+                param_by_symbol[s]: s for s in chunk_symbols
+            }
+            try:
+                quotes_by_param = self._fetch_getquotes_chunk(list(param_to_symbol))
+            except Exception:
+                log.warning(
+                    "tipranks GetQuotes chunk of %d symbol(s) failed; skipping this chunk "
+                    "(falls back to per-symbol dataForTicker for anything it would have "
+                    "resolved)",
+                    len(chunk_symbols),
+                    exc_info=True,
+                )
+                quotes_by_param = {}
+
+            for param, quote in quotes_by_param.items():
+                symbol = param_to_symbol.get(param)
+                if symbol:
+                    out[symbol] = quote
+
+            done += len(chunk_symbols)
+            hook = self.on_symbol_progress
+            if hook is not None:
+                try:
+                    hook(done, total)
+                except Exception:  # progress must never fail a fetch
+                    log.debug("symbol-progress hook raised during GetQuotes; continuing", exc_info=True)
+
+        return out
+
+    def _fetch_getquotes_chunk(self, ticker_params: list[str]) -> dict[str, dict[str, Any]]:
+        """One GetQuotes HTTP call for up to ``getquotes_batch_size``
+        tickers. Fail-closed rules from ``_get`` apply identically to this
+        endpoint (401/403 -> ``SourceBlockedError``, 429 -> ``RateLimitError``,
+        5xx -> retryable ``ProviderError``) -- all propagate to the caller
+        (``get_quotes``), which logs and skips just this one chunk rather
+        than aborting the whole sweep.
+        """
+        self._rate_limiter.acquire()
+        with self._lock:
+            self._calls += 1
+        label = f"<GetQuotes batch of {len(ticker_params)} tickers>"
+        try:
+            response = self._get(
+                label,
+                base_url=GETQUOTES_BASE_URL,
+                params={"tickers": ",".join(ticker_params)},
+            )
+        except _TipRanksNotFoundError:
+            # Not a per-symbol "unknown ticker" signal on this endpoint (that
+            # semantic is specific to dataForTicker) -- an HTTP 404 here just
+            # means this chunk returned nothing.
+            log.info("tipranks GetQuotes returned HTTP 404 for a %d-symbol batch", len(ticker_params))
+            return {}
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SourceBlockedError(
+                f"tipranks GetQuotes returned non-JSON for a batch of {len(ticker_params)} "
+                f"tickers: {exc}",
+                provider=self.name,
+            ) from exc
+
+        quotes, errors = _parse_getquotes_envelope(payload, ticker_params)
+        if errors:
+            log.info(
+                "tipranks GetQuotes reported errors for %d/%d ticker(s) in this batch",
+                len(errors), len(ticker_params),
+            )
+        return quotes
+
+    def get_current_session_bars(self, symbols: list[str]) -> dict[str, Bar]:
+        """Today's (current-session) OHLCV bar per symbol, from GetQuotes --
+        a REAL-TIME SNAPSHOT of the session currently in progress (or the
+        most recently completed one when the market is closed), never a
+        historical series. This is a capability distinct from
+        ``get_daily_bars`` (close-only, last-resort, unaffected by any of
+        this) and is not part of the ``MarketDataProvider`` protocol --
+        callers that want it merge it in explicitly; see
+        ``data.ingest.DataIngestor.ingest_prices``'s conservative
+        append-only, dedupe-by-session-date merge for the documented rule.
+
+        A symbol GetQuotes has no quote for, or whose quote is missing any
+        of open/high/low/price/lastTradeDate, is simply omitted -- never
+        synthesised (see ``_getquotes_session_bar``).
+        """
+        out: dict[str, Bar] = {}
+        for symbol, quote in self.get_quotes(symbols).items():
+            bar = _getquotes_session_bar(symbol, quote)
+            if bar is not None:
+                out[symbol] = bar
+        return out
+
     # --- market caps ------------------------------------------------------------
 
     def get_market_caps(self, symbols: list[str]) -> dict[str, float]:
-        """Bulk market-cap lookup. First tries the optional GetQuotes batch
-        for Canadian symbols (if enabled), then ``dataForTicker`` per symbol
-        for anything left unresolved -- see the module docstring."""
-        out: dict[str, float] = {}
+        """Bulk market-cap lookup, in USD.
 
-        if self._config.use_getquotes_batch:
-            ca_symbols = [s for s in symbols if _is_ca_symbol(s)]
-            if len(ca_symbols) > 1:
-                try:
-                    out.update(self._get_market_caps_via_getquotes(ca_symbols))
-                except Exception:
-                    log.debug(
-                        "tipranks GetQuotes batch optimisation failed; falling back to "
-                        "per-symbol dataForTicker",
-                        exc_info=True,
-                    )
+        GetQuotes (batched, whole-universe) is tried FIRST -- see the module
+        docstring's "GetQuotes batching" section -- covering the large
+        majority of a refresh in a handful of calls (a no-op, network-call-
+        free, when ``TipRanksConfig.use_getquotes_batch`` is ``False``);
+        ``dataForTicker`` per symbol (the pre-existing path, via
+        ``_resolve_map``) then fills in anything GetQuotes did not cover --
+        a symbol in its ``errors[]``, a chunk that failed outright, or the
+        feature disabled entirely. Any GetQuotes failure (bad response
+        shape, network error, anything) is caught inside ``get_quotes``
+        itself and never prevents this fallback pass from running.
+        """
+        out: dict[str, float] = {}
+        overall_total = len(symbols)
+
+        quotes = self.get_quotes(symbols)
+        via_getquotes = 0
+        for symbol, quote in quotes.items():
+            cap = _getquotes_market_cap_usd(quote)
+            if cap is not None:
+                out[symbol] = cap
+                via_getquotes += 1
 
         remaining = [s for s in symbols if s not in out]
-        resolved = self._resolve_map(remaining)
+        # progress_offset/progress_total keep the on_symbol_progress hook's
+        # `done` value climbing from where the GetQuotes sweep above left
+        # off, instead of resetting to 0 for this fallback pass and making
+        # the caller's progress surface jump backwards -- see
+        # _resolve_map's own docstring.
+        resolved = self._resolve_map(
+            remaining,
+            progress_offset=overall_total,
+            progress_total=overall_total,
+        )
+        via_fallback = 0
         for symbol in remaining:
             resolution = resolved.get(symbol)
             overview = resolution.overview if resolution else None
@@ -1110,36 +1430,14 @@ class TipRanksProvider(MarketDataProvider):
             cap = _preferred_market_cap(overview)
             if cap is not None:
                 out[symbol] = cap
-        return out
+                via_fallback += 1
 
-    def _get_market_caps_via_getquotes(self, ca_symbols: list[str]) -> dict[str, float]:
-        """OPTIONAL, UNVERIFIED batching path -- see the module docstring."""
-        out: dict[str, float] = {}
-        batch_size = max(1, self._config.getquotes_batch_size)
-        for i in range(0, len(ca_symbols), batch_size):
-            chunk = ca_symbols[i : i + batch_size]
-            ticker_by_param = {tipranks_ticker(s): s for s in chunk}
-            self._rate_limiter.acquire()
-            try:
-                with httpx.Client(
-                    timeout=self._config.request_timeout_s,
-                    verify=True,
-                    follow_redirects=True,
-                    headers={"User-Agent": _USER_AGENT},
-                ) as client:
-                    response = client.get(
-                        GETQUOTES_BASE_URL, params={"tickers": ",".join(ticker_by_param)}
-                    )
-                response.raise_for_status()
-                payload = response.json()
-            except Exception:
-                log.debug("tipranks GetQuotes batch request failed", exc_info=True)
-                continue
-            parsed = _parse_getquotes_response(payload, list(ticker_by_param))
-            for ticker_param, cap in parsed.items():
-                original = ticker_by_param.get(ticker_param)
-                if original:
-                    out[original] = cap
+        if quotes or self._config.use_getquotes_batch:
+            log.info(
+                "market caps: %d via GetQuotes batches, %d via dataForTicker fallback, "
+                "%d unresolved",
+                via_getquotes, via_fallback, overall_total - len(out),
+            )
         return out
 
     # --- reference data -----------------------------------------------------------

@@ -282,6 +282,14 @@ integration widget calls) that returns one rich `overview` object per
 symbol. One HTTP call per symbol serves all four capabilities, because they
 are all different views onto that same object.
 
+Market caps and a current-session bar are now sourced primarily from a
+second, genuinely *batched* endpoint, GetQuotes -- one HTTP call serves an
+entire chunk of tickers, not one per symbol -- with the per-symbol
+`dataForTicker` path above as the fallback for whatever it does not cover.
+See "GetQuotes batching" below; this is the change that cuts a
+~2,400-symbol universe refresh from roughly one `dataForTicker` call per
+symbol down to a handful of batch calls plus a much smaller fallback tail.
+
 **Configuration**:
 
 ```toml
@@ -299,7 +307,8 @@ rate_limit_per_minute = 60      # raised from the original 30 -- see below
 request_timeout_s = 20.0
 cache_ttl_trading_days = 1      # response cache under paths.cache_dir/tipranks/
 unknown_ticker_ttl_days = 30    # negative/limited-result cache TTL, see below
-use_getquotes_batch = false     # optional Canadian cap batching, see below
+use_getquotes_batch = true      # primary batched cap + current-bar path, see below
+getquotes_batch_size = 200      # symbols per GetQuotes call
 ```
 
 **Credentials**: None required (no authentication).
@@ -404,13 +413,22 @@ series or a hand-maintained CSV. Two mapping details worth knowing:
   `providers.market.tipranks._TIME_OF_DAY_MAP` if TipRanks' own
   documentation, or further real captures, clarify this.
 
-**Market caps**: prefers `overview.marketCapUSD`; falls back to
-`overview.marketCap` as-is with **no currency gating** -- the >= $1B
-universe floor is currency-agnostic by explicit owner decision (a nominal
-$1B in either USD or CAD clears it). Nested blocks that also happen to carry
-a `marketCap` field (e.g. `portfolioHoldingData.nextDividendDate.marketCap`
-in the Canadian fixture, a *different*, CAD-only figure from the top-level
-cap) are never used as a cap source.
+**Market caps -- GetQuotes first, `dataForTicker` fallback (the primary
+speed win of this change)**: `get_market_caps` tries the batched GetQuotes
+endpoint (below) for the WHOLE requested symbol list first -- turning what
+used to be one `dataForTicker` call per symbol into roughly a dozen batch
+calls for a full ~2,400-symbol universe refresh -- then falls back to the
+per-symbol `dataForTicker` path (`overview.marketCapUSD`, else
+`overview.marketCap` as-is with **no currency gating** -- the market-cap
+universe floor is currency-agnostic by explicit owner decision, a nominal
+figure in either USD or CAD clears it) for anything GetQuotes did not
+resolve. Nested blocks that also happen to carry a `marketCap` field (e.g.
+`portfolioHoldingData.nextDividendDate.marketCap` in the Canadian fixture, a
+*different*, CAD-only figure from the top-level cap) are never used as a cap
+source. `tipranks.use_getquotes_batch` defaults to `true` now -- see
+"GetQuotes batching" below for the confirmed envelope shape, the USD
+normalisation rule, and the current-session-bar capability built on the same
+endpoint.
 
 **Reference data**: `get_security_info` maps `overview.companyName` / market
 / `companyData.sector` / `.industry` / cap. `overview.market` is
@@ -454,25 +472,96 @@ trading day, shared across all four capabilities, rather than one call per
 symbol per capability per run. An "unknown ticker" result is cached too, so
 a universe's always-a-few unresolvable names don't get re-probed every run.
 
-**GetQuotes batching (optional, off by default)**: TipRanks also exposes a
+**GetQuotes batching -- CONFIRMED, now the PRIMARY market-cap path (owner
+directive, confirmed by live probes)**: TipRanks also exposes a
 CIBC-integration batch endpoint,
-`https://marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=TSE:A,TSE:B,...`,
-that can reduce Canadian cap enrichment to a handful of calls instead of one
-per symbol. A real probe (7 mixed US/TSX tickers) confirmed it works and
-that requested tickers are echoed back exactly as sent, but this repository
-still has no committed fixture of the exact response body, so the parser
-(`providers.market.tipranks._parse_getquotes_response`) stays defensive and
-the feature stays behind `tipranks.use_getquotes_batch = false`.
-**Confirmed currency trap**: GetQuotes' own `marketCap` field is in the
-listing's *local* currency, not USD (`TSE:TECK.B`'s GetQuotes `marketCap` is
-~40.6B CAD with an `exchangeRate` of ~0.712, while `dataForTicker`'s
-`marketCapUSD` is the already-converted ~28.9B USD figure -- the two are
-consistent once converted). The parser therefore only trusts a GetQuotes cap
-via `marketCapUSD` when present, or `marketCap * exchangeRate` when both
-fields are present and positive; a bare, un-converted `marketCap` is never
-used for a non-USD listing. Canadian cap coverage never depends on this
-optimisation succeeding -- `dataForTicker` (with the `TSE:SYMBOL` notation)
-is the primary path for every symbol regardless.
+`https://marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=A,B,C,...`,
+that is genuinely batched -- one HTTP call serves every ticker in the
+request, unlike `dataForTicker`'s one-call-per-symbol. It returns a
+real-time snapshot per ticker (current-session OHLCV plus caps), never
+history. The envelope shape is now CONFIRMED from the owner's own probes:
+
+- Top level: `{"quotes": [...], "errors": [...], "metadata": {"count",
+  "success", "errors"}}`.
+- Each `quotes[]` row: `{ticker, currency, exchangeRate, isomic,
+  marketName, price, open, low, high, volume, changeAmount, changePercent,
+  lastTradeDate, lastClose, marketCap, realTimeMarketCap, isRealTime,
+  isMarketOpen, isPremarket, isAfterMarket, prePostMarket,
+  lastCacheUpdate}`.
+- Requested tickers are echoed back exactly as sent, including `TSE:`
+  notation for Canadian names -- the same `tipranks_ticker` mapping
+  `dataForTicker` uses is reused here, comma-joined per chunk.
+- A ticker TipRanks has nothing for comes back either in `errors[]` or
+  simply absent from `quotes[]` -- both are skipped, never fatal to the
+  rest of the batch.
+
+`tipranks.use_getquotes_batch` now defaults to **`true`** (it was an
+off-by-default, Canadian-only, UNVERIFIED optimisation before this
+confirmation) -- `get_market_caps` chunks the FULL requested symbol list at
+`tipranks.getquotes_batch_size` (default 200) and tries GetQuotes before
+falling back to `dataForTicker` for whatever it did not cover. This
+repository still has no committed fixture of a *raw* captured response body
+(the owner's probe output was relayed as a confirmed field list/shape, not
+pasted verbatim) -- see each `tests/fixtures/tipranks/getquotes_*.json`
+file's own `_fixture_note`. Every field access stays defensive regardless.
+
+**Confirmed currency trap**: GetQuotes has no `marketCapUSD` field at all
+(unlike `dataForTicker`'s `overview`) -- `marketCap`/`realTimeMarketCap` are
+always in the listing's *local* currency (`TSE:TECK.B`'s GetQuotes
+`marketCap` is CAD with a non-1 `exchangeRate`, and `local_cap *
+exchangeRate` recovers the same USD figure `dataForTicker.marketCapUSD`
+reports directly; a US entry's `exchangeRate` is confirmed to be 1). The
+exact rule (`providers.market.tipranks._getquotes_market_cap_usd`): prefer
+`realTimeMarketCap` over `marketCap` when both are present and positive;
+if `currency` is `"USD"` (or absent) use that raw cap as-is; otherwise
+multiply by `exchangeRate` if it is present and positive; a non-USD cap with
+no usable `exchangeRate` contributes nothing -- a raw, un-normalised
+non-USD cap is never returned by this adapter, from either endpoint. Market
+cap coverage never depends on GetQuotes succeeding -- `dataForTicker` (with
+the `TSE:SYMBOL` notation) remains the fallback path for every symbol, US
+and Canadian alike, and any GetQuotes failure (bad shape, network error, a
+whole chunk failing) is caught and logged, falling straight back with no
+user-visible effect beyond the wasted batch call(s).
+
+**Current-session bar (`get_current_session_bars`)**: the same GetQuotes
+row also yields today's (or the most recently completed session's) OHLCV
+bar -- `open`/`high`/`low` as reported, `price` as the close, `volume` as
+reported, session date from `lastTradeDate`. This is a capability distinct
+from `get_daily_bars` (still close-only/last-resort, unaffected by any of
+this) and is not part of the `MarketDataProvider` protocol; `DataIngestor.
+ingest_prices` merges it in explicitly and conservatively (see "Current-bar
+merge rule" immediately below) to reduce reliance on Yahoo's historical
+chart for "today" specifically, since that endpoint typically lags by one
+session until after the close.
+
+**Current-bar merge rule (`DataIngestor._merge_current_session_bars`) --
+deliberately CONSERVATIVE**: after the normal `get_daily_bars` cascade
+(Yahoo primarily) and the dedicated benchmark fetch both run, this appends a
+TipRanks GetQuotes current-session bar for any symbol whose collected series
+has no bar for today's session at all. It is append-only: it never replaces
+or overwrites an existing bar, even for today's own session, and does NOT
+implement "prefer GetQuotes over Yahoo when the market is open or GetQuotes
+is newer" -- that richer rule was judged not worth the look-ahead/
+double-counting risk (a downstream signal being computed from one value and
+then silently recomputed from a different one later in the same run) for
+this change. Deduping is by exact session-date equality, so even a symbol
+included in the GetQuotes query by an imprecise "today" pre-filter is still
+safe: a GetQuotes bar is only ever appended when nothing in the collected
+series already carries that exact date. A GetQuotes failure here (bad
+shape, network error, provider missing/misconfigured) degrades silently to
+"no bar added" -- it never fails the run.
+
+**Why there's no TipRanks daily-history feed (the CIBC finding)**: a
+separate probe into the CIBC brokerage integration TipRanks' GetQuotes and
+`historicalprices` endpoints originate from confirmed that TipRanks serves
+CIBC's *ratings/analyst widgets*, not CIBC's own price-chart data -- there is
+no TipRanks endpoint, confirmed or hypothesised, that returns a genuine
+daily OHLCV series. `historicalprices` (above) is a fixed ~biweekly cadence
+regardless of any request parameter, not a daily source, and GetQuotes is a
+single real-time snapshot, not history. Yahoo's chart endpoint remains the
+only daily-history source in this codebase; TipRanks' role is real-time
+(GetQuotes) and last-resort close-only/`prices_only` backfill, never the
+historical backbone.
 
 **Limitations**:
 
@@ -512,7 +601,7 @@ tiers; unsuitable for commercial use; fails closed per ADR-0008 Decision 1.
 CSVs below are bootstrap seeds only. The authoritative universe is the one
 computed at refresh time: every US + Canadian listing on a permitted exchange
 for which the market-data path can establish a real market cap, filtered to
-`>= universe.min_market_cap_usd` (default $1B) -- see
+`>= universe.min_market_cap_usd` (default $500M) -- see
 [Runtime Market-Cap Filter](#runtime-market-cap-filter-adr-0008-decision-3)
 below. A name missing from the seeds but present in provider data joins the
 universe on the next refresh; a seeded name that delists falls out. The
@@ -620,7 +709,7 @@ synthetic data and run `claudetrade refresh`.
 source = "database"                          # default
 packaged_universes = ["us_default", "ca_default"]  # set to [] to disable the fallback
 permitted_exchanges = ["NYSE", "NASDAQ", "AMEX", "TSX"]  # TSXV/CSE/NEO excluded
-min_market_cap_usd = 1000000000              # ADR-0008 Decision 3 runtime floor, default $1B
+min_market_cap_usd = 500000000               # ADR-0008 Decision 3 runtime floor, default $500M (owner-lowered 2026-07-31)
 unknown_cap_policy = "include"               # "include" | "exclude" -- see below
 ```
 
@@ -655,12 +744,18 @@ production and was removed outright), then, if it is a cascading fallback
 wrapper, each of its fallbacks in turn (a provider's `get_market_caps` is an
 **optional** capability -- see `providers.base.MarketDataProvider.get_market_caps`
 -- so a provider that does not support it, the default for every adapter
-except `tipranks`, simply contributes nothing rather than erroring). The
-resolved figure is stored on `Security.market_cap_usd`. The enriched floor is
-also applied **before** price, corporate-action, earnings and sentiment
-requests, so a company that currently resolves below $1B does not consume a
-bars-history request. The benchmark is retained because regime and
-relative-strength calculations require it even though it is an ETF.
+except `tipranks`, simply contributes nothing rather than erroring). Inside
+`TipRanksProvider.get_market_caps` itself, the batched GetQuotes endpoint is
+tried for the whole symbol list first, with the per-symbol `dataForTicker`
+path as the fallback for anything it did not cover -- see "GetQuotes
+batching" in the TipRanks section above; this is what turns a ~2,400-symbol
+refresh's cap sweep from thousands of individual calls into a handful of
+batches plus a much smaller fallback tail. The resolved figure is stored on
+`Security.market_cap_usd`. The enriched floor is also applied **before**
+price, corporate-action, earnings and sentiment requests, so a company that
+currently resolves below $1B does not consume a bars-history request. The
+benchmark is retained because regime and relative-strength calculations
+require it even though it is an ETF.
 
 `UniverseSelector.for_session` then applies `universe.min_market_cap_usd`
 (default $1B) against that stored figure:

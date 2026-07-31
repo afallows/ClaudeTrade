@@ -29,7 +29,9 @@ from claudetrade.domain import EarningsSession
 from claudetrade.providers.base import ProviderError, RateLimitError, SourceBlockedError
 from claudetrade.providers.market.tipranks import (
     TipRanksProvider,
-    _parse_getquotes_response,
+    _getquotes_market_cap_usd,
+    _getquotes_session_bar,
+    _parse_getquotes_envelope,
     tipranks_ticker,
 )
 
@@ -38,6 +40,11 @@ INTC_PAYLOAD = json.loads((FIXTURES / "dataForTicker_INTC.json").read_text(encod
 TECK_B_PAYLOAD = json.loads((FIXTURES / "dataForTicker_TECK_B.json").read_text(encoding="utf-8"))
 MHD_HISTORICALPRICES = json.loads(
     (FIXTURES / "historicalprices_MHD.json").read_text(encoding="utf-8")
+)
+GETQUOTES_AMZN = json.loads((FIXTURES / "getquotes_AMZN.json").read_text(encoding="utf-8"))
+GETQUOTES_NVDA = json.loads((FIXTURES / "getquotes_NVDA.json").read_text(encoding="utf-8"))
+GETQUOTES_BATCH_MIXED = json.loads(
+    (FIXTURES / "getquotes_batch_mixed.json").read_text(encoding="utf-8")
 )
 
 
@@ -518,9 +525,17 @@ def test_404_degrades_only_that_symbol_not_treated_as_outage(monkeypatch, tmp_pa
 # --------------------------------------------------------------------------
 
 
+#: These caching tests are about the per-symbol ``dataForTicker`` cache
+#: specifically -- GetQuotes has separate, deliberately-uncached-every-call
+#: semantics (a fresh real-time snapshot each time; see the GetQuotes tests
+#: further down), so it is turned off here to keep these request-count
+#: assertions meaningful and about the mechanism they actually name.
+_NO_GETQUOTES = TipRanksConfig(use_getquotes_batch=False)
+
+
 def test_second_call_within_ttl_is_served_from_cache(monkeypatch, tmp_path, stub):
     _install(monkeypatch, stub)
-    provider = _provider(tmp_path)
+    provider = _provider(tmp_path, config=_NO_GETQUOTES)
     provider.get_market_caps(["INTC"])
     calls_after_first = len(stub.requests)
     provider.get_market_caps(["INTC"])
@@ -532,10 +547,10 @@ def test_cache_persists_across_provider_instances(monkeypatch, tmp_path, stub):
     attribute -- a fresh provider instance (e.g. the next scheduled refresh
     process) must still see the cached response."""
     _install(monkeypatch, stub)
-    _provider(tmp_path).get_market_caps(["INTC"])
+    _provider(tmp_path, config=_NO_GETQUOTES).get_market_caps(["INTC"])
     calls_after_first = len(stub.requests)
 
-    second = _provider(tmp_path)
+    second = _provider(tmp_path, config=_NO_GETQUOTES)
     second.get_market_caps(["INTC"])
     assert len(stub.requests) == calls_after_first
 
@@ -544,7 +559,7 @@ def test_cache_expires_after_configured_trading_days(monkeypatch, tmp_path, stub
     """Backdating the cached ``fetched_date`` past the TTL must force a
     fresh fetch on the next call."""
     _install(monkeypatch, stub)
-    config = TipRanksConfig(cache_ttl_trading_days=1)
+    config = TipRanksConfig(cache_ttl_trading_days=1, use_getquotes_batch=False)
     provider = _provider(tmp_path, config=config)
     provider.get_market_caps(["INTC"])
     calls_after_first = len(stub.requests)
@@ -564,7 +579,7 @@ def test_unknown_ticker_result_is_also_cached(monkeypatch, tmp_path, stub):
     every call either -- that would defeat the whole point of the cache for
     a universe that always contains a few unresolvable names."""
     _install(monkeypatch, stub)
-    provider = _provider(tmp_path)
+    provider = _provider(tmp_path, config=_NO_GETQUOTES)
     provider.get_market_caps(["NEVERHEARDOFIT"])
     calls_after_first = len(stub.requests)
     provider.get_market_caps(["NEVERHEARDOFIT"])
@@ -629,7 +644,9 @@ def test_prices_only_cache_uses_the_unknown_ticker_ttl(monkeypatch, tmp_path, st
     short ``cache_ttl_trading_days`` one."""
     stub.historicalprices_by_ticker["MHD"] = MHD_HISTORICALPRICES
     _install(monkeypatch, stub)
-    config = TipRanksConfig(cache_ttl_trading_days=1, unknown_ticker_ttl_days=30)
+    config = TipRanksConfig(
+        cache_ttl_trading_days=1, unknown_ticker_ttl_days=30, use_getquotes_batch=False
+    )
     provider = _provider(tmp_path, config=config)
 
     provider.get_market_caps(["MHD"])
@@ -769,134 +786,433 @@ def test_status_declares_capabilities(tmp_path):
     assert status.capabilities["earnings"] is True
     assert status.capabilities["market_caps"] is True
     assert status.capabilities["bars_last_resort"] is True
-    assert status.capabilities["getquotes_batch_enabled"] is False
+    # GetQuotes is the primary batched path now -- on by default.
+    assert status.capabilities["getquotes_batch_enabled"] is True
+    assert status.capabilities["getquotes_current_bar"] is True
     assert status.licence_note, "ToS posture must be stated"
     assert "fail" in status.licence_note.lower()
 
 
+def test_status_declares_getquotes_disabled_when_configured_off(tmp_path):
+    status = _provider(tmp_path, config=TipRanksConfig(use_getquotes_batch=False)).status()
+    assert status.capabilities["getquotes_batch_enabled"] is False
+    assert status.capabilities["getquotes_current_bar"] is False
+
+
 # --------------------------------------------------------------------------
-# GetQuotes -- optional, UNVERIFIED batching path
+# GetQuotes -- CONFIRMED batched primary path (default on)
 # --------------------------------------------------------------------------
 
 
-def test_getquotes_disabled_by_default_never_calls_marketsv3(monkeypatch, tmp_path, stub):
+def _getquotes_stub_factory(monkeypatch, handler):
+    real_client = httpx.Client
+
+    def _factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr("claudetrade.providers.market.tipranks.httpx.Client", _factory)
+
+
+def test_getquotes_disabled_explicitly_never_calls_marketsv3(monkeypatch, tmp_path, stub):
     _install(monkeypatch, stub)
-    provider = _provider(tmp_path)  # use_getquotes_batch defaults to False
+    provider = _provider(tmp_path, config=TipRanksConfig(use_getquotes_batch=False))
     provider.get_market_caps(["TECK-B", "CCL-B"])
     assert all("marketsv3" not in str(r.url) for r in stub.requests)
 
 
-def test_parse_getquotes_response_is_defensive_to_unexpected_shapes():
-    """No real GetQuotes response body was ever obtained (see the module
-    docstring) -- the parser must degrade to an empty result for any shape
-    that doesn't match its best-guess structure, never raise."""
-    assert _parse_getquotes_response(None, ["TSE:TECK.B"]) == {}
-    assert _parse_getquotes_response({}, ["TSE:TECK.B"]) == {}
-    assert _parse_getquotes_response({"quotes": "not a list"}, ["TSE:TECK.B"]) == {}
-    assert _parse_getquotes_response({"quotes": [{"ticker": None}]}, ["TSE:TECK.B"]) == {}
-    assert _parse_getquotes_response({"quotes": [123, "bad"]}, ["TSE:TECK.B"]) == {}
+def test_getquotes_enabled_by_default_calls_marketsv3(monkeypatch, tmp_path, stub):
+    """``use_getquotes_batch`` now defaults to True -- GetQuotes is the
+    primary path, not an opt-in extra."""
+    _install(monkeypatch, stub)
+    provider = _provider(tmp_path)  # default config
+    provider.get_market_caps(["INTC"])
+    assert any("marketsv3" in str(r.url) for r in stub.requests)
 
 
-def test_parse_getquotes_response_prefers_market_cap_usd():
-    payload = {
-        "quotes": [
-            {"ticker": "TSE:TECK.B", "marketCapUSD": 28_913_081_465.0},
-        ]
-    }
-    caps = _parse_getquotes_response(payload, ["TSE:TECK.B"])
-    assert caps == {"TSE:TECK.B": pytest.approx(28_913_081_465.0)}
+# --- envelope parsing --------------------------------------------------------
 
 
-def test_parse_getquotes_response_converts_local_currency_via_exchange_rate():
-    """CONFIRMED currency trap from the real probe: TSE:TECK.B's GetQuotes
-    ``marketCap`` (40,620,412,377) is CAD, not USD; multiplying by its
-    ``exchangeRate`` (~0.712) recovers the USD figure ``dataForTicker``
-    reports directly (28,913,081,465) -- the raw local-currency figure must
-    never be returned as-is."""
-    payload = {
-        "quotes": [
-            {"ticker": "TSE:TECK.B", "marketCap": 40_620_412_377.0, "exchangeRate": 0.712},
-        ]
-    }
-    caps = _parse_getquotes_response(payload, ["TSE:TECK.B"])
-    assert caps["TSE:TECK.B"] == pytest.approx(28_921_733_612.424, rel=1e-3)
+def test_parse_getquotes_envelope_is_defensive_to_unexpected_shapes():
+    assert _parse_getquotes_envelope(None, ["AMZN"]) == ({}, set())
+    assert _parse_getquotes_envelope({}, ["AMZN"]) == ({}, set())
+    assert _parse_getquotes_envelope({"quotes": "not a list"}, ["AMZN"]) == ({}, set())
+    assert _parse_getquotes_envelope({"quotes": [{"ticker": None}]}, ["AMZN"]) == ({}, set())
+    assert _parse_getquotes_envelope({"quotes": [123, "bad"]}, ["AMZN"]) == ({}, set())
+    assert _parse_getquotes_envelope({"errors": "not a list"}, ["AMZN"]) == ({}, set())
 
 
-def test_parse_getquotes_response_omits_local_currency_cap_with_no_exchange_rate():
-    """Without an ``exchangeRate`` to convert with, a non-USD ``marketCap``
-    must never be treated as if it were already USD."""
-    payload = {"quotes": [{"ticker": "TSE:CCL.B", "marketCap": 9_000_000_000.0}]}
-    caps = _parse_getquotes_response(payload, ["TSE:CCL.B"])
-    assert "TSE:CCL.B" not in caps
+def test_parse_getquotes_envelope_success_single_ticker():
+    """Against the owner-confirmed-shape AMZN fixture (see its own
+    ``_fixture_note`` -- constructed to the confirmed field list, not a
+    verbatim capture)."""
+    quotes, errors = _parse_getquotes_envelope(GETQUOTES_AMZN, ["AMZN"])
+    assert set(quotes) == {"AMZN"}
+    assert quotes["AMZN"]["price"] == pytest.approx(231.15)
+    assert errors == set()
 
 
-def test_parse_getquotes_response_us_entry_with_exchange_rate_one():
-    """A US entry's ``exchangeRate`` is 1 per the real probe -- local-currency
-    conversion is a no-op for it."""
-    payload = {"quotes": [{"ticker": "AAPL", "marketCap": 2_800_000_000_000.0, "exchangeRate": 1}]}
-    caps = _parse_getquotes_response(payload, ["AAPL"])
-    assert caps["AAPL"] == pytest.approx(2_800_000_000_000.0)
+def test_parse_getquotes_envelope_second_single_ticker_fixture():
+    """The NVDA fixture -- a second single-ticker shape, same schema."""
+    quotes, errors = _parse_getquotes_envelope(GETQUOTES_NVDA, ["NVDA"])
+    assert set(quotes) == {"NVDA"}
+    assert quotes["NVDA"]["marketCap"] == pytest.approx(3_140_000_000_000.0)
+    assert errors == set()
 
 
-def test_getquotes_batch_optimisation_used_when_enabled(monkeypatch, tmp_path):
-    """When explicitly opted in, the batch call is attempted first and its
-    resolved symbols skip the per-symbol dataForTicker fetch entirely."""
+def test_parse_getquotes_envelope_multi_ticker_with_error_entry():
+    """The synthesized batch fixture: AAPL + TSE:TECK.B resolve, BADSYM is
+    in errors[] -- a per-ticker error must not be fatal to the rest."""
+    quotes, errors = _parse_getquotes_envelope(
+        GETQUOTES_BATCH_MIXED, ["AAPL", "TSE:TECK.B", "BADSYM"]
+    )
+    assert set(quotes) == {"AAPL", "TSE:TECK.B"}
+    assert errors == {"BADSYM"}
+
+
+def test_parse_getquotes_envelope_ignores_unrequested_tickers():
+    """A row for a ticker outside ``requested_params`` (echoed back for some
+    other reason, or a stale/misrouted response) must never leak in."""
+    quotes, errors = _parse_getquotes_envelope(GETQUOTES_BATCH_MIXED, ["AAPL"])
+    assert set(quotes) == {"AAPL"}
+    assert errors == set()  # BADSYM wasn't requested here, so it's not "our" error either
+
+
+def test_parse_getquotes_envelope_string_error_entries_are_supported():
+    payload = {"quotes": [], "errors": ["BADSYM"], "metadata": {}}
+    quotes, errors = _parse_getquotes_envelope(payload, ["BADSYM"])
+    assert quotes == {}
+    assert errors == {"BADSYM"}
+
+
+def test_parse_getquotes_envelope_ticker_absent_from_both_quotes_and_errors():
+    """A ticker TipRanks silently drops from the response (in neither
+    ``quotes`` nor ``errors``) resolves to neither -- the caller treats this
+    identically to an explicit error (skip, not fatal)."""
+    payload = {"quotes": [], "errors": [], "metadata": {"count": 0}}
+    quotes, errors = _parse_getquotes_envelope(payload, ["GHOST"])
+    assert quotes == {}
+    assert errors == set()
+
+
+# --- USD market-cap normalisation --------------------------------------------
+
+
+def test_getquotes_market_cap_usd_currency_passthrough():
+    """A plain USD quote (AMZN fixture) needs no conversion."""
+    quote = GETQUOTES_AMZN["quotes"][0]
+    cap = _getquotes_market_cap_usd(quote)
+    # realTimeMarketCap is preferred over marketCap when both are present.
+    assert cap == pytest.approx(quote["realTimeMarketCap"])
+
+
+def test_getquotes_market_cap_usd_missing_currency_field_defaults_to_usd():
+    quote = {"marketCap": 2_800_000_000_000.0}
+    assert _getquotes_market_cap_usd(quote) == pytest.approx(2_800_000_000_000.0)
+
+
+def test_getquotes_market_cap_usd_prefers_realtime_over_marketcap():
+    quote = {"marketCap": 100.0, "realTimeMarketCap": 200.0, "currency": "USD"}
+    assert _getquotes_market_cap_usd(quote) == pytest.approx(200.0)
+
+
+def test_getquotes_market_cap_usd_converts_cad_via_exchange_rate():
+    """CONFIRMED currency trap: the batch fixture's TSE:TECK.B row is CAD;
+    multiplying by ``exchangeRate`` recovers the USD figure -- the raw
+    local-currency number must never be returned as-is."""
+    quote = GETQUOTES_BATCH_MIXED["quotes"][1]
+    assert quote["ticker"] == "TSE:TECK.B"
+    assert quote["currency"] == "CAD"
+    cap = _getquotes_market_cap_usd(quote)
+    expected = quote["realTimeMarketCap"] * quote["exchangeRate"]
+    assert cap == pytest.approx(expected)
+    # The raw, un-normalised local-currency figure must never be returned.
+    assert cap != pytest.approx(quote["realTimeMarketCap"])
+
+
+def test_getquotes_market_cap_usd_non_usd_without_exchange_rate_is_never_used_unconverted():
+    """Without an ``exchangeRate`` to convert with, a non-USD cap must never
+    be treated as if it were already USD."""
+    quote = {"marketCap": 9_000_000_000.0, "currency": "CAD"}
+    assert _getquotes_market_cap_usd(quote) is None
+
+
+def test_getquotes_market_cap_usd_non_usd_with_zero_or_negative_rate_is_omitted():
+    assert _getquotes_market_cap_usd(
+        {"marketCap": 9_000_000_000.0, "currency": "CAD", "exchangeRate": 0}
+    ) is None
+    assert _getquotes_market_cap_usd(
+        {"marketCap": 9_000_000_000.0, "currency": "CAD", "exchangeRate": -1}
+    ) is None
+
+
+def test_getquotes_market_cap_usd_no_cap_field_at_all():
+    assert _getquotes_market_cap_usd({"currency": "USD"}) is None
+
+
+# --- current-session bar ------------------------------------------------------
+
+
+def test_getquotes_session_bar_builds_from_confirmed_fields():
+    quote = GETQUOTES_AMZN["quotes"][0]
+    bar = _getquotes_session_bar("AMZN", quote)
+    assert bar is not None
+    assert bar.symbol == "AMZN"
+    assert bar.session == dt.date(2026, 7, 30)
+    assert bar.open == pytest.approx(quote["open"])
+    assert bar.high == pytest.approx(quote["high"])
+    assert bar.low == pytest.approx(quote["low"])
+    assert bar.close == pytest.approx(quote["price"])  # price is the close
+    assert bar.volume == pytest.approx(quote["volume"])
+    assert bar.source == "tipranks_getquotes"
+
+
+def test_getquotes_session_bar_missing_field_yields_none():
+    quote = dict(GETQUOTES_AMZN["quotes"][0])
+    del quote["open"]
+    assert _getquotes_session_bar("AMZN", quote) is None
+
+
+def test_getquotes_session_bar_missing_last_trade_date_yields_none():
+    quote = dict(GETQUOTES_AMZN["quotes"][0])
+    del quote["lastTradeDate"]
+    assert _getquotes_session_bar("AMZN", quote) is None
+
+
+def test_getquotes_session_bar_unparseable_date_yields_none():
+    quote = dict(GETQUOTES_AMZN["quotes"][0])
+    quote["lastTradeDate"] = "not-a-date"
+    assert _getquotes_session_bar("AMZN", quote) is None
+
+
+# --- get_quotes / get_current_session_bars (provider-level) ------------------
+
+
+def test_get_quotes_disabled_returns_empty_with_no_network_call(monkeypatch, tmp_path, stub):
+    _install(monkeypatch, stub)
+    provider = _provider(tmp_path, config=TipRanksConfig(use_getquotes_batch=False))
+    assert provider.get_quotes(["AMZN"]) == {}
+    assert not stub.requests
+
+
+def test_get_quotes_keyed_by_caller_symbol_not_ticker_param(monkeypatch, tmp_path):
+    """A TSX symbol is requested in ``TSE:`` notation but the result is keyed
+    by the caller's own hyphenated symbol."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=GETQUOTES_BATCH_MIXED)
+
+    _getquotes_stub_factory(monkeypatch, handler)
+    provider = _provider(tmp_path)
+    quotes = provider.get_quotes(["AAPL", "TECK-B"])
+    assert set(quotes) == {"AAPL", "TECK-B"}
+    assert quotes["TECK-B"]["ticker"] == "TSE:TECK.B"
+
+
+def test_get_quotes_uses_tse_notation_in_the_batch_param(monkeypatch, tmp_path):
+    captured: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(httpx.QueryParams(request.url.query).get("tickers", ""))
+        return httpx.Response(200, json={"quotes": [], "errors": [], "metadata": {}})
+
+    _getquotes_stub_factory(monkeypatch, handler)
+    provider = _provider(tmp_path)
+    provider.get_quotes(["AAPL", "TECK-B"])
+    assert captured
+    tickers_param = captured[0].split(",")
+    assert "AAPL" in tickers_param
+    assert "TSE:TECK.B" in tickers_param
+
+
+def test_get_quotes_chunks_by_configured_batch_size(monkeypatch, tmp_path):
+    """450 symbols at batch_size=200 -> 3 calls, with every symbol appearing
+    in exactly one chunk (correct membership, no drops, no duplicates)."""
+    symbols = [f"SYM{i:04d}" for i in range(450)]
+    chunks_seen: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tickers = httpx.QueryParams(request.url.query).get("tickers", "")
+        chunk = tickers.split(",") if tickers else []
+        chunks_seen.append(chunk)
+        return httpx.Response(200, json={"quotes": [], "errors": [], "metadata": {}})
+
+    _getquotes_stub_factory(monkeypatch, handler)
+    config = TipRanksConfig(getquotes_batch_size=200, rate_limit_per_minute=6000)
+    provider = _provider(tmp_path, config=config)
+    provider.get_quotes(symbols)
+
+    assert len(chunks_seen) == 3
+    assert [len(c) for c in chunks_seen] == [200, 200, 50]
+    all_seen = [s for chunk in chunks_seen for s in chunk]
+    assert sorted(all_seen) == sorted(symbols)
+    assert len(all_seen) == len(set(all_seen)) == 450
+
+
+def test_get_current_session_bars_from_batch_fixture(monkeypatch, tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=GETQUOTES_BATCH_MIXED)
+
+    _getquotes_stub_factory(monkeypatch, handler)
+    provider = _provider(tmp_path)
+    bars = provider.get_current_session_bars(["AAPL", "TECK-B", "BADSYM"])
+    assert set(bars) == {"AAPL", "TECK-B"}  # BADSYM is in errors[] -- omitted
+    assert bars["AAPL"].source == "tipranks_getquotes"
+    assert bars["AAPL"].close == pytest.approx(215.32)
+
+
+def test_get_quotes_progress_hook_fires_across_chunks(monkeypatch, tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"quotes": [], "errors": [], "metadata": {}})
+
+    _getquotes_stub_factory(monkeypatch, handler)
+    config = TipRanksConfig(getquotes_batch_size=2, rate_limit_per_minute=6000)
+    provider = _provider(tmp_path, config=config)
+    seen: list[tuple[int, int]] = []
+    provider.on_symbol_progress = lambda done, total: seen.append((done, total))
+
+    provider.get_quotes(["A", "B", "C", "D", "E"])
+    assert seen[-1] == (5, 5)
+    assert all(done <= total for done, total in seen)
+
+
+# --- market caps: GetQuotes-first, dataForTicker-fallback --------------------
+
+
+def test_get_market_caps_resolves_via_getquotes_without_dataforticker_call(monkeypatch, tmp_path):
+    """When GetQuotes resolves every requested symbol, the per-symbol
+    dataForTicker fallback is never called at all."""
+    dataforticker_calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "GetQuotes" in request.url.path:
+            return httpx.Response(200, json=GETQUOTES_BATCH_MIXED)
+        dataforticker_calls.append(request)
+        return httpx.Response(200, json={"overview": None})
+
+    _getquotes_stub_factory(monkeypatch, handler)
+    provider = _provider(tmp_path)
+    caps = provider.get_market_caps(["AAPL", "TECK-B"])
+
+    assert caps["AAPL"] == pytest.approx(GETQUOTES_BATCH_MIXED["quotes"][0]["realTimeMarketCap"])
+    teck_quote = GETQUOTES_BATCH_MIXED["quotes"][1]
+    assert caps["TECK-B"] == pytest.approx(teck_quote["realTimeMarketCap"] * teck_quote["exchangeRate"])
+    assert not dataforticker_calls
+
+
+def test_get_market_caps_falls_back_to_dataforticker_for_getquotes_gaps(monkeypatch, tmp_path, stub):
+    """A symbol GetQuotes has no data for (errors[] or absent) falls back to
+    dataForTicker; a symbol GetQuotes DID resolve never makes that call."""
+    dataforticker_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "GetQuotes" in request.url.path:
+            return httpx.Response(200, json=GETQUOTES_BATCH_MIXED)  # only AAPL/TECK-B resolve
+        dataforticker_calls.append(httpx.QueryParams(request.url.query).get("ticker", ""))
+        return stub.handler(request)
+
+    _getquotes_stub_factory(monkeypatch, handler)
+    provider = _provider(tmp_path)
+    caps = provider.get_market_caps(["AAPL", "INTC"])  # INTC isn't in the batch fixture
+
+    assert "AAPL" in caps  # resolved via GetQuotes
+    assert dataforticker_calls == ["INTC"]  # only the GetQuotes gap hit dataForTicker
+    assert caps["INTC"] == pytest.approx(435297215393.0)  # from the INTC fixture, via fallback
+
+
+def test_getquotes_batch_optimisation_used_by_default(monkeypatch, tmp_path):
+    """GetQuotes is attempted first (default-on) and resolved symbols skip
+    the per-symbol dataForTicker fetch entirely."""
     getquotes_calls: list[httpx.Request] = []
     dataforticker_calls: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if "GetQuotes" in request.url.path:
             getquotes_calls.append(request)
-            return httpx.Response(
-                200,
-                json={
-                    "quotes": [
-                        {"ticker": "TSE:TECK.B", "marketCapUSD": 28_913_081_465.0},
-                        {"ticker": "TSE:CCL.B", "marketCapUSD": 9_000_000_000.0},
-                    ]
-                },
-            )
+            return httpx.Response(200, json=GETQUOTES_BATCH_MIXED)
         dataforticker_calls.append(request)
         return httpx.Response(200, json={"overview": None})
 
-    real_client = httpx.Client
-
-    def _factory(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(handler)
-        return real_client(*args, **kwargs)
-
-    monkeypatch.setattr("claudetrade.providers.market.tipranks.httpx.Client", _factory)
-
-    config = TipRanksConfig(use_getquotes_batch=True)
-    provider = _provider(tmp_path, config=config)
-    caps = provider.get_market_caps(["TECK-B", "CCL-B"])
+    _getquotes_stub_factory(monkeypatch, handler)
+    provider = _provider(tmp_path)
+    caps = provider.get_market_caps(["AAPL", "TECK-B"])
 
     assert getquotes_calls, "GetQuotes must have been attempted"
-    assert caps["TECK-B"] == pytest.approx(28_913_081_465.0)
-    assert caps["CCL-B"] == pytest.approx(9_000_000_000.0)
-    # Both resolved by the batch call -- no per-symbol dataForTicker fallback needed.
+    assert set(caps) == {"AAPL", "TECK-B"}
     assert not dataforticker_calls
 
 
 def test_getquotes_failure_falls_back_to_dataforticker(monkeypatch, tmp_path, stub):
     """A GetQuotes failure (bad shape, network error, anything) must never
     take down market-cap enrichment -- it falls straight back to the
-    per-symbol dataForTicker path."""
+    per-symbol dataForTicker path. GetQuotes now covers every symbol (not
+    just a Canadian-only subset), so this is exercised with a mixed US/TSX
+    pair."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if "GetQuotes" in request.url.path:
             raise httpx.ConnectError("connection refused")
         return stub.handler(request)
 
-    real_client = httpx.Client
-
-    def _factory(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(handler)
-        return real_client(*args, **kwargs)
-
-    monkeypatch.setattr("claudetrade.providers.market.tipranks.httpx.Client", _factory)
-
-    config = TipRanksConfig(use_getquotes_batch=True)
-    provider = _provider(tmp_path, config=config)
-    caps = provider.get_market_caps(["TECK-B", "SHOP"])  # >1 CA symbol triggers the batch attempt
+    _getquotes_stub_factory(monkeypatch, handler)
+    provider = _provider(tmp_path)
+    caps = provider.get_market_caps(["TECK-B", "SHOP"])
     assert caps["TECK-B"] == pytest.approx(28_913_081_465.0)
+
+
+def test_getquotes_401_falls_back_but_dataforticker_401_still_raises(monkeypatch, tmp_path):
+    """A GetQuotes-specific 401 is swallowed (falls back); if the fallback
+    dataForTicker call ALSO 401s, that -- a real block signal -- still
+    raises ``SourceBlockedError``, per the fail-closed rules."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={})
+
+    _getquotes_stub_factory(monkeypatch, handler)
+    provider = _provider(tmp_path)
+    with pytest.raises(SourceBlockedError):
+        provider.get_market_caps(["AAPL"])
+
+
+def test_getquotes_429_on_batch_endpoint_is_swallowed_then_fallback_raises_rate_limit(
+    monkeypatch, tmp_path
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={}, headers={"Retry-After": "1"})
+
+    _getquotes_stub_factory(monkeypatch, handler)
+    provider = _provider(tmp_path)
+    with pytest.raises(RateLimitError):
+        provider.get_market_caps(["AAPL"])
+
+
+def test_getquotes_5xx_on_batch_endpoint_falls_back_to_retryable_provider_error(
+    monkeypatch, tmp_path
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={})
+
+    _getquotes_stub_factory(monkeypatch, handler)
+    provider = _provider(tmp_path)
+    with pytest.raises(ProviderError) as excinfo:
+        provider.get_market_caps(["AAPL"])
+    assert not isinstance(excinfo.value, SourceBlockedError)
+    assert excinfo.value.retryable is True
+
+
+def test_getquotes_404_on_batch_endpoint_is_treated_as_an_empty_chunk_not_an_error(
+    monkeypatch, tmp_path, stub
+):
+    """Unlike dataForTicker (where 404 means "unknown ticker"), a 404 on the
+    batch endpoint just means this chunk had nothing -- never raised, always
+    falls through to the per-symbol fallback."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "GetQuotes" in request.url.path:
+            return httpx.Response(404, json={})
+        return stub.handler(request)
+
+    _getquotes_stub_factory(monkeypatch, handler)
+    provider = _provider(tmp_path)
+    caps = provider.get_market_caps(["INTC"])
+    assert caps["INTC"] == pytest.approx(435297215393.0)
