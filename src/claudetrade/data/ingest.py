@@ -326,7 +326,18 @@ class DataIngestor:
                 row.is_etf = info.is_etf
                 row.is_leveraged_or_inverse = info.is_leveraged_or_inverse
                 row.listed_date = info.listed_date
-                row.delisted_date = info.delisted_date
+                if info.delisted_date is not None:
+                    row.delisted_date = info.delisted_date
+                # else: leave whatever is already stored untouched. Most
+                # providers' reference data never tracks a delisting date at
+                # all (info.delisted_date is simply None), and treating that
+                # absence as "confirmed still listed" would silently clear a
+                # deactivation this application made itself (see
+                # ``_deactivate_confirmed_unknown``) on the very next
+                # refresh -- undoing it before ``ingest_prices`` even runs
+                # again. Reactivation is instead the more precise trigger of
+                # "a refresh actually found real bars again" -- see
+                # ``_persist_bars``.
                 row.source = getattr(self.market, "name", "unknown")
                 row.updated_at = utc_now()
                 report.securities_upserted += 1
@@ -438,6 +449,14 @@ class DataIngestor:
             collected.update(fetched)
             self._report_progress("prices", min(i + batch_size, total), total)
 
+        # The merged-batch inclusion above is harmless when it works, but it
+        # ties the benchmark's fate to whatever else lands in its batch: a
+        # real refresh log showed 641/1,673 symbols (SPY included) degrade to
+        # close-only fallback bars because one batch's failure cascaded the
+        # whole chunk to the fallback provider. This dedicated, independent,
+        # single-symbol call is the actual guarantee.
+        self._ensure_benchmark_bars(benchmark, start, end, collected, report)
+
         self.checker.check_provider_gap(
             getattr(self.market, "name", "market"),
             expected=len(symbols),
@@ -462,11 +481,176 @@ class DataIngestor:
             self.checker.check_staleness(symbol, bars, end, report=report.quality)
             self._persist_bars(symbol, bars, report)
 
+        self._deactivate_confirmed_unknown(symbols, report)
+
         self.checker.persist(report.quality)
         return collected
 
+    def _ensure_benchmark_bars(
+        self,
+        benchmark: str,
+        start: dt.date,
+        end: dt.date,
+        collected: dict[str, list[Bar]],
+        report: IngestReport,
+    ) -> None:
+        """Guarantee an independent attempt to fetch the benchmark's bars.
+
+        Only attempted when the merged-batch pass above did not already
+        yield real bars for ``benchmark`` -- the common case costs nothing
+        extra. When it was missing, this issues one dedicated, single-symbol
+        ``get_daily_bars`` call, entirely independent of whatever else was
+        in the benchmark's batch, so an unrelated failure elsewhere in that
+        batch cannot take the benchmark down with it. If bars are still
+        unavailable after this dedicated attempt -- i.e. no configured
+        source had anything for it -- an ERROR (not a warning) is logged,
+        because ``Pipeline.classify_regimes`` will report every session's
+        regime as UNKNOWN without it, and that is a materially worse outcome
+        than an ordinary missing-bars warning for an arbitrary symbol.
+        """
+        if collected.get(benchmark):
+            return
+        if self.market is None:
+            return
+        try:
+            fetched = self.market.get_daily_bars([benchmark], start, end)
+        except ProviderError as exc:
+            log.error(
+                "dedicated benchmark fetch for %s failed: %s -- regime classification will be "
+                "reported as UNKNOWN for every session in this run because no bars are "
+                "available for the benchmark",
+                benchmark, exc,
+            )
+            report.provider_failures.setdefault(f"benchmark:{benchmark}", str(exc))
+            return
+
+        bars = fetched.get(benchmark) or []
+        if bars:
+            collected[benchmark] = bars
+            log.info(
+                "dedicated benchmark fetch recovered %d bar(s) for %s", len(bars), benchmark
+            )
+            return
+
+        log.error(
+            "benchmark %s has no bars from any configured market-data source, even after a "
+            "dedicated fetch attempt -- regime classification will be reported as UNKNOWN for "
+            "every session in this run",
+            benchmark,
+        )
+
+    def _market_provider_named(self, name: str) -> object | None:
+        """Find a provider instance by ``.name`` within ``self.market``.
+
+        Reaches through a ``FallbackMarketProvider``-shaped wrapper's
+        ``.primary``/``.fallbacks`` the same way ``_market_cap_sources``
+        does -- duck-typed rather than importing ``FallbackMarketProvider``
+        (``providers.registry``), which does not itself carry a ``.name``
+        matching any real adapter's.
+        """
+        if self.market is None:
+            return None
+        candidates: list[object] = [self.market]
+        primary = getattr(self.market, "primary", None)
+        if primary is not None:
+            candidates.append(primary)
+        candidates.extend(getattr(self.market, "fallbacks", None) or [])
+        for candidate in candidates:
+            if getattr(candidate, "name", None) == name:
+                return candidate
+        return None
+
+    def _deactivate_confirmed_unknown(self, symbols: list[str], report: IngestReport) -> None:
+        """Mark a symbol inactive when BOTH tipranks and yahoo report it
+        unknown in this same refresh, and it has no recently-stored bars.
+
+        Both adapters keep a per-refresh ``_not_found`` set of symbols they
+        had no data for this run (see
+        ``providers.market.tipranks.TipRanksProvider._not_found`` and
+        ``providers.market.yahoo.YahooMarketProvider._not_found``) -- a real
+        refresh log showed WBA/JNPR/SNV/HES/HOLX/ATA/INE hitting this on
+        every single refresh (a confirmed HTTP 404 from yahoo and no
+        analyst/overview coverage from tipranks), burning an API call and
+        polluting a batch every time for names that are, in fact, gone.
+
+        Deliberately conservative -- a single provider hiccup must never
+        deactivate a live name: both sources must agree in the SAME refresh
+        AND the symbol must have no ``price_bars`` row in the last 30 days.
+        Only ``Security.delisted_date`` is touched (the same column
+        ``UniverseSelector.for_session``/``SecurityInfo.is_active_on``
+        already use for point-in-time universe membership) -- never a new,
+        parallel flag -- and only for a security that is not already marked
+        inactive. Already-stored history is untouched, so a backtest
+        spanning the period the symbol WAS listed still sees it; this only
+        stops it from being offered to today's *scannable* universe.
+
+        Every symbol deactivated this way gets a WARNING data-quality
+        finding, so the change is visible, never silent.
+
+        This method does not itself stop a future refresh from attempting
+        the symbol again -- ``ingest_securities`` no longer clobbers an
+        existing ``delisted_date`` back to ``None`` from a source that
+        simply does not track delisting (see its docstring), but nothing
+        here filters the symbol out of a future ``get_daily_bars`` call
+        either. If a future refresh's fetch succeeds, ``_persist_bars``
+        clears ``delisted_date`` again automatically -- that is
+        reactivation's entire mechanism, deliberately with no separate flag
+        or scheduled re-probe to keep in sync.
+        """
+        tipranks = self._market_provider_named("tipranks")
+        yahoo = self._market_provider_named("yahoo")
+        if tipranks is None or yahoo is None:
+            return
+        tipranks_unknown = getattr(tipranks, "_not_found", None)
+        yahoo_unknown = getattr(yahoo, "_not_found", None)
+        if not tipranks_unknown or not yahoo_unknown:
+            return
+
+        both_unknown = sorted((tipranks_unknown & yahoo_unknown) & set(symbols))
+        if not both_unknown:
+            return
+
+        today = utc_now().date()
+        cutoff = today - dt.timedelta(days=30)
+        with self.db.session() as session:
+            for symbol in both_unknown:
+                row = session.get(Security, symbol)
+                if row is None or row.delisted_date is not None:
+                    continue  # nothing known about it, or already inactive
+                recent = session.execute(
+                    select(PriceBar.id)
+                    .where(PriceBar.symbol == symbol, PriceBar.session >= cutoff)
+                    .limit(1)
+                ).first()
+                if recent is not None:
+                    # A provider hiccup must not deactivate a name that was
+                    # trading as recently as last month.
+                    continue
+                row.delisted_date = today
+                report.quality.add(
+                    DataQualitySeverity.WARNING,
+                    "symbol_deactivated",
+                    f"{symbol}: both tipranks and yahoo report this ticker unknown this "
+                    f"refresh, and no price bars have been stored in the last 30 days; "
+                    f"marked delisted_date={today} so it drops out of the point-in-time-active "
+                    "universe. Reactivates automatically if a future refresh finds real bars "
+                    "for it again.",
+                    symbol=symbol,
+                )
+
     def _persist_bars(self, symbol: str, bars: list[Bar], report: IngestReport) -> None:
-        """Insert new bars; flag (but still apply) restatements of existing ones."""
+        """Insert new bars; flag (but still apply) restatements of existing ones.
+
+        Only ever called with a non-empty ``bars`` (see ``ingest_prices``'s
+        ``if not bars: continue`` guard), so reaching this method at all
+        means a provider found real data for ``symbol`` this refresh. That
+        is exactly the trigger this application uses for reactivation: if
+        the security was previously marked ``delisted_date`` by
+        ``_deactivate_confirmed_unknown`` (a provider hiccup must not
+        strand a name that comes back to life), it is cleared here so the
+        symbol re-enters the point-in-time-active set
+        ``UniverseSelector.for_session``/``SecurityInfo.is_active_on`` check.
+        """
         source = getattr(self.market, "name", "unknown")
         with self.db.session() as session:
             existing = {
@@ -520,6 +704,19 @@ class DataIngestor:
                 row.volume = bar.volume
                 row.ingested_at = utc_now()
                 report.bars_revised += 1
+
+            security = session.get(Security, symbol)
+            if security is not None and security.delisted_date is not None:
+                previous = security.delisted_date
+                security.delisted_date = None
+                report.quality.add(
+                    DataQualitySeverity.INFO,
+                    "symbol_reactivated",
+                    f"{symbol}: real bars found again this refresh (was marked "
+                    f"delisted_date={previous}); delisted_date cleared and the symbol "
+                    "re-enters the point-in-time-active universe.",
+                    symbol=symbol,
+                )
 
     def ingest_corporate_actions(
         self, symbols: list[str], start: dt.date, end: dt.date, report: IngestReport

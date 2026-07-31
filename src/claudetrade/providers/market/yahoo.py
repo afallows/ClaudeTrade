@@ -214,7 +214,10 @@ class YahooMarketProvider(MarketDataProvider):
             "events": "div,splits",
         }
         url = YAHOO_CHART_URL.format(symbol=self.yahoo_symbol(symbol))
-        response = self._get(url, params, symbol)
+        # symbol_scoped=True (the default): this chart URL identifies exactly
+        # one ticker, so a 404/410 means "this ticker is unknown/delisted",
+        # not "the endpoint is down" -- see _get's docstring.
+        response = self._get(url, params, symbol, symbol_scoped=True)
         return self._parse_chart_response(response.json(), symbol, start, end, adjusted=adjusted)
 
     @staticmethod
@@ -322,7 +325,41 @@ class YahooMarketProvider(MarketDataProvider):
 
     # --- shared plumbing --------------------------------------------------------
 
-    def _get(self, url: str, params: dict[str, str], symbol_label: str):
+    def _get(
+        self,
+        url: str,
+        params: dict[str, str],
+        symbol_label: str,
+        *,
+        symbol_scoped: bool = True,
+    ):
+        """Perform the request, translating expected failure modes into
+        ``ProviderError`` subclasses.
+
+        Args:
+            symbol_scoped: Whether ``url`` identifies exactly one ticker (the
+                only kind of request this adapter makes today -- see
+                ``_fetch_chart``). When true, an HTTP 404 or 410 is mapped to
+                ``_YahooNoDataError`` -- "this specific ticker is unknown or
+                delisted" -- which ``get_daily_bars``'s per-symbol fetch loop
+                degrades to an empty bar list for *that symbol only* rather
+                than aborting the whole batch. A real production refresh hit
+                exactly this bug: a plain HTTP 404 for one delisted symbol
+                (WBA) fell through to the generic ``ProviderError`` branch
+                below, which ``get_daily_bars`` treats as a batch-wide
+                failure (see ``_fetch_one``'s ``except ProviderError:
+                raise``, and ``providers.base.parallel_map`` cancelling the
+                rest of the batch on any exception) -- cascading every OTHER
+                symbol in that same batch to the close-only fallback
+                provider too, degrading hundreds of unrelated symbols
+                (including the benchmark) for one delisted ticker. A 404/410
+                on a non-symbol-scoped URL (none exists in this adapter
+                today, but a future one might) keeps the generic,
+                batch-aborting treatment -- there, a 404 is not "unknown
+                ticker", it is "unexpected response from the endpoint".
+                429 (rate limit), 401/403, and 5xx are unaffected by this
+                flag either way.
+        """
         try:
             with httpx.Client(
                 timeout=self._config.request_timeout_s,
@@ -346,14 +383,19 @@ class YahooMarketProvider(MarketDataProvider):
                 retryable=True,
             ) from exc
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 429:
+            status = exc.response.status_code
+            if status == 429:
                 raise ProviderError(
                     f"rate limited by yahoo for {symbol_label}",
                     provider=self.name,
                     retryable=True,
                 ) from exc
+            if symbol_scoped and status in (404, 410):
+                raise _YahooNoDataError(
+                    f"yahoo returned {status} for {symbol_label}"
+                ) from exc
             raise ProviderError(
-                f"yahoo returned {exc.response.status_code} for {symbol_label}",
+                f"yahoo returned {status} for {symbol_label}",
                 provider=self.name,
                 retryable=True,
             ) from exc

@@ -81,6 +81,12 @@ class _YahooStub:
         self.requests: list[httpx.Request] = []
         self.rate_limited_next = False
         self.chart_by_symbol: dict[str, dict] = {}
+        #: symbol -> HTTP status Yahoo answers with for that symbol's chart
+        #: request, e.g. a real HTTP 404/410 for a delisted ticker -- as
+        #: opposed to ``_CHART_ERROR_PAYLOAD``'s HTTP-200-with-JSON-error
+        #: shape, which is a different failure mode this adapter already
+        #: handled before this change.
+        self.status_override: dict[str, int] = {}
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -89,6 +95,11 @@ class _YahooStub:
 
         if "/v8/finance/chart/" in request.url.path:
             symbol = request.url.path.rsplit("/", 1)[-1]
+            status = self.status_override.get(symbol)
+            if status is not None:
+                # A real HTTP-level error -- an empty/irrelevant body, since
+                # a genuine 404 from this endpoint carries no chart JSON.
+                return httpx.Response(status, json={})
             payload = self.chart_by_symbol.get(symbol, _CHART_ERROR_PAYLOAD)
             return httpx.Response(200, json=payload)
 
@@ -218,6 +229,69 @@ def test_get_daily_bars_unknown_symbol_degrades_per_symbol(monkeypatch):
     assert result["AAPL"], "a good symbol in the same batch must still be fetched"
     assert result["NOSUCH"] == [], "unknown symbol degrades to an empty series, not a raise"
     assert "NOSUCH" in provider._not_found
+
+
+def test_get_daily_bars_http_404_degrades_per_symbol_not_the_batch(monkeypatch):
+    """The root-cause bug this change fixes: a real HTTP 404 (delisted
+    symbol) from the chart endpoint used to become a generic, batch-aborting
+    ``ProviderError`` -- ``get_daily_bars``'s per-symbol loop would then
+    re-raise it (see ``_fetch_one``'s ``except ProviderError: raise``
+    branch), cancelling every other symbol in the same batch via
+    ``parallel_map`` and cascading the whole batch to the fallback provider.
+    A batch of three where the MIDDLE symbol 404s must still return bars for
+    the other two, and must not raise at all."""
+    stub = _YahooStub()
+    ts = [int(dt.datetime(2024, 1, 2, 21, 0, tzinfo=dt.UTC).timestamp())]
+    stub.chart_by_symbol["AAA"] = _chart_payload("AAA", ts, [10.0])
+    stub.chart_by_symbol["CCC"] = _chart_payload("CCC", ts, [30.0])
+    stub.status_override["BBB"] = 404  # a real HTTP 404, not the JSON-error shape
+    _install(monkeypatch, stub)
+
+    provider = YahooMarketProvider(MarketDataConfig())
+    result = provider.get_daily_bars(
+        ["AAA", "BBB", "CCC"], dt.date(2024, 1, 1), dt.date(2024, 1, 31)
+    )
+
+    assert result["AAA"], "a good symbol before the 404'd one must still be fetched"
+    assert result["CCC"], "a good symbol after the 404'd one must still be fetched"
+    assert result["BBB"] == [], "the 404'd symbol degrades to an empty series, not a raise"
+    assert "BBB" in provider._not_found
+
+
+def test_get_daily_bars_http_410_degrades_per_symbol_too(monkeypatch):
+    """410 Gone gets the same per-symbol treatment as 404 -- both mean "this
+    ticker is not being served any more", mapped in the same code path."""
+    stub = _YahooStub()
+    ts = [int(dt.datetime(2024, 1, 2, 21, 0, tzinfo=dt.UTC).timestamp())]
+    stub.chart_by_symbol["AAPL"] = _chart_payload("AAPL", ts, [185.64])
+    stub.status_override["GONE"] = 410
+    _install(monkeypatch, stub)
+
+    provider = YahooMarketProvider(MarketDataConfig())
+    result = provider.get_daily_bars(
+        ["AAPL", "GONE"], dt.date(2024, 1, 1), dt.date(2024, 1, 31)
+    )
+
+    assert result["AAPL"]
+    assert result["GONE"] == []
+    assert "GONE" in provider._not_found
+
+
+def test_get_daily_bars_429_still_raises_rate_limit(monkeypatch):
+    """A 429 must NOT be swallowed the way a 404 now is -- it is a quantity
+    signal (come back later), never treated as "unknown ticker", and still
+    aborts the batch as a retryable ``ProviderError``."""
+    stub = _YahooStub()
+    stub.rate_limited_next = True
+    _install(monkeypatch, stub)
+
+    provider = YahooMarketProvider(MarketDataConfig())
+    with pytest.raises(ProviderError) as excinfo:
+        provider.get_daily_bars(["AAPL"], dt.date(2024, 1, 1), dt.date(2024, 1, 31))
+
+    assert excinfo.value.retryable is True
+    assert "rate limited" in str(excinfo.value).lower()
+    assert "AAPL" not in provider._not_found
 
 
 def test_get_daily_bars_network_failure_is_a_retryable_provider_error(monkeypatch):
