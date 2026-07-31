@@ -295,3 +295,19 @@ export interface PipelineDiagnostic {
   detail: string;
 }
 export interface DiagnosticsResponse { pipelines: PipelineDiagnostic[]; probe_note: string; }
+
+export interface CredentialTestResult {
+  ok: boolean;
+  mode: string | null;
+  status_detail: string;
+}
+
+export interface RefreshStatus {
+  running: boolean;
+  phase: string;
+  symbols_done: number;
+  symbols_total: number;
+  started_at: string | null;
+  finished_at: string | null;
+  last_error: string | null;
+}

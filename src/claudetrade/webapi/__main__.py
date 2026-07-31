@@ -78,7 +78,7 @@ def _wait_until_listening(host: str, port: int, timeout: float = 10.0) -> bool:
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     config = AppConfig.load(args.config)
-    setup_logging(config)
+    setup_logging(config, component="web")
     port = args.port or config.ui.port
 
     pipeline = Pipeline.bootstrap(config)

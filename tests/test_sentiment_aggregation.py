@@ -65,7 +65,6 @@ class TestPostAfterSessionExcluded:
 
     def test_post_after_session_excluded(self):
         """Post created after session close is not included in aggregation."""
-        session = dt.date(2023, 1, 3)
         session_close = dt.datetime(2023, 1, 3, 16, 0, 0, tzinfo=dt.UTC)  # 4pm ET
 
         post_after_close = dt.datetime(2023, 1, 3, 20, 30, 0, tzinfo=dt.UTC)  # After 4pm
@@ -73,6 +72,72 @@ class TestPostAfterSessionExcluded:
         # Post should be excluded
         should_include = post_after_close <= session_close
         assert not should_include
+
+
+class TestDropSummary:
+    """Per-(symbol, session) no-look-ahead drops are accumulated, not
+    logged individually -- ``drain_drop_summary()`` reports them once per
+    aggregation run instead. A real refresh log across a whole universe and
+    weeks of sessions produced a near-identical warning line per pair; this
+    is what replaced it."""
+
+    def test_no_drops_returns_none(self):
+        aggregator = SentimentAggregator(SentimentConfig())
+        assert aggregator.drain_drop_summary() is None
+
+    def test_dropped_post_is_accumulated_not_logged_per_call(self, caplog):
+        aggregator = SentimentAggregator(SentimentConfig())
+        session = dt.date(2024, 6, 3)
+        close = dt.datetime(2024, 6, 3, 20, 0, tzinfo=dt.UTC)
+        future_post = _post(created_at=close + dt.timedelta(hours=1))
+        mention = TickerMention(
+            post_external_id=future_post.external_id,
+            symbol="AAPL",
+            confidence=0.9,
+            method="cashtag",
+        )
+        with caplog.at_level("WARNING"):
+            aggregator.aggregate("AAPL", session, [future_post], [mention], {})
+        assert not any("dropped" in r.message for r in caplog.records)
+
+        summary = aggregator.drain_drop_summary()
+        assert summary is not None
+        assert "dropped 1 post" in summary
+        assert "1 symbol/session pair" in summary
+
+    def test_drain_resets_the_counters(self):
+        aggregator = SentimentAggregator(SentimentConfig())
+        session = dt.date(2024, 6, 3)
+        close = dt.datetime(2024, 6, 3, 20, 0, tzinfo=dt.UTC)
+        future_post = _post(created_at=close + dt.timedelta(hours=1))
+        mention = TickerMention(
+            post_external_id=future_post.external_id,
+            symbol="AAPL",
+            confidence=0.9,
+            method="cashtag",
+        )
+        aggregator.aggregate("AAPL", session, [future_post], [mention], {})
+        aggregator.drain_drop_summary()
+        assert aggregator.drain_drop_summary() is None
+
+    def test_multiple_symbol_session_pairs_accumulate(self):
+        aggregator = SentimentAggregator(SentimentConfig())
+        session = dt.date(2024, 6, 3)
+        close = dt.datetime(2024, 6, 3, 20, 0, tzinfo=dt.UTC)
+        for symbol in ("AAPL", "MSFT"):
+            future_post = _post(
+                external_id=f"t3_{symbol}", created_at=close + dt.timedelta(hours=1)
+            )
+            mention = TickerMention(
+                post_external_id=future_post.external_id,
+                symbol=symbol,
+                confidence=0.9,
+                method="cashtag",
+            )
+            aggregator.aggregate(symbol, session, [future_post], [mention], {})
+        summary = aggregator.drain_drop_summary()
+        assert "dropped 2 post" in summary
+        assert "2 symbol/session pair" in summary
 
 
 class TestConfidenceWithSampleSize:

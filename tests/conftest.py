@@ -39,6 +39,10 @@ def tmp_app_config(tmp_path: Path, monkeypatch) -> AppConfig:
     config.market_data.provider = "synthetic"
     config.market_data.fallbacks = []
     config.earnings.provider = "synthetic"
+    # Production defaults reddit.provider to the live adapter (mirroring
+    # market_data/earnings above); pin it back to synthetic here for the same
+    # reason -- deterministic, network-free unit tests.
+    config.reddit.provider = "synthetic"
     config.logging.console = False
     config.paths.app_dir = tmp_path
 

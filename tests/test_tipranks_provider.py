@@ -36,10 +36,14 @@ from claudetrade.providers.market.tipranks import (
 FIXTURES = Path(__file__).parent / "fixtures" / "tipranks"
 INTC_PAYLOAD = json.loads((FIXTURES / "dataForTicker_INTC.json").read_text(encoding="utf-8"))
 TECK_B_PAYLOAD = json.loads((FIXTURES / "dataForTicker_TECK_B.json").read_text(encoding="utf-8"))
+MHD_HISTORICALPRICES = json.loads(
+    (FIXTURES / "historicalprices_MHD.json").read_text(encoding="utf-8")
+)
 
 
 class _TipRanksStub:
-    """Serves ``dataForTicker`` responses keyed by the ``ticker`` query param."""
+    """Serves ``dataForTicker``/``historicalprices`` responses keyed by the
+    ``ticker`` query param and the request path."""
 
     def __init__(self):
         self.requests: list[httpx.Request] = []
@@ -47,6 +51,9 @@ class _TipRanksStub:
         #: Tickers that should get a 200 + null overview instead of the
         #: default (confirmed-by-probe) 404 for "not in payload_by_ticker".
         self.null_overview_tickers: set[str] = set()
+        #: ``historicalprices`` fallback responses, keyed by ticker -- a
+        #: ticker absent here gets a 404 from that endpoint too.
+        self.historicalprices_by_ticker: dict[str, list] = {}
         self.status_override: int | None = None
         self.content_type_override: str | None = None
         self.body_override: str | None = None
@@ -60,6 +67,13 @@ class _TipRanksStub:
             return httpx.Response(200, headers=headers, content=self.body_override)
 
         ticker = httpx.QueryParams(request.url.query).get("ticker", "")
+
+        if request.url.path.endswith("/historicalprices"):
+            rows = self.historicalprices_by_ticker.get(ticker)
+            if rows is not None:
+                return httpx.Response(200, json=rows)
+            return httpx.Response(404, json={})
+
         payload = self.payload_by_ticker.get(ticker)
         if payload is not None:
             return httpx.Response(200, json=payload)
@@ -110,6 +124,30 @@ def test_tipranks_ticker_ca_gets_tse_prefix_and_dotted_share_class():
     assert tipranks_ticker("TECK-B", exchange="TSX") == "TSE:TECK.B"
     assert tipranks_ticker("SHOP", exchange="TSX") == "TSE:SHOP"
     assert tipranks_ticker("XYZ", exchange="TSXV") == "TSE:XYZ"
+
+
+def test_tipranks_ticker_us_class_share_gets_dot_notation():
+    """CONFIRMED by the owner's live refresh log: TipRanks 404s on 'BRK-B'/
+    'BF-B' under this codebase's own dash notation and needs the dot form.
+    Yahoo, by contrast, wants the dash form for the very same symbols (see
+    ``YahooMarketProvider.yahoo_symbol``) -- this mapping is local to this
+    module only."""
+    assert tipranks_ticker("BRK-B", exchange="NYSE") == "BRK.B"
+    assert tipranks_ticker("BF-B", exchange="NYSE") == "BF.B"
+    assert tipranks_ticker("brk-b", exchange="NYSE") == "BRK.B"
+
+
+def test_tipranks_ticker_plain_and_multiletter_symbols_are_unaffected():
+    """A symbol with no dash, or one that merely happens to contain a dash
+    that is NOT a single-letter class suffix, must never be rewritten."""
+    assert tipranks_ticker("AAPL", exchange="NASDAQ") == "AAPL"
+    assert tipranks_ticker("LILAP", exchange="NASDAQ") == "LILAP"
+
+
+def test_tipranks_ticker_tsx_dot_conversion_is_unchanged_by_the_us_rule():
+    """The TSX ``TSE:`` + dotted-share-class mapping is untouched -- it takes
+    a different code path from the US single-letter-suffix rule above."""
+    assert tipranks_ticker("TECK-B", exchange="TSX") == "TSE:TECK.B"
 
 
 def test_tipranks_ticker_resolves_exchange_from_packaged_universe():
@@ -531,6 +569,194 @@ def test_unknown_ticker_result_is_also_cached(monkeypatch, tmp_path, stub):
     calls_after_first = len(stub.requests)
     provider.get_market_caps(["NEVERHEARDOFIT"])
     assert len(stub.requests) == calls_after_first
+
+
+# --------------------------------------------------------------------------
+# historicalprices fallback -- "prices_only" state (item 4)
+# --------------------------------------------------------------------------
+
+
+def test_dataforticker_success_never_calls_historicalprices(monkeypatch, tmp_path, stub):
+    """A dataForTicker SUCCESS must never trigger the historicalprices probe
+    at all -- it is a fallback for the unknown-ticker case only."""
+    _install(monkeypatch, stub)
+    provider = _provider(tmp_path)
+    provider.get_market_caps(["INTC"])
+    assert all("historicalprices" not in str(r.url) for r in stub.requests)
+
+
+def test_404_falls_back_to_historicalprices_and_caches_prices_only(monkeypatch, tmp_path, stub):
+    """dataForTicker 404s for MHD (a closed-end fund with no analyst
+    coverage), but historicalprices has real rows -- the symbol EXISTS and
+    is cached as the distinct 'prices_only' state, not plain 'unknown'."""
+    stub.historicalprices_by_ticker["MHD"] = MHD_HISTORICALPRICES
+    _install(monkeypatch, stub)
+    provider = _provider(tmp_path)
+
+    caps = provider.get_market_caps(["MHD"])
+    assert "MHD" not in caps  # no analyst overview -> no cap, same as unknown
+    assert "MHD" in provider._not_found
+
+    resolution = provider._resolve("MHD")
+    assert resolution.state == "prices_only"
+
+    cache_file = tmp_path / "cache" / "tipranks" / "MHD.json"
+    assert cache_file.exists()
+    record = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert record["state"] == "prices_only"
+    assert record["historical_prices"]
+
+
+def test_404_with_no_historicalprices_data_either_caches_unknown(monkeypatch, tmp_path, stub):
+    """A genuinely delisted/renamed symbol 404s on both endpoints -- cached
+    as plain 'unknown', the normal outcome for the vast majority of unknown
+    tickers (ANSS, JNPR, FLT, SQ, K, WBA, HES, DFS, PARA, ... per the
+    owner's log)."""
+    _install(monkeypatch, stub)  # "DELISTED" registered nowhere -> 404 both endpoints
+    provider = _provider(tmp_path)
+
+    resolution = provider._resolve("DELISTED")
+    assert resolution.state == "unknown"
+
+    cache_file = tmp_path / "cache" / "tipranks" / "DELISTED.json"
+    record = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert record["state"] == "unknown"
+
+
+def test_prices_only_cache_uses_the_unknown_ticker_ttl(monkeypatch, tmp_path, stub):
+    """A cached 'prices_only' result must not be re-probed on every refresh
+    either -- it shares the long ``unknown_ticker_ttl_days`` TTL, not the
+    short ``cache_ttl_trading_days`` one."""
+    stub.historicalprices_by_ticker["MHD"] = MHD_HISTORICALPRICES
+    _install(monkeypatch, stub)
+    config = TipRanksConfig(cache_ttl_trading_days=1, unknown_ticker_ttl_days=30)
+    provider = _provider(tmp_path, config=config)
+
+    provider.get_market_caps(["MHD"])
+    calls_after_first = len(stub.requests)
+    provider.get_market_caps(["MHD"])
+    assert len(stub.requests) == calls_after_first, "prices_only must be served from cache"
+
+
+def test_get_daily_bars_prefers_historicalprices_over_close_only_for_prices_only(
+    monkeypatch, tmp_path, stub
+):
+    """A prices_only symbol's bars come from historicalprices (real OHLCV),
+    never from close-only synthesis (there is no ``overview.prices`` to
+    synthesise from at all for this state)."""
+    stub.historicalprices_by_ticker["MHD"] = MHD_HISTORICALPRICES
+    _install(monkeypatch, stub)
+    provider = _provider(tmp_path)
+
+    bars = provider.get_daily_bars(["MHD"], dt.date(2023, 1, 1), dt.date(2026, 12, 31))["MHD"]
+    assert bars, "fixture rows within range must produce bars"
+    # Real OHLCV, not the close-only degrade: open/high/low are not all equal
+    # to close for at least one row, and volume is nonzero.
+    assert any(b.volume > 0 for b in bars)
+    assert any(b.open != b.close or b.high != b.close or b.low != b.close for b in bars)
+
+
+def test_historicalprices_drops_zero_volume_holiday_padding_rows(monkeypatch, tmp_path, stub):
+    """Jan-1 rows in the fixture carry volume 0 -- holiday padding, not real
+    trading sessions -- and must be dropped."""
+    rows = TipRanksProvider._parse_historicalprices_rows(MHD_HISTORICALPRICES)
+    assert dt.date(2024, 1, 1) not in {r["session"] for r in rows}
+    assert dt.date(2025, 1, 1) not in {r["session"] for r in rows}
+    assert dt.date(2026, 1, 1) not in {r["session"] for r in rows}
+    # A real (nonzero-volume) row from the same fixture survives.
+    assert dt.date(2023, 11, 6) in {r["session"] for r in rows}
+
+
+def test_historicalprices_maps_price_to_adj_close_and_close_to_close(monkeypatch, tmp_path, stub):
+    rows = {
+        r["session"]: r for r in TipRanksProvider._parse_historicalprices_rows(MHD_HISTORICALPRICES)
+    }
+    row = rows[dt.date(2023, 11, 6)]
+    assert row["close"] == pytest.approx(10.51)
+    assert row["adj_close"] == pytest.approx(8.97)  # "price" in the raw fixture
+
+
+def test_historicalprices_cadence_guard_flags_downsampled_series(monkeypatch, tmp_path, stub):
+    """The fixture's real cadence is biweekly (~14 calendar days), well
+    above the 4-day median-gap threshold -- must be flagged, not served
+    silently as ordinary daily bars."""
+    stub.historicalprices_by_ticker["MHD"] = MHD_HISTORICALPRICES
+    _install(monkeypatch, stub)
+    provider = _provider(tmp_path)
+
+    bars = provider.get_daily_bars(["MHD"], dt.date(2023, 1, 1), dt.date(2026, 12, 31))["MHD"]
+    assert bars  # rows are still returned, un-interpolated
+    warnings = provider.drain_quality_warnings()
+    sparse = [w for w in warnings if w.category == "sparse_bars"]
+    assert len(sparse) == 1
+    assert sparse[0].symbol == "MHD"
+    assert "downsampled" in sparse[0].message
+
+
+def test_is_sparse_false_for_fewer_than_two_rows():
+    assert TipRanksProvider._is_sparse([]) is False
+    assert TipRanksProvider._is_sparse([{"session": dt.date(2024, 1, 1)}]) is False
+
+
+def test_is_sparse_false_for_dense_daily_rows():
+    rows = [{"session": dt.date(2024, 1, 1) + dt.timedelta(days=i)} for i in range(10)]
+    assert TipRanksProvider._is_sparse(rows) is False
+
+
+# --------------------------------------------------------------------------
+# parallel fetch + progress logging (items 2 and 6)
+# --------------------------------------------------------------------------
+
+
+def test_resolve_map_logs_progress_at_the_configured_cadence(monkeypatch, tmp_path, stub, caplog):
+    """"market data: N/TOTAL symbols (X fetched, Y cached, Z unknown)" every
+    _PROGRESS_LOG_EVERY_N symbols, so a long refresh never looks hung."""
+    monkeypatch.setattr("claudetrade.providers.market.tipranks._PROGRESS_LOG_EVERY_N", 2)
+    for i in range(5):
+        stub.payload_by_ticker[f"SYM{i}"] = INTC_PAYLOAD
+    _install(monkeypatch, stub)
+    provider = _provider(tmp_path)
+
+    with caplog.at_level("INFO"):
+        provider.get_market_caps([f"SYM{i}" for i in range(5)])
+
+    progress_lines = [r.message for r in caplog.records if r.message.startswith("market data:")]
+    assert any("2/5 symbols" in line for line in progress_lines)
+    assert any("5/5 symbols" in line for line in progress_lines)  # final line always fires
+    assert any("fetched" in line and "cached" in line and "unknown" in line for line in progress_lines)
+
+
+def test_resolve_map_uses_worker_threads_up_to_max_workers(monkeypatch, tmp_path, stub):
+    """A higher max_workers must not change the resolved results -- only how
+    the per-symbol fetch loop is scheduled."""
+    for i in range(6):
+        stub.payload_by_ticker[f"SYM{i}"] = INTC_PAYLOAD
+    _install(monkeypatch, stub)
+    config = TipRanksConfig(rate_limit_per_minute=6000)  # avoid rate-limiter stalls in the test
+    provider = TipRanksProvider(config, cache_dir=tmp_path / "cache", max_workers=4)
+
+    caps = provider.get_market_caps([f"SYM{i}" for i in range(6)])
+    assert len(caps) == 6
+    assert all(v == pytest.approx(435297215393.0) for v in caps.values())
+
+
+def test_get_daily_bars_of_a_mixed_batch_resolves_each_symbol_independently(
+    monkeypatch, tmp_path, stub
+):
+    """found + prices_only + unknown symbols in the same parallel batch each
+    resolve to their own correct outcome."""
+    stub.historicalprices_by_ticker["MHD"] = MHD_HISTORICALPRICES
+    _install(monkeypatch, stub)
+    provider = _provider(tmp_path)
+
+    result = provider.get_daily_bars(
+        ["INTC", "MHD", "NOSUCH"], dt.date(2023, 1, 1), dt.date(2026, 12, 31)
+    )
+    assert result["INTC"]  # found -> close-only
+    assert all(b.volume == 0.0 for b in result["INTC"])
+    assert result["MHD"]  # prices_only -> real OHLCV
+    assert any(b.volume > 0 for b in result["MHD"])
+    assert result["NOSUCH"] == []  # unknown -> empty
 
 
 # --------------------------------------------------------------------------

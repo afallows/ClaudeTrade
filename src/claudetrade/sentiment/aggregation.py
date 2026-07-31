@@ -136,6 +136,14 @@ class SentimentAggregator:
     ):
         self.config = config
         self.manipulation = manipulation_detector or ManipulationDetector()
+        #: Accumulated no-look-ahead post drops (see ``aggregate``), flushed
+        #: by ``drain_drop_summary()``. Not logged per (symbol, session) pair
+        #: any more -- a real refresh across a whole universe and weeks of
+        #: sessions produced a near-identical warning line per pair, which
+        #: buried everything else in the console; one summary line per run
+        #: says the same thing without the noise.
+        self._dropped_total = 0
+        self._dropped_symbol_days = 0
 
     def aggregate(
         self,
@@ -175,14 +183,8 @@ class SentimentAggregator:
         }
         dropped = len(posts) - len(eligible_posts)
         if dropped:
-            log.warning(
-                "%s/%s: dropped %d post(s) dated after session close (%s) -- "
-                "no-look-ahead violation upstream",
-                symbol,
-                session,
-                dropped,
-                close.isoformat(),
-            )
+            self._dropped_total += dropped
+            self._dropped_symbol_days += 1
         assert all(ensure_utc(p.created_at) <= close for p in eligible_posts.values()), (
             f"{symbol}/{session}: a post dated after session close survived filtering"
         )
@@ -322,6 +324,22 @@ class SentimentAggregator:
             catalyst_quality=catalyst_quality,
             total_engagement=total_engagement,
             labels=labels,
+        )
+
+    def drain_drop_summary(self) -> str | None:
+        """One human-readable summary of every no-look-ahead post drop
+        accumulated across every ``aggregate()`` call since the last drain,
+        or ``None`` if nothing was dropped. Resets the counters. The caller
+        (``Pipeline.build_sentiment``) logs this once per run instead of a
+        line per (symbol, session) pair."""
+        if self._dropped_total == 0:
+            return None
+        total, days = self._dropped_total, self._dropped_symbol_days
+        self._dropped_total = 0
+        self._dropped_symbol_days = 0
+        return (
+            f"dropped {total} post(s) dated after their session close across {days} "
+            "symbol/session pair(s) this run -- no-look-ahead violation(s) upstream"
         )
 
     def aggregate_series(

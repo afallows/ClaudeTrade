@@ -538,6 +538,45 @@ class TestCookieSessionMode:
         RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
         assert stub.token_calls == 0
 
+    def test_has_token_v2_false_with_only_reddit_session(
+        self, reddit_config, cookie_credentials, monkeypatch
+    ):
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+        provider = RedditProvider(reddit_config)
+        assert provider.has_token_v2 is False
+
+    def test_single_cookie_backward_compatible_header(
+        self, reddit_config, cookie_credentials, monkeypatch
+    ):
+        """No token_v2 configured -- the Cookie header is unchanged from
+        before token_v2 support was added: reddit_session alone."""
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+        listing_calls = [r for r in stub.requests if "new.json" in r.url.path]
+        assert listing_calls[0].headers.get("cookie") == "reddit_session=owner-cookie-value"
+
+    def test_combined_cookie_header_with_token_v2(
+        self, reddit_config, cookie_credentials, monkeypatch
+    ):
+        """Both cookies configured -- the Cookie header combines them in
+        'reddit_session=...; token_v2=...' order, mirroring what a real
+        logged-in browser tab sends."""
+        monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_TOKEN_V2", "owner-token-v2-value")
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        provider = RedditProvider(reddit_config)
+        assert provider.has_token_v2 is True
+        provider.fetch_posts(since=NOW - dt.timedelta(days=1))
+        listing_calls = [r for r in stub.requests if "new.json" in r.url.path]
+        assert (
+            listing_calls[0].headers.get("cookie")
+            == "reddit_session=owner-cookie-value; token_v2=owner-token-v2-value"
+        )
+
 
 class TestModePriorityWithCookie:
     """Cookie session sits between password grant and client-credentials in

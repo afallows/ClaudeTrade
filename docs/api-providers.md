@@ -288,15 +288,18 @@ are all different views onto that same object.
 [market_data]
 provider = "tipranks"          # the default
 fallbacks = ["yahoo", "csv"]
+max_workers = 8                 # per-symbol fetch parallelism, shared across TipRanks + Yahoo
+yahoo_rate_limit_per_minute = 120
 
 [earnings]
 provider = "tipranks"          # also the default
 
 [tipranks]
-rate_limit_per_minute = 30
+rate_limit_per_minute = 60      # raised from the original 30 -- see below
 request_timeout_s = 20.0
-cache_ttl_trading_days = 1     # response cache under paths.cache_dir/tipranks/
-use_getquotes_batch = false    # optional Canadian cap batching, see below
+cache_ttl_trading_days = 1      # response cache under paths.cache_dir/tipranks/
+unknown_ticker_ttl_days = 30    # negative/limited-result cache TTL, see below
+use_getquotes_batch = false     # optional Canadian cap batching, see below
 ```
 
 **Credentials**: None required (no authentication).
@@ -307,19 +310,78 @@ published, contracted API. TipRanks could restrict, reshape, rate-limit or
 withdraw it at any time with no notice and no deprecation window. This is
 the same posture this codebase already applies to stooq's free CSV endpoint,
 Yahoo's undocumented chart JSON, and Stocktwits' keyless stream: personal/
-research use only, a conservative self-imposed rate limit (default
-30/minute), and a **fail-closed** response to anything that looks like a
-block or an unexpected shape -- see the fail-closed rules below. Nothing
-here bypasses authentication, defeats a paywall, or solves a challenge.
+research use only, a conservative self-imposed rate limit, and a
+**fail-closed** response to anything that looks like a block or an
+unexpected shape -- see the fail-closed rules below. Nothing here bypasses
+authentication, defeats a paywall, or solves a challenge.
 
-**Symbol notation**: a bare US ticker is passed through unchanged (`AAPL`).
-A Canadian (TSX/TSXV) one is rewritten to `TSE:<SYMBOL-WITH-DOTS>` -- this
-codebase's hyphenated share-class convention (`TECK-B`) becomes TipRanks'
-dotted one (`TSE:TECK.B`) -- confirmed against a real Canadian-listing
-fixture (`tests/fixtures/tipranks/dataForTicker_TECK_B.json`), whose
+`rate_limit_per_minute` was raised from the original launch default of
+30/minute to **60/minute** after the owner confirmed their own brokerage app
+calls this same public eToro widget endpoint at that kind of cadence with no
+observed pushback -- still a fraction of an idly-refreshing browser tab, and
+fully self-imposed and operator-configurable, not a vendor-published
+ceiling. This was the single biggest driver of a real first refresh across
+~2,400 symbols taking 80+ minutes (roughly `symbol_count / rate_limit`).
+`market_data.max_workers` (default 8) additionally lets the per-symbol fetch
+loop (`TipRanksProvider`/`YahooMarketProvider`) overlap request *latency*
+across symbols on a shared, thread-safe `RateLimiter` -- it does not itself
+raise the enforced calls/minute ceiling, only how much of the wall clock is
+spent idly waiting on one request at a time. `yahoo_rate_limit_per_minute`
+(default 120) is Yahoo's own separate bucket -- the bars cascade tries it
+before TipRanks (see `bars_last_resort` below), so it was the other major
+contributor to that 80-minute figure.
+
+**Symbol notation**: a bare US ticker is passed through unchanged (`AAPL`),
+**except** a dash-suffixed single-letter share class, which TipRanks also
+expects in dot notation: `BRK-B` -> `BRK.B`, `BF-B` -> `BF.B` -- confirmed
+by a real refresh log showing plain 404s for both under this codebase's own
+dash convention (`tipranks_ticker`'s `_US_CLASS_SHARE_RE` matches only a
+genuine single-letter suffix, so e.g. `LILAP` is never mistaken for one).
+**Yahoo, by contrast, wants the dash form for these same symbols** (see
+`YahooMarketProvider.yahoo_symbol`) -- this mapping is local to the TipRanks
+adapter only. A Canadian (TSX/TSXV) listing is rewritten to
+`TSE:<SYMBOL-WITH-DOTS>` -- this codebase's hyphenated share-class
+convention (`TECK-B`) becomes TipRanks' dotted one (`TSE:TECK.B`) --
+confirmed against a real Canadian-listing fixture
+(`tests/fixtures/tipranks/dataForTicker_TECK_B.json`), whose
 `overview.ticker` echoes exactly that form back. This is a *different*
 convention from both stooq's (`teck-b.to`) and Yahoo's (`TECK-B.TO`) --
 each adapter owns its own mapping table.
+
+**Unknown-ticker caching (`unknown_ticker_ttl_days`, default 30)**: a
+confirmed "TipRanks has no data for this symbol" result -- a clean HTTP 404
+from BOTH `dataForTicker` and the `historicalprices` fallback probe below --
+is cached under this much longer TTL instead of the ordinary
+`cache_ttl_trading_days`. Without this, a genuinely delisted/renamed name (a
+real refresh log showed ANSS, JNPR, FLT, SQ, K, WBA, HES, DFS, PARA and
+others) gets re-probed on every single refresh forever. A name that later
+regains coverage is picked up within that 30-trading-day window at worst --
+an accepted trade-off, not an oversight.
+
+**Closed-end funds and other "prices_only" symbols**: some real, still-listed
+securities (closed-end funds like MHD, GAB, BDJ, BKT are the common case) have
+no analyst/overview coverage at all -- `dataForTicker` 404s for them -- but
+DO have real price history at
+`https://widgets.tipranks.com/api/etoro/historicalprices?ticker={SYMBOL}`
+(verbatim owner-captured fixture committed at
+`tests/fixtures/tipranks/historicalprices_MHD.json`). When `dataForTicker`
+404s, this adapter tries that endpoint before caching the symbol as fully
+unknown; a non-empty result is cached as a distinct `"prices_only"` state
+(same long TTL as unknown). For such a symbol: market cap stays unresolved
+(`unknown_cap_policy` applies as for any unresolved cap) and earnings are
+unavailable, but bars are served from `historicalprices` -- real OHLCV,
+**preferred over close-only synthesis** -- at the same last-resort cascade
+position as the close-only bars below. Parsing rules: `volume == 0` rows are
+Jan-1 holiday padding and are dropped; `price` (the dividend/split-adjusted
+close) maps to `adj_close`, `close` maps to `close`. **Cadence guard**: the
+real cadence observed in the fixture is biweekly (~14 calendar days), not
+daily -- if the requested date range's rows have a median gap over 4
+calendar days, the series is flagged as downsampled (a `sparse_bars`
+data-quality WARNING) rather than served silently as if it were ordinary
+daily data; the rows are still returned as-is (no interpolation), and the
+existing `MIN_CONTEXT_BARS` / exact-session-match guards in
+`data.context.ContextBuilder` mean a series this sparse naturally fails to
+produce a usable context for most sessions regardless.
 
 **Earnings (the headline capability)**: `get_upcoming_earnings` /
 `get_historical_earnings` map `overview.portfolioHoldingData.
@@ -827,11 +889,18 @@ claudetrade secrets set reddit_password
 Reads the same public listing endpoint as the public-JSON fallback, but
 authenticated with the owner's own `reddit_session` cookie -- copied from a
 logged-in browser -- plus a browser-style User-Agent, instead of anonymous
-requests with the descriptive app UA. **Live-probe evidence (2026-07-30)**
-showed Reddit's public JSON endpoint 403ing every non-browser client tested
-(both a generic UA and this codebase's descriptive app UA) while a
-logged-in Chrome tab got a clean 200 -- the gate is the session cookie, not
-the User-Agent string.
+requests with the descriptive app UA.
+
+**CONFIRMED WORKING from a non-browser client (owner-validated 2026-07-31)**:
+a properly-attached `reddit_session` cookie plus a browser-style User-Agent
+gets a clean HTTP 200 with real JSON from a plain HTTP client -- this is not
+a browser-only endpoint, it is a *cookie-gated* one, and a correctly
+configured, current cookie works from this codebase's own `httpx` client
+exactly as it does from a logged-in browser tab. (Two earlier apparent
+403s during validation both turned out to be tooling artifacts, not a real
+block: PowerShell 5.1 silently drops a `Cookie` header passed via
+`-Headers`, and a separate run used an empty cookie value -- neither
+reflects how this adapter actually sends the header.)
 
 **This is the owner's own personal Reddit session, for personal use only**
 (ADR-0008 Decision 1: "own credentials only" -- never a shared/default
@@ -846,8 +915,13 @@ integration path.
 1. Log in to reddit.com in your browser as normal.
 2. Open devtools (F12) -> **Application** tab -> **Storage** -> **Cookies**
    -> `https://www.reddit.com` (Firefox: **Storage** tab instead of
-   **Application**).
-3. Find the cookie named `reddit_session`; copy its **Value**.
+   **Application**). Both `reddit_session` and `token_v2` (see below) are
+   **HttpOnly** cookies -- they are invisible to `document.cookie` in the
+   Console; the Application/Storage -> Cookies panel is the only place to
+   read their values.
+3. Find the cookie named `reddit_session`; copy its **Value** exactly as
+   shown (it is already URL-encoded where needed -- paste it verbatim, do
+   not re-encode or otherwise edit it).
 4. Store it via the credential store, never in `config.toml`:
 
 ```bash
@@ -856,17 +930,60 @@ claudetrade secrets set reddit_session_cookie
 export CLAUDETRADE_SECRET_REDDIT_SESSION_COOKIE="..."
 ```
 
+`reddit_session` alone is sufficient -- try it by itself first. Reddit's own
+web frontend additionally sends a second cookie, `token_v2` (an HttpOnly
+OAuth JWT), captured the same way from the same Cookies panel. It is
+**optional** and only worth adding if `reddit_session` alone stops working:
+
+```bash
+claudetrade secrets set reddit_token_v2
+# or: export CLAUDETRADE_SECRET_REDDIT_TOKEN_V2="..."
+```
+
+Cookie lifetimes differ significantly: `reddit_session` is long-lived (weeks
+or more), while `token_v2` is a short-lived JWT (typically hours to about a
+day). Because `token_v2` expires so much faster, configuring it does not
+make cookie-session mode *more* reliable over time -- it is an extra value
+that itself needs re-exporting far more often than `reddit_session` does, so
+only add it if you have observed `reddit_session` alone being rejected. When
+both are configured, the Cookie header sent is
+`reddit_session=<value>; token_v2=<value>` (both values sent verbatim, in
+that order); with only `reddit_session` configured, the header is unchanged
+from before `token_v2` support existed (`reddit_session=<value>` alone).
+
 No separate enable flag is needed -- like the password and client-credentials
 grants above, this mode is picked up automatically the moment the cookie
 resolves and the password-grant credentials do not (see the mode order
 above). `reddit.session_rate_limit_per_minute` (default 30) governs its
 pace, same conservative, human-scale budget as the public-JSON fallback.
 
+**Testing your cookie from the app**: the Configuration screen has a "Test"
+button next to the Reddit credential fields (`POST
+/api/system/credentials/reddit/test`), which makes one small live request
+using whichever mode your current credentials select and reports
+`{ok, mode, status_detail}` without ever echoing the credential value back.
+Use it after pasting a fresh cookie to confirm it works before waiting for
+a full scheduled refresh.
+
+**If the cookie test reports blocked**: given the confirmation above, a
+block from a correctly-configured client now most likely means the pasted
+`reddit_session` value has **expired or was mistyped/truncated** -- re-export
+a fresh one from DevTools (step 3 above) and test again. It is not expected
+to mean TLS-fingerprinting or a browser-only requirement; that theory was
+considered during validation and ruled out. If you have `token_v2`
+configured and only recently started seeing blocks, its shorter lifetime
+makes it the more likely culprit -- try removing it (`reddit_session` alone
+is sufficient) before re-exporting both. If cookie-session mode remains
+blocked after a fresh export, the password-grant OAuth path
+(`reddit_client_id`/`reddit_client_secret`/`reddit_username`/`reddit_password`,
+see above) is the sanctioned, durable alternative once your Reddit API app
+is approved; news RSS keeps sentiment flowing in the meantime regardless.
+
 **Fail-closed behaviour (cookie-session and public-JSON modes, ADR-0008
 Decision 1)**: any HTTP 401/403 (a 401/403 here usually means the pasted
-cookie has expired or been logged out -- re-export a fresh one), a non-JSON
-response body, or any other unexpected/non-2xx response immediately disables
-the source **for the rest of that fetch cycle** -- no retry loop, no
+cookie(s) have expired or been logged out -- re-export a fresh one), a
+non-JSON response body, or any other unexpected/non-2xx response immediately
+disables the source **for the rest of that fetch cycle** -- no retry loop, no
 fingerprint or proxy rotation, no CAPTCHA handling. The next scheduled cycle
 tries again from scratch. A 429 is handled the same way as the OAuth path (a
 `RateLimitError` carrying `Retry-After`, also ending the cycle). This is
@@ -881,7 +998,8 @@ exercised in `tests/test_reddit_provider.py`.
 - Author names are stored as salted hashes only (never plaintext), per config `store_author_names = false`
 - Cookie-session mode carries no delivery guarantee at all -- it can be
   throttled or blocked by Reddit at any time with no notice, and the pasted
-  cookie will eventually expire and need re-exporting
+  cookie(s) will eventually expire and need re-exporting (`reddit_session`
+  on the order of weeks; `token_v2`, if used, on the order of hours)
 - The public-JSON fallback carries no delivery guarantee at all -- it can be
   throttled or blocked by Reddit at any time with no notice, by design
 
@@ -1033,24 +1151,42 @@ unconditionally for every post, Stocktwits included. Treating a self-declared
 label as truth would let anyone paint their own post's sentiment without the
 classifier ever checking it against the actual content.
 
-**Browser-style request headers (best-effort only)**: **live-probe evidence
-(2026-07-30)** showed this endpoint returning HTTP 403 to PowerShell/.NET
-clients regardless of User-Agent (both a generic UA and this codebase's
-descriptive app UA), but HTTP 200 JSON to a plain browser tab -- consistent
-with an edge filter keyed on browser-shaped request headers and/or TLS
-fingerprint, not a credential or API-contract check (the API itself remains
-keyless and open, per the vendor's own documentation). This adapter
-therefore sends a realistic desktop-browser User-Agent plus
+**Browser-style request headers (best-effort only, and stays that way by
+design)**: **live-probe evidence (2026-07-30)** showed this endpoint
+returning HTTP 403 to PowerShell/.NET clients regardless of User-Agent (both
+a generic UA and this codebase's descriptive app UA), but HTTP 200 JSON to a
+plain browser tab. **CONFIRMED CAUSE (owner, 2026-07-31)**: the keyless API
+sits behind Cloudflare bot management, gated on browser-earned,
+fingerprint-bound cookies (the `cf_clearance`/`__cf_bm` family) that are
+short-lived (hours) -- not a credential or API-contract check; the API
+itself remains keyless and open per the vendor's own documentation. This
+adapter sends a realistic desktop-browser User-Agent plus
 `Accept`/`Accept-Language` headers matching what a browser sends, instead of
-the descriptive app UA used elsewhere in this codebase. **This is
-best-effort only**: a header swap cannot fix a TLS-fingerprint-based block,
-since the HTTP client's TLS handshake doesn't look like a browser's no
-matter what headers ride on top of it. If the edge still blocks despite the
-browser-style headers, the existing fail-closed path below
-(`SourceBlockedError` on 401/403/non-JSON) handles it exactly as before, and
-`claudetrade diagnostics`/the Diagnostics screen report the source blocked
--- no cookie support is added for this source, unlike Reddit's cookie-session
-mode above.
+the descriptive app UA used elsewhere in this codebase, as a best-effort
+measure.
+
+**Decision: no Cloudflare cookie support for this source, ever.** Unlike
+Reddit's cookie-session mode (an owner-provided, weeks-lived credential --
+see above), a Cloudflare clearance cookie is short-lived and bound to the
+browser session/TLS fingerprint that earned it. Supporting it here would
+mean an unending maintenance treadmill of re-capturing an expiring,
+environment-bound value that cannot simply be pasted once like
+`reddit_session` can, and it would cross the ADR-0008 Decision 1 fail-closed
+line ("never work around a block/challenge") this adapter otherwise stays
+firmly on the right side of. **A blocked result in Diagnostics is the
+expected steady state on this source for most machines**, not a
+misconfiguration to chase -- when the edge blocks despite the browser-style
+headers, the existing fail-closed path (`SourceBlockedError` on
+401/403/non-JSON, worded to name Cloudflare bot management explicitly)
+handles it exactly as before: no retry loop, no fingerprint/proxy rotation,
+no cookie workaround, no CAPTCHA handling.
+
+**Sentiment coverage in practice**: Reddit's cookie-session mode
+(owner-verified working, see above) plus the four default news RSS feeds
+are this application's reliable social-sentiment sources. Stocktwits
+contributes opportunistically whenever the edge happens not to challenge a
+given request/IP, and the application is fully functional with it
+contributing nothing at all.
 
 **Configuration**:
 

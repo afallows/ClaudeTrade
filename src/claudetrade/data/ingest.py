@@ -17,6 +17,7 @@ with its defects labelled.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from sqlalchemy import select
@@ -46,6 +47,11 @@ from claudetrade.sentiment.entity_resolution import TickerResolver
 from claudetrade.utils.timeutils import ensure_utc, utc_now
 
 log = get_logger(__name__)
+
+#: ``(phase, symbols_done, symbols_total) -> None`` -- see
+#: ``DataIngestor.progress_callback``. Never required to succeed: a raising
+#: callback is caught and logged, never allowed to break ingestion itself.
+ProgressCallback = Callable[[str, int, int], None]
 
 
 @dataclass(slots=True)
@@ -97,6 +103,7 @@ class DataIngestor:
         market_provider=None,
         earnings_provider=None,
         social_providers=None,
+        progress_callback: ProgressCallback | None = None,
     ):
         self.config = config
         self.db = db
@@ -104,6 +111,19 @@ class DataIngestor:
         self.earnings = earnings_provider
         self.social = list(social_providers or [])
         self.checker = DataQualityChecker(config, db)
+        #: Optional ``(phase, done, total)`` progress hook -- see
+        #: ``webapi.routers.system``'s background refresh endpoint, the
+        #: caller that actually uses this. The CLI's ``claudetrade refresh``
+        #: passes none and is unaffected.
+        self.progress_callback = progress_callback
+
+    def _report_progress(self, phase: str, done: int, total: int) -> None:
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback(phase, done, total)
+        except Exception:
+            log.debug("progress callback raised; ignored", exc_info=True)
 
     # --- reference data ---------------------------------------------------
 
@@ -249,7 +269,9 @@ class DataIngestor:
         ``UniverseSelector.for_session`` later enforces the ADR-0008
         Decision 3 ">= $1B" floor against.
         """
+        self._report_progress("securities", 0, len(securities))
         securities = self.enrich_market_caps(securities, report)
+        self._report_progress("securities", len(securities), len(securities))
         with self.db.session() as session:
             for info in securities:
                 row = session.get(Security, info.symbol)
@@ -347,17 +369,35 @@ class DataIngestor:
             report.provider_failures["market_data"] = "no market-data provider configured"
             return {}
 
+        # The benchmark (regime classification, relative-strength features)
+        # is not a universe member and is typically an ETF, so it can be
+        # missing from ``symbols`` -- e.g. a caller that narrowed the
+        # universe before this call, or a universe source that simply never
+        # lists ETFs. A real refresh log showed exactly this: "benchmark SPY
+        # unavailable; regime reported as UNKNOWN for all sessions", because
+        # SPY's bars were never fetched at all. This bar-fetch loop is the
+        # one place that must never be missing it, regardless of what any
+        # upstream caller already did or forgot to do -- deduped so a caller
+        # that DID already include it (e.g. Pipeline.refresh) costs nothing
+        # extra.
+        benchmark = self.config.market_data.benchmark_symbol
+        symbols = list(dict.fromkeys([*symbols, benchmark]))
+
         batch_size = max(1, self.config.market_data.max_symbols_per_request)
         collected: dict[str, list[Bar]] = {}
-        for i in range(0, len(symbols), batch_size):
+        total = len(symbols)
+        self._report_progress("prices", 0, total)
+        for i in range(0, total, batch_size):
             chunk = symbols[i : i + batch_size]
             try:
                 fetched = self.market.get_daily_bars(chunk, start, end)
             except ProviderError as exc:
                 log.error("market provider failed for %d symbols: %s", len(chunk), exc)
                 report.provider_failures[getattr(self.market, "name", "market")] = str(exc)
+                self._report_progress("prices", min(i + batch_size, total), total)
                 continue
             collected.update(fetched)
+            self._report_progress("prices", min(i + batch_size, total), total)
 
         self.checker.check_provider_gap(
             getattr(self.market, "name", "market"),

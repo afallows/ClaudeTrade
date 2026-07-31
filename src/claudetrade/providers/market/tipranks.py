@@ -171,9 +171,13 @@ extra batch call having been wasted.
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import json
 import logging
 import re
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -196,18 +200,41 @@ from claudetrade.providers.base import (
     RateLimiter,
     RateLimitError,
     SourceBlockedError,
+    parallel_map,
 )
 from claudetrade.utils.timeutils import trading_days_between, utc_now
 
 log = logging.getLogger(__name__)
 
 WIDGET_BASE_URL = "https://widgets.tipranks.com/api/etoro/dataForTicker"
+#: Fallback probe for a symbol ``dataForTicker`` has no analyst/overview
+#: coverage for -- see the module docstring's "prices_only" section. Verbatim
+#: owner-captured response committed at
+#: ``tests/fixtures/tipranks/historicalprices_MHD.json`` (a closed-end fund).
+HISTORICALPRICES_BASE_URL = "https://widgets.tipranks.com/api/etoro/historicalprices"
 #: Optional batching path -- see the module docstring's GetQuotes section.
 #: UNVERIFIED response shape; off by default.
 GETQUOTES_BASE_URL = "https://marketsv3.tipranks.com/api/quotes/GetQuotes"
 
-DEFAULT_RATE_LIMIT = 30  # Calls per minute -- conservative, unauthenticated endpoint.
+DEFAULT_RATE_LIMIT = 60  # Calls per minute -- see TipRanksConfig.rate_limit_per_minute.
+DEFAULT_MAX_WORKERS = 8  # See MarketDataConfig.max_workers.
 _USER_AGENT = "Mozilla/5.0 (compatible; claudetrade research use)"
+
+#: A US-listed dash share-class suffix TipRanks expects as a dot instead
+#: (``BRK-B`` -> ``BRK.B``, ``BF-B`` -> ``BF.B``) -- confirmed by the owner's
+#: live refresh log ("tipranks has no data for BRK-B", "BF-B": plain 404s
+#: under this codebase's own hyphenated notation). Deliberately narrow: only a
+#: single trailing letter after the dash matches, so a symbol like ``LILAP``
+#: (no dash at all) or a hypothetical multi-letter suffix is never mistaken
+#: for a share class and rewritten. Canadian (TSX/TSXV) listings have their
+#: own, separately-handled dot conversion below (``TECK-B`` -> ``TSE:TECK.B``)
+#: and never reach this branch.
+_US_CLASS_SHARE_RE = re.compile(r"^[A-Z]{1,5}-[A-Z]$")
+
+#: Progress logging cadence (item 6): a long-running refresh across the whole
+#: universe must never look hung. Whichever of these triggers first.
+_PROGRESS_LOG_EVERY_N = 100
+_PROGRESS_LOG_EVERY_S = 60.0
 
 #: Canadian (TSX/TSXV) listings are requested with a TipRanks "TSE:" prefix
 #: and the exchange's own dotted share-class notation (confirmed against the
@@ -252,11 +279,20 @@ def _default_exchange_map() -> dict[str, str]:
 def tipranks_ticker(symbol: str, exchange: str | None = None) -> str:
     """Map an exchange ticker to TipRanks' ``dataForTicker`` notation.
 
-    US listings are passed through bare (``INTC``). Canadian (TSX/TSXV)
-    listings get a ``TSE:`` prefix with this codebase's hyphenated
-    share-class convention rewritten to TipRanks' dotted one
+    Canadian (TSX/TSXV) listings get a ``TSE:`` prefix with this codebase's
+    hyphenated share-class convention rewritten to TipRanks' dotted one
     (``TECK-B`` -> ``TSE:TECK.B``) -- confirmed against the committed TECK.B
     fixture, whose ``overview.ticker`` echoes exactly this form back.
+
+    US listings are passed through bare EXCEPT for a dash-suffixed single-
+    letter share class, which TipRanks also expects in dot notation
+    (``BRK-B`` -> ``BRK.B``, ``BF-B`` -> ``BF.B``) -- confirmed by a real
+    refresh log showing plain 404s for both under this codebase's own dash
+    convention. Yahoo, by contrast, wants the dash form for these same
+    symbols (see ``YahooMarketProvider.yahoo_symbol``) -- this mapping is
+    local to this module and never touches that one. Only a genuine
+    single-letter class suffix matches (``_US_CLASS_SHARE_RE``); a symbol
+    like ``LILAP`` (no dash) is left untouched.
 
     Exchange resolution: pass ``exchange`` explicitly when known, otherwise
     fall back to the packaged seed universes' symbol -> exchange column,
@@ -266,6 +302,8 @@ def tipranks_ticker(symbol: str, exchange: str | None = None) -> str:
     exch = (exchange or _default_exchange_map().get(stripped, "")).upper()
     if exch in CA_EXCHANGES:
         return f"TSE:{stripped.replace('-', '.')}"
+    if _US_CLASS_SHARE_RE.match(stripped):
+        return stripped.replace("-", ".")
     return stripped
 
 
@@ -373,6 +411,21 @@ def _parse_getquotes_response(payload: Any, requested_tickers: list[str]) -> dic
     return out
 
 
+@dataclass(slots=True)
+class _Resolution:
+    """One symbol's resolved state from ``TipRanksProvider._resolve`` --
+    see that method's docstring for what each ``state`` value means."""
+
+    state: str  # "found" | "unknown" | "prices_only"
+    overview: dict[str, Any] | None = None
+    #: Raw ``historicalprices`` rows, only populated for ``"prices_only"``.
+    bars_rows: list[dict[str, Any]] | None = None
+    #: Whether this resolution came from the on-disk cache rather than a
+    #: live fetch this call -- used only for the progress log's
+    #: fetched/cached split, never for correctness.
+    from_cache: bool = False
+
+
 class _TipRanksNotFoundError(ProviderError):
     """TipRanks has no data for this specific symbol -- a confirmed clean
     HTTP 404 for an unknown/garbage ticker (see the module docstring's
@@ -403,7 +456,13 @@ class TipRanksProvider(MarketDataProvider):
     #: position in ``market_data.provider``/``fallbacks``.
     bars_last_resort = True
 
-    def __init__(self, config: TipRanksConfig | None = None, *, cache_dir: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        config: TipRanksConfig | None = None,
+        *,
+        cache_dir: Path | str | None = None,
+        max_workers: int | None = None,
+    ) -> None:
         self._config = config or TipRanksConfig()
         self._cache_dir = (Path(cache_dir) / "tipranks") if cache_dir else None
         self._rate_limiter = RateLimiter(
@@ -411,15 +470,27 @@ class TipRanksProvider(MarketDataProvider):
             name="tipranks",
             max_wait_s=30.0,
         )
+        #: See ``providers.base.parallel_map``: worker threads for the
+        #: per-symbol fetch loop, all sharing ``self._rate_limiter`` above (a
+        #: thread-safe limiter), so the enforced calls/minute ceiling is
+        #: global across workers, not per thread.
+        self._max_workers = max(1, max_workers or DEFAULT_MAX_WORKERS)
+        #: Guards every piece of mutable state below that a worker thread can
+        #: touch concurrently (everything except the per-symbol cache files,
+        #: which are already one file per unique symbol).
+        self._lock = threading.Lock()
         self._calls = 0
         self._last_error: str | None = None
         self._last_success: dt.datetime | None = None
         #: Symbols TipRanks returned an empty/null overview for on the most
-        #: recent call(s) -- mirrors ``StooqMarketProvider._not_found``.
+        #: recent call(s) -- mirrors ``StooqMarketProvider._not_found``. Also
+        #: populated for the "prices_only" state (see ``_Resolution``): both
+        #: mean "no dataForTicker/analyst coverage", which is what this set
+        #: has always meant.
         self._not_found: set[str] = set()
-        #: Accumulated close-only-bars data-quality warnings, drained by
-        #: ``drain_quality_warnings()``. Always logged too, so a caller that
-        #: never drains this still sees the degrade in the logs.
+        #: Accumulated close-only-bars / sparse-bars data-quality warnings,
+        #: drained by ``drain_quality_warnings()``. Always logged too, so a
+        #: caller that never drains this still sees the degrade in the logs.
         self._quality_warnings: list[DataQualityIssue] = []
 
     # --- status -------------------------------------------------------------
@@ -476,9 +547,17 @@ class TipRanksProvider(MarketDataProvider):
             return None
         return self._cache_dir / f"{cache_key}.json"
 
-    def _load_cached_overview(self, cache_key: str) -> dict[str, Any] | None:
-        """Return a cached ``overview`` (possibly ``{}`` for a cached "unknown
-        ticker" result) if still within the TTL, else ``None`` (cache miss)."""
+    def _load_cache_record(self, cache_key: str) -> dict[str, Any] | None:
+        """Return the raw cached record for ``cache_key`` if it exists and is
+        still within its state's TTL, else ``None`` (cache miss/expired).
+
+        The record's ``state`` (item 3/4) selects which TTL applies: a
+        "found" record uses the short ``cache_ttl_trading_days`` (a real,
+        analyst-covered symbol may get real updates daily); an "unknown" or
+        "prices_only" record uses the much longer ``unknown_ticker_ttl_days``
+        -- neither state is going to change from one day to the next, so
+        there is no reason to keep paying a round trip for it every refresh.
+        """
         path = self._cache_path(cache_key)
         if path is None or not path.exists():
             return None
@@ -488,36 +567,56 @@ class TipRanksProvider(MarketDataProvider):
         except (OSError, ValueError, KeyError, TypeError):
             return None
         today = dt.datetime.now(tz=dt.UTC).date()
-        ttl = max(1, self._config.cache_ttl_trading_days)
+        state = record.get("state", "found")
+        ttl = (
+            max(1, self._config.unknown_ticker_ttl_days)
+            if state in ("unknown", "prices_only")
+            else max(1, self._config.cache_ttl_trading_days)
+        )
         if trading_days_between(fetched_date, today) >= ttl:
             return None
-        overview = record.get("overview")
-        return overview if isinstance(overview, dict) else None
+        return record
 
-    def _store_cached_overview(self, cache_key: str, overview: dict[str, Any]) -> None:
+    def _store_cache_record(
+        self,
+        cache_key: str,
+        *,
+        state: str,
+        overview: dict[str, Any] | None = None,
+        historical_prices: list[dict[str, Any]] | None = None,
+    ) -> None:
         path = self._cache_path(cache_key)
         if path is None:
             return
+        record: dict[str, Any] = {
+            "fetched_date": dt.datetime.now(tz=dt.UTC).date().isoformat(),
+            "state": state,
+        }
+        if overview is not None:
+            record["overview"] = overview
+        if historical_prices is not None:
+            record["historical_prices"] = historical_prices
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(
-                    {
-                        "fetched_date": dt.datetime.now(tz=dt.UTC).date().isoformat(),
-                        "overview": overview,
-                    }
-                ),
-                encoding="utf-8",
-            )
+            path.write_text(json.dumps(record), encoding="utf-8")
         except OSError:
             log.debug("failed to write tipranks cache for %s", cache_key, exc_info=True)
 
-    def _fetch_overview(self, symbol: str, exchange: str | None = None) -> dict[str, Any] | None:
-        """Return the raw ``overview`` object for ``symbol``, via cache or a
-        live fetch. Returns ``None`` for an unknown ticker -- an HTTP 404
-        (confirmed by a real probe: a garbage ticker gets a clean 404) or an
-        empty/null ``overview`` on an otherwise-2xx response -- that degrades
-        this one symbol, not the whole call.
+    def _resolve(self, symbol: str, exchange: str | None = None) -> _Resolution:
+        """Resolve ``symbol`` to one of three states, via cache or a live
+        fetch -- the single path every capability (market caps, security
+        info, earnings, bars) goes through, so the cache stays consistent
+        across all of them:
+
+        * ``"found"`` -- ``dataForTicker`` has a real ``overview``.
+        * ``"unknown"`` -- neither ``dataForTicker`` nor the
+          ``historicalprices`` fallback probe (item 4) has anything for this
+          symbol; a genuinely unknown/delisted/renamed ticker.
+        * ``"prices_only"`` -- ``dataForTicker`` has nothing (a 404 or a
+          null/empty overview), but ``historicalprices`` returned real rows:
+          the symbol exists (typically a closed-end fund with no analyst
+          coverage) and can serve bars as a last resort, but never a market
+          cap, security info beyond the packaged seed, or earnings.
 
         Raises:
             SourceBlockedError: non-JSON body, missing ``overview`` key,
@@ -529,22 +628,37 @@ class TipRanksProvider(MarketDataProvider):
         ticker_param = tipranks_ticker(symbol, exchange)
         cache_key = _safe_cache_key(ticker_param)
 
-        cached = self._load_cached_overview(cache_key)
+        cached = self._load_cache_record(cache_key)
         if cached is not None:
-            return cached or None
+            state = cached.get("state", "found")
+            if state == "prices_only":
+                rows = cached.get("historical_prices")
+                return _Resolution(
+                    state="prices_only",
+                    bars_rows=rows if isinstance(rows, list) else [],
+                    from_cache=True,
+                )
+            if state == "unknown":
+                return _Resolution(state="unknown", from_cache=True)
+            overview = cached.get("overview")
+            return _Resolution(
+                state="found",
+                overview=overview if isinstance(overview, dict) else None,
+                from_cache=True,
+            )
 
         self._rate_limiter.acquire()
-        self._calls += 1
+        with self._lock:
+            self._calls += 1
         try:
             response = self._get(ticker_param)
         except _TipRanksNotFoundError:
-            # HTTP 404 -- confirmed "unknown ticker", not an outage. Same
-            # degrade-and-cache treatment as an empty/null overview below.
-            log.info("tipranks has no data for %s (%s) -- HTTP 404, unknown ticker", symbol, ticker_param)
-            self._last_success = utc_now()
-            self._not_found.add(symbol)
-            self._store_cached_overview(cache_key, {})
-            return None
+            # HTTP 404 -- confirmed "unknown ticker", not an outage. Try the
+            # historicalprices fallback before finalising the cache state.
+            log.info(
+                "tipranks has no data for %s (%s) -- HTTP 404, unknown ticker", symbol, ticker_param
+            )
+            return self._resolve_unknown_via_fallback(symbol, ticker_param, cache_key)
 
         try:
             payload = response.json()
@@ -561,18 +675,110 @@ class TipRanksProvider(MarketDataProvider):
                 provider=self.name,
             )
 
-        self._last_success = utc_now()
+        with self._lock:
+            self._last_success = utc_now()
         overview = payload.get("overview")
         if not overview:
             log.info("tipranks has no overview for %s (%s) -- unknown ticker", symbol, ticker_param)
+            return self._resolve_unknown_via_fallback(symbol, ticker_param, cache_key)
+
+        self._store_cache_record(cache_key, state="found", overview=overview)
+        return _Resolution(state="found", overview=overview)
+
+    def _resolve_unknown_via_fallback(
+        self, symbol: str, ticker_param: str, cache_key: str
+    ) -> _Resolution:
+        """``dataForTicker`` had nothing for ``symbol`` -- try
+        ``historicalprices`` (item 4) before caching it as fully unknown. A
+        ``dataForTicker`` SUCCESS never reaches this method at all, so a
+        success never calls ``historicalprices``, by construction.
+        """
+        with self._lock:
+            self._last_success = utc_now()
             self._not_found.add(symbol)
-            self._store_cached_overview(cache_key, {})
-            return None
+        rows = self._fetch_historicalprices_rows(ticker_param)
+        if rows:
+            log.info(
+                "tipranks: %s (%s) has no dataForTicker coverage but historicalprices "
+                "returned %d row(s) -- caching as prices_only (bars-only, last resort)",
+                symbol, ticker_param, len(rows),
+            )
+            self._store_cache_record(cache_key, state="prices_only", historical_prices=rows)
+            return _Resolution(state="prices_only", bars_rows=rows)
+        self._store_cache_record(cache_key, state="unknown")
+        return _Resolution(state="unknown")
 
-        self._store_cached_overview(cache_key, overview)
-        return overview
+    def _fetch_historicalprices_rows(self, ticker_param: str) -> list[dict[str, Any]]:
+        """Raw ``historicalprices`` rows for ``ticker_param``, or ``[]`` if
+        this symbol has nothing there either (a 404 -- the same fail-soft
+        treatment as ``dataForTicker``'s own unknown-ticker case; this is a
+        fallback PROBE, not a second fail-open path). A genuine block/outage
+        signal (401/403/429/5xx/unexpected shape) still raises, via ``_get``.
+        """
+        self._rate_limiter.acquire()
+        with self._lock:
+            self._calls += 1
+        try:
+            response = self._get(ticker_param, base_url=HISTORICALPRICES_BASE_URL)
+        except _TipRanksNotFoundError:
+            return []
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SourceBlockedError(
+                f"tipranks historicalprices returned non-JSON for {ticker_param}: {exc}",
+                provider=self.name,
+            ) from exc
+        if not isinstance(payload, list):
+            log.debug("tipranks historicalprices returned a non-list payload for %s", ticker_param)
+            return []
+        return [row for row in payload if isinstance(row, dict)]
 
-    def _get(self, ticker_param: str) -> httpx.Response:
+    def _fetch_overview(self, symbol: str, exchange: str | None = None) -> dict[str, Any] | None:
+        """Back-compat convenience wrapper over ``_resolve``: the ``overview``
+        for a "found" symbol, else ``None`` ("unknown" or "prices_only" --
+        neither has analyst/overview data)."""
+        return self._resolve(symbol, exchange).overview
+
+    def _resolve_map(self, symbols: list[str]) -> dict[str, _Resolution]:
+        """Resolve every symbol in ``symbols`` -- in parallel, see
+        ``providers.base.parallel_map`` -- logging progress every
+        ``_PROGRESS_LOG_EVERY_N`` symbols or ``_PROGRESS_LOG_EVERY_S``
+        seconds, whichever comes first (item 6), so a long refresh across a
+        whole universe never looks hung.
+        """
+        total = len(symbols)
+        if total == 0:
+            return {}
+        counts = {"done": 0, "fetched": 0, "cached": 0, "unknown": 0}
+        last_log = time.monotonic()
+        progress_lock = threading.Lock()
+
+        def _resolve_one(symbol: str) -> _Resolution:
+            nonlocal last_log
+            resolution = self._resolve(symbol)
+            with progress_lock:
+                counts["done"] += 1
+                counts["cached" if resolution.from_cache else "fetched"] += 1
+                if resolution.state == "unknown":
+                    counts["unknown"] += 1
+                now = time.monotonic()
+                due = (
+                    counts["done"] == total
+                    or counts["done"] % _PROGRESS_LOG_EVERY_N == 0
+                    or (now - last_log) >= _PROGRESS_LOG_EVERY_S
+                )
+                if due:
+                    last_log = now
+                    log.info(
+                        "market data: %d/%d symbols (%d fetched, %d cached, %d unknown)",
+                        counts["done"], total, counts["fetched"], counts["cached"], counts["unknown"],
+                    )
+            return resolution
+
+        return parallel_map(symbols, _resolve_one, max_workers=self._max_workers)
+
+    def _get(self, ticker_param: str, *, base_url: str = WIDGET_BASE_URL) -> httpx.Response:
         try:
             with httpx.Client(
                 timeout=self._config.request_timeout_s,
@@ -580,7 +786,7 @@ class TipRanksProvider(MarketDataProvider):
                 follow_redirects=True,
                 headers={"User-Agent": _USER_AGENT},
             ) as client:
-                response = client.get(WIDGET_BASE_URL, params={"ticker": ticker_param})
+                response = client.get(base_url, params={"ticker": ticker_param})
         except httpx.ConnectError as exc:
             self._last_error = str(exc)
             raise ProviderError(
@@ -660,30 +866,78 @@ class TipRanksProvider(MarketDataProvider):
         start: dt.date,
         end: dt.date,
         *,
-        adjusted: bool = True,  # noqa: ARG002 - close-only; there is nothing to adjust.
+        adjusted: bool = True,  # noqa: ARG002 - neither source needs an adjustment toggle: close-only has nothing to adjust, historicalprices already reports both close and adjusted close.
     ) -> dict[str, list[Bar]]:
-        """Close-only bars from ``overview.prices``. LAST RESORT ONLY --
-        see the module docstring and ``bars_last_resort``."""
+        """Bars for the bars-last-resort cascade position. LAST RESORT ONLY --
+        see the module docstring and ``bars_last_resort``.
+
+        Two sources, preferring real OHLCV whenever it is available:
+
+        * A "found" symbol (real analyst/overview coverage) -- close-only
+          bars from ``overview.prices``, as before (no volume/high/low).
+        * A "prices_only" symbol (no analyst coverage, but
+          ``historicalprices`` has real OHLCV -- typically a closed-end
+          fund; item 4) -- real bars from that endpoint, preferred over
+          close-only synthesis. Its cadence in practice is downsampled
+          (biweekly, not daily); see ``_is_sparse`` for the cadence guard
+          that flags this rather than serving it silently as daily data.
+        * An "unknown" symbol contributes an empty list.
+        """
         out: dict[str, list[Bar]] = {}
+        resolved = self._resolve_map(symbols)
         for symbol in symbols:
-            overview = self._fetch_overview(symbol)
-            if overview is None:
+            resolution = resolved.get(symbol)
+            if resolution is None or resolution.state == "unknown":
                 out[symbol] = []
                 continue
-            bars = self._parse_close_only_bars(symbol, overview, start, end)
+
+            if resolution.state == "found":
+                bars = self._parse_close_only_bars(symbol, resolution.overview or {}, start, end)
+                out[symbol] = bars
+                if bars:
+                    message = f"{symbol}: close-only bars from tipranks; volume/ATR/gap features degraded"
+                    log.warning(message)
+                    with self._lock:
+                        self._quality_warnings.append(
+                            DataQualityIssue(
+                                detected_at=utc_now(),
+                                severity=DataQualitySeverity.WARNING,
+                                category="close_only_bars",
+                                symbol=symbol,
+                                session=None,
+                                message=message,
+                            )
+                        )
+                continue
+
+            # prices_only -- real OHLCV from historicalprices, preferred
+            # over close-only synthesis, subject to the cadence guard.
+            bars, sparse = self._parse_historicalprices_bars(
+                symbol, resolution.bars_rows or [], start, end
+            )
             out[symbol] = bars
-            if bars:
-                message = f"{symbol}: close-only bars from tipranks; volume/ATR/gap features degraded"
+            if sparse:
+                message = (
+                    f"{symbol}: historicalprices series is downsampled (median gap > 4 "
+                    "calendar days) over the requested range -- returned as-is, "
+                    "un-interpolated; not a continuous daily series"
+                )
                 log.warning(message)
-                self._quality_warnings.append(
-                    DataQualityIssue(
-                        detected_at=utc_now(),
-                        severity=DataQualitySeverity.WARNING,
-                        category="close_only_bars",
-                        symbol=symbol,
-                        session=None,
-                        message=message,
+                with self._lock:
+                    self._quality_warnings.append(
+                        DataQualityIssue(
+                            detected_at=utc_now(),
+                            severity=DataQualitySeverity.WARNING,
+                            category="sparse_bars",
+                            symbol=symbol,
+                            session=None,
+                            message=message,
+                        )
                     )
+            elif bars:
+                log.info(
+                    "%s: bars from tipranks historicalprices (no analyst/overview coverage)",
+                    symbol,
                 )
         return out
 
@@ -720,6 +974,84 @@ class TipRanksProvider(MarketDataProvider):
         bars.sort(key=lambda b: b.session)
         return bars
 
+    @staticmethod
+    def _parse_historicalprices_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Parse raw ``historicalprices`` rows per the module docstring's
+        schema facts: ``volume == 0`` rows are Jan-1 holiday padding and are
+        dropped; ``price`` (the dividend/split-adjusted close) maps to
+        ``adj_close``, ``close`` maps to ``close``. Deduped and sorted by
+        date -- a duplicate date keeps the last row seen."""
+        by_date: dict[dt.date, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                volume = row.get("volume")
+                if volume is None or float(volume) == 0.0:
+                    continue
+                date_str = row.get("date")
+                if not date_str:
+                    continue
+                session = dt.datetime.fromisoformat(date_str).date()
+                close = row.get("close")
+                price = row.get("price")
+                if close is None or price is None:
+                    continue
+                close_f = float(close)
+                open_ = row.get("open")
+                high = row.get("high")
+                low = row.get("low")
+                by_date[session] = {
+                    "session": session,
+                    "open": float(open_) if open_ is not None else close_f,
+                    "high": float(high) if high is not None else close_f,
+                    "low": float(low) if low is not None else close_f,
+                    "close": close_f,
+                    "adj_close": float(price),
+                    "volume": float(volume),
+                }
+            except (TypeError, ValueError):
+                continue
+        return [by_date[d] for d in sorted(by_date)]
+
+    @staticmethod
+    def _is_sparse(rows: list[dict[str, Any]]) -> bool:
+        """Cadence guard (item 4): the committed MHD fixture's real cadence
+        is biweekly (~14 calendar days between rows), not daily. A median
+        inter-row gap over 4 calendar days means the series is downsampled
+        and must be flagged rather than served as ordinary daily bars.
+        Fewer than two rows cannot have a gap at all -- never flagged."""
+        if len(rows) < 2:
+            return False
+        dates = sorted(r["session"] for r in rows)
+        gaps = sorted((b - a).days for a, b in itertools.pairwise(dates))
+        mid = len(gaps) // 2
+        median = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2.0
+        return median > 4
+
+    def _parse_historicalprices_bars(
+        self, symbol: str, rows: list[dict[str, Any]], start: dt.date, end: dt.date
+    ) -> tuple[list[Bar], bool]:
+        """Rows within ``[start, end]`` as ``Bar`` objects, plus whether that
+        in-range subset triggers the cadence guard. Real OHLCV throughout --
+        this is never close-only synthesis."""
+        parsed = self._parse_historicalprices_rows(rows)
+        in_range = [r for r in parsed if start <= r["session"] <= end]
+        sparse = self._is_sparse(in_range)
+        bars = [
+            Bar(
+                symbol=symbol,
+                session=r["session"],
+                open=round(r["open"], 4),
+                high=round(r["high"], 4),
+                low=round(r["low"], 4),
+                close=round(r["close"], 4),
+                volume=round(r["volume"], 1),
+                adj_close=round(r["adj_close"], 6),
+                source="tipranks",
+            )
+            for r in in_range
+        ]
+        return bars, sparse
+
     def get_intraday_bars(
         self,
         symbols: list[str],  # noqa: ARG002
@@ -753,10 +1085,11 @@ class TipRanksProvider(MarketDataProvider):
                         exc_info=True,
                     )
 
-        for symbol in symbols:
-            if symbol in out:
-                continue
-            overview = self._fetch_overview(symbol)
+        remaining = [s for s in symbols if s not in out]
+        resolved = self._resolve_map(remaining)
+        for symbol in remaining:
+            resolution = resolved.get(symbol)
+            overview = resolution.overview if resolution else None
             if overview is None:
                 continue
             cap = _preferred_market_cap(overview)
@@ -799,8 +1132,10 @@ class TipRanksProvider(MarketDataProvider):
     def get_security_info(self, symbols: list[str]) -> dict[str, SecurityInfo]:
         out: dict[str, SecurityInfo] = {}
         by_symbol = {s.symbol: s for s in load_packaged_universe()}
+        resolved = self._resolve_map(symbols)
         for symbol in symbols:
-            overview = self._fetch_overview(symbol)
+            resolution = resolved.get(symbol)
+            overview = resolution.overview if resolution else None
             if overview is None:
                 out[symbol] = by_symbol.get(symbol.upper(), SecurityInfo(symbol=symbol))
                 continue
@@ -844,8 +1179,10 @@ class TipRanksProvider(MarketDataProvider):
         if through is None:
             through = dt.datetime.now(tz=dt.UTC).date()
         out: dict[str, list[EarningsEvent]] = {}
+        resolved = self._resolve_map(symbols)
         for symbol in symbols:
-            overview = self._fetch_overview(symbol)
+            resolution = resolved.get(symbol)
+            overview = resolution.overview if resolution else None
             events: list[EarningsEvent] = []
             if overview:
                 holding = overview.get("portfolioHoldingData") or {}
@@ -866,8 +1203,10 @@ class TipRanksProvider(MarketDataProvider):
         falls outside ``[start, end]`` contributes nothing for this call.
         """
         out: dict[str, list[EarningsEvent]] = {}
+        resolved = self._resolve_map(symbols)
         for symbol in symbols:
-            overview = self._fetch_overview(symbol)
+            resolution = resolved.get(symbol)
+            overview = resolution.overview if resolution else None
             events: list[EarningsEvent] = []
             if overview:
                 holding = overview.get("portfolioHoldingData") or {}

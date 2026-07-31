@@ -123,6 +123,7 @@ class RedditProvider:
         username_secret = get_secret(config.username_credential)
         password_secret = get_secret(config.password_credential)
         session_cookie_secret = get_secret(config.session_cookie_credential)
+        token_v2_secret = get_secret(config.token_v2_credential)
 
         has_client_creds = client_id_secret is not None and client_secret_secret is not None
         has_user_creds = username_secret is not None and password_secret is not None
@@ -132,16 +133,22 @@ class RedditProvider:
         self._username: str | None = None
         self._password: str | None = None
         self._session_cookie: str | None = None
+        self._token_v2: str | None = None
+        #: Whether the second cookie (see ``RedditConfig.token_v2_credential``)
+        #: resolved -- exposed for ``status()`` and the credentials-test
+        #: endpoint so the owner can tell which cookie combination is in use.
+        self.has_token_v2 = token_v2_secret is not None
 
         if has_client_creds and has_user_creds:
             self.mode = "password"
         elif session_cookie_secret is not None:
             self.mode = "cookie_session"
             log.warning(
-                "Reddit provider configured (mode=cookie_session): this reads "
-                "the public listing endpoint authenticated with the owner's "
-                "own reddit_session cookie (personal use only, ADR-0008 "
-                "Decision 1) -- not the official OAuth API."
+                "Reddit provider configured (mode=cookie_session, cookies=%s): this reads "
+                "the public listing endpoint authenticated with the owner's own session "
+                "cookie(s) (personal use only, ADR-0008 Decision 1) -- not the official "
+                "OAuth API.",
+                "reddit_session+token_v2" if token_v2_secret is not None else "reddit_session only",
             )
         elif has_client_creds:
             self.mode = "client_credentials"
@@ -178,6 +185,8 @@ class RedditProvider:
                 self._password = password_secret.reveal()  # type: ignore[union-attr]
         elif self.mode == "cookie_session":
             self._session_cookie = session_cookie_secret.reveal()  # type: ignore[union-attr]
+            if token_v2_secret is not None:
+                self._token_v2 = token_v2_secret.reveal()
 
         self._access_token: str | None = None
         self._token_expires_at = 0.0
@@ -209,13 +218,14 @@ class RedditProvider:
                 "ADR-0008 Decision 1)."
             )
         elif self.mode == "cookie_session":
+            cookies = "reddit_session+token_v2" if self.has_token_v2 else "reddit_session only"
             message = (
-                f"Reddit cookie-session, owner's own session "
-                f"({len(self.config.subreddits)} subreddits)"
+                f"Reddit cookie-session, owner's own session ({cookies}, "
+                f"{len(self.config.subreddits)} subreddits)"
             )
             licence_note = (
                 "Reads www.reddit.com/r/<sub>/new.json authenticated with the "
-                "owner's own reddit_session cookie and a browser-style "
+                f"owner's own session cookie(s) ({cookies}) and a browser-style "
                 "User-Agent (ADR-0008 Decision 1: personal use, own credentials "
                 "only). Not the official OAuth API -- shares the public-JSON "
                 "path's fail-closed behaviour exactly: no retry, no "
@@ -381,7 +391,7 @@ class RedditProvider:
                 url = f"https://www.reddit.com/r/{subreddit}/new.json"
                 headers = {
                     "User-Agent": _COOKIE_SESSION_USER_AGENT,
-                    "Cookie": f"reddit_session={self._session_cookie}",
+                    "Cookie": self._cookie_header(),
                 }
             elif self.mode == "public_json":
                 url = f"https://www.reddit.com/r/{subreddit}/new.json"
@@ -440,6 +450,18 @@ class RedditProvider:
             self._rate_limiter.acquire()
 
         return collected
+
+    def _cookie_header(self) -> str:
+        """Cookie header for cookie-session mode.
+
+        Reddit's own web frontend sends both ``reddit_session`` and
+        ``token_v2`` (both HttpOnly -- see ``RedditConfig.token_v2_credential``).
+        When ``token_v2`` was not configured, behaviour is unchanged from
+        before this was added: ``reddit_session`` alone.
+        """
+        if self._token_v2:
+            return f"reddit_session={self._session_cookie}; token_v2={self._token_v2}"
+        return f"reddit_session={self._session_cookie}"
 
     def _fail_closed_if_blocked(self, response: httpx.Response, subreddit: str) -> None:
         """Public-JSON and cookie-session modes only: raise on any

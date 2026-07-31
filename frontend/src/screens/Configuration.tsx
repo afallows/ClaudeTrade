@@ -1,13 +1,15 @@
 import { useEffect, useState } from 'react';
-import { KeyRound, Trash2 } from 'lucide-react';
+import { CheckCircle2, KeyRound, Trash2, XCircle } from 'lucide-react';
 import { api } from '../api/client';
-import type { CredentialStatus } from '../api/types';
+import type { CredentialStatus, CredentialTestResult } from '../api/types';
 
 export function Configuration() {
   const [items, setItems] = useState<CredentialStatus[]>([]);
   const [values, setValues] = useState<Record<string, string>>({});
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(true);
+  const [redditTest, setRedditTest] = useState<CredentialTestResult | null>(null);
+  const [testingReddit, setTestingReddit] = useState(false);
   const load = () => api.credentials().then((r) => setItems(r.credentials)).finally(() => setLoading(false));
   useEffect(() => { void load(); }, []);
   async function save(item: CredentialStatus) {
@@ -22,10 +24,28 @@ export function Configuration() {
     try { await api.deleteCredential(item.name); await load(); setMessage(`${item.label} removed.`); }
     catch (e) { setMessage(e instanceof Error ? e.message : 'Unable to remove credential.'); }
   }
+  async function testReddit() {
+    setTestingReddit(true);
+    setRedditTest(null);
+    try { setRedditTest(await api.testCredential('reddit')); }
+    catch (e) { setRedditTest({ ok: false, mode: null, status_detail: e instanceof Error ? e.message : 'Test failed' }); }
+    finally { setTestingReddit(false); }
+  }
+  const hasReddit = items.some((item) => item.name.startsWith('reddit'));
   return <div className="flex flex-col gap-5 p-6">
     <header><h1 className="text-lg font-semibold text-ink">Configuration</h1><p className="text-sm text-ink-secondary">Add API credentials without storing secrets in ClaudeTrade files or its database.</p></header>
     <div className="rounded-xl border border-gridline bg-surface p-4 text-sm text-ink-secondary"><KeyRound className="mr-2 inline h-4 w-4 text-accent" />Secrets are written to your operating system credential store. Existing values are never returned to this page.</div>
     {message && <div role="status" className="rounded-lg border border-gridline px-3 py-2 text-sm text-ink">{message}</div>}
+    {hasReddit && <section className="rounded-xl border border-gridline bg-surface p-4">
+      <div className="mb-2 flex items-center justify-between">
+        <div><h2 className="font-medium text-ink">Reddit connectivity</h2><p className="text-xs text-ink-secondary">Makes one small live request using whichever Reddit credentials are currently configured -- no secret is ever echoed back.</p></div>
+        <button onClick={() => void testReddit()} disabled={testingReddit} className="rounded-lg border border-gridline px-3 py-2 text-sm font-medium text-ink disabled:opacity-40">{testingReddit ? 'Testing…' : 'Test'}</button>
+      </div>
+      {redditTest && <div role="status" className={`flex items-start gap-2 rounded-lg px-3 py-2 text-sm ${redditTest.ok ? 'bg-good/15 text-good' : 'bg-critical/15 text-critical'}`}>
+        {redditTest.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /> : <XCircle className="mt-0.5 h-4 w-4 shrink-0" />}
+        <span>{redditTest.mode ? <strong className="mr-1">[{redditTest.mode}]</strong> : null}{redditTest.status_detail}</span>
+      </div>}
+    </section>}
     {loading ? <p className="text-sm text-ink-secondary">Loading credentials…</p> : <div className="grid gap-3">
       {items.map((item) => <section key={item.name} className="rounded-xl border border-gridline bg-surface p-4">
         <div className="mb-3 flex items-start justify-between"><div><h2 className="font-medium text-ink">{item.label}</h2><p className="text-xs text-ink-secondary">{item.pipeline.replace('_', ' ')} pipeline · {item.configured ? `${item.masked} via ${item.source}` : 'Not configured'}</p></div><span className={`rounded-full px-2 py-1 text-xs ${item.configured ? 'bg-good/15 text-good' : 'bg-surface-2 text-ink-secondary'}`}>{item.configured ? 'Configured' : 'Not configured'}</span></div>

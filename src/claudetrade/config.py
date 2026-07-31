@@ -173,6 +173,22 @@ class MarketDataConfig(BaseModel):
     max_symbols_per_request: int = 100
     request_timeout_s: float = 20.0
     rate_limit_per_minute: int = 60
+    #: Yahoo's undocumented chart endpoint gets its own bucket, separate from
+    #: the field above (which stooq -- an opt-in-only fallback -- still reads).
+    #: 120/min is still conservative for a single-symbol-per-call, keyless,
+    #: undocumented endpoint, but was the second-biggest driver (after
+    #: TipRanks' own rate limit -- see ``TipRanksConfig.rate_limit_per_minute``)
+    #: of the owner's first live refresh taking 80+ minutes for ~2,400 symbols.
+    yahoo_rate_limit_per_minute: int = 120
+    #: Worker threads used for the per-symbol fetch loops in
+    #: ``TipRanksProvider``/``YahooMarketProvider`` (market caps, security
+    #: info, earnings, and the last-resort bars cascade). Each provider's own
+    #: ``RateLimiter`` is shared across every worker thread -- see
+    #: ``providers.base.RateLimiter`` and ``providers.base.parallel_map`` --
+    #: so raising this overlaps request *latency* across symbols; it does not
+    #: raise the enforced calls/minute ceiling, which is what
+    #: ``rate_limit_per_minute``/``yahoo_rate_limit_per_minute`` control.
+    max_workers: int = 8
     benchmark_symbol: str = "SPY"
     #: Sector ETF proxies used for relative-strength comparisons.
     sector_etfs: dict[str, str] = Field(
@@ -229,9 +245,18 @@ class TipRanksConfig(BaseModel):
     one call per symbol rather than four.
     """
 
-    #: Conservative default for an unauthenticated, undocumented endpoint --
-    #: same posture as stooq/yahoo's own defaults.
-    rate_limit_per_minute: int = 30
+    #: Raised from the original conservative default of 30/min (ADR-0008
+    #: Decision 1's launch posture) to 60/min after the owner confirmed their
+    #: own brokerage app calls this same public eToro widget endpoint freely
+    #: at that kind of cadence with no observed pushback -- it is still a
+    #: fraction of what a browser tab idly refreshing a watchlist would issue,
+    #: and remains fully self-imposed and operator-configurable, not a vendor
+    #: published ceiling. This was the single biggest driver of the owner's
+    #: first live refresh taking 80+ minutes for ~2,400 symbols (roughly
+    #: symbol_count / rate_limit_per_minute at that rate); see also
+    #: ``MarketDataConfig.max_workers``, which overlaps request latency across
+    #: symbols but does not itself raise this ceiling.
+    rate_limit_per_minute: int = 60
     request_timeout_s: float = 20.0
     #: Cached ``overview`` responses are reused until this many trading
     #: sessions have elapsed since they were fetched (see
@@ -240,6 +265,21 @@ class TipRanksConfig(BaseModel):
     #: refresh within the same trading day -- only once a new session begins.
     #: Stored under ``paths.cache_dir/tipranks/``.
     cache_ttl_trading_days: int = 1
+    #: A confirmed "TipRanks has no data for this symbol" result (a clean
+    #: HTTP 404 from BOTH ``dataForTicker`` and the ``historicalprices``
+    #: fallback probe -- see ``TipRanksProvider._resolve``) is cached under
+    #: this much longer TTL instead of ``cache_ttl_trading_days``. Without
+    #: this, a genuinely delisted/renamed name (the owner's log showed ANSS,
+    #: JNPR, FLT, SQ, K, WBA, HES, DFS, PARA and others) gets re-probed on
+    #: EVERY refresh forever, paying a full round trip for a symbol that will
+    #: never resolve. 30 trading days means a name that later regains
+    #: coverage (a re-listing, a data-vendor backfill) is picked up within
+    #: that window at worst -- an accepted trade-off, not an oversight. Also
+    #: applied to the "prices_only" state (a real, still-listed security with
+    #: no analyst/overview coverage -- typically a closed-end fund -- that
+    #: only ``historicalprices`` can serve): that gap is no more likely to
+    #: close from one day to the next than a fully unknown ticker is.
+    unknown_ticker_ttl_days: int = 30
     #: OPTIONAL, UNVERIFIED batching optimisation for Canadian market caps via
     #: ``marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=TSE:A,TSE:B,...``
     #: (the CIBC-app endpoint, not the widget). Off by default: this sandbox
@@ -291,13 +331,18 @@ class RedditConfig(BaseModel):
     OAuth credentials work, this class prefers them automatically.
     """
 
-    #: On by default pointing at the *synthetic* generator, so a fresh install
-    #: exercises the whole sentiment pipeline with no credentials and no
-    #: network. Set ``provider = "reddit"`` and store credentials to go live;
-    #: if those credentials do not resolve the source disables itself cleanly
-    #: rather than failing the run.
+    #: ``provider = "reddit"`` (the default, mirroring
+    #: ``MarketDataConfig.provider = "tipranks"``) points at the live OAuth/
+    #: cookie-session adapter; with no credentials configured it disables
+    #: itself cleanly (``NotConfiguredError``, logged, pipeline continues) --
+    #: never silently fabricating sentiment. A real refresh log showed the
+    #: previous ``"synthetic"`` default storing tens of thousands of
+    #: fabricated posts on an install the owner believed was fully live (the
+    #: same footgun ``market_data.provider`` used to have before it defaulted
+    #: to ``"tipranks"``). Set ``provider = "synthetic"`` explicitly for an
+    #: offline/demo install with no credentials and no network.
     enabled: bool = True
-    provider: str = "synthetic"
+    provider: str = "reddit"
     client_id_credential: str = "reddit_client_id"
     client_secret_credential: str = "reddit_client_secret"
     #: Owner's own Reddit account credentials (ADR-0008 Decision 1: "own
@@ -316,6 +361,19 @@ class RedditConfig(BaseModel):
     #: resolve. See ``docs/api-providers.md`` for how to export it (F12 ->
     #: Application -> Cookies -> reddit.com -> reddit_session).
     session_cookie_credential: str = "reddit_session_cookie"
+    #: Optional second cookie for cookie-session mode. Reddit's own web
+    #: frontend sends BOTH ``reddit_session`` and ``token_v2`` (an HttpOnly
+    #: OAuth JWT cookie -- invisible to ``document.cookie``, only visible via
+    #: DevTools' Application/Storage -> Cookies panel, never the Console).
+    #: CONFIRMED (owner-validated 2026-07-31): ``reddit_session`` alone,
+    #: correctly attached, is sufficient for a 200 from a non-browser client
+    #: -- this is an optional extra, not a requirement. ``reddit_session`` is
+    #: long-lived (weeks+); ``token_v2`` is short-lived (hours, not weeks),
+    #: so try ``reddit_session`` alone first and only add this if that stops
+    #: working. When this does not resolve, cookie-session mode behaves
+    #: exactly as before (``Cookie: reddit_session=<v>`` only) -- see
+    #: ``RedditProvider._cookie_header``.
+    token_v2_credential: str = "reddit_token_v2"
     #: Cookie-session mode shares the same public listing endpoint as the
     #: public-JSON fallback below (an unauthenticated-by-design endpoint,
     #: just authenticated here via the owner's own cookie rather than

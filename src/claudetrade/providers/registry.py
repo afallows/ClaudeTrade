@@ -310,7 +310,9 @@ def _instantiate_market_provider(
         return provider_class(csv_dir=config.market_data.csv_dir)  # type: ignore[call-arg]
     if name == "tipranks":
         return provider_class(  # type: ignore[call-arg]
-            config=config.tipranks, cache_dir=config.paths.resolve("cache_dir")
+            config=config.tipranks,
+            cache_dir=config.paths.resolve("cache_dir"),
+            max_workers=config.market_data.max_workers,
         )
     # stooq, yahoo, synthetic all take the shared MarketDataConfig.
     return provider_class(config=config.market_data)  # type: ignore[call-arg]
@@ -342,7 +344,9 @@ def get_earnings_provider(config: AppConfig) -> EarningsProvider:
             primary = primary_class(csv_path=config.earnings.csv_path)
         elif primary_name == "tipranks":
             primary = primary_class(
-                config=config.tipranks, cache_dir=config.paths.resolve("cache_dir")
+                config=config.tipranks,
+                cache_dir=config.paths.resolve("cache_dir"),
+                max_workers=config.market_data.max_workers,
             )
         else:  # synthetic
             primary = primary_class()

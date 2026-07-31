@@ -12,19 +12,32 @@ refresh cycle will fetch (see ``StocktwitsConfig``).
 **Browser-style request headers (best-effort only)**: live-probe evidence
 (2026-07-30) showed this endpoint returning HTTP 403 to PowerShell/.NET
 clients regardless of User-Agent (both a generic UA and this codebase's
-descriptive app UA), but HTTP 200 JSON to a plain browser tab -- consistent
-with an edge filter keyed on browser-shaped request headers and/or TLS
-fingerprint, not a credential or API-contract check (the API itself remains
-keyless and open). This adapter therefore sends a realistic desktop-browser
-User-Agent plus ``Accept``/``Accept-Language`` headers matching what a
-browser sends, instead of the identifying app UA used elsewhere in this
-codebase. This is **best-effort only**: a header swap cannot fix a
-TLS-fingerprint-based block, since httpx/urllib3's TLS handshake doesn't
-look like a browser's no matter what headers ride on top of it. If the edge
-still blocks despite the browser-style headers, the existing fail-closed
-path below (``SourceBlockedError`` on 401/403/non-JSON) handles it exactly
-as before -- diagnostics reports the source blocked, no retry loop, no
-fingerprint/proxy rotation, no CAPTCHA handling.
+descriptive app UA), but HTTP 200 JSON to a plain browser tab. **CONFIRMED
+CAUSE (owner, 2026-07-31)**: Cloudflare bot management, gated on
+browser-earned, TLS-fingerprint-bound cookies (the ``cf_clearance``/
+``__cf_bm`` family) that live for hours, not a credential or API-contract
+check (the API itself remains keyless and open per the vendor's own
+documentation). This adapter sends a realistic desktop-browser User-Agent
+plus ``Accept``/``Accept-Language`` headers matching what a browser sends,
+instead of the identifying app UA used elsewhere in this codebase. This is
+**best-effort only and stays that way BY DESIGN**: a header swap cannot pass
+a Cloudflare TLS-fingerprint challenge, and this codebase deliberately adds
+**no cookie-session mode for this source, ever** -- unlike Reddit's (see
+``providers.social.reddit``), a Cloudflare clearance cookie is short-lived
+and re-bound to the browser session/fingerprint that earned it, so
+supporting it here would mean an unending maintenance treadmill of
+re-capturing an expiring, environment-bound value, not a stable
+owner-provided credential; it would also cross the ADR-0008 Decision 1
+fail-closed line ("never work around a block/challenge") this whole
+adapter otherwise stays firmly on the right side of. If the edge blocks
+despite the browser-style headers, the existing fail-closed path below
+(``SourceBlockedError`` on 401/403/non-JSON) handles it exactly as before --
+diagnostics reports the source blocked, no retry loop, no fingerprint/proxy
+rotation, no CAPTCHA handling. **This is the expected steady state on most
+machines** -- Reddit's cookie-session mode (owner-verified working) plus the
+four default news RSS feeds are this application's reliable social-sentiment
+sources; Stocktwits contributes opportunistically when the edge happens not
+to challenge a given request/IP, never as something to depend on.
 
 Each message may carry a self-declared ``entities.sentiment.basic`` tag
 ("Bullish"/"Bearish") -- some authors tag their own posts this way. This is
@@ -239,8 +252,10 @@ class StocktwitsProvider:
         if response.status_code in (401, 403):
             raise SourceBlockedError(
                 f"Stocktwits denied access for {symbol} (HTTP {response.status_code}) -- "
-                "fail-closed per ADR-0008 Decision 1: no retry, no fingerprint/proxy "
-                "rotation, no CAPTCHA handling.",
+                "blocked (Cloudflare bot management, confirmed cause) -- fail-closed per "
+                "ADR-0008 Decision 1: no retry, no fingerprint/proxy rotation, no cookie "
+                "workaround, no CAPTCHA handling. See the module docstring for why this "
+                "source deliberately never gets cookie support.",
                 provider="stocktwits",
             )
 

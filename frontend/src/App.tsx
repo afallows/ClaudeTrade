@@ -2,6 +2,7 @@ import { lazy, Suspense } from 'react';
 import { createBrowserRouter, Outlet, RouterProvider } from 'react-router-dom';
 import { Sidebar } from './components/Sidebar';
 import { Footer } from './components/Footer';
+import { RefreshBanner } from './components/RefreshBanner';
 import { SkeletonCard, SkeletonRows } from './components/Skeleton';
 
 // Route-level code splitting: AG Grid (Screener) and Plotly (Dashboard's
@@ -30,6 +31,7 @@ function RouteSkeleton() {
 function Layout() {
   return (
     <div className="flex h-full min-h-screen flex-col">
+      <RefreshBanner />
       <div className="flex min-h-0 flex-1">
         <Sidebar />
         <main className="min-w-0 flex-1 overflow-y-auto">

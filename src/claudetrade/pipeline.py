@@ -21,6 +21,7 @@ result; it does not abort the run.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -124,8 +125,17 @@ class Pipeline:
         start: dt.date,
         end: dt.date,
         symbols: list[str] | None = None,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> PipelineResult:
-        """Pull, validate and store data from every configured source."""
+        """Pull, validate and store data from every configured source.
+
+        Args:
+            progress_callback: Optional ``(phase, done, total)`` hook, see
+                ``data.ingest.DataIngestor.progress_callback`` -- used by the
+                web API's background-refresh endpoint
+                (``webapi.routers.system``) to expose live progress; the CLI
+                does not pass one and is unaffected.
+        """
         result = PipelineResult()
 
         # Deliberately NOT `as_of=end`: that returns point-in-time membership and
@@ -149,6 +159,7 @@ class Pipeline:
             market_provider=self.market,
             earnings_provider=self.earnings,
             social_providers=self.social,
+            progress_callback=progress_callback,
         )
         report = ingestor.run_full_refresh(
             symbols=[s.symbol for s in securities],
@@ -235,6 +246,9 @@ class Pipeline:
                     if snapshot.post_count == 0:
                         continue
                     written += _upsert_sentiment(session, snapshot)
+        drop_summary = aggregator.drain_drop_summary()
+        if drop_summary:
+            log.warning(drop_summary)
         log.info("stored %d daily sentiment rows across %d symbols", written, len(by_symbol))
         return written
 

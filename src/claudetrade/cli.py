@@ -61,7 +61,7 @@ ConfigOption = Annotated[
 
 def _load(config_path: Path | None) -> AppConfig:
     config = get_config(config_path, reload=True)
-    setup_logging(config)
+    setup_logging(config, component="cli")
     return config
 
 
@@ -802,6 +802,105 @@ def db_backup(config: ConfigOption = None, label: str = "") -> None:
 
     path = create_backup(get_database(cfg), cfg.paths.resolve("backups_dir"), label=label)
     typer.echo(f"backup written to {path}")
+
+
+@db_app.command("purge-synthetic")
+def db_purge_synthetic(config: ConfigOption = None) -> None:
+    """Delete social posts/mentions/sentiment aggregates that came from the
+    offline synthetic generator.
+
+    ``reddit.provider`` (and, less commonly, ``x.provider``/``news.provider``)
+    used to default to ``"synthetic"``; an install left on that default while
+    the operator believed it was live would silently fill the database with
+    fabricated posts -- a real refresh log showed tens of thousands of them.
+    Changing the default going forward does not clean up a database that
+    already has them, so this exists as a scoped fix short of a full reset.
+
+    Synthetic posts are identified by their ``external_id`` prefix
+    (``"synthetic-"``), stamped unconditionally by every synthetic social
+    adapter (``providers.social.synthetic.SyntheticSocialProvider``,
+    regardless of which ``SocialSource`` -- reddit/x/news -- it is filed
+    under) -- no live adapter ever produces an id in that form.
+
+    Daily sentiment aggregates (``symbol_sentiment_daily``) cannot be
+    attributed to a single originating post without a recompute, so ALL of
+    them are cleared too, not just the ones touching a purged post -- run
+    `claudetrade refresh` afterwards to rebuild them from whichever sources
+    are configured now.
+    """
+    cfg = _load(config)
+    from sqlalchemy import select
+
+    from claudetrade.db.models import (
+        SentimentRecordRow,
+        SocialPostRow,
+        SymbolSentimentDaily,
+        TickerMentionRow,
+    )
+    from claudetrade.db.session import get_database
+
+    db = get_database(cfg)
+    with db.session() as session:
+        synthetic_posts = (
+            session.execute(
+                select(SocialPostRow).where(SocialPostRow.external_id.like("synthetic-%"))
+            )
+            .scalars()
+            .all()
+        )
+        post_ids = [p.id for p in synthetic_posts]
+
+        mentions_deleted = 0
+        if post_ids:
+            mentions = (
+                session.execute(
+                    select(TickerMentionRow).where(TickerMentionRow.post_id.in_(post_ids))
+                )
+                .scalars()
+                .all()
+            )
+            mentions_deleted = len(mentions)
+            for mention in mentions:
+                session.delete(mention)
+
+            # A second foreign key into social_posts -- the per-post,
+            # per-symbol classifier output -- must also go before the post
+            # itself can be deleted.
+            sentiment_records = (
+                session.execute(
+                    select(SentimentRecordRow).where(SentimentRecordRow.post_id.in_(post_ids))
+                )
+                .scalars()
+                .all()
+            )
+            for record in sentiment_records:
+                session.delete(record)
+
+        posts_deleted = len(synthetic_posts)
+        for post in synthetic_posts:
+            session.delete(post)
+
+        aggregates = session.execute(select(SymbolSentimentDaily)).scalars().all()
+        aggregates_deleted = len(aggregates)
+        for aggregate in aggregates:
+            session.delete(aggregate)
+
+    _echo_json(
+        {
+            "posts_deleted": posts_deleted,
+            "mentions_deleted": mentions_deleted,
+            "sentiment_aggregates_deleted": aggregates_deleted,
+        }
+    )
+    if posts_deleted == 0:
+        typer.secho("No synthetic-origin posts found -- nothing to purge.", fg=typer.colors.GREEN)
+    else:
+        typer.secho(
+            f"Purged {posts_deleted} synthetic post(s), {mentions_deleted} mention(s), and "
+            f"{aggregates_deleted} sentiment aggregate row(s). Run 'claudetrade refresh' to "
+            "rebuild aggregates from your currently configured (live) sources.",
+            fg=typer.colors.YELLOW,
+        )
 
 
 @db_app.command("restore")

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import threading
 from typing import Any
 
 import httpx
@@ -54,6 +55,7 @@ from claudetrade.providers.base import (
     ProviderError,
     ProviderStatus,
     RateLimiter,
+    parallel_map,
 )
 
 log = logging.getLogger(__name__)
@@ -64,7 +66,11 @@ log = logging.getLogger(__name__)
 #: cookie+crumb auth in production and has been removed outright; see the
 #: module docstring.
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-DEFAULT_RATE_LIMIT = 30  # Calls per minute -- conservative, undocumented endpoint.
+#: Yahoo gets its own rate-limit bucket, separate from
+#: ``MarketDataConfig.rate_limit_per_minute`` (which stooq still reads) --
+#: see ``MarketDataConfig.yahoo_rate_limit_per_minute``.
+DEFAULT_RATE_LIMIT = 120  # Calls per minute -- conservative, undocumented endpoint.
+DEFAULT_MAX_WORKERS = 8  # See MarketDataConfig.max_workers.
 
 #: Canadian (TSX/TSXV) listings carry a ``.TO`` suffix on Yahoo. Matched
 #: case-insensitively against ``SecurityInfo.exchange`` / the ``exchange``
@@ -101,10 +107,17 @@ class YahooMarketProvider(MarketDataProvider):
     def __init__(self, config: MarketDataConfig | None = None) -> None:
         self._config = config or MarketDataConfig()
         self._rate_limiter = RateLimiter(
-            self._config.rate_limit_per_minute or DEFAULT_RATE_LIMIT,
+            self._config.yahoo_rate_limit_per_minute or DEFAULT_RATE_LIMIT,
             name="yahoo",
             max_wait_s=30.0,
         )
+        #: See ``providers.base.parallel_map``: worker threads for the
+        #: per-symbol bars fetch loop, sharing ``self._rate_limiter`` above
+        #: (thread-safe), so the enforced calls/minute ceiling stays global.
+        self._max_workers = max(1, self._config.max_workers or DEFAULT_MAX_WORKERS)
+        #: Guards every piece of mutable state below that a worker thread
+        #: can touch concurrently.
+        self._lock = threading.Lock()
         self._calls = 0
         self._last_error: str | None = None
         self._last_success: dt.datetime | None = None
@@ -122,7 +135,7 @@ class YahooMarketProvider(MarketDataProvider):
             message="undocumented query1.finance.yahoo.com/v8/finance/chart endpoint; bars fallback",
             supports_point_in_time=False,
             supports_delisted=False,
-            rate_limit_per_minute=self._config.rate_limit_per_minute or DEFAULT_RATE_LIMIT,
+            rate_limit_per_minute=self._config.yahoo_rate_limit_per_minute or DEFAULT_RATE_LIMIT,
             calls_made=self._calls,
             last_error=self._last_error,
             last_success=self._last_success,
@@ -152,33 +165,44 @@ class YahooMarketProvider(MarketDataProvider):
         *,
         adjusted: bool = True,
     ) -> dict[str, list[Bar]]:
-        """Fetch daily bars. Unknown/errored symbols degrade to an empty list
-        and the rest of the batch continues -- same contract as
-        ``StooqMarketProvider.get_daily_bars``."""
-        self._calls += 1
-        out: dict[str, list[Bar]] = {}
-        for symbol in symbols:
+        """Fetch daily bars, in parallel across up to ``max_workers`` threads
+        (see ``providers.base.parallel_map``). Unknown/errored symbols
+        degrade to an empty list and the rest of the batch continues -- same
+        contract as ``StooqMarketProvider.get_daily_bars``. A genuine
+        ``ProviderError`` from any symbol still aborts the call: not-yet-
+        started fetches are cancelled and the exception propagates, matching
+        the pre-parallel behaviour where the first such failure stopped the
+        rest of the batch."""
+        with self._lock:
+            self._calls += 1
+
+        def _fetch_one(symbol: str) -> list[Bar]:
             try:
                 self._rate_limiter.acquire()
                 bars = self._fetch_chart(symbol, start, end, adjusted=adjusted)
-                out[symbol] = bars
-                self._last_success = dt.datetime.now(tz=dt.UTC)
+                with self._lock:
+                    self._last_success = dt.datetime.now(tz=dt.UTC)
+                return bars
             except _YahooNoDataError as exc:
                 log.info("yahoo has no chart data for %s: %s", symbol, exc)
-                self._last_error = str(exc)
-                self._not_found.add(symbol)
-                out[symbol] = []
+                with self._lock:
+                    self._last_error = str(exc)
+                    self._not_found.add(symbol)
+                return []
             except ProviderError:
-                self._last_error = f"failed to fetch {symbol}"
+                with self._lock:
+                    self._last_error = f"failed to fetch {symbol}"
                 raise
             except Exception as exc:
-                self._last_error = str(exc)
+                with self._lock:
+                    self._last_error = str(exc)
                 raise ProviderError(
                     f"failed to fetch {symbol} from yahoo: {exc}",
                     provider=self.name,
                     retryable=True,
                 ) from exc
-        return out
+
+        return parallel_map(symbols, _fetch_one, max_workers=self._max_workers)
 
     def _fetch_chart(
         self, symbol: str, start: dt.date, end: dt.date, *, adjusted: bool
