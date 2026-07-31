@@ -822,6 +822,31 @@ class SentimentConfig(BaseModel):
     duplicate_ratio_alert: float = 0.35
     use_ai_classifier: bool = True
     ai_sample_per_symbol: int = 20
+    #: Fetch every social provider (Reddit, news RSS, X, Stocktwits, ...)
+    #: concurrently with the market-data phases of a refresh (securities /
+    #: prices / earnings) rather than strictly after them. Social sources hit
+    #: completely different hosts than the market-data provider (TipRanks/
+    #: Yahoo), so there is no reason the ~minutes-long social fetch should sit
+    #: behind the ~8-minute market pass instead of overlapping it. Only the
+    #: NETWORK FETCH moves earlier -- persistence (posts, mentions, daily
+    #: sentiment aggregates) still happens on the main refresh thread, after
+    #: the securities phase has committed (mention resolution depends on the
+    #: alias table ``ingest_securities`` writes), exactly as it does today.
+    #: See ``data.ingest.DataIngestor.run_full_refresh``. Set False to
+    #: restore the fully sequential order (securities -> prices -> earnings
+    #: -> social fetch -> sentiment persist) -- useful for tests/debugging
+    #: where a strict, single-threaded ordering is easier to reason about.
+    fetch_concurrently: bool = True
+    #: How long ``run_full_refresh`` waits, once the market-data phases are
+    #: done, for a still-running background social fetch before giving up on
+    #: it for this refresh. A social fetch is minutes at most in practice --
+    #: this is deliberately generous so it is essentially never hit in
+    #: normal operation, not a tuning knob. On timeout the refresh proceeds
+    #: with zero posts from the abandoned fetch (a warning is logged); the
+    #: background thread is a daemon and is not killed, but its result is
+    #: discarded rather than raced with the main thread -- the same ground
+    #: gets covered on the next refresh.
+    fetch_join_timeout_s: float = 300.0
 
 
 class RegimeConfig(BaseModel):

@@ -17,6 +17,7 @@ with its defects labelled.
 from __future__ import annotations
 
 import datetime as dt
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
@@ -90,6 +91,23 @@ class IngestReport:
             "quality_warnings": len(self.quality.warnings),
             "provider_failures": self.provider_failures,
         }
+
+
+@dataclass(slots=True)
+class _SocialFetchOutcome:
+    """Result of the network-only social fetch.
+
+    Produced entirely on the background fetch thread (see
+    ``DataIngestor._start_social_fetch``) and handed to the main thread only
+    after ``Thread.join()`` returns -- a single-writer-then-single-reader
+    handoff with no field ever touched by both threads at once. This is what
+    keeps SQLite writes single-threaded even though the *fetch* now overlaps
+    the market-data phases: nothing here is persisted until it is back on
+    the main thread, in ``DataIngestor._join_social_fetch``.
+    """
+
+    posts: list[SocialPost] = field(default_factory=list)
+    provider_failures: dict[str, str] = field(default_factory=dict)
 
 
 class DataIngestor:
@@ -607,26 +625,148 @@ class DataIngestor:
         symbols: list[str] | None = None,
         report: IngestReport | None = None,
     ) -> list[SocialPost]:
-        """Fetch posts from every enabled social provider.
+        """Fetch (synchronously, on this thread) and persist posts from every
+        enabled social provider.
 
         A provider that is not configured is skipped silently -- that is the
-        documented reduced-capability path, not an error.
+        documented reduced-capability path, not an error. This is the fully
+        sequential path: used directly whenever
+        ``config.sentiment.fetch_concurrently`` is ``False``, and still the
+        method any other caller gets by calling it directly. See
+        ``run_full_refresh`` for the concurrent path, which fetches (via
+        ``_fetch_social_posts_only``, on a background thread) while the
+        market-data phases run, and only persists here-equivalent output
+        once back on the main thread.
         """
         report = report or IngestReport()
-        posts: list[SocialPost] = []
-        for provider in self.social:
-            try:
-                fetched = provider.fetch_posts(since=since, until=until, symbols=symbols)
-            except ProviderError as exc:
-                name = getattr(provider, "name", "social")
-                log.warning("social provider %s unavailable: %s", name, exc)
-                report.provider_failures[name] = str(exc)
-                continue
-            posts.extend(fetched)
-
+        outcome = self._fetch_social_posts_only(since=since, until=until, symbols=symbols)
+        report.provider_failures.update(outcome.provider_failures)
+        posts = outcome.posts
         if posts:
             self._persist_posts(posts, report)
             report.posts.extend(posts)
+        return posts
+
+    def _fetch_social_posts_only(
+        self,
+        *,
+        since: dt.datetime,
+        until: dt.datetime | None,
+        symbols: list[str] | None,
+    ) -> _SocialFetchOutcome:
+        """Fetch from every enabled social provider -- network only, no
+        database access -- isolating one provider's failure from the rest.
+
+        Safe to call from a background thread (see ``_start_social_fetch``):
+        it never touches ``self.db`` or a shared ``IngestReport``, only the
+        freshly-constructed ``_SocialFetchOutcome`` it returns.
+        """
+        outcome = _SocialFetchOutcome()
+        for provider in self.social:
+            name = getattr(provider, "name", "social")
+            try:
+                fetched = provider.fetch_posts(since=since, until=until, symbols=symbols)
+            except ProviderError as exc:
+                log.warning("social provider %s unavailable: %s", name, exc)
+                outcome.provider_failures[name] = str(exc)
+                continue
+            outcome.posts.extend(fetched)
+        return outcome
+
+    def _start_social_fetch(
+        self,
+        *,
+        since: dt.datetime,
+        until: dt.datetime | None,
+        symbols: list[str] | None,
+    ) -> tuple[threading.Thread, list[_SocialFetchOutcome]]:
+        """Kick off the network-only social fetch on a background thread.
+
+        Returns the thread (already started) and the single-item list it
+        will append its ``_SocialFetchOutcome`` to when done -- a list
+        rather than a plain attribute so the "has it finished" question is
+        answerable without a lock: ``run_full_refresh`` only ever reads it
+        after ``thread.join()`` returns (see ``_join_social_fetch``), by
+        which point the append has already happened-before that return, per
+        ``threading.Thread``'s join/append happens-before guarantee. If the
+        thread is still alive at the join timeout, the box is deliberately
+        left unread and its eventual contents (should the thread finish
+        later) are simply never collected -- the daemon thread is allowed to
+        finish and be discarded, not killed, and not raced with the main
+        thread's use of ``self.db``.
+
+        A bug that raises something other than ``ProviderError`` out of
+        ``_fetch_social_posts_only`` itself (not just out of one provider,
+        which is already isolated there) is still caught here and turned
+        into a single degraded-source entry -- the sequential path would
+        have let such a bug abort the whole refresh loudly; on a background
+        thread that is not an option (an unhandled exception on a thread
+        just terminates it silently), so it is logged with its traceback and
+        surfaced through the normal ``provider_failures``/``degraded`` path
+        instead.
+        """
+        box: list[_SocialFetchOutcome] = []
+
+        def _worker() -> None:
+            try:
+                box.append(
+                    self._fetch_social_posts_only(since=since, until=until, symbols=symbols)
+                )
+            except Exception:
+                log.exception(
+                    "unexpected error in background social fetch; degrading the social "
+                    "source for this refresh rather than losing it silently"
+                )
+                failure = _SocialFetchOutcome()
+                failure.provider_failures["social_fetch"] = (
+                    "unexpected error in background social fetch -- see log for traceback"
+                )
+                box.append(failure)
+
+        thread = threading.Thread(
+            target=_worker, name="claudetrade-social-fetch", daemon=True
+        )
+        log.info("social fetch started in background (%d provider(s))", len(self.social))
+        thread.start()
+        return thread, box
+
+    def _join_social_fetch(
+        self,
+        thread: threading.Thread,
+        box: list[_SocialFetchOutcome],
+        report: IngestReport,
+    ) -> list[SocialPost]:
+        """Wait for the background social fetch and persist what it found.
+
+        Called once the market-data phases (securities/prices/earnings) are
+        done, so persistence -- and the mention resolution that follows it
+        in ``run_full_refresh`` -- happens after ``ingest_securities`` has
+        committed the alias table those mentions resolve against, exactly as
+        it does in the sequential path. Only the *fetch* ran earlier.
+        """
+        timeout = self.config.sentiment.fetch_join_timeout_s
+        thread.join(timeout)
+        if thread.is_alive():
+            log.warning(
+                "social fetch still running after %.0fs timeout; proceeding with no posts "
+                "from this run's background fetch -- it is left running in the background "
+                "and its results are simply picked up on the next refresh instead of "
+                "hanging this one",
+                timeout,
+            )
+            return []
+
+        outcome = box[0] if box else _SocialFetchOutcome()
+        report.provider_failures.update(outcome.provider_failures)
+        posts = outcome.posts
+        if posts:
+            self._persist_posts(posts, report)
+            report.posts.extend(posts)
+        ok_providers = len(self.social) - len(outcome.provider_failures)
+        log.info(
+            "social fetch complete: %d post(s) from %d/%d provider(s)",
+            len(posts), ok_providers, len(self.social),
+        )
         return posts
 
     def _persist_posts(self, posts: list[SocialPost], report: IngestReport) -> None:
@@ -743,9 +883,40 @@ class DataIngestor:
         securities: list[SecurityInfo] | None = None,
         social_lookback_hours: int | None = None,
     ) -> IngestReport:
-        """One complete refresh cycle across every configured source."""
+        """One complete refresh cycle across every configured source.
+
+        Reddit/news-RSS/X/Stocktwits hit entirely different hosts than the
+        market-data provider (TipRanks/Yahoo), so by default
+        (``config.sentiment.fetch_concurrently``, true unless overridden) the
+        social *fetch* is started on a background thread before the
+        securities/prices/earnings phases run, and only joined once they are
+        done -- hiding the social fetch's wall-clock cost behind the market
+        pass instead of paying for both in sequence. Persistence (posts,
+        mentions, daily sentiment aggregates) always happens on this thread,
+        after the join: SQLite writes stay single-threaded, and mention
+        resolution still runs strictly after ``ingest_securities`` has
+        committed the alias table it depends on -- only the network fetch
+        moved earlier. Setting the config flag to ``False`` restores the
+        original strictly sequential order.
+        """
         report = IngestReport()
         reference = {s.symbol: s for s in (securities or [])}
+
+        concurrent_social = bool(self.social) and self.config.sentiment.fetch_concurrently
+        social_thread: threading.Thread | None = None
+        social_box: list[_SocialFetchOutcome] = []
+        if concurrent_social:
+            since, until = _social_fetch_window(start, end, social_lookback_hours)
+            # The market-cap-floor filter isn't known yet -- it depends on
+            # ingest_securities, which this fetch is deliberately running
+            # ahead of -- so the full candidate list is used here. Only
+            # StocktwitsProvider actually reads `symbols` (as a fetch-priority
+            # hint, internally capped); every other provider ignores it, so
+            # this does not change what gets fetched for them.
+            social_thread, social_box = self._start_social_fetch(
+                since=since, until=until, symbols=list(symbols)
+            )
+
         if securities:
             enriched = self.ingest_securities(securities, report)
             reference = {s.symbol: s for s in enriched}
@@ -755,24 +926,42 @@ class DataIngestor:
         self.ingest_earnings(symbols, start, end, report)
 
         if self.social:
-            # Backfill social over the same window as the price history when a
-            # lookback is not given explicitly, so a historical refresh produces
-            # sentiment covering the same period as its bars.
-            if social_lookback_hours is not None:
-                since = utc_now() - dt.timedelta(hours=social_lookback_hours)
-                until = None
+            self._report_progress("sentiment", 0, 1)
+            if concurrent_social and social_thread is not None:
+                posts = self._join_social_fetch(social_thread, social_box, report)
             else:
-                since = dt.datetime.combine(start, dt.time.min, tzinfo=dt.UTC)
-                until = dt.datetime.combine(end, dt.time.max, tzinfo=dt.UTC)
-            posts = self.ingest_social(
-                since=since, until=until, symbols=symbols, report=report
-            )
+                # Backfill social over the same window as the price history
+                # when a lookback is not given explicitly, so a historical
+                # refresh produces sentiment covering the same period as its
+                # bars.
+                since, until = _social_fetch_window(start, end, social_lookback_hours)
+                posts = self.ingest_social(
+                    since=since, until=until, symbols=symbols, report=report
+                )
             self.resolve_and_persist_mentions(posts, reference, report)
+            self._report_progress("sentiment", 1, 1)
 
         self.checker.persist(report.quality)
         report.finished_at = utc_now()
         log.info("ingestion complete: %s", report.summary())
         return report
+
+
+def _social_fetch_window(
+    start: dt.date, end: dt.date, social_lookback_hours: int | None
+) -> tuple[dt.datetime, dt.datetime | None]:
+    """The ``(since, until)`` window ``run_full_refresh`` fetches social over.
+
+    A lookback given in hours backfills only recent activity (``until`` is
+    open-ended, i.e. "up to now"); otherwise social is fetched over the same
+    calendar window as the price history, so a historical refresh produces
+    sentiment covering the same period as its bars.
+    """
+    if social_lookback_hours is not None:
+        return utc_now() - dt.timedelta(hours=social_lookback_hours), None
+    since = dt.datetime.combine(start, dt.time.min, tzinfo=dt.UTC)
+    until = dt.datetime.combine(end, dt.time.max, tzinfo=dt.UTC)
+    return since, until
 
 
 def _normalise_alias(alias: str) -> str:
