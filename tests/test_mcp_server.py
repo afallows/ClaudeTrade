@@ -426,6 +426,49 @@ def test_trigger_refresh_failure_is_reported_and_unblocks_the_next_run(
 
 
 # --------------------------------------------------------------------------
+# get_backtest_report
+# --------------------------------------------------------------------------
+
+
+def test_get_backtest_report_with_no_report_yet_says_so(tmp_app_config: AppConfig) -> None:
+    result = mcp_server.get_backtest_report(tmp_app_config)
+    assert result["available"] is False
+    assert "claudetrade backtest report" in result["note"]
+
+
+def test_get_backtest_report_reads_back_the_latest_saved_report(tmp_app_config: AppConfig) -> None:
+    from claudetrade.backtest.report import (
+        BacktestReport,
+        DataCoverage,
+        save_report,
+    )
+
+    report = BacktestReport(
+        generated_at=utc_now(),
+        window_start=dt.date(2024, 1, 1),
+        window_end=dt.date(2024, 6, 1),
+        coverage=DataCoverage(
+            symbol_count=3,
+            session_start=dt.date(2024, 1, 2),
+            session_end=dt.date(2024, 5, 31),
+            total_sessions=100,
+            sentiment_row_count=42,
+            config_hash="deadbeef",
+            code_version="test-version",
+        ),
+        sections=[],
+    )
+    exports_dir = tmp_app_config.paths.resolve("exports_dir")
+    save_report(report, exports_dir)
+
+    result = mcp_server.get_backtest_report(tmp_app_config)
+    assert result["available"] is True
+    assert result["disclaimer"] == DISCLAIMER
+    assert result["report"]["coverage"]["config_hash"] == "deadbeef"
+    assert result["report"]["coverage"]["symbol_count"] == 3
+
+
+# --------------------------------------------------------------------------
 # FastMCP wiring
 # --------------------------------------------------------------------------
 
@@ -437,6 +480,7 @@ EXPECTED_TOOL_NAMES = {
     "run_scan",
     "trigger_refresh",
     "get_refresh_status",
+    "get_backtest_report",
 }
 
 
@@ -470,6 +514,7 @@ def test_build_server_tool_schemas_match_the_documented_signatures(
     assert properties("run_scan") == set()
     assert properties("trigger_refresh") == set()
     assert properties("get_refresh_status") == set()
+    assert properties("get_backtest_report") == set()
 
 
 def test_write_tools_are_named_and_described_as_writes(

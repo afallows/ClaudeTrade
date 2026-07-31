@@ -9,6 +9,7 @@ schedulable.
     claudetrade refresh              # pull data from configured providers
     claudetrade scan                 # generate ranked signals for a session
     claudetrade backtest             # replay strategies over history
+    claudetrade backtest report      # honest, per-strategy walk-forward evidence report
     claudetrade paper ...            # inspect and drive the paper account
     claudetrade secrets ...          # store credentials in the OS keychain
     claudetrade db ...               # backup, restore, migrate
@@ -49,10 +50,17 @@ secrets_app = typer.Typer(help="Manage API credentials in the OS credential stor
 paper_app = typer.Typer(help="Inspect and drive the paper-trading account.")
 db_app = typer.Typer(help="Database maintenance: migrate, backup, restore.")
 verify_app = typer.Typer(help="Integrity and reproducibility checks.")
+#: A Typer group rather than a plain command so ``claudetrade backtest report``
+#: (the multi-strategy owner report, see ``backtest.report``) can live
+#: alongside the original single-run ``claudetrade backtest`` -- which keeps
+#: working unchanged as this group's callback, invoked when no subcommand is
+#: given (see ``backtest()`` below).
+backtest_app = typer.Typer(help="Replay strategies over history and report performance.")
 app.add_typer(secrets_app, name="secrets")
 app.add_typer(paper_app, name="paper")
 app.add_typer(db_app, name="db")
 app.add_typer(verify_app, name="verify")
+app.add_typer(backtest_app, name="backtest")
 
 ConfigOption = Annotated[
     Path | None, typer.Option("--config", "-c", help="Path to config.toml.")
@@ -81,6 +89,20 @@ def _today() -> dt.date:
 def _parse_date(value: str | None, default: dt.date) -> dt.date:
     if not value:
         return default
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        raise typer.BadParameter(f"expected an ISO date (YYYY-MM-DD), got {value!r}") from None
+
+
+def _parse_optional_date(value: str | None) -> dt.date | None:
+    """Like ``_parse_date`` but with no default -- ``None`` means 'let the caller decide'.
+
+    Used by ``backtest report``, where an unset ``--start``/``--end`` means
+    "everything available" rather than a fixed lookback window.
+    """
+    if not value:
+        return None
     try:
         return dt.date.fromisoformat(value)
     except ValueError:
@@ -446,8 +468,9 @@ def scan(
         typer.secho(f"! {warning}", fg=typer.colors.YELLOW)
 
 
-@app.command()
+@backtest_app.callback(invoke_without_command=True)
 def backtest(
+    ctx: typer.Context,
     config: ConfigOption = None,
     start: Annotated[str | None, typer.Option(help="ISO start date.")] = None,
     end: Annotated[str | None, typer.Option(help="ISO end date.")] = None,
@@ -456,7 +479,19 @@ def backtest(
     export: Annotated[Path | None, typer.Option(help="Export trades/metrics CSV here.")] = None,
     walk_forward: Annotated[bool, typer.Option(help="Run walk-forward validation.")] = False,
 ) -> None:
-    """Replay strategies over history and report performance."""
+    """Replay strategies over history and report performance.
+
+    Bare ``claudetrade backtest`` runs one combined-strategy backtest exactly
+    as before. For the honest, per-strategy, significance-gated evidence
+    report an owner would hand to themselves before trusting a
+    recommendation, see ``claudetrade backtest report``.
+    """
+    if ctx.invoked_subcommand is not None:
+        # A subcommand (e.g. `report`) was given -- this group callback still
+        # runs first (that's how Typer/Click groups work), but the single-run
+        # backtest below must not also execute.
+        return
+
     cfg = _load(config)
     if strategies:
         cfg.signals.enabled_strategies = [s.strip() for s in strategies.split(",")]
@@ -508,6 +543,72 @@ def backtest(
         export.mkdir(parents=True, exist_ok=True)
         export_csv(result, export)
         typer.echo(f"CSV exported to {export}")
+
+
+@backtest_app.command("report")
+def backtest_report_cmd(
+    config: ConfigOption = None,
+    start: Annotated[
+        str | None, typer.Option(help="ISO start date (default: earliest stored session).")
+    ] = None,
+    end: Annotated[
+        str | None, typer.Option(help="ISO end date (default: latest stored session).")
+    ] = None,
+    strategies: Annotated[
+        str | None,
+        typer.Option(help="Comma-separated strategy names (default: every registered strategy)."),
+    ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(help="Directory for the .md/.json report (default: the exports directory)."),
+    ] = None,
+) -> None:
+    """Generate the honest, multi-strategy backtest REPORT (Markdown + JSON).
+
+    Runs walk-forward validation for every registered strategy, in isolation,
+    over the bars/sentiment/earnings already stored in this installation's
+    database (the full available history by default), then writes ONE
+    Markdown report and its JSON twin to ``--output-dir`` (default: the
+    configured exports directory, ``backtest-report-<date>.{md,json}``).
+
+    Every headline is significance-gated: a strategy without enough
+    out-of-sample evidence is reported as 'INSUFFICIENT EVIDENCE', not its
+    best-looking point estimate, and a strategy with zero trades in the
+    window says so plainly instead of rendering a table of zeros. See
+    docs/backtest-report.md.
+    """
+    cfg = _load(config)
+    from claudetrade.backtest.report import (
+        generate_backtest_report,
+        render_report_markdown,
+        save_report,
+    )
+    from claudetrade.pipeline import Pipeline
+
+    start_date = _parse_optional_date(start)
+    end_date = _parse_optional_date(end)
+    strategy_list = [s.strip() for s in strategies.split(",")] if strategies else None
+
+    pipeline = Pipeline.bootstrap(cfg)
+    typer.echo(
+        "running walk-forward backtests for every strategy, in isolation -- this replays "
+        "the full signal engine per strategy and can take a while on a large universe/window..."
+    )
+    try:
+        report_obj = generate_backtest_report(
+            pipeline, cfg, start=start_date, end=end_date, strategy_names=strategy_list
+        )
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(1) from None
+
+    out_dir = output_dir or cfg.paths.resolve("exports_dir")
+    md_path, json_path = save_report(report_obj, out_dir)
+
+    typer.echo(f"\n{DISCLAIMER}\n")
+    typer.echo(render_report_markdown(report_obj))
+    typer.echo(f"\nmarkdown report: {md_path}")
+    typer.echo(f"json report:     {json_path}")
 
 
 # --------------------------------------------------------------------------

@@ -102,6 +102,9 @@ Example prompts:
   plans."*
 - *"What's the recent sentiment on NVDA — is mention volume picking up?"*
 - *"Start a data refresh and let me know when it's done."*
+- *"How have the strategies performed historically?"* (run
+  `claudetrade backtest report` on this machine first — see
+  `docs/backtest-report.md`)
 
 ## What the server can do
 
@@ -118,6 +121,7 @@ these tools. All of them return plain JSON — no charts, no pandas objects.
 | `run_scan()` | **write** | Runs a full scan for today's session and records new signals to the immutable ledger (same as `claudetrade scan`). |
 | `trigger_refresh()` | **write, background** | Starts a data refresh (market data, earnings, sentiment) on a background thread; can take several minutes on a large universe. |
 | `get_refresh_status()` | read-only | Progress of a refresh started by `trigger_refresh`. |
+| `get_backtest_report()` | read-only | The latest `claudetrade backtest report` (see `docs/backtest-report.md`): per-strategy walk-forward win rate/expectancy/profit factor/drawdown, each gated behind a prominent significance verdict. Never runs a backtest itself — returns `available: false` with instructions if none has been generated yet. |
 
 Every read-only tool queries the exact same ledger/database objects the web
 UI and CLI use (`pipeline.ledger`, the daily sentiment table, provider

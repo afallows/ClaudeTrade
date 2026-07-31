@@ -443,6 +443,34 @@ def get_refresh_status(state: RefreshState) -> dict[str, Any]:
     return state.snapshot()
 
 
+def get_backtest_report(config: AppConfig) -> dict[str, Any]:
+    """Read-only. The latest generated backtest report, or a clear "run it first" message.
+
+    Reads back the JSON twin ``claudetrade backtest report`` writes under
+    this installation's exports directory (``backtest.report.save_report``)
+    -- never recomputes anything here: a walk-forward backtest across every
+    strategy can take a while, and this tool must answer instantly even when
+    no report exists yet. Mirrors ``get_signals``' ``why_no_signals`` shape:
+    a bool ``available`` flag plus either the report or a ``note`` explaining
+    what to run.
+    """
+    from claudetrade.backtest.report import load_latest_report
+
+    exports_dir = config.paths.resolve("exports_dir")
+    report = load_latest_report(exports_dir)
+    if report is None:
+        return {
+            "available": False,
+            "note": (
+                "No backtest report has been generated on this installation yet. Run "
+                "`claudetrade backtest report` on the machine with the real database, "
+                "then ask again -- it walk-forward backtests every registered strategy "
+                "and can take a while on a large universe/window."
+            ),
+        }
+    return {"available": True, "disclaimer": DISCLAIMER, "report": report}
+
+
 # --------------------------------------------------------------------------
 # Server wiring
 # --------------------------------------------------------------------------
@@ -544,6 +572,23 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
     def _get_refresh_status() -> dict[str, Any]:
         return get_refresh_status(refresh_state)
 
+    @server.tool(
+        name="get_backtest_report",
+        description=(
+            "Read-only. The most recently generated backtest report (see `claudetrade "
+            "backtest report`): per-strategy walk-forward win rate with a 95% confidence "
+            "interval, expectancy per trade after costs, profit factor, max drawdown, average "
+            "hold time, and a prominent significance verdict -- a strategy without enough "
+            "out-of-sample evidence is headlined 'INSUFFICIENT EVIDENCE', not its "
+            "best-looking point estimate. Also includes the data-coverage header (symbols, "
+            "session range, config hash) and per-window rejection funnels. Returns "
+            "available=false with instructions if no report has been generated yet -- this "
+            "never runs a backtest itself."
+        ),
+    )
+    def _get_backtest_report() -> dict[str, Any]:
+        return get_backtest_report(config)
+
     return server
 
 
@@ -562,6 +607,7 @@ def run_stdio(config: AppConfig) -> None:
 
 __all__ = [
     "build_server",
+    "get_backtest_report",
     "get_market_status",
     "get_refresh_status",
     "get_sentiment",
