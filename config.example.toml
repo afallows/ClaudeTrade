@@ -125,6 +125,27 @@ session_max_results_per_query = 40
 session_rate_limit_per_minute = 6
 session_request_timeout_s = 20.0
 
+[stocktwits]
+# Stocktwits' own documented, KEYLESS public symbol-stream API. No credential
+# is used or bypassed. On by default (owner directive, 2026-07-31); the
+# vendor's published 200 requests/hour unauthenticated budget is respected by
+# `rate_limit_per_minute` and `max_symbols_per_cycle` below.
+#
+# The endpoint's Cloudflare edge gates on the client's TLS (JA3) fingerprint:
+# a plain Python client gets HTTP 403 where a browser tab gets HTTP 200, so
+# requests are issued through curl_cffi's browser impersonation (ADR-0008
+# Decision 1 Amendment 1). `curl_cffi` is an OPTIONAL dependency -- without it
+# everything else runs unchanged and this source simply reports itself
+# unavailable (`pip install curl_cffi` to enable it).
+enabled = true
+provider = "stocktwits"
+impersonate = "chrome"                    # curl_cffi profile: "chrome"/"safari"/"firefox"/"edge" aliases (newest build) or e.g. "chrome142"
+watchlist_symbols = []                    # Fetched when the pipeline passes no symbol hint, e.g. ["AAPL", "MSFT"]
+max_symbols_per_cycle = 20                # Hard budget guard: at most this many symbols per refresh
+rate_limit_per_minute = 3                 # 180/hour -- a working margin below the 200/hour vendor cap
+request_timeout_s = 20.0
+store_author_names = false
+
 [ai]
 # Optional LLM-assisted sentiment classification -- an ensemble ADJUNCT,
 # never the decision-maker. The system is fully functional with

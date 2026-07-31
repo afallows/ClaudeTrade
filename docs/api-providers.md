@@ -1270,18 +1270,18 @@ cycle (429) to resume. This is exercised in `tests/test_x_provider.py`.
 - The official API path above remains intact and is always preferred the
   moment a bearer token is configured
 
-### Stocktwits (Live, Keyless, Opt-in)
+### Stocktwits (Live, Keyless, On by Default)
 
 **Module**: `src/claudetrade/providers/social/stocktwits.py`
 
 Stocktwits' own documented, **keyless** public symbol-stream API
 (`api.stocktwits.com/api/2/streams/symbol/{SYMBOL}.json`) -- ADR-0008
 Decision 1's "official API first-choice" applies in the fullest sense here:
-this is not scraping at all, no authentication is bypassed, and no ToS
-boundary is tested. Off by default only because the vendor's published
-unauthenticated budget (200 requests/hour) is easy to exhaust across a large
-universe, not because of any risk to the account or credentials (there are
-none).
+no credential is used, none is bypassed, and no paywall or authentication
+boundary is touched. **On by default** (owner directive, 2026-07-31): the
+vendor's published unauthenticated budget (200 requests/hour) is respected by
+`rate_limit_per_minute` and `max_symbols_per_cycle` rather than by leaving
+the source switched off.
 
 **Sentiment tags are a prior hint, not ground truth**: a message may carry a
 self-declared `entities.sentiment.basic` tag ("Bullish"/"Bearish") the
@@ -1292,53 +1292,85 @@ unconditionally for every post, Stocktwits included. Treating a self-declared
 label as truth would let anyone paint their own post's sentiment without the
 classifier ever checking it against the actual content.
 
-**Browser-style request headers (best-effort only, and stays that way by
-design)**: **live-probe evidence (2026-07-30)** showed this endpoint
-returning HTTP 403 to PowerShell/.NET clients regardless of User-Agent (both
-a generic UA and this codebase's descriptive app UA), but HTTP 200 JSON to a
-plain browser tab. **CONFIRMED CAUSE (owner, 2026-07-31)**: the keyless API
-sits behind Cloudflare bot management, gated on browser-earned,
-fingerprint-bound cookies (the `cf_clearance`/`__cf_bm` family) that are
-short-lived (hours) -- not a credential or API-contract check; the API
-itself remains keyless and open per the vendor's own documentation. This
-adapter sends a realistic desktop-browser User-Agent plus
-`Accept`/`Accept-Language` headers matching what a browser sends, instead of
-the descriptive app UA used elsewhere in this codebase, as a best-effort
-measure.
+**Browser-TLS (JA3) impersonation** -- see ADR-0008 Decision 1
+**Amendment 1** (owner directive, 2026-07-31): **live-probe evidence
+(2026-07-30)** showed this endpoint returning HTTP 403 to PowerShell/.NET and
+Python clients regardless of User-Agent (both a generic UA and this
+codebase's descriptive app UA), but HTTP 200 JSON to a plain, logged-out
+browser tab on the same machine and IP. **Confirmed cause**: Cloudflare bot
+management gating on the client's **TLS ClientHello fingerprint (JA3)**. A
+stdlib-`ssl`-backed client (`httpx`, `requests`, .NET) presents a
+cipher/extension ordering no browser produces, and the edge rejects the
+connection before any application-layer header is considered -- which is why
+the earlier header-only approach could never have worked. This is a
+client-shape heuristic on a keyless-open endpoint, not an auth or
+API-contract check.
 
-**Decision: no Cloudflare cookie support for this source, ever.** Unlike
-Reddit's cookie-session mode (an owner-provided, weeks-lived credential --
-see above), a Cloudflare clearance cookie is short-lived and bound to the
-browser session/TLS fingerprint that earned it. Supporting it here would
-mean an unending maintenance treadmill of re-capturing an expiring,
-environment-bound value that cannot simply be pasted once like
-`reddit_session` can, and it would cross the ADR-0008 Decision 1 fail-closed
-line ("never work around a block/challenge") this adapter otherwise stays
-firmly on the right side of. **A blocked result in Diagnostics is the
-expected steady state on this source for most machines**, not a
-misconfiguration to chase -- when the edge blocks despite the browser-style
-headers, the existing fail-closed path (`SourceBlockedError` on
-401/403/non-JSON, worded to name Cloudflare bot management explicitly)
-handles it exactly as before: no retry loop, no fingerprint/proxy rotation,
-no cookie workaround, no CAPTCHA handling.
+The adapter therefore issues its GET through
+[`curl_cffi`](https://github.com/lexiforest/curl_cffi)'s browser
+impersonation (`impersonate = "chrome"` by default -- the library's alias for
+its current newest Chrome profile, so it tracks `curl_cffi` upgrades instead
+of pinning a version that goes stale). That reproduces the browser's TLS
+ClientHello and HTTP/2 settings, i.e. it makes our client look like the
+client this endpoint **already serves**.
+
+`curl_cffi` also supplies the profile-consistent `User-Agent` and
+`sec-ch-ua*` client hints, so this adapter deliberately does **not** override
+the User-Agent: a hand-written UA that disagrees with the profile's client
+hints or its TLS fingerprint is itself a bot signal. What the adapter adds is
+the request-context headers a stocktwits.com XHR carries (`Accept`,
+`Accept-Language`, `Referer`, `Origin`, `Sec-Fetch-*`).
+
+**What this deliberately does not do**: no Cloudflare clearance cookie is
+captured, stored or replayed (no `cf_clearance`/`__cf_bm` harvesting, no
+session persistence -- each request stands alone); no CAPTCHA solving; no
+fingerprint *rotation* (one honest, configured, documented profile, never a
+shuffling pool) and no proxy rotation; no credential of any party. Rates stay
+conservative and human-scale with jitter, and the per-cycle symbol cap still
+applies. **Impersonation makes a block unlikely, not impossible** -- if the
+edge blocks anyway, the fail-closed path below is unchanged
+(`SourceBlockedError`, cycle over, no retry loop), and "Stocktwits
+unavailable" remains a fully supported state.
+
+**`curl_cffi` is an OPTIONAL dependency**, lazy-imported at request time
+(same pattern as the `anthropic`/`openai` SDKs, or `scikit-learn` for the ML
+extras). Without it installed: the module still imports, the provider still
+constructs, the registry still builds it, the whole test suite still passes
+-- Diagnostics simply reports the source **unavailable** with the install
+hint (`pip install curl_cffi`), and any fetch attempt raises
+`SourceBlockedError` naming the missing package rather than a bare
+`ImportError`. Install it with:
+
+```
+pip install curl_cffi
+```
 
 **Sentiment coverage in practice**: Reddit's cookie-session mode
-(owner-verified working, see above) plus the four default news RSS feeds
-are this application's reliable social-sentiment sources. Stocktwits
-contributes opportunistically whenever the edge happens not to challenge a
-given request/IP, and the application is fully functional with it
-contributing nothing at all.
+(owner-verified working, see above) and the four default news RSS feeds
+remain this application's other social-sentiment sources; with the TLS
+fingerprint matched, Stocktwits is expected to contribute reliably rather
+than opportunistically -- but the application stays fully functional with it
+contributing nothing at all, which is exactly what happens if `curl_cffi` is
+absent or the edge tightens.
 
 **Configuration**:
 
 ```toml
 [stocktwits]
-enabled = true
+enabled = true                  # on by default since 2026-07-31
+impersonate = "chrome"          # curl_cffi browser profile supplying the TLS/JA3 fingerprint
 watchlist_symbols = ["AAPL", "MSFT", "TSLA"]
 max_symbols_per_cycle = 20      # hard budget guard, see below
 rate_limit_per_minute = 3       # 180/hour -- a margin below the 200/hour vendor cap
 request_timeout_s = 20.0
 ```
+
+`impersonate` accepts any profile `curl_cffi` supports -- the aliases
+`"chrome"`, `"safari"`, `"firefox"`, `"edge"` (each resolving to that
+browser's newest bundled profile) or an explicit build such as
+`"chrome142"` / `"safari180"` / `"firefox135"`. It is worth changing only if
+the edge starts blocking the default; **rotating** it per request is not
+supported and is explicitly out of bounds (ADR-0008 Decision 1).
 
 **Rate budget**: Stocktwits documents 200 requests/hour for unauthenticated
 reads. The default `rate_limit_per_minute = 3` (180/hour) keeps a working
@@ -1374,6 +1406,12 @@ source and also ends the cycle. This is exercised in
 - Author handles are stored as salted hashes only, never plaintext
 - The self-declared sentiment tag is optional per-message; most messages
   carry no tag at all, in which case `sentiment_prior` is `None`
+- Requires the optional `curl_cffi` package; without it the source reports
+  itself unavailable (everything else keeps working)
+- The impersonation profile is only as current as the installed `curl_cffi`.
+  As Chrome advances, an old bundled profile drifts from the real browser
+  fleet and can start being challenged -- `pip install -U curl_cffi` is the
+  first thing to try if Stocktwits starts showing as blocked
 
 **Licence**: Stocktwits' public stream is documented for keyless basic
 reads; this adapter performs only that. Commercial or high-volume use may

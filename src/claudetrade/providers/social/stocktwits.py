@@ -1,43 +1,49 @@
-"""Stocktwits provider: official public symbol-stream API adapter.
+"""Stocktwits provider: official public symbol-stream API adapter, fetched
+with browser-TLS (JA3) impersonation.
 
 Reads ``api.stocktwits.com/api/2/streams/symbol/{SYMBOL}.json`` -- Stocktwits'
-own documented, **keyless** endpoint for basic reads (ADR-0008 Decision 1's
-"official APIs first-choice" applies here in the fullest sense: this is not
-scraping at all, no authentication is bypassed, and no ToS boundary is
-tested). The only engineering discipline this source needs is respecting the
-vendor's published unauthenticated budget (200 requests/hour): this adapter
-budgets conservatively below that ceiling and caps how many symbols one
-refresh cycle will fetch (see ``StocktwitsConfig``).
+own documented, **keyless** endpoint for basic reads. No credential is used,
+none is bypassed, and no paywall or authentication boundary is touched: the
+endpoint is open to anyone, which is exactly why a browser tab gets HTTP 200
+from it with no login at all. The engineering discipline this source needs is
+respecting the vendor's published unauthenticated budget (200 requests/hour):
+this adapter budgets conservatively below that ceiling and caps how many
+symbols one refresh cycle will fetch (see ``StocktwitsConfig``).
 
-**Browser-style request headers (best-effort only)**: live-probe evidence
-(2026-07-30) showed this endpoint returning HTTP 403 to PowerShell/.NET
-clients regardless of User-Agent (both a generic UA and this codebase's
-descriptive app UA), but HTTP 200 JSON to a plain browser tab. **CONFIRMED
-CAUSE (owner, 2026-07-31)**: Cloudflare bot management, gated on
-browser-earned, TLS-fingerprint-bound cookies (the ``cf_clearance``/
-``__cf_bm`` family) that live for hours, not a credential or API-contract
-check (the API itself remains keyless and open per the vendor's own
-documentation). This adapter sends a realistic desktop-browser User-Agent
-plus ``Accept``/``Accept-Language`` headers matching what a browser sends,
-instead of the identifying app UA used elsewhere in this codebase. This is
-**best-effort only and stays that way BY DESIGN**: a header swap cannot pass
-a Cloudflare TLS-fingerprint challenge, and this codebase deliberately adds
-**no cookie-session mode for this source, ever** -- unlike Reddit's (see
-``providers.social.reddit``), a Cloudflare clearance cookie is short-lived
-and re-bound to the browser session/fingerprint that earned it, so
-supporting it here would mean an unending maintenance treadmill of
-re-capturing an expiring, environment-bound value, not a stable
-owner-provided credential; it would also cross the ADR-0008 Decision 1
-fail-closed line ("never work around a block/challenge") this whole
-adapter otherwise stays firmly on the right side of. If the edge blocks
-despite the browser-style headers, the existing fail-closed path below
-(``SourceBlockedError`` on 401/403/non-JSON) handles it exactly as before --
-diagnostics reports the source blocked, no retry loop, no fingerprint/proxy
-rotation, no CAPTCHA handling. **This is the expected steady state on most
-machines** -- Reddit's cookie-session mode (owner-verified working) plus the
-four default news RSS feeds are this application's reliable social-sentiment
-sources; Stocktwits contributes opportunistically when the edge happens not
-to challenge a given request/IP, never as something to depend on.
+**Why the transport is curl_cffi and not httpx** (owner directive,
+2026-07-31; see ADR-0008 Decision 1's *Amendment 1*): live-probe evidence
+(2026-07-30) showed this endpoint returning HTTP 403 to Python/.NET clients
+regardless of User-Agent, but HTTP 200 JSON to a plain browser tab on the
+same machine and IP. The confirmed cause is Cloudflare bot management gating
+on the **TLS ClientHello fingerprint (JA3)** of the connecting client: a
+stdlib-``ssl``-backed client (``httpx``, ``requests``, .NET) presents a
+cipher/extension ordering no browser produces, and the edge rejects it before
+any application-layer header is even considered. That is a client-shape
+check on a keyless-open endpoint, not an auth or API-contract check -- the
+same request from the same machine is served the moment the handshake looks
+like the browser it already serves.
+
+This adapter therefore issues its GET through `curl_cffi
+<https://github.com/lexiforest/curl_cffi>`_'s browser impersonation
+(``impersonate=config.impersonate``, default ``"chrome"`` -- the library's
+alias for its current newest Chrome profile), which reproduces that browser's
+TLS ClientHello and HTTP/2 settings. ``curl_cffi`` is an **optional**
+dependency, lazy-imported at request time (same pattern as the ``anthropic``
+/ ``openai`` SDKs): the module imports, ``StocktwitsProvider`` constructs, and
+the rest of the application runs unchanged without it -- the source simply
+reports itself unavailable (see ``status()``) and any fetch attempt raises
+``SourceBlockedError`` naming the missing package.
+
+**What this does NOT do.** No Cloudflare clearance cookie is captured, stored
+or replayed (each request stands alone -- no ``cf_clearance``/``__cf_bm``
+harvesting, no session persistence); no CAPTCHA is solved; no fingerprint is
+*rotated* (one honest, configured browser profile, not a shuffling pool) and
+no proxy is rotated; no credential of any party is used. Rates stay
+conservative and human-scale with jitter, the per-cycle symbol cap still
+applies, and if the edge blocks anyway the fail-closed path below is
+unchanged: ``SourceBlockedError``, cycle over, no retry loop. Impersonation
+makes the block *unlikely*, not impossible -- Cloudflare's heuristics change,
+and this adapter is designed to degrade to "source unavailable" when they do.
 
 Each message may carry a self-declared ``entities.sentiment.basic`` tag
 ("Bullish"/"Bearish") -- some authors tag their own posts this way. This is
@@ -68,8 +74,8 @@ import datetime as dt
 import logging
 import random
 import time
-
-import httpx
+from collections.abc import Callable, Mapping
+from typing import Any, Protocol
 
 from claudetrade.config import StocktwitsConfig
 from claudetrade.domain import SocialPost, SocialSource
@@ -86,19 +92,124 @@ log = logging.getLogger(__name__)
 
 _VALID_SENTIMENT_LABELS = frozenset({"bullish", "bearish"})
 
-#: Browser-style request headers, sent instead of ``config.user_agent``'s
-#: descriptive app UA (see the module docstring's probe-evidence note).
-#: Best-effort: this cannot defeat TLS-fingerprint-based filtering, only a
-#: header-based one -- when it isn't enough, the existing fail-closed path
-#: (``SourceBlockedError`` below) still applies exactly as before.
-_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+#: Shown whenever the optional transport dependency is absent. Kept as one
+#: string so ``status()`` and the fetch path say exactly the same thing.
+_MISSING_DEP_MESSAGE = (
+    "Stocktwits source unavailable -- the optional 'curl_cffi' package is not "
+    "installed. It supplies the browser TLS (JA3) fingerprint this endpoint's "
+    "Cloudflare edge requires; a plain Python HTTP client is answered with "
+    "HTTP 403. Install it with `pip install curl_cffi` (or `pip install "
+    "claudetrade[stocktwits]`) and retry, or set stocktwits.enabled = false."
+)
+
+
+class _HttpResponse(Protocol):
+    """The response surface this adapter uses -- deliberately tiny.
+
+    Both ``curl_cffi.requests.Response`` and ``httpx.Response`` satisfy it,
+    which is what lets tests drive every branch below through a response
+    double without a network, a real Cloudflare edge, or curl_cffi installed.
+    """
+
+    @property
+    def status_code(self) -> int: ...
+
+    @property
+    def headers(self) -> Mapping[str, str]: ...
+
+    @property
+    def text(self) -> str: ...
+
+    def json(self) -> Any: ...
+
+
+#: Signature of the transport seam (see ``_http_get``).
+HttpGet = Callable[..., _HttpResponse]
+
+
+def _import_curl_cffi_requests() -> Any:
+    """Import and return ``curl_cffi.requests``.
+
+    Kept as its own function -- rather than a module-level import -- so that
+    importing this module, constructing ``StocktwitsProvider``, and running
+    the whole test suite never require the optional package (mirrors
+    ``providers.ai.anthropic_provider._require_anthropic_sdk``). Raises
+    ``ImportError`` when the package is absent; callers translate that.
+    """
+    from curl_cffi import requests as curl_requests
+
+    return curl_requests
+
+
+def curl_cffi_available() -> bool:
+    """Whether the optional browser-TLS transport can actually be loaded.
+
+    Imports rather than merely checking for the distribution: ``curl_cffi``
+    loads a compiled shared library, so "installed" and "usable on this
+    machine" are genuinely different questions.
+    """
+    try:
+        _import_curl_cffi_requests()
+    except Exception:  # pragma: no cover - exercised via the seam in tests
+        return False
+    return True
+
+
+def _http_get(
+    url: str,
+    *,
+    headers: Mapping[str, str],
+    timeout: float,
+    impersonate: str,
+) -> _HttpResponse:
+    """Transport seam: one GET with a real browser's TLS fingerprint.
+
+    This is the single point where the network is touched, and the single
+    point tests monkeypatch (or replace per-provider via
+    ``StocktwitsProvider(config, http_get=...)``).
+
+    ``impersonate`` is passed straight to curl_cffi, which reproduces that
+    browser's TLS ClientHello and HTTP/2 settings. The library also supplies
+    a ``User-Agent`` and the matching ``sec-ch-ua*`` client hints for the
+    chosen profile; this adapter deliberately does **not** override the
+    User-Agent, because a hand-written UA string that disagrees with the
+    profile's client hints (or with its TLS fingerprint) is itself a bot
+    signal. Only the headers a browser's own XHR to this endpoint would add
+    are supplied by the caller -- see ``_browser_headers``.
+
+    No cookie jar or session is kept across calls: nothing Cloudflare issues
+    is stored or replayed.
+    """
+    try:
+        curl_requests = _import_curl_cffi_requests()
+    except Exception as exc:
+        raise SourceBlockedError(_MISSING_DEP_MESSAGE, provider="stocktwits") from exc
+
+    return curl_requests.get(
+        url,
+        headers=dict(headers),
+        timeout=timeout,
+        impersonate=impersonate,
+    )
+
+
+def _browser_headers(symbol: str) -> dict[str, str]:
+    """Headers a stocktwits.com tab's own XHR sends for this endpoint.
+
+    Complements (never contradicts) the impersonated profile's own
+    ``User-Agent``/client hints, which curl_cffi fills in: these are the
+    request-context headers -- what the browser is asking for, from where,
+    and why -- that a fetch from the site's front end carries.
+    """
+    return {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://stocktwits.com/symbol/{symbol}",
+        "Origin": "https://stocktwits.com",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+    }
 
 
 class StocktwitsProvider:
@@ -114,29 +225,56 @@ class StocktwitsProvider:
     name: str = "stocktwits"
     source: SocialSource = SocialSource.STOCKTWITS
 
-    def __init__(self, config: StocktwitsConfig):
+    def __init__(self, config: StocktwitsConfig, *, http_get: HttpGet | None = None):
         """Initialize the Stocktwits provider.
 
         Args:
-            config: ``StocktwitsConfig`` with the watchlist, symbol cap and
-                rate limit. No credentials are required -- this endpoint is
-                keyless by the vendor's own design.
+            config: ``StocktwitsConfig`` with the watchlist, symbol cap,
+                rate limit and browser impersonation profile. No credentials
+                are required -- this endpoint is keyless by the vendor's own
+                design.
+            http_get: Optional replacement for the module-level ``_http_get``
+                transport seam (tests, or any caller that wants to supply its
+                own client). Defaults to the curl_cffi browser-TLS path.
         """
         self.config = config
+        self._http_get = http_get
         self._rate_limiter = RateLimiter(
             config.rate_limit_per_minute,
             name="stocktwits",
             max_wait_s=config.request_timeout_s,
         )
         log.info(
-            "Stocktwits provider configured (%d watchlist symbols, cap %d/cycle, %d/min)",
+            "Stocktwits provider configured (%d watchlist symbols, cap %d/cycle, "
+            "%d/min, impersonate=%s)",
             len(config.watchlist_symbols),
             config.max_symbols_per_cycle,
             config.rate_limit_per_minute,
+            config.impersonate,
         )
 
     def status(self) -> ProviderStatus:
-        """Report provider status."""
+        """Report provider status.
+
+        ``available`` is ``False`` when the optional ``curl_cffi`` transport
+        cannot be loaded: without a browser TLS fingerprint this endpoint's
+        edge answers HTTP 403, so reporting the source as available would be
+        a false promise. Diagnostics then shows the install instruction
+        rather than a bare "blocked".
+        """
+        transport_ok = self._http_get is not None or curl_cffi_available()
+        if not transport_ok:
+            return ProviderStatus(
+                name=self.name,
+                kind="social",
+                available=False,
+                configured=True,
+                message=_MISSING_DEP_MESSAGE,
+                supports_point_in_time=False,
+                rate_limit_per_minute=self._rate_limiter.calls_per_minute,
+                licence_note=self._licence_note(),
+            )
+
         return ProviderStatus(
             name=self.name,
             kind="social",
@@ -144,20 +282,27 @@ class StocktwitsProvider:
             configured=True,
             message=(
                 f"Stocktwits public stream ({len(self.config.watchlist_symbols)} watchlist "
-                f"symbols, cap {self.config.max_symbols_per_cycle}/cycle)"
+                f"symbols, cap {self.config.max_symbols_per_cycle}/cycle, "
+                f"impersonating {self.config.impersonate})"
             ),
             supports_point_in_time=False,
             rate_limit_per_minute=self._rate_limiter.calls_per_minute,
-            licence_note=(
-                "Stocktwits public symbol-stream API "
-                "(api.stocktwits.com/api/2/streams/symbol), documented and keyless for "
-                "basic reads -- no scraping, no authentication bypassed. Unauthenticated "
-                f"vendor budget is 200 requests/hour; this adapter is configured for "
-                f"{self.config.rate_limit_per_minute}/min to keep a working margin. A "
-                "message's self-declared sentiment tag is stored as "
-                "SocialPost.sentiment_prior, a hint only -- the ensemble classifier still "
-                "scores every post's text."
-            ),
+            licence_note=self._licence_note(),
+        )
+
+    def _licence_note(self) -> str:
+        return (
+            "Stocktwits public symbol-stream API "
+            "(api.stocktwits.com/api/2/streams/symbol), documented and keyless for "
+            "basic reads -- no scraping, no authentication bypassed, no credential "
+            "of any party used. Requests are issued with a real browser's TLS "
+            "fingerprint (curl_cffi impersonation) because the endpoint's Cloudflare "
+            "edge gates on client TLS shape; see ADR-0008 Decision 1 Amendment 1. "
+            "Unauthenticated vendor budget is 200 requests/hour; this adapter is "
+            f"configured for {self.config.rate_limit_per_minute}/min to keep a working "
+            "margin. A message's self-declared sentiment tag is stored as "
+            "SocialPost.sentiment_prior, a hint only -- the ensemble classifier still "
+            "scores every post's text."
         )
 
     def fetch_posts(
@@ -185,8 +330,10 @@ class StocktwitsProvider:
             List of SocialPost, newest first, all sanitised and author-hashed.
 
         Raises:
-            SourceBlockedError: on any block/challenge/unexpected response --
+            SourceBlockedError: on any block/challenge/unexpected response, or
+                when the optional ``curl_cffi`` transport is not installed --
                 terminates the fetch for the whole cycle (ADR-0008 Decision 1).
+                An absent dependency never surfaces as a bare ``ImportError``.
             RateLimitError: if the vendor's own rate limit is hit (HTTP 429).
         """
         if until is None:
@@ -228,8 +375,15 @@ class StocktwitsProvider:
     ) -> list[SocialPost]:
         """Fetch and map one symbol's stream. Raises on any fail-closed signal."""
         url = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
-        with httpx.Client(timeout=self.config.request_timeout_s) as client:
-            response = client.get(url, headers=_BROWSER_HEADERS)
+        # Resolved per call, not captured at construction, so the module-level
+        # seam stays monkeypatchable after the provider exists.
+        getter: HttpGet = self._http_get or _http_get
+        response = getter(
+            url,
+            headers=_browser_headers(symbol),
+            timeout=self.config.request_timeout_s,
+            impersonate=self.config.impersonate,
+        )
 
         if response.status_code == 404:
             # An unknown ticker or a symbol with no stream at all -- ordinary,
@@ -252,10 +406,12 @@ class StocktwitsProvider:
         if response.status_code in (401, 403):
             raise SourceBlockedError(
                 f"Stocktwits denied access for {symbol} (HTTP {response.status_code}) -- "
-                "blocked (Cloudflare bot management, confirmed cause) -- fail-closed per "
-                "ADR-0008 Decision 1: no retry, no fingerprint/proxy rotation, no cookie "
-                "workaround, no CAPTCHA handling. See the module docstring for why this "
-                "source deliberately never gets cookie support.",
+                "blocked by Cloudflare bot management despite browser-TLS impersonation "
+                f"(profile '{self.config.impersonate}'). Fail-closed per ADR-0008 "
+                "Decision 1: no retry, no fingerprint or proxy rotation, no CAPTCHA "
+                "handling. Try a different stocktwits.impersonate profile (e.g. a "
+                "newer Chrome, or 'safari'/'firefox') and upgrade curl_cffi; if it "
+                "keeps blocking, leave the source unavailable.",
                 provider="stocktwits",
             )
 

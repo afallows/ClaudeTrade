@@ -536,18 +536,48 @@ class XConfig(BaseModel):
 class StocktwitsConfig(BaseModel):
     """Stocktwits public symbol-stream API (ADR-0008 Decision 1's "official
     APIs first-choice" path for this source): keyless for basic reads, no
-    scraping, no ToS boundary crossed.
+    credential used or bypassed, no paywall touched.
 
     Reads ``api.stocktwits.com/api/2/streams/symbol/{SYMBOL}.json``, which is
-    Stocktwits' own documented, unauthenticated basic-read endpoint. Off by
-    default: even though no credential is at risk here, the vendor's
-    published unauthenticated budget (200 requests/hour) is easy to exhaust
-    across a large universe, so this is an explicit opt-in with a hard cap on
-    symbols scanned per cycle rather than a silent default.
+    Stocktwits' own documented, unauthenticated basic-read endpoint -- open
+    to anyone, which is why a logged-out browser tab is served HTTP 200 JSON
+    from it.
+
+    **Browser-TLS impersonation (owner directive, 2026-07-31; ADR-0008
+    Decision 1 Amendment 1).** That same endpoint answers HTTP 403 to a plain
+    Python client from the same machine and IP. The confirmed cause is
+    Cloudflare bot management gating on the TLS ClientHello fingerprint
+    (JA3): a stdlib-``ssl``-backed client presents a handshake no browser
+    produces. The provider therefore issues its GET through ``curl_cffi``'s
+    browser impersonation (``impersonate`` below), reproducing the
+    handshake of the browser the endpoint already serves. This is a scoped,
+    owner-authorised exception for this one keyless source; it does not
+    extend to credentialed sources (X, Reddit), and every other fail-closed
+    guarantee still holds -- conservative human-scale rates with jitter, a
+    hard per-cycle symbol cap, no CAPTCHA solving, no proxy rotation, no
+    Cloudflare cookie harvesting, and ``SourceBlockedError`` (cycle over, no
+    retry loop) if the edge blocks anyway. Impersonation makes a block
+    unlikely, not impossible.
+
+    ``curl_cffi`` is an **optional** dependency, lazy-imported at request
+    time. Without it the whole application still runs; this source simply
+    reports itself unavailable with an install hint.
+
+    On by default (owner directive): the vendor's published unauthenticated
+    budget (200 requests/hour) is respected by ``rate_limit_per_minute`` and
+    ``max_symbols_per_cycle`` rather than by leaving the source switched off.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     provider: str = "stocktwits"
+    #: curl_cffi browser-impersonation profile supplying the TLS/JA3
+    #: fingerprint (and the matching User-Agent + client hints). ``"chrome"``
+    #: is curl_cffi's alias for its current newest Chrome build, so it tracks
+    #: library upgrades instead of pinning a version that goes stale; explicit
+    #: profiles (``"chrome142"``, ``"safari180"``, ``"firefox135"``, ...) are
+    #: accepted too -- see curl_cffi's ``BrowserType`` for the full list.
+    #: Worth changing only if the edge starts blocking the default profile.
+    impersonate: str = "chrome"
     #: Symbols fetched when the caller does not supply a more specific
     #: (recent-signal / watchlist) hint via ``fetch_posts(symbols=...)``.
     watchlist_symbols: list[str] = Field(default_factory=list)
@@ -565,9 +595,11 @@ class StocktwitsConfig(BaseModel):
     #: Kept for config-file backwards compatibility, but no longer sent:
     #: live-probe evidence (2026-07-30) showed this endpoint's edge rejecting
     #: this descriptive app UA (and generic non-browser UAs) with HTTP 403
-    #: while accepting a real browser tab, so the provider now sends a fixed
-    #: browser-style User-Agent instead -- see
-    #: ``providers.social.stocktwits._BROWSER_HEADERS``.
+    #: while accepting a real browser tab. The User-Agent (and matching
+    #: ``sec-ch-ua*`` client hints) now come from the ``impersonate`` profile
+    #: itself, so they cannot disagree with the TLS fingerprint on the wire --
+    #: a mismatch that would be a bot signal in its own right. See
+    #: ``providers.social.stocktwits._http_get``/``_browser_headers``.
     user_agent: str = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
     store_author_names: bool = False
 

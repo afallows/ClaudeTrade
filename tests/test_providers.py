@@ -511,6 +511,7 @@ def test_reddit_registry_skips_unconfigured_source_without_raising():
     config.reddit.provider = "reddit"  # the live adapter, with no credentials
     config.x.enabled = False
     config.news.enabled = False  # news_rss is on by default; isolate reddit here
+    config.stocktwits.enabled = False  # keyless, so also on by default; isolate reddit
     assert get_social_providers(config) == []
 
 
@@ -524,6 +525,7 @@ def test_synthetic_reddit_provider_is_reachable_without_credentials():
     config.reddit.provider = "synthetic"
     config.news.enabled = False  # news_rss is on by default; isolate reddit here
     config.x.enabled = False  # X is auto-enabled by default too; isolate reddit here
+    config.stocktwits.enabled = False  # keyless, so also on by default; isolate reddit
     providers = get_social_providers(config)
     assert len(providers) == 1
     assert providers[0].source is SocialSource.REDDIT
@@ -603,6 +605,7 @@ def test_x_auto_activates_via_registry_once_session_credentialed(monkeypatch):
     config.x.session_symbols = ["AAPL"]
     config.reddit.enabled = False
     config.news.enabled = False
+    config.stocktwits.enabled = False  # on by default (keyless); isolate X here
 
     providers = get_social_providers(config)
     assert len(providers) == 1
@@ -621,6 +624,7 @@ def test_x_skipped_cleanly_via_registry_when_not_credentialed():
     config.x.provider = "x"
     config.reddit.enabled = False
     config.news.enabled = False
+    config.stocktwits.enabled = False  # on by default (keyless); isolate X here
 
     assert get_social_providers(config) == []
 
