@@ -44,6 +44,7 @@ from claudetrade.db.models import SymbolSentimentDaily
 from claudetrade.domain import Signal, SignalStatus
 from claudetrade.logging_setup import get_logger
 from claudetrade.pipeline import Pipeline
+from claudetrade.signals import funnel_store
 from claudetrade.ui.data_access import data_freshness, sentiment_timeline
 from claudetrade.utils.timeutils import (
     MARKET_CLOSE,
@@ -125,13 +126,28 @@ def _signal_summary(sig: Signal, status: SignalStatus | None) -> dict[str, Any]:
     }
 
 
-def get_signals(pipeline: Pipeline, *, min_score: float = 0.0, limit: int = 20) -> dict[str, Any]:
+def get_signals(
+    pipeline: Pipeline,
+    config: AppConfig | None = None,
+    *,
+    min_score: float = 0.0,
+    limit: int = 20,
+) -> dict[str, Any]:
     """Read-only. Current signals from the immutable ledger, most-recent-first.
 
     Mirrors ``webapi.routers.signals.list_signals`` (the Screener grid's data
     source) filtered to ``min_score``, via the same ``pipeline.ledger`` calls
     -- not the HTTP layer. The standing research-only disclaimer is included
     once at the top level, not repeated per row.
+
+    Args:
+        config: When given and there are no matching signals, a
+            ``why_no_signals`` block is added from the most recent scan's
+            persisted rejection funnel (see :func:`_why_no_signals`) -- "why
+            no picks today?" answered from data instead of a bare empty list.
+            Optional (defaults to omitting that block) only so callers that
+            genuinely do not have a config on hand still get a valid result;
+            :func:`build_server` always passes one.
     """
     limit = max(1, min(int(limit), 200))
     recent = pipeline.ledger.recent(limit=SIGNAL_SCAN_LIMIT)
@@ -145,7 +161,45 @@ def get_signals(pipeline: Pipeline, *, min_score: float = 0.0, limit: int = 20) 
         if len(rows) >= limit:
             break
 
-    return {"disclaimer": DISCLAIMER, "count": len(rows), "signals": rows}
+    result: dict[str, Any] = {"disclaimer": DISCLAIMER, "count": len(rows), "signals": rows}
+    if not rows and config is not None:
+        result["why_no_signals"] = _why_no_signals(config)
+    return result
+
+
+def _why_no_signals(config: AppConfig) -> dict[str, Any]:
+    """The most recent scan's rejection funnel, for an empty ``get_signals`` result.
+
+    This MCP server bootstraps its own ``Pipeline`` (see the module
+    docstring) -- separate from the CLI's and the web API server's -- so a
+    scan run from either of those has no in-memory ``ScanResult`` here to
+    read. ``signals.funnel_store`` persists the funnel from every
+    ``Pipeline.scan()`` call, by any process, to a small file under this
+    installation's ``snapshots_dir``; this reads that artifact back.
+    """
+    funnel_data = funnel_store.load_latest(config)
+    if funnel_data is None:
+        return {
+            "available": False,
+            "note": (
+                "No scan has been run on this installation yet (or its funnel record is "
+                "missing). Run the run_scan tool, or `claudetrade scan`, then check "
+                "get_signals again."
+            ),
+        }
+    return {
+        "available": True,
+        "session": funnel_data.get("session"),
+        "generated_at": funnel_data.get("generated_at"),
+        "evaluated_symbols": funnel_data.get("evaluated_symbols"),
+        "rejected_count": funnel_data.get("rejected_count"),
+        "note": (
+            "Rejection funnel and closest near-misses from the most recent scan on this "
+            "installation -- may predate the current get_signals call if no scan has run "
+            "since."
+        ),
+        "funnel": funnel_data.get("funnel"),
+    }
 
 
 def get_sentiment(pipeline: Pipeline, symbol: str, *, days: int = 7) -> dict[str, Any]:
@@ -416,11 +470,14 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "Read-only. Current signals/recommendations from the immutable ledger, "
             "most-recent-first: symbol, strategy, direction, score, confidence, "
             "entry/stop/targets and days_to_earnings. Includes the standing "
-            "research-only disclaimer once, not per row."
+            "research-only disclaimer once, not per row. When there are no matching "
+            "signals, includes a why_no_signals block: the rejection funnel (reasons "
+            "and counts) and closest near-misses from the most recent scan on this "
+            "installation, so 'why no picks today?' has a real answer."
         ),
     )
     def _get_signals(min_score: float = 0.0, limit: int = 20) -> dict[str, Any]:
-        return get_signals(pipeline, min_score=min_score, limit=limit)
+        return get_signals(pipeline, config, min_score=min_score, limit=limit)
 
     @server.tool(
         name="get_sentiment",

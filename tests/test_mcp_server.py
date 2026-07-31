@@ -97,6 +97,73 @@ def test_get_signals_respects_limit(pipeline: Pipeline, tmp_db: Database, make_s
 
 
 # --------------------------------------------------------------------------
+# get_signals empty-state: why_no_signals (the rejection funnel)
+# --------------------------------------------------------------------------
+
+
+def test_get_signals_empty_without_a_config_omits_why_no_signals(pipeline: Pipeline) -> None:
+    """Without a config there is nowhere to read a funnel artifact from --
+    the field is omitted rather than a misleading always-empty placeholder."""
+    result = mcp_server.get_signals(pipeline)
+    assert "why_no_signals" not in result
+
+
+def test_get_signals_empty_with_config_but_no_scan_yet_says_so(
+    pipeline: Pipeline, tmp_app_config: AppConfig
+) -> None:
+    result = mcp_server.get_signals(pipeline, tmp_app_config)
+    assert result["count"] == 0
+    assert result["why_no_signals"]["available"] is False
+    assert "run_scan" in result["why_no_signals"]["note"] or "scan" in result["why_no_signals"]["note"]
+
+
+def test_get_signals_empty_includes_the_persisted_funnel(
+    pipeline: Pipeline, tmp_app_config: AppConfig
+) -> None:
+    """A scan run elsewhere (CLI, web UI -- a different process/Pipeline,
+    see the module docstring) persisted a funnel artifact; get_signals reads
+    it back and surfaces it instead of a bare empty list."""
+    from claudetrade.signals import funnel_store
+    from claudetrade.signals.engine import NearMiss, ScanResult
+    from claudetrade.utils.timeutils import utc_now
+
+    scan_result = ScanResult(
+        session=dt.date(2026, 7, 31), generated_at=utc_now(), regime=None, evaluated_symbols=1673
+    )
+    scan_result.funnel.record(strategy="sentiment_breakout", reason_code="illiquid")
+    scan_result.funnel.offer_near_miss(
+        NearMiss(
+            symbol="ZZZZ",
+            strategy="sentiment_pullback",
+            reason_code="score_below_threshold",
+            metric=46.2,
+            threshold=48.0,
+            margin=-1.8,
+        )
+    )
+    scan_result.funnel.finalize()
+    scan_result.rejected = [None] * 8365  # only len() matters to save()
+    funnel_store.save(tmp_app_config, scan_result)
+
+    result = mcp_server.get_signals(pipeline, tmp_app_config)
+
+    why = result["why_no_signals"]
+    assert why["available"] is True
+    assert why["evaluated_symbols"] == 1673
+    assert why["rejected_count"] == 8365
+    assert why["funnel"]["by_reason"] == {"illiquid": 1}
+    assert why["funnel"]["near_misses"][0]["symbol"] == "ZZZZ"
+
+
+def test_get_signals_with_matches_never_includes_why_no_signals(
+    pipeline: Pipeline, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+) -> None:
+    _record(tmp_db, make_signal(symbol="AAA", overall_score=70.0))
+    result = mcp_server.get_signals(pipeline, tmp_app_config)
+    assert "why_no_signals" not in result
+
+
+# --------------------------------------------------------------------------
 # get_sentiment
 # --------------------------------------------------------------------------
 

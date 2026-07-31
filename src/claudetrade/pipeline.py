@@ -57,6 +57,7 @@ from claudetrade.regime.market_regime import RegimeClassifier
 from claudetrade.sentiment.aggregation import SentimentAggregator
 from claudetrade.sentiment.classifiers import RuleSentimentClassifier
 from claudetrade.sentiment.entity_resolution import TickerResolver
+from claudetrade.signals import funnel_store
 from claudetrade.signals.engine import ScanResult, SignalEngine
 from claudetrade.signals.ledger import SignalLedger
 from claudetrade.utils.timeutils import trading_day_range, utc_now
@@ -358,6 +359,13 @@ class Pipeline:
         )
         result.scan = scan_result
         result.warnings.extend(scan_result.warnings)
+        # Cross-process diagnosability (see `signals.funnel_store`'s module
+        # docstring): the CLI, the web API server and the MCP server each
+        # bootstrap their own `Pipeline`, so a rejection funnel that only
+        # lived on this in-memory `scan_result` would be invisible to "why no
+        # picks today?" asked from a different one of those processes.
+        # Best-effort -- never raises.
+        funnel_store.save(self.config, scan_result)
 
         if record:
             for signal in scan_result.signals:

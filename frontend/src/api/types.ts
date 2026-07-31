@@ -79,6 +79,28 @@ export interface RejectedCandidate {
   strategy: string;
   stage: string;
   reasons: string[];
+  reason_codes: string[];
+}
+
+export interface NearMiss {
+  symbol: string;
+  strategy: string;
+  reason_code: string;
+  metric: number;
+  threshold: number;
+  margin: number;
+  overall_score: number | null;
+  confidence: number | null;
+  weakest_components: [string, number][];
+  strongest_components: [string, number][];
+}
+
+export interface ScanFunnel {
+  top_n: number;
+  total_rejections: number;
+  by_reason: Record<string, number>;
+  by_strategy_reason: Record<string, Record<string, number>>;
+  near_misses: NearMiss[];
 }
 
 export interface RejectedResponse {
@@ -87,6 +109,7 @@ export interface RejectedResponse {
   generated_at: string | null;
   evaluated_symbols: number;
   rejected: RejectedCandidate[];
+  funnel: ScanFunnel | null;
 }
 
 export interface ScanRequest {
