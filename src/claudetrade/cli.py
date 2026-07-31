@@ -1034,6 +1034,45 @@ def _run_streamlit_in_process(app_path: str, port: int) -> None:
     bootstrap.run(app_path, False, [], {"server.port": port})
 
 
+@app.command("mcp")
+def mcp_server(config: ConfigOption = None) -> None:
+    r"""Run a local MCP (Model Context Protocol) server over stdio.
+
+    Lets an MCP client on this machine -- typically the Claude Desktop app,
+    configured via its ``claude_desktop_config.json`` -- query this
+    installation's signals, sentiment and market status directly, without
+    the web UI running. See docs/claude-desktop-mcp.md for setup.
+
+    Bootstraps its own ``Pipeline`` (``Pipeline.bootstrap``, same as every
+    other entry point), so it works whether or not ``claudetrade ui`` is
+    already running -- SQLite's WAL mode makes concurrent read access safe.
+    This command blocks, serving requests on stdin/stdout, until the client
+    disconnects; all diagnostic output here goes to stderr so it never
+    collides with the MCP protocol framing on stdout.
+
+    Requires the optional ``mcp`` package (``pip install claudetrade\[mcp]``);
+    everything else in the application works without it.
+    """
+    cfg = get_config(config, reload=True)
+    setup_logging(cfg, component="mcp")
+
+    try:
+        from claudetrade.mcp_server import run_stdio
+    except ImportError as exc:
+        typer.secho(
+            "The 'mcp' package is not installed. Install it with:\n"
+            "  pip install claudetrade[mcp]\n"
+            "(or: pip install mcp)\n\n"
+            f"Details: {exc}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"claudetrade MCP server starting (stdio transport). {DISCLAIMER}", err=True)
+    run_stdio(cfg)
+
+
 def main() -> None:
     """Console-script entry point."""
     app()
