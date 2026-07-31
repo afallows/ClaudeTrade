@@ -805,6 +805,7 @@ class DataIngestor:
                         duplicate_group=post.duplicate_group,
                         injection_risk=post.injection_risk,
                         raw_ref=post.raw_ref,
+                        flair=post.flair,
                     )
                 )
                 report.posts_inserted += 1

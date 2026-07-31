@@ -283,6 +283,11 @@ class SocialPostRow(Base):
     duplicate_group: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     injection_risk: Mapped[float] = mapped_column(Float, default=0.0)
     raw_ref: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    #: Reddit's native ``link_flair_text`` (e.g. "DD", "YOLO", "News"),
+    #: nullable -- absent for posts with no flair and for every non-Reddit
+    #: source. See ``domain.SocialPost.flair`` for the field's provenance
+    #: and how it is used as a scoring prior. Added by migration 004.
+    flair: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
 
 class TickerMentionRow(Base):

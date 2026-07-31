@@ -31,10 +31,14 @@ from claudetrade.sentiment.lexicon import (
     DIMINISHERS,
     EARNINGS_SPECULATION_TERMS,
     FEAR_TERMS,
+    FLAIR_CATALYST_TERMS,
+    FLAIR_HYPE_TERMS,
     HYPE_FOMO_TERMS,
     INTENSIFIERS,
     NEGATION_WINDOW,
     NEGATORS,
+    OPTIONS_CALL_TERMS,
+    OPTIONS_PUT_TERMS,
     POSITION_DISCLOSURE_PATTERNS,
     PRODUCT_CATALYST_TERMS,
     PUMP_DUMP_TEMPLATES,
@@ -50,6 +54,23 @@ log = logging.getLogger(__name__)
 _WORD_RE = re.compile(r"[a-z0-9']+")
 _EXCESS_PUNCT_RE = re.compile(r"[!?]{2,}")
 _ALLCAPS_TOKEN_RE = re.compile(r"\b[A-Z]{2,}\b")
+#: Strike-shorthand ("100c" / "100p"): digits immediately (no space) followed
+#: by the bare letter, word-bounded so "100 Celsius" or "scored 100 points"
+#: don't match -- only a directly-appended letter reads as options slang.
+#: Run against the already-lower-cased ``text_norm``, so no IGNORECASE flag
+#: is needed here. Idea (the `\d+C`/`\d+P` shape): Stocksera
+#: (``scheduled_tasks/reddit/stocks/scrape_discussion_thread.py``, MIT).
+_OPTIONS_CALL_STRIKE_RE = re.compile(r"\b\d+c\b")
+_OPTIONS_PUT_STRIKE_RE = re.compile(r"\b\d+p\b")
+#: Modest, capped nudges from Reddit's own flair -- see
+#: ``lexicon.FLAIR_CATALYST_TERMS``/``FLAIR_HYPE_TERMS`` for the term sets
+#: and provenance. Sized in the same range as the other ad-hoc adjustments
+#: in ``classify`` below (excess-punctuation, emoji, ...), well under a
+#: single average-weight lexicon phrase hit -- a self-applied label is
+#: weaker evidence than the classifier's own read of the text.
+_FLAIR_CATALYST_BOOST = 0.25
+_FLAIR_HYPE_BOOST = 0.25
+_FLAIR_PUMP_BOOST = 0.2
 
 
 def _normalise(text: str) -> str:
@@ -184,6 +205,15 @@ class RuleSentimentClassifier:
         squeeze_raw, _ = _lexicon_score(text_norm, SHORT_SQUEEZE_TERMS)
         pump_raw, pump_hits = _lexicon_score(text_norm, PUMP_DUMP_TEMPLATES)
         position_raw, _ = _lexicon_score(text_norm, POSITION_DISCLOSURE_PATTERNS)
+        call_raw, _ = _lexicon_score(text_norm, OPTIONS_CALL_TERMS)
+        put_raw, _ = _lexicon_score(text_norm, OPTIONS_PUT_TERMS)
+
+        # Strike shorthand ("100c"/"100p") isn't a literal phrase, so it is
+        # scanned separately from the phrase lexicons above (see
+        # ``_OPTIONS_CALL_STRIKE_RE`` for why); each hit contributes about
+        # as much as one below-average-weight phrase match.
+        call_raw += 0.5 * len(_OPTIONS_CALL_STRIKE_RE.findall(text_norm))
+        put_raw += 0.5 * len(_OPTIONS_PUT_STRIKE_RE.findall(text_norm))
 
         # Emoji: cheap, reliable, source-independent bullish/bearish/hype signal.
         bullish_emoji_hits = sum(text.count(e) for e in BULLISH_EMOJI)
@@ -212,6 +242,23 @@ class RuleSentimentClassifier:
 
         pump_raw += 0.3 * squeeze_raw  # squeeze hype compounds pump-and-dump language
 
+        # Reddit's own `link_flair_text`, when present, is a cheap,
+        # deterministic post-type hint the author/community attached --
+        # not proof of anything, so the nudge stays modest (see
+        # `_FLAIR_*_BOOST` above) and never manufactures a catalyst or
+        # pump-and-dump read out of otherwise-neutral text on its own; it
+        # only amplifies whatever the lexicon scan already found. `None`
+        # or any flair outside the two curated sets is neutral -- no
+        # adjustment at all, identical to today's behaviour.
+        flair_norm = (post.flair or "").strip().casefold()
+        if flair_norm in FLAIR_CATALYST_TERMS:
+            earnings_raw += _FLAIR_CATALYST_BOOST
+            product_raw += _FLAIR_CATALYST_BOOST
+            regulatory_raw += _FLAIR_CATALYST_BOOST
+        elif flair_norm in FLAIR_HYPE_TERMS:
+            hype_raw += _FLAIR_HYPE_BOOST
+            pump_raw += _FLAIR_PUMP_BOOST
+
         bullish = _squash(bullish_raw)
         bearish = _squash(bearish_raw)
         hype = _squash(hype_raw)
@@ -226,6 +273,8 @@ class RuleSentimentClassifier:
         short_squeeze = _squash(squeeze_raw)
         pump_and_dump = _squash(pump_raw)
         position_disclosure = _squash(position_raw)
+        options_call = _squash(call_raw)
+        options_put = _squash(put_raw)
         fomo = _squash(hype_raw * 0.7)  # fomo tracks hype but is not identical to it
 
         total_signal = bullish + bearish
@@ -260,6 +309,8 @@ class RuleSentimentClassifier:
             short_squeeze=short_squeeze,
             pump_and_dump=pump_and_dump,
             position_disclosure=position_disclosure,
+            options_call=options_call,
+            options_put=options_put,
             # Coordination is a cross-post property (near-identical text from
             # many authors); a single-post rule classifier has no basis to
             # score it and leaves it to `sentiment.manipulation` /
@@ -362,6 +413,15 @@ def _blend(rule_scores: SentimentScores, ai_scores: SentimentScores) -> Sentimen
     it is a cross-post property the AI classifier (which only ever sees one
     post at a time) cannot legitimately assess; the rule value (always 0.0 at
     this stage, populated later by aggregation) passes through unchanged.
+
+    ``options_call``/``options_put`` are excluded for the same reason as
+    ``coordinated``, just for a different cause: the AI schema
+    (``ai_classifier._REQUIRED_FIELDS``) has no options-chatter fields, so
+    ``ai_scores`` always carries the dataclass default (0.0) there -- if
+    these were blended, every AI-assisted post would have its rule-derived
+    options signal diluted toward zero in proportion to the AI's confidence,
+    which is not a real "the AI disagrees" signal, just an artefact of the
+    field not being asked for. The rule value passes through unchanged.
     """
     w_rule = max(1e-6, rule_scores.confidence)
     w_ai = max(0.0, ai_scores.confidence)
@@ -381,6 +441,8 @@ def _blend(rule_scores: SentimentScores, ai_scores: SentimentScores) -> Sentimen
     return SentimentScores(
         **blended,
         coordinated=rule_scores.coordinated,
+        options_call=rule_scores.options_call,
+        options_put=rule_scores.options_put,
         confidence=combined_confidence,
         classifier=f"ensemble(rules+{ai_scores.classifier})",
     )

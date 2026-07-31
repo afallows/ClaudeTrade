@@ -543,6 +543,13 @@ class RedditProvider:
             parent_list[0].get("name") if parent_list else None
         )
 
+        # Reddit's own community-maintained post-type taxonomy (DD, YOLO,
+        # News, Meme, ...) rides along in every listing item we already
+        # fetch, right next to `score`/`num_comments`, but was previously
+        # discarded. Idea: reddit-stock-ai-agent-recommendation (MIT) --
+        # native-field capture only, no code copied.
+        flair = data.get("link_flair_text") or None
+
         return SocialPost(
             source=SocialSource.REDDIT,
             # Reddit's ``name`` is the fullname ("t3_abc123"), unique across
@@ -569,4 +576,5 @@ class RedditProvider:
             duplicate_group=None,
             injection_risk=injection_risk,
             fetched_at=dt.datetime.now(tz=dt.UTC),
+            flair=flair,
         )

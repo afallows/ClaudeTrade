@@ -402,6 +402,17 @@ AMBIGUOUS_TICKER_WORDS: frozenset[str] = frozenset(
         "U",
         "X",
         "Y",
+        # Real tickers that collide with common English words/names, mined
+        # by cross-checking reddit-sentiment-analysis / asad70's ticker
+        # blacklist (`data.py`, MIT) against our live `SecurityInfo`
+        # universe -- the word list was mined, not the mechanism: their
+        # blacklist silently discards these as tickers outright, while our
+        # confidence-scored approach still lets a strongly-contextualised
+        # mention resolve, just at a heavily discounted starting point.
+        "OPEN",  # Opendoor Technologies
+        "RH",  # RH (formerly Restoration Hardware)
+        "FL",  # Foot Locker
+        "RIDE",  # Lordstown Motors
     }
 )
 
@@ -469,3 +480,65 @@ BULLISH_EMOJI: frozenset[str] = frozenset({"\U0001f680", "\U0001f4c8", "\U0001f4
 # rocket, chart-up, gem, raised-hands
 BEARISH_EMOJI: frozenset[str] = frozenset({"\U0001f4c9", "\U0001f43b", "\U0001f480"})
 # chart-down, bear, skull
+
+# --------------------------------------------------------------------------
+# Reddit flair priors
+# --------------------------------------------------------------------------
+
+#: Reddit's native ``link_flair_text``, case-folded and trimmed, that reads
+#: as evidence-based/analytical framing -- the author's own claim to have
+#: done research, not a fact we verify. ``sentiment.classifiers`` and
+#: ``sentiment.aggregation`` use this for a small, capped nudge only, never
+#: as a substitute for scoring the post's actual text.
+#: Idea (native-field capture): reddit-stock-ai-agent-recommendation (MIT).
+FLAIR_CATALYST_TERMS: frozenset[str] = frozenset({"dd", "due diligence", "analysis"})
+
+#: Flair that reads as speculative/low-effort framing -- again the author's
+#: or community's own label, used only for a small nudge in the hype /
+#: pump-and-dump direction.
+FLAIR_HYPE_TERMS: frozenset[str] = frozenset({"yolo", "meme", "gain", "loss", "shitpost"})
+
+# --------------------------------------------------------------------------
+# Options chatter (calls vs. puts)
+# --------------------------------------------------------------------------
+
+#: Phrase-based call-side options chatter. Deliberately excludes the bare
+#: singular "call" (phone/earnings/conference call would swamp it with false
+#: positives) -- "calls" plural is the options-specific word.
+#: Strike-shorthand ("100c") is *not* representable as a literal-substring
+#: phrase here (this module matches literal text, not regex -- see the
+#: module docstring), so that half of the signal is a small compiled regex
+#: living next to ``RuleSentimentClassifier.classify`` in
+#: ``sentiment.classifiers`` instead, following the same split
+#: ``_ALLCAPS_TOKEN_RE``/``_EXCESS_PUNCT_RE`` already use there.
+#: Idea (calls/puts split + `\d+C`/`\d+P` strike-shorthand shape): Stocksera
+#: (``scheduled_tasks/reddit/stocks/scrape_discussion_thread.py::check_for_options``,
+#: MIT) -- reimplemented cleanly against our own weighted-phrase convention,
+#: not copied.
+OPTIONS_CALL_TERMS: dict[str, float] = {
+    "calls": 0.55,
+    "call options": 0.7,
+    "buying calls": 0.65,
+    "bought calls": 0.65,
+    "long calls": 0.6,
+    "loaded up on calls": 0.7,
+    "weekly calls": 0.55,
+    "otm calls": 0.6,
+    "itm calls": 0.6,
+    "leaps": 0.5,
+}
+
+#: Put-side counterpart of ``OPTIONS_CALL_TERMS``. Bare singular "put" is
+#: excluded for the same false-positive reason ("put together", "put me
+#: down"); "puts" plural is the options-specific word.
+OPTIONS_PUT_TERMS: dict[str, float] = {
+    "puts": 0.55,
+    "put options": 0.7,
+    "buying puts": 0.65,
+    "bought puts": 0.65,
+    "long puts": 0.6,
+    "protective puts": 0.55,
+    "weekly puts": 0.55,
+    "otm puts": 0.6,
+    "itm puts": 0.6,
+}

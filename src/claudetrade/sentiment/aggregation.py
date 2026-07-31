@@ -34,6 +34,7 @@ from claudetrade.domain import (
     SymbolSentiment,
     TickerMention,
 )
+from claudetrade.sentiment.lexicon import FLAIR_CATALYST_TERMS
 from claudetrade.sentiment.manipulation import ManipulationDetector
 from claudetrade.utils.timeutils import ensure_utc, session_close_utc
 
@@ -52,6 +53,16 @@ _DEFAULT_CREDIBILITY_BASELINE_BY_SOURCE: dict[str, float] = {
     "reddit": 0.3,
     "x": 0.3,
 }
+
+#: Modest credibility nudge for Reddit's own "DD"/"Due Diligence"/"Analysis"
+#: flair (``lexicon.FLAIR_CATALYST_TERMS``) -- the author's own claim to have
+#: done research, not verified fact. Kept well under the weight of any one
+#: of the three age/karma/follower components below (each contributes at
+#: most 1/3 of the computed score), and applied identically whether the
+#: post fell into the baseline branch or the fully-computed branch, so it
+#: never itself decides which branch runs.
+#: Idea (native-field capture): reddit-stock-ai-agent-recommendation (MIT).
+_FLAIR_CREDIBILITY_BOOST = 0.1
 
 
 def time_decay_weight(age_hours: float, half_life_hours: float) -> float:
@@ -101,14 +112,22 @@ def _credibility_score(post: SocialPost, config: SentimentConfig | None = None) 
             if config is not None
             else _DEFAULT_CREDIBILITY_BASELINE_BY_SOURCE
         )
-        return baseline_by_source.get(post.source, 0.0)
+        score = baseline_by_source.get(post.source, 0.0)
+    else:
+        age_component = min(1.0, (post.author_age_days or 0.0) / 365.0)
+        karma_component = min(
+            1.0, math.log1p(max(0.0, post.author_karma or 0.0)) / math.log1p(10_000.0)
+        )
+        follower_component = min(
+            1.0, math.log1p(max(0.0, post.author_followers or 0.0)) / math.log1p(100_000.0)
+        )
+        score = max(0.0, min(1.0, (age_component + karma_component + follower_component) / 3.0))
 
-    age_component = min(1.0, (post.author_age_days or 0.0) / 365.0)
-    karma_component = min(1.0, math.log1p(max(0.0, post.author_karma or 0.0)) / math.log1p(10_000.0))
-    follower_component = min(
-        1.0, math.log1p(max(0.0, post.author_followers or 0.0)) / math.log1p(100_000.0)
-    )
-    return max(0.0, min(1.0, (age_component + karma_component + follower_component) / 3.0))
+    # Flair prior, applied identically to either branch above (see
+    # `_FLAIR_CREDIBILITY_BOOST`).
+    if (post.flair or "").strip().casefold() in FLAIR_CATALYST_TERMS:
+        score = min(1.0, score + _FLAIR_CREDIBILITY_BOOST)
+    return score
 
 
 def _engagement_weight(post: SocialPost, decay: float) -> float:
@@ -296,6 +315,13 @@ class SentimentAggregator:
             "short_squeeze": _weighted_mean([(s.short_squeeze, d) for _, s, d in weighted]),
             "pump_and_dump": _weighted_mean([(s.pump_and_dump, d) for _, s, d in weighted]),
             "position_disclosure": _weighted_mean([(s.position_disclosure, d) for _, s, d in weighted]),
+            # Options-chatter split (calls vs. puts) -- a per-post signal
+            # from `RuleSentimentClassifier`, surfaced the same way as the
+            # other labels above; see `SentimentScores.options_call`/
+            # `options_put`. Available to strategies via
+            # `SymbolSentiment.labels.get("options_call"/"options_put")`.
+            "options_call": _weighted_mean([(s.options_call, d) for _, s, d in weighted]),
+            "options_put": _weighted_mean([(s.options_put, d) for _, s, d in weighted]),
         }
 
         return SymbolSentiment(

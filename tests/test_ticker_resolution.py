@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
-from claudetrade.domain import SecurityInfo
+import datetime as dt
+
+import pytest
+
+from claudetrade.domain import SecurityInfo, SocialPost, SocialSource
 from claudetrade.sentiment.entity_resolution import (
     TickerResolver,
+    _resolve_bare_symbols,
     normalise_company_name,
 )
+from claudetrade.sentiment.lexicon import AMBIGUOUS_TICKER_WORDS
+
+
+def _make_post(text: str) -> SocialPost:
+    return SocialPost(
+        source=SocialSource.REDDIT,
+        external_id="t3_test",
+        created_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+        text=text,
+    )
 
 
 class TestAmbiguousWordExclusion:
@@ -14,31 +29,97 @@ class TestAmbiguousWordExclusion:
 
     def test_ai_in_ordinary_sentence(self):
         """'AI' in 'I use AI at work' doesn't resolve as $AI stock."""
-        text = "I use AI at work every day"
         # With threshold > confidence of bare word match for ambiguous term,
         # this should not resolve
         # The confidence for 'AI' as a bare word is low (~0.12) when ambiguous
-
-        from claudetrade.sentiment.lexicon import AMBIGUOUS_TICKER_WORDS
-
         assert "ai" in AMBIGUOUS_TICKER_WORDS or "AI" in AMBIGUOUS_TICKER_WORDS
 
     def test_it_in_ordinary_sentence(self):
         """'IT' in 'turn IT on' doesn't resolve as $IT stock."""
-        text = "turn IT on"
         # Similar: IT is ambiguous, low confidence
 
     def test_all_in_ordinary_sentence(self):
         """'ALL' in 'ALL of it' doesn't resolve."""
-        text = "Give me ALL of it"
 
     def test_so_in_ordinary_sentence(self):
         """'SO' in 'SO tired' doesn't resolve."""
-        text = "I'm SO tired today"
 
     def test_for_in_ordinary_sentence(self):
         """'FOR' in 'this is FOR you' doesn't resolve."""
-        text = "this gift is FOR you"
+
+
+class TestNewlyAddedAmbiguousTickers:
+    """OPEN, RH, FL, RIDE are real tickers that collide with ordinary
+    English words/names and were missing from ``AMBIGUOUS_TICKER_WORDS``.
+    Mined from asad70's reddit-sentiment-analysis ticker blacklist
+    (``data.py``, MIT) cross-checked against the live ``SecurityInfo``
+    universe -- word list only, not code; our confidence-scored mechanism
+    differs structurally from their hard blacklist."""
+
+    @pytest.mark.parametrize("symbol", ["OPEN", "RH", "FL", "RIDE"])
+    def test_symbol_is_in_ambiguous_word_set(self, symbol):
+        assert symbol in AMBIGUOUS_TICKER_WORDS
+
+    @pytest.mark.parametrize(
+        "symbol,sentence",
+        [
+            ("OPEN", "I think OPEN could pop this week"),
+            ("RH", "not sure but RH looks interesting lately"),
+            ("FL", "heard FL might rally soon"),
+            ("RIDE", "watching RIDE closely this week"),
+        ],
+    )
+    def test_bare_mention_uses_the_discounted_ambiguous_base(self, symbol, sentence):
+        """Isolated at the ``_resolve_bare_symbols`` level (bypassing the
+        alias/company-name paths, which membership in
+        ``AMBIGUOUS_TICKER_WORDS`` does not affect): a bare mention starts
+        from the discounted ambiguous base (0.12), not the ordinary
+        bare-symbol base (0.55) -- this is exactly the code path
+        ``AMBIGUOUS_TICKER_WORDS`` membership controls."""
+        seen: dict[str, float] = {}
+
+        def consider(sym, confidence, method, matched, context):
+            seen[sym] = confidence
+
+        _resolve_bare_symbols(sentence, {symbol}, consider)
+
+        assert symbol in seen
+        assert seen[symbol] < 0.30  # well under the 0.55 ordinary base
+
+    def test_ordinary_ticker_bare_symbol_base_is_higher_for_comparison(self):
+        """A ticker NOT in ``AMBIGUOUS_TICKER_WORDS`` gets the higher,
+        undiscounted base via the exact same code path."""
+        seen: dict[str, float] = {}
+
+        def consider(sym, confidence, method, matched, context):
+            seen[sym] = confidence
+
+        _resolve_bare_symbols("I think ACME could pop this week", {"ACME"}, consider)
+
+        assert seen["ACME"] >= 0.40
+
+    @pytest.mark.parametrize(
+        "symbol,name,sentence",
+        [
+            ("OPEN", "Opendoor Technologies", "I think OPEN could pop this week"),
+            ("RH", "Restoration Hardware", "not sure but RH looks interesting lately"),
+            ("FL", "Foot Locker", "heard FL might rally soon"),
+            ("RIDE", "Lordstown Motors", "watching RIDE closely this week"),
+        ],
+    )
+    def test_full_resolve_discounts_the_bare_mention(self, symbol, name, sentence):
+        """End-to-end through ``TickerResolver.resolve``: with a realistic
+        company name (that does not itself appear in the sentence), the
+        only path that fires is the discounted bare-symbol one."""
+        directory = {symbol: SecurityInfo(symbol=symbol, name=name)}
+        resolver = TickerResolver(directory)
+
+        mentions = resolver.resolve(_make_post(sentence))
+
+        assert len(mentions) == 1
+        assert mentions[0].symbol == symbol
+        assert mentions[0].method == "symbol_context"
+        assert mentions[0].confidence < 0.30
 
 
 class TestCashtagResolution:
@@ -46,7 +127,6 @@ class TestCashtagResolution:
 
     def test_cashtag_high_confidence(self):
         """Cashtag $AAPL resolves with confidence ~0.92."""
-        text = "Just bought $AAPL calls, looking good"
         # Cashtag base confidence: ~0.92
         # Should resolve AAPL with high confidence
 
@@ -61,17 +141,14 @@ class TestCompanyNameResolution:
 
     def test_company_name_exact_match(self):
         """Exact company name resolves."""
-        text = "Apple Inc is trading well"
         # "Apple Inc" -> normalized "apple" -> resolves to AAPL
 
     def test_company_name_without_suffix(self):
         """Company name without legal suffix resolves."""
-        text = "Apple is up today"
         # "Apple" normalized matches
 
     def test_former_symbol_resolves(self):
         """Former ticker symbol resolves via aliases."""
-        text = "FB (now META) announced earnings"
         # FB in former_symbols for META
 
 

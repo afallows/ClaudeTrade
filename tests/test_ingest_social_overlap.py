@@ -135,7 +135,13 @@ class _FakeSocialProvider:
         return list(self._posts)
 
 
-def _post(external_id: str, text: str, *, source: SocialSource = SocialSource.REDDIT) -> SocialPost:
+def _post(
+    external_id: str,
+    text: str,
+    *,
+    source: SocialSource = SocialSource.REDDIT,
+    flair: str | None = None,
+) -> SocialPost:
     return SocialPost(
         source=source,
         external_id=external_id,
@@ -144,6 +150,7 @@ def _post(external_id: str, text: str, *, source: SocialSource = SocialSource.RE
         score=10,
         author_hash="author1",
         num_comments=1,
+        flair=flair,
     )
 
 
@@ -317,6 +324,71 @@ class TestJoinTimeout:
         assert elapsed < 3.0
         assert report.posts_inserted == 0
         assert any("timeout" in r.message for r in caplog.records)
+
+
+class TestFlairPersistence:
+    """``SocialPost.flair`` round-trips through ``_persist_posts`` onto
+    ``SocialPostRow.flair`` -- checked against the *current* (concurrent
+    -fetch-capable) ``DataIngestor``, since that persistence path was
+    reworked for background social fetch and is the one that actually
+    runs in production."""
+
+    def test_flair_is_persisted_and_readable(self):
+        db = _fresh_db()
+        market = _FastMarketProvider()
+        social = _FakeSocialProvider(
+            "social_a",
+            [_post("p1", "$ZZZ this is DD on the fundamentals", flair="DD")],
+        )
+        config = _config(fetch_concurrently=True)
+        ingestor = DataIngestor(config, db, market_provider=market, social_providers=[social])
+        securities = [SecurityInfo(symbol="ZZZ", name="Zzz Corp")]
+
+        ingestor.run_full_refresh(symbols=["ZZZ"], start=START, end=END, securities=securities)
+
+        with db.read_session() as session:
+            row = session.execute(
+                select(SocialPostRow).where(SocialPostRow.external_id == "p1")
+            ).scalar_one()
+        assert row.flair == "DD"
+
+    def test_none_flair_is_persisted_as_null_not_dropped(self):
+        db = _fresh_db()
+        market = _FastMarketProvider()
+        social = _FakeSocialProvider("social_a", [_post("p2", "$ZZZ nothing special today")])
+        config = _config(fetch_concurrently=False)
+        ingestor = DataIngestor(config, db, market_provider=market, social_providers=[social])
+        securities = [SecurityInfo(symbol="ZZZ", name="Zzz Corp")]
+
+        ingestor.run_full_refresh(symbols=["ZZZ"], start=START, end=END, securities=securities)
+
+        with db.read_session() as session:
+            row = session.execute(
+                select(SocialPostRow).where(SocialPostRow.external_id == "p2")
+            ).scalar_one()
+        assert row.flair is None
+
+    def test_flair_survives_the_concurrent_fetch_path_too(self):
+        """Same assertion, but exercised the other way -- posts arriving
+        via the background/concurrent fetch (not just sequential) still get
+        their flair persisted; this is the exact path ``ingest.py`` was
+        recently reworked around."""
+        db = _fresh_db()
+        market = _SlowMarketProvider(_EventLog(), delay=0.05)
+        social = _FakeSocialProvider(
+            "social_a", [_post("p3", "$ZZZ yolo into next week", flair="YOLO")], delay=0.05
+        )
+        config = _config(fetch_concurrently=True)
+        ingestor = DataIngestor(config, db, market_provider=market, social_providers=[social])
+        securities = [SecurityInfo(symbol="ZZZ", name="Zzz Corp")]
+
+        ingestor.run_full_refresh(symbols=["ZZZ"], start=START, end=END, securities=securities)
+
+        with db.read_session() as session:
+            row = session.execute(
+                select(SocialPostRow).where(SocialPostRow.external_id == "p3")
+            ).scalar_one()
+        assert row.flair == "YOLO"
 
 
 class TestAliasDependency:

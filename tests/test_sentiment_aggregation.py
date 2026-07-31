@@ -413,3 +413,120 @@ class TestCredibilityWeightedDistinguishesNewsFromRedditBaseline:
         # credibility weight and _weighted_mean fell back to the plain,
         # unweighted average of the two opposite polarities (0.0).
         assert result.credibility_weighted != pytest.approx(0.0, abs=1e-6)
+
+
+class TestFlairCredibilityPrior:
+    """Reddit's own "DD"/"Due Diligence"/"Analysis" flair gives a small,
+    capped credibility nudge -- see ``_FLAIR_CREDIBILITY_BOOST``."""
+
+    @pytest.mark.parametrize("flair", ["DD", "dd", "  DD  ", "Due Diligence", "Analysis"])
+    def test_catalyst_flair_raises_credibility(self, flair):
+        baseline = _credibility_score(_post())
+        boosted = _credibility_score(_post(flair=flair))
+        assert boosted > baseline
+
+    def test_boost_is_small_not_dominant(self):
+        """The boost must not overwhelm the underlying signal -- well under
+        doubling a typical baseline."""
+        baseline = _credibility_score(_post())
+        boosted = _credibility_score(_post(flair="DD"))
+        assert boosted - baseline < 0.2
+
+    def test_boost_applies_on_top_of_computed_score_not_only_baseline(self):
+        """The nudge is not limited to the "no author metrics" baseline
+        branch -- a post with real author metrics gets it too."""
+        baseline = _credibility_score(_post(author_karma=500))
+        boosted = _credibility_score(_post(author_karma=500, flair="DD"))
+        assert boosted > baseline
+
+    def test_boost_never_pushes_score_above_one(self):
+        near_max = _credibility_score(
+            _post(author_age_days=100_000, author_karma=1_000_000, author_followers=1_000_000)
+        )
+        boosted = _credibility_score(
+            _post(
+                author_age_days=100_000,
+                author_karma=1_000_000,
+                author_followers=1_000_000,
+                flair="DD",
+            )
+        )
+        assert near_max <= 1.0
+        assert boosted <= 1.0
+
+    @pytest.mark.parametrize("flair", ["YOLO", "Meme", "Discussion", "News", None])
+    def test_non_catalyst_flair_does_not_raise_credibility(self, flair):
+        baseline = _credibility_score(_post())
+        unaffected = _credibility_score(_post(flair=flair))
+        assert unaffected == pytest.approx(baseline)
+
+    def test_none_flair_is_unchanged_from_before_this_field_existed(self):
+        """Explicit unchanged-behaviour check for the common (no-flair)
+        case."""
+        assert _credibility_score(_post(flair=None)) == _credibility_score(_post())
+
+
+class TestOptionsChatterLabels:
+    """The per-post ``options_call``/``options_put`` signal from
+    ``RuleSentimentClassifier`` is surfaced through
+    ``SymbolSentiment.labels``, the same way ``short_squeeze``/
+    ``pump_and_dump``/``position_disclosure`` already are -- this is the
+    surface strategies read via ``sentiment.labels.get(...)`` without any
+    strategy-side code change."""
+
+    def test_options_call_and_put_appear_in_labels(self):
+        created_at = dt.datetime(2024, 6, 3, 14, 0, tzinfo=dt.UTC)
+        post = _post(external_id="opt-1", created_at=created_at)
+        aggregator = SentimentAggregator(SentimentConfig())
+        session = dt.date(2024, 6, 3)
+        mentions = [
+            TickerMention(post_external_id="opt-1", symbol="ACME", confidence=0.9, method="cashtag")
+        ]
+        scores = {"opt-1": SentimentScores(options_call=0.7, options_put=0.2)}
+
+        result = aggregator.aggregate(
+            "ACME", session, [post], mentions, scores, source="test"
+        )
+
+        assert result.labels["options_call"] == pytest.approx(0.7)
+        assert result.labels["options_put"] == pytest.approx(0.2)
+
+    def test_no_options_signal_yields_zero_labels(self):
+        created_at = dt.datetime(2024, 6, 3, 14, 0, tzinfo=dt.UTC)
+        post = _post(external_id="opt-2", created_at=created_at)
+        aggregator = SentimentAggregator(SentimentConfig())
+        session = dt.date(2024, 6, 3)
+        mentions = [
+            TickerMention(post_external_id="opt-2", symbol="ACME", confidence=0.9, method="cashtag")
+        ]
+        scores = {"opt-2": SentimentScores()}
+
+        result = aggregator.aggregate(
+            "ACME", session, [post], mentions, scores, source="test"
+        )
+
+        assert result.labels["options_call"] == pytest.approx(0.0)
+        assert result.labels["options_put"] == pytest.approx(0.0)
+
+    def test_options_labels_are_decay_weighted_like_other_labels(self):
+        """Two posts, one recent and one old: the weighted mean should skew
+        toward the fresher post's value, exactly like every other label in
+        this dict."""
+        close = dt.datetime(2024, 6, 3, 20, 0, tzinfo=dt.UTC)
+        fresh = _post(external_id="fresh", created_at=close - dt.timedelta(hours=1))
+        stale = _post(external_id="stale", created_at=close - dt.timedelta(hours=400))
+        aggregator = SentimentAggregator(SentimentConfig())
+        mentions = [
+            TickerMention(post_external_id="fresh", symbol="ACME", confidence=0.9, method="cashtag"),
+            TickerMention(post_external_id="stale", symbol="ACME", confidence=0.9, method="cashtag"),
+        ]
+        scores = {
+            "fresh": SentimentScores(options_call=1.0),
+            "stale": SentimentScores(options_call=0.0),
+        }
+
+        result = aggregator.aggregate(
+            "ACME", dt.date(2024, 6, 3), [fresh, stale], mentions, scores, source="test"
+        )
+
+        assert result.labels["options_call"] > 0.9
