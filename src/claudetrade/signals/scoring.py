@@ -498,9 +498,15 @@ def score_candidate(
     # Confidence blends data quality with sample adequacy and agreement.
     confidence = components.data_confidence / 100.0
     if sentiment is not None:
-        confidence *= 0.5 + 0.5 * sentiment.confidence
+        sentiment_factor = 0.5 + 0.5 * sentiment.confidence
         # Wide disagreement means the signal is contested, not confirmed.
-        confidence *= 1.0 - 0.25 * min(1.0, sentiment.dispersion)
+        sentiment_factor *= 1.0 - 0.25 * min(1.0, sentiment.dispersion)
+        # Floored at the no-sentiment multiplier below: a thin or noisy
+        # social sample is missing evidence, not contrary evidence, and must
+        # never leave a candidate WORSE off than having no sentiment row at
+        # all -- otherwise storing a weak aggregate actively suppresses the
+        # price-driven strategies for that symbol.
+        confidence *= max(0.75, sentiment_factor)
     else:
         confidence *= 0.75
     if ctx.data_warnings:

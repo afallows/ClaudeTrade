@@ -296,7 +296,25 @@ class SentimentAggregator:
         unique_authors = len({p.author_hash for p, _, _ in weighted if p.author_hash})
         comment_count = sum(1 for p, _, _ in weighted if p.is_comment)
 
-        avg_age_hours = sum((close - ensure_utc(p.created_at)).total_seconds() / 3600.0 for p, _, _ in weighted) / len(weighted)
+        # Decay-weighted mean age, NOT the raw mean: staleness must measure how
+        # old the *effective* evidence is. A sample holding a week of old posts
+        # plus a burst of fresh ones is fresh evidence -- the old posts already
+        # contribute almost nothing to every polarity measure above (their
+        # decay weight is near zero), so letting them drag the raw mean age up
+        # double-counted their staleness and, worse, made confidence *decrease*
+        # for newer sessions whenever the fetch window trailed the session
+        # (each new session saw the same posts, one day older). Weighting each
+        # post's age by its own decay weight makes the freshest evidence
+        # dominate, so a session with genuinely new posts scores fresher than
+        # one aggregating only yesterday's.
+        ages = [(close - ensure_utc(p.created_at)).total_seconds() / 3600.0 for p, _, _ in weighted]
+        decay_total = sum(d for _, _, d in weighted)
+        if decay_total > 1e-12:
+            avg_age_hours = (
+                sum(d * age for (_, _, d), age in zip(weighted, ages, strict=True)) / decay_total
+            )
+        else:
+            avg_age_hours = sum(ages) / len(ages)
         confidence = _aggregate_confidence(
             config=self.config,
             post_count=len(weighted),
@@ -322,6 +340,14 @@ class SentimentAggregator:
             # `SymbolSentiment.labels.get("options_call"/"options_put")`.
             "options_call": _weighted_mean([(s.options_call, d) for _, s, d in weighted]),
             "options_put": _weighted_mean([(s.options_put, d) for _, s, d in weighted]),
+            # Catalyst components, individually. `catalyst_quality` above
+            # keeps only their max, but strategies gate on the specific kind:
+            # the capitulation reversal's "unresolved regulatory catalyst"
+            # veto reads labels["regulatory_catalyst"] and was dead code
+            # (always 0.0) while only the collapsed max was stored.
+            "earnings_speculation": _weighted_mean([(s.earnings_speculation, d) for _, s, d in weighted]),
+            "product_catalyst": _weighted_mean([(s.product_catalyst, d) for _, s, d in weighted]),
+            "regulatory_catalyst": _weighted_mean([(s.regulatory_catalyst, d) for _, s, d in weighted]),
         }
 
         return SymbolSentiment(
@@ -437,28 +463,44 @@ def _aggregate_confidence(
 ) -> float:
     """Explicit multiplicative confidence combination, one factor per cause.
 
+    Calibration matters as much as the factor list: this value is gated
+    downstream against ``FiltersConfig.min_sentiment_confidence`` (0.35 by
+    default) and feeds the signal-level confidence gated against
+    ``SignalConfig.min_confidence``. Each factor is therefore calibrated so a
+    *healthy* sample -- adequate size, ordinary duplication, ordinary
+    disagreement, fresh posts -- lands well above those bars (~0.5-0.8), and
+    only genuine pathologies pull it below. An earlier calibration compounded
+    five heavy discounts and produced 0.02-0.08 for perfectly healthy
+    samples, which silently made every confidence threshold unreachable and
+    the scanner permanently empty.
+
     * ``sample_factor`` -- confidence ramps up toward 1.0 as the sample
       approaches ``min_posts_for_signal``/``min_unique_authors_for_signal``;
       below that, both post count and author count discount it.
-    * ``duplicate_factor`` -- a superlinear (squared) discount for duplicate
-      content, since a high duplicate ratio means the *effective* sample size
-      is much smaller than ``post_count`` suggests.
+    * ``duplicate_factor`` -- linear discount for duplicate content.
+      Deliberately not superlinear: coordinated duplication is already an
+      input to ``manipulation_risk`` (see ``sentiment.manipulation.detect``),
+      which has its own factor here, so squaring this one double-counted the
+      same evidence.
     * ``manipulation_factor`` -- direct discount from the manipulation-risk
       assessment; a sample that looks coordinated should not be trusted at
       face value regardless of its raw size.
-    * ``dispersion_factor`` -- high disagreement among posts (dispersion) is
-      itself evidence the "average" is not a stable, meaningful summary.
+    * ``dispersion_factor`` -- penalises disagreement only beyond the ~0.3
+      dispersion a healthy, genuinely mixed crowd produces. Signal-level
+      scoring applies its own dispersion discount on top
+      (``signals.scoring.score_candidate``), so this one stays mild.
     * ``staleness_factor`` -- reuses the decay curve (at double the sentiment
       half-life, since staleness is a softer, secondary penalty) applied to
-      the *mean* post age, so a sample that is mostly old news is trusted
-      less even if it was large and clean when it was fresh.
+      the *decay-weighted* mean post age the caller computes, so a sample
+      whose freshest evidence is genuinely old is trusted less, while old
+      posts sitting behind fresh ones cost nothing extra.
     """
     sample_factor = min(1.0, post_count / max(1, config.min_posts_for_signal)) * min(
         1.0, unique_authors / max(1, config.min_unique_authors_for_signal)
     )
-    duplicate_factor = (1.0 - duplicate_ratio) ** 2
+    duplicate_factor = max(0.0, 1.0 - duplicate_ratio)
     manipulation_factor = 1.0 - manipulation_risk
-    dispersion_factor = max(0.2, 1.0 - min(1.0, dispersion))
+    dispersion_factor = 1.0 - 0.7 * max(0.0, min(1.0, dispersion) - 0.3)
     staleness_factor = time_decay_weight(max(0.0, avg_age_hours), config.half_life_hours * 2.0)
 
     confidence = (

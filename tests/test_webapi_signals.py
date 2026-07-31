@@ -191,8 +191,8 @@ def test_scan_with_no_stored_market_data_evaluates_nothing_but_does_not_crash(
 ):
     """The bootstrap seed universe is non-empty (ADR-0008 Decision 3: seeds are
     always present), but with zero stored price bars nothing can be evaluated
-    -- so the honest outcome is zero signals, zero evaluated symbols, and a
-    real (if empty) cached ``ScanResult`` rather than a crash.
+    -- so the scan refuses loudly (an explicit warning naming the missing
+    data) instead of fabricating an empty-but-"successful" result.
     """
     resp = client.post("/api/scan", json={"session": "2024-06-28"})
     assert resp.status_code == 200
@@ -200,12 +200,13 @@ def test_scan_with_no_stored_market_data_evaluates_nothing_but_does_not_crash(
     assert body["signal_count"] == 0
     assert body["evaluated_symbols"] == 0
     assert body["rejected_count"] == 0
+    assert any("No price bars" in w for w in body["warnings"])
 
-    # A scan genuinely ran in this process, so the near-miss cache is now
-    # populated (even though it's empty) rather than reporting "unavailable".
+    # No scan actually ran (there was nothing to evaluate), so the near-miss
+    # cache honestly reports unavailable rather than caching a fabricated
+    # empty result.
     rejected = client.get("/api/signals/rejected").json()
-    assert rejected["available"] is True
-    assert rejected["rejected"] == []
+    assert rejected["available"] is False
 
 
 def test_refresh_degrades_without_configured_providers(client: TestClient):

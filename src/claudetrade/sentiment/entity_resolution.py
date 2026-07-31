@@ -216,6 +216,16 @@ class TickerResolver:
         # made to earn confidence from nearby finance context at match time
         # rather than being dropped.
         tokens = normalised.split()
+        # Single-token names only. Extending this to "every token is a common
+        # word" looks like it would catch "best buy"-style phrase collisions,
+        # but the common-words set is wordfreq's top-30k INCLUDING brand
+        # words made common by the companies themselves -- cisco, morgan,
+        # depot, lilly -- so the multi-token variant demoted Bank of America,
+        # Morgan Stanley, Home Depot and much of the large-cap universe to
+        # context-earned confidence and starved mention volume (verified
+        # live, 2026-07-31). "that was the best buy of my life" remains a
+        # known, accepted false-positive path; per-token commonness is not a
+        # usable phrase-ambiguity test.
         ambiguous = len(tokens) == 1 and is_ambiguous_symbol(tokens[0])
         existing = self._alias_index.get(normalised)
         # First registration wins; company_name should not be clobbered by a
@@ -260,28 +270,58 @@ class TickerResolver:
                 )
 
         for match in _CASHTAG_RE.finditer(text):
-            symbol = match.group(1).upper()
+            raw_symbol = match.group(1)
+            symbol = raw_symbol.upper()
             if symbol in self._symbols:
                 ctx = _window_text(text, match.start(), match.end())
-                _consider(symbol, _CASHTAG_BASE, "cashtag", match.group(0), ctx)
+                if raw_symbol != symbol and is_ambiguous_symbol(symbol):
+                    # "$cash", "$real": a lower/mixed-case cashtag of a common
+                    # English word might be a stylistic dollar sign rather
+                    # than a ticker callout ("paying in $cash"), so it starts
+                    # from the ordinary bare-symbol base instead of the flat
+                    # cashtag base and earns the rest from nearby finance
+                    # context. The base stays substantial because a "$" before
+                    # a word is strong ticker intent even lower-cased --
+                    # "$spy puts", "$amc calls" are everyday usage for some of
+                    # the most-discussed (and common-word-colliding) symbols,
+                    # and one finance term nearby clears the actionable
+                    # threshold. A deliberately typed uppercase "$CASH" keeps
+                    # full credit.
+                    confidence = min(
+                        _CASHTAG_BASE,
+                        _context_earned_confidence(
+                            text, match.start(), match.end(), base=_BARE_BASE_ORDINARY
+                        ),
+                    )
+                else:
+                    confidence = _CASHTAG_BASE
+                _consider(symbol, confidence, "cashtag", match.group(0), ctx)
 
         normalised_text = normalise_company_name(text)
         for alias, entry in self._alias_index.items():
             # Whole-phrase containment on normalised text; word-boundary
             # guarded via padding so "on" doesn't match inside "iron".
             if f" {alias} " in f" {normalised_text} ":
+                # The context passed on is a real window of the ORIGINAL text
+                # around the alias, never the alias string itself: the
+                # sentiment classifier prefers ``mention.context`` over the
+                # full post, so handing it just "cisco systems" made every
+                # name-resolved mention classify as neutral -- the highest-
+                # confidence match got the worst possible context.
+                window = _alias_window(text, alias)
                 if entry.ambiguous:
-                    # A single-common-word name ("target", "arm", "apple"):
-                    # no flat base -- confidence is earned from finance
-                    # context in a window around the word in the ORIGINAL
-                    # text. One generic hit ("my target is higher") stays
-                    # under the actionable floor; a real discussion ("apple
-                    # crushed earnings, buying calls") clears it easily.
+                    # A name that boils down to common English words
+                    # ("target", "arm", "best buy"): no flat base --
+                    # confidence is earned from finance context in a window
+                    # around the phrase in the original text. One generic hit
+                    # ("my target is higher") stays under the actionable
+                    # floor; a real discussion ("apple crushed earnings,
+                    # buying calls") clears it easily.
                     confidence = _ambiguous_alias_confidence(text, alias)
-                    _consider(entry.symbol, confidence, entry.method, alias, alias)
+                    _consider(entry.symbol, confidence, entry.method, alias, window)
                 else:
                     base = _NAME_BASE if entry.method == "company_name" else _ALIAS_BASE
-                    _consider(entry.symbol, base, entry.method, alias, alias)
+                    _consider(entry.symbol, base, entry.method, alias, window)
 
         _resolve_bare_symbols(text, self._symbols, _consider)
 
@@ -297,8 +337,29 @@ class TickerResolver:
         return {post.external_id: self.resolve(post) for post in posts}
 
 
-def _window_text(text: str, start: int, end: int, radius: int = 40) -> str:
+def _window_text(text: str, start: int, end: int, radius: int = 120) -> str:
+    """Slice of ``text`` around a match.
+
+    The default radius sizes the window that becomes ``TickerMention.context``
+    -- the text the sentiment classifier scores in preference to the full
+    post. It must be wide enough to carry the sentiment-bearing clause, not
+    just the ticker itself; the confidence-scoring helpers that want a tight
+    window pass their own radius explicitly.
+    """
     return text[max(0, start - radius) : min(len(text), end + radius)]
+
+
+def _alias_window(text: str, alias: str) -> str:
+    """Context window around ``alias`` as it appears in the original text.
+
+    The alias was found in *normalised* text, so its raw spelling may differ
+    (punctuation, case). When it cannot be located, the full post text is the
+    honest fallback -- strictly more information than the alias string alone.
+    """
+    match = re.search(rf"\b{re.escape(alias)}\b", text, re.IGNORECASE)
+    if match is None:
+        return text
+    return _window_text(text, match.start(), match.end())
 
 
 #: Ambiguous single-word name aliases: base too low to act on alone, and each
@@ -312,16 +373,31 @@ _AMBIGUOUS_ALIAS_WINDOW = 60
 
 
 def _ambiguous_alias_confidence(text: str, alias: str) -> float:
-    """Context-earned confidence for a single-common-word name alias."""
+    """Context-earned confidence for a common-word name alias."""
     match = re.search(rf"\b{re.escape(alias)}\b", text, re.IGNORECASE)
     if match is None:
         # Normalisation found it but the raw text spells it differently
         # (e.g. punctuation split); be conservative.
         return _AMBIGUOUS_ALIAS_BASE
-    window = _window_text(text, match.start(), match.end(), radius=_AMBIGUOUS_ALIAS_WINDOW)
+    return _context_earned_confidence(text, match.start(), match.end())
+
+
+def _context_earned_confidence(
+    text: str, start: int, end: int, *, base: float = _AMBIGUOUS_ALIAS_BASE
+) -> float:
+    """Confidence earned from finance vocabulary near a match, atop ``base``.
+
+    Shared by every "this looks like ordinary English" path -- ambiguous name
+    aliases and lower-case cashtags of common words -- so all of them price
+    context identically: each distinct nearby finance term adds one step.
+    ``base`` sets how much the match's own shape is worth before context:
+    a bare common-word alias starts near zero, a lower-case cashtag higher
+    (the "$" itself is evidence).
+    """
+    window = _window_text(text, start, end, radius=_AMBIGUOUS_ALIAS_WINDOW)
     window_words = {w.strip(".,;:!?()[]'\"").lower() for w in window.split()}
     hits = len(window_words & FINANCE_CONTEXT_TERMS)
-    return _AMBIGUOUS_ALIAS_BASE + _AMBIGUOUS_ALIAS_STEP * min(hits, _AMBIGUOUS_ALIAS_MAX_HITS)
+    return base + _AMBIGUOUS_ALIAS_STEP * min(hits, _AMBIGUOUS_ALIAS_MAX_HITS)
 
 
 def _resolve_bare_symbols(text: str, symbols: set[str], consider: _ConsiderFn) -> None:

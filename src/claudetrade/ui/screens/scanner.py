@@ -69,8 +69,14 @@ def _render_controls(config, pipeline) -> None:
             with st.spinner("Fetching market data, social posts, and earnings..."):
                 try:
                     today = dt.datetime.now(dt.UTC).date()
-                    start = today - dt.timedelta(days=config.sentiment.lookback_days)
-                    result = pipeline.refresh(start=start, end=today)
+                    # 90 days of price history (context building needs 30+
+                    # bars); social sources bounded to the sentiment window.
+                    start = today - dt.timedelta(days=90)
+                    result = pipeline.refresh(
+                        start=start,
+                        end=today,
+                        social_lookback_hours=config.sentiment.lookback_days * 24,
+                    )
                     set_last_refresh_result(result)
                     st.success(
                         f"Refreshed: {result.universe_size} symbols, "
@@ -86,7 +92,11 @@ def _render_controls(config, pipeline) -> None:
             with st.spinner("Scanning universe for trading signals..."):
                 try:
                     today = dt.datetime.now(dt.UTC).date()
-                    result = pipeline.scan(today, lookback_days=config.sentiment.lookback_days)
+                    # The pipeline default (400 days) is the PRICE-history
+                    # window; passing the 14-day social lookback here starved
+                    # every context below MIN_CONTEXT_BARS and guaranteed an
+                    # empty scan from the UI.
+                    result = pipeline.scan(today)
                     if result.scan is not None:
                         set_last_scan_result(result.scan)
                         st.success(

@@ -493,8 +493,19 @@ class XConfig(BaseModel):
     cookie-session path even if cookies are configured).
     """
 
+    #: ``provider = "x"`` (the default, mirroring ``RedditConfig.provider =
+    #: "reddit"``) points at the live API/cookie-session adapter; with no
+    #: credentials configured it disables itself cleanly
+    #: (``NotConfiguredError``, logged, pipeline continues) -- never silently
+    #: fabricating sentiment. The previous ``"synthetic"`` default had the
+    #: exact footgun RedditConfig documents: combined with ``enabled = True``
+    #: it wrote seeded fake posts into a live install's aggregates (QA found
+    #: the fabricated ticker BLSH carrying engagement-weighted sentiment while
+    #: every real ticker read 0.0). Set ``provider = "synthetic"`` explicitly
+    #: for an offline/demo install, and run ``claudetrade db purge-synthetic``
+    #: to clear fabricated rows an old default left behind.
     enabled: bool = True
-    provider: str = "synthetic"
+    provider: str = "x"
     bearer_credential: str = "x_bearer_token"
     query_terms: list[str] = Field(default_factory=list)
     max_results_per_query: int = 100
@@ -817,7 +828,11 @@ class FilterConfig(BaseModel):
     exclude_binary_event_sectors: bool = False
     binary_event_sectors: list[str] = Field(default_factory=lambda: ["Biotechnology"])
 
-    min_unique_authors: int = 5
+    #: Kept equal to ``SentimentConfig.min_unique_authors_for_signal``: this
+    #: is the HARD veto layer for the same underlying adequacy question that
+    #: layer already answers softly, and a stricter value here silently
+    #: hard-failed samples the sentiment module itself considered adequate.
+    min_unique_authors: int = 4
     min_sentiment_confidence: float = 0.35
     max_manipulation_risk: float = 0.60
     max_annualised_volatility: float = 1.20

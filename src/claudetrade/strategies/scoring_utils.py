@@ -95,6 +95,14 @@ def percentile_rank(history: Sequence[float], value: float) -> float:
     values = [v for v in history if v == v]  # drop NaN (x != x is the NaN test)
     if not values:
         return 0.5
+    # A constant history equal to the value itself carries no ranking
+    # information, but "count <= value" would report 1.0 -- the TOP percentile
+    # for a value that is merely the same as every other observation. During
+    # the degenerate-sentiment incident every acceleration series was exactly
+    # 0.0, and this saturation silently awarded full percentile credit to
+    # dead-flat data. Neutral (0.5) is the honest answer.
+    if all(v == value for v in values):
+        return 0.5
     at_or_below = sum(1 for v in values if v <= value)
     return at_or_below / len(values)
 

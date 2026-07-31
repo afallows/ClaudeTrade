@@ -141,6 +141,17 @@ def next_trading_day(day: dt.date, *, skip: int = 1) -> dt.date:
     return cur
 
 
+def previous_trading_day(day: dt.date, *, skip: int = 1) -> dt.date:
+    """The ``skip``-th trading day strictly before ``day``."""
+    cur = day
+    remaining = skip
+    while remaining > 0:
+        cur -= dt.timedelta(days=1)
+        if is_trading_day(cur):
+            remaining -= 1
+    return cur
+
+
 def trading_days_between(start: dt.date, end: dt.date) -> int:
     """Count trading days in the half-open interval ``(start, end]``."""
     if end <= start:

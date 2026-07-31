@@ -108,7 +108,7 @@ store_author_names = false                # Store only salted hashes of username
 # this source stays cleanly disabled exactly as before. Set either flag to
 # false to explicitly opt out.
 enabled = true
-provider = "synthetic"                    # Options: synthetic (offline), x (requires API v2 or session cookies)
+provider = "x"                            # Options: x (live; disables itself cleanly without credentials), synthetic (offline demo only -- fabricates posts)
 bearer_credential = "x_bearer_token"      # Environment variable or keyring lookup name
 query_terms = []                          # Search terms, e.g. ["$AAPL", "Apple earnings"]
 max_results_per_query = 100
