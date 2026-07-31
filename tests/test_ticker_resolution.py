@@ -266,3 +266,78 @@ class TestResolverInitialization:
 
         resolver = TickerResolver(directory)
         assert resolver is not None
+
+
+class TestSlangCollisionAudit:
+    """Regression suite for the 2026-07-31 adversarial audit.
+
+    Before the generated common-words set and the ambiguous-alias path,
+    "IMO this market is overheated" resolved Imperial Oil at 0.80 and
+    "cost an ARM and a leg" minted three fake mentions. These cases pin
+    the fix: slang never reaches the actionable floor (0.35), real
+    mentions always do.
+    """
+
+    FLOOR = 0.35
+
+    @pytest.fixture()
+    def resolver(self):
+        names = [
+            ("IMO", "Imperial Oil Limited"),
+            ("DD", "DuPont de Nemours"),
+            ("ARM", "Arm Holdings"),
+            ("APP", "AppLovin"),
+            ("COST", "Costco Wholesale"),
+            ("AN", "AutoNation"),
+            ("TGT", "Target Corporation"),
+            ("AAPL", "Apple Inc."),
+            ("ORCL", "Oracle Corporation"),
+            ("NVDA", "NVIDIA Corporation"),
+        ]
+        return TickerResolver(
+            directory={s: SecurityInfo(symbol=s, name=n) for s, n in names}
+        )
+
+    def _confident(self, resolver, text):
+        post = SocialPost(
+            source=SocialSource.REDDIT,
+            external_id="audit",
+            created_at=dt.datetime(2026, 7, 30, tzinfo=dt.UTC),
+            text=text,
+            score=10,
+            author_hash="a",
+        )
+        return {
+            m.symbol for m in resolver.resolve(post) if m.confidence >= self.FLOOR
+        }
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "IMO this whole market is overheated, be careful out there",
+            "Just finished my DD, posting it tomorrow",
+            "IMO you need to do your own DD before buying ANYTHING",
+            "cost an ARM and a leg but worth it",
+            "download the APP and check it yourself",
+            "AN absolute steal at these prices",
+            "my target for this is way higher",
+            "an apple a day keeps the doctor away",
+            "the oracle of omaha says be fearful",
+        ],
+    )
+    def test_slang_never_actionable(self, resolver, text):
+        assert self._confident(resolver, text) == set()
+
+    @pytest.mark.parametrize(
+        ("text", "symbol"),
+        [
+            ("NVDA earnings next week, I'm long calls", "NVDA"),
+            ("Imperial Oil (IMO) crushed earnings, buying IMO at open", "IMO"),
+            ("$DD DuPont breaking out on volume, entered at 78", "DD"),
+            ("$ARM arm holdings earnings beat, buying calls", "ARM"),
+            ("apple crushed earnings, buying calls at open", "AAPL"),
+            ("target earnings beat, buying calls before the market open", "TGT"),
+        ],
+    )
+    def test_real_mentions_stay_actionable(self, resolver, text, symbol):
+        assert symbol in self._confident(resolver, text)

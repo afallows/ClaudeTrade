@@ -40,9 +40,35 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from claudetrade.domain import SecurityInfo, SocialPost, TickerMention
+from claudetrade.sentiment.common_words import COMMON_WORDS_AND_ACRONYMS
 from claudetrade.sentiment.lexicon import AMBIGUOUS_TICKER_WORDS, FINANCE_CONTEXT_TERMS
 
 log = logging.getLogger(__name__)
+
+
+def is_ambiguous_symbol(symbol: str) -> bool:
+    """Whether a symbol must take the ambiguous-mention path.
+
+    A live audit (2026-07-31) showed the hand-curated
+    ``AMBIGUOUS_TICKER_WORDS`` alone was nowhere near enough: "IMO this
+    market is overheated" resolved Imperial Oil at 0.80 and "cost an ARM and
+    a leg" minted three fake mentions (ARM, COST, AN) -- because IMO, DD,
+    ARM, COST, APP, NET, SHOP, KEY, AN, ... are all real >=$1B tickers AND
+    common words/acronyms. Whack-a-mole curation cannot keep up with a
+    2,400-symbol universe, so the generated
+    ``COMMON_WORDS_AND_ACRONYMS`` set (wordfreq top-30k, a corpus that
+    includes Reddit, plus curated finance/internet acronyms -- see
+    ``scripts/generate_common_words.py``) and every single-letter symbol are
+    ambiguous automatically. Ambiguous means DISCOUNTED, never blocked:
+    cashtags ($DD), company names ("DuPont"), and finance context ("bought
+    DD calls") still resolve confidently.
+    """
+    token = symbol.upper()
+    return (
+        len(token) <= 1
+        or token in AMBIGUOUS_TICKER_WORDS
+        or token in COMMON_WORDS_AND_ACRONYMS
+    )
 
 # --------------------------------------------------------------------------
 # Normalisation helpers
@@ -123,6 +149,11 @@ def _strip_apostrophes(word: str) -> str:
 class _AliasEntry:
     symbol: str
     method: str  # "company_name" | "alias"
+    #: The alias is a single common English word ("target", "arm", "apple"),
+    #: so a match must EARN confidence from nearby finance context instead of
+    #: receiving the flat name/alias base -- see the ambiguous-alias branch in
+    #: ``TickerResolver.resolve``.
+    ambiguous: bool = False
 
 
 @dataclass(slots=True)
@@ -161,7 +192,7 @@ class TickerResolver:
             # scoring below. Those symbols must go through the bare-symbol
             # path, which starts them at _BARE_BASE_AMBIGUOUS and makes them
             # earn confidence from surrounding finance context.
-            if symbol.upper() not in AMBIGUOUS_TICKER_WORDS:
+            if not is_ambiguous_symbol(symbol):
                 self._index_alias(normalise_company_name(symbol), symbol, "alias")
             if info.name:
                 self._index_alias(normalise_company_name(info.name), symbol, "company_name")
@@ -175,11 +206,24 @@ class TickerResolver:
     def _index_alias(self, normalised: str, symbol: str, method: str) -> None:
         if not normalised or len(normalised) < 2:
             return
+        # A company name that boils down to ONE common English word after
+        # legal-suffix stripping ("Arm Holdings" -> "arm", "Target Corp" ->
+        # "target", "Apple Inc" -> "apple") must not receive the flat
+        # name/alias base: "cost an arm and a leg" would resolve Arm Holdings
+        # at 0.80+, bypassing the ambiguity mechanism entirely (caught by a
+        # live audit, 2026-07-31). But such names ARE how humans reference
+        # those companies, so they are indexed with ``ambiguous=True`` and
+        # made to earn confidence from nearby finance context at match time
+        # rather than being dropped.
+        tokens = normalised.split()
+        ambiguous = len(tokens) == 1 and is_ambiguous_symbol(tokens[0])
         existing = self._alias_index.get(normalised)
         # First registration wins; company_name should not be clobbered by a
         # later, weaker alias of a different symbol sharing the same text.
         if existing is None:
-            self._alias_index[normalised] = _AliasEntry(symbol=symbol, method=method)
+            self._alias_index[normalised] = _AliasEntry(
+                symbol=symbol, method=method, ambiguous=ambiguous
+            )
         elif existing.symbol != symbol:
             log.debug(
                 "alias collision: %r already maps to %s, ignoring duplicate for %s",
@@ -226,8 +270,18 @@ class TickerResolver:
             # Whole-phrase containment on normalised text; word-boundary
             # guarded via padding so "on" doesn't match inside "iron".
             if f" {alias} " in f" {normalised_text} ":
-                base = _NAME_BASE if entry.method == "company_name" else _ALIAS_BASE
-                _consider(entry.symbol, base, entry.method, alias, alias)
+                if entry.ambiguous:
+                    # A single-common-word name ("target", "arm", "apple"):
+                    # no flat base -- confidence is earned from finance
+                    # context in a window around the word in the ORIGINAL
+                    # text. One generic hit ("my target is higher") stays
+                    # under the actionable floor; a real discussion ("apple
+                    # crushed earnings, buying calls") clears it easily.
+                    confidence = _ambiguous_alias_confidence(text, alias)
+                    _consider(entry.symbol, confidence, entry.method, alias, alias)
+                else:
+                    base = _NAME_BASE if entry.method == "company_name" else _ALIAS_BASE
+                    _consider(entry.symbol, base, entry.method, alias, alias)
 
         _resolve_bare_symbols(text, self._symbols, _consider)
 
@@ -247,6 +301,29 @@ def _window_text(text: str, start: int, end: int, radius: int = 40) -> str:
     return text[max(0, start - radius) : min(len(text), end + radius)]
 
 
+#: Ambiguous single-word name aliases: base too low to act on alone, and each
+#: distinct finance-context word in the window adds one step. One generic hit
+#: (0.34) deliberately lands just below the 0.35 sentiment-confidence floor;
+#: two or more hits clear it.
+_AMBIGUOUS_ALIAS_BASE = 0.22
+_AMBIGUOUS_ALIAS_STEP = 0.12
+_AMBIGUOUS_ALIAS_MAX_HITS = 4
+_AMBIGUOUS_ALIAS_WINDOW = 60
+
+
+def _ambiguous_alias_confidence(text: str, alias: str) -> float:
+    """Context-earned confidence for a single-common-word name alias."""
+    match = re.search(rf"\b{re.escape(alias)}\b", text, re.IGNORECASE)
+    if match is None:
+        # Normalisation found it but the raw text spells it differently
+        # (e.g. punctuation split); be conservative.
+        return _AMBIGUOUS_ALIAS_BASE
+    window = _window_text(text, match.start(), match.end(), radius=_AMBIGUOUS_ALIAS_WINDOW)
+    window_words = {w.strip(".,;:!?()[]'\"").lower() for w in window.split()}
+    hits = len(window_words & FINANCE_CONTEXT_TERMS)
+    return _AMBIGUOUS_ALIAS_BASE + _AMBIGUOUS_ALIAS_STEP * min(hits, _AMBIGUOUS_ALIAS_MAX_HITS)
+
+
 def _resolve_bare_symbols(text: str, symbols: set[str], consider: _ConsiderFn) -> None:
     """Scan for bare uppercase tokens that match the known symbol universe."""
     tokens = list(_TOKEN_RE.finditer(text))
@@ -263,7 +340,7 @@ def _resolve_bare_symbols(text: str, symbols: set[str], consider: _ConsiderFn) -
         if candidate not in symbols:
             continue
 
-        ambiguous = candidate in AMBIGUOUS_TICKER_WORDS
+        ambiguous = is_ambiguous_symbol(candidate)
         confidence = _BARE_BASE_AMBIGUOUS if ambiguous else _BARE_BASE_ORDINARY
 
         context_hits = _count_context_hits(tokens, idx)
