@@ -533,6 +533,32 @@ def get_ai_provider(config: AppConfig) -> AIProvider:
     return _NullAIProvider()
 
 
+def get_attention_providers(config: AppConfig) -> list:
+    """Construct the enabled attention providers.
+
+    Separate from :func:`get_social_providers` because these return
+    per-symbol mention tallies (``domain.SymbolAttention``), not posts --
+    see ``providers.social.apewisdom`` for why forcing an aggregator into
+    the post-shaped ``SocialProvider`` protocol would mean fabricating
+    authors and text. Same degradation posture as the social list: a source
+    that is disabled, missing, or misconfigured is skipped and the refresh
+    continues without it.
+    """
+    providers: list = []
+    if not config.apewisdom.enabled:
+        return providers
+    try:
+        from claudetrade.providers.social.apewisdom import ApeWisdomProvider
+
+        providers.append(ApeWisdomProvider(config.apewisdom))
+        log.info("loaded attention provider: apewisdom")
+    except ImportError:
+        log.debug("apewisdom provider module is not available; skipping")
+    except Exception as exc:
+        log.warning("failed to initialise attention provider 'apewisdom': %s", exc)
+    return providers
+
+
 def provider_status_report(config: AppConfig) -> list[ProviderStatus]:
     """Generate a status report for the dashboard.
 
@@ -577,6 +603,14 @@ def provider_status_report(config: AppConfig) -> list[ProviderStatus]:
     # Social providers.
     for provider in get_social_providers(config):
         statuses.append(provider.status())
+
+    # Attention providers (aggregate mention counts, not posts -- see
+    # ``get_attention_providers``). Reported alongside the social sources
+    # because that is where an operator looks to answer "is anything feeding
+    # sentiment?", and a silently-absent source is exactly what QA found
+    # with Stocktwits' empty watchlist.
+    for attention in get_attention_providers(config):
+        statuses.append(attention.status())
 
     # AI provider.
     ai = get_ai_provider(config)

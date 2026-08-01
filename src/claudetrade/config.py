@@ -654,6 +654,59 @@ class StocktwitsConfig(BaseModel):
     store_author_names: bool = False
 
 
+class ApeWisdomConfig(BaseModel):
+    """ApeWisdom aggregate mention counts for Reddit and 4chan.
+
+    A deliberately different *kind* of source from every other entry in this
+    section. Reddit/X/Stocktwits/news providers return individual posts that
+    this application then resolves tickers from and classifies. ApeWisdom
+    publishes the finished tally instead: per ticker, how many times a
+    community mentioned it and how many upvotes those mentions drew, plus
+    the same numbers 24h earlier. Free, keyless, and documented at
+    ``apewisdom.io/api``.
+
+    Two properties make it worth having despite carrying no post text:
+
+    * **Corpus reach.** It counts whole communities (all of r/wallstreetbets,
+      r/stocks, 4chan's /biz/) continuously. This application's own Reddit
+      and X fetches are narrow, rate-limited windows by comparison, and QA
+      found Stocktwits configured with an empty watchlist feeding nothing.
+    * **Tickers, pre-resolved.** Rows arrive as symbols, so nothing here goes
+      through the common-word entity resolution that kept minting ``AS``,
+      ``YOU`` and ``DAY`` from ordinary English (QA F25). This source
+      structurally cannot produce that class of junk.
+
+    What it explicitly does **not** carry is direction: a mention count says
+    people are talking, never what they are saying. These observations feed
+    the attention axis only and are stored under their own ``source`` labels
+    -- they never contribute to ``raw_sentiment``, ``bull_bear_ratio``, or
+    the combined ``"all"`` aggregate that strategies score against. See
+    ``domain.SymbolAttention`` and ``providers.social.apewisdom``.
+    """
+
+    enabled: bool = True
+    provider: str = "apewisdom"
+    base_url: str = "https://apewisdom.io/api/v1.0"
+    #: Which communities to pull, in ApeWisdom's own filter vocabulary.
+    #: ``all-stocks`` is its combined equity-subreddit tally (wallstreetbets,
+    #: stocks, investing, options, ...); ``4chan`` is the /biz/ board. Both
+    #: default on because the two populations differ enough that one is a
+    #: poor proxy for the other. Crypto-only filters are deliberately absent
+    #: -- this application screens US equities.
+    filters: list[str] = Field(default_factory=lambda: ["all-stocks", "4chan"])
+    #: Pages to walk per filter (100 tickers per page). Two pages covers the
+    #: names with enough chatter to matter; the long tail is single-digit
+    #: mention counts that ``min_mentions`` would discard anyway.
+    max_pages_per_filter: int = 2
+    #: Rows below this many mentions are dropped before storage. One or two
+    #: mentions is indistinguishable from noise and would otherwise dominate
+    #: the row count without informing anything.
+    min_mentions: int = 5
+    rate_limit_per_minute: int = 30
+    request_timeout_s: float = 20.0
+    user_agent: str = "claudetrade/0.1 (research; contact configured by operator)"
+
+
 class NewsConfig(BaseModel):
     """Publisher-syndicated RSS/Atom news feeds: a lawful, credential-free
     social-sentiment source.
@@ -1318,6 +1371,7 @@ class AppConfig(BaseSettings):
     reddit: RedditConfig = Field(default_factory=RedditConfig)
     x: XConfig = Field(default_factory=XConfig)
     stocktwits: StocktwitsConfig = Field(default_factory=StocktwitsConfig)
+    apewisdom: ApeWisdomConfig = Field(default_factory=ApeWisdomConfig)
     news: NewsConfig = Field(default_factory=NewsConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)

@@ -48,6 +48,7 @@ from claudetrade.domain import (
 from claudetrade.logging_setup import get_logger
 from claudetrade.providers.registry import (
     get_ai_provider,
+    get_attention_providers,
     get_earnings_provider,
     get_market_provider,
     get_social_providers,
@@ -105,6 +106,9 @@ class Pipeline:
         self.market = get_market_provider(config)
         self.earnings = get_earnings_provider(config)
         self.social = get_social_providers(config)
+        #: Aggregate mention-count sources (ApeWisdom); separate from
+        #: ``social`` because they yield per-symbol tallies, not posts.
+        self.attention = get_attention_providers(config)
         self.ai = get_ai_provider(config)
         self.ledger = SignalLedger(db)
         self.universe = UniverseSelector(config, db)
@@ -194,6 +198,7 @@ class Pipeline:
             market_provider=self.market,
             earnings_provider=self.earnings,
             social_providers=self.social,
+            attention_providers=self.attention,
             progress_callback=progress_callback,
         )
         report = ingestor.run_full_refresh(

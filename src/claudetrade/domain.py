@@ -412,6 +412,58 @@ class SentimentScores:
 
 
 @dataclass(slots=True)
+class SymbolAttention:
+    """How much a community is *talking about* one symbol -- not what it says.
+
+    Deliberately separate from :class:`SymbolSentiment` and from
+    :class:`SocialPost`. Aggregator sources (ApeWisdom, see
+    ``providers.social.apewisdom``) publish per-ticker mention and upvote
+    counts with no post text, no authors and no timestamps. Forcing them
+    into ``SocialPost`` would mean inventing all three, which is precisely
+    the fabricated-data failure the synthetic providers were removed for:
+    ``unique_authors``, ``bot_risk``, ``duplicate_ratio`` and
+    ``manipulation_risk`` are all computed *from* post-level identity and
+    text, so synthesising posts would not add attention data, it would
+    corrupt the manipulation model with confident-looking fiction.
+
+    Attention is also a strictly separate axis from polarity -- see
+    ``sentiment.aggregation``'s note that counting mentions toward
+    bullishness "is exactly the mistake this module exists to avoid". These
+    observations therefore carry no sentiment field at all: there is nothing
+    in a mention count that says which way anyone is leaning.
+
+    ``mentions_prev`` is the source's own trailing comparison (ApeWisdom's
+    ``mentions_24h_ago``); it is what makes an attention *change* readable
+    from a single fetch, without this application needing its own history of
+    a corpus it never sees.
+    """
+
+    symbol: str
+    community: str
+    mentions: int = 0
+    upvotes: int = 0
+    mentions_prev: int | None = None
+    rank: int | None = None
+    rank_prev: int | None = None
+    name: str = ""
+    observed_at: dt.datetime | None = None
+
+    @property
+    def mention_acceleration(self) -> float:
+        """Fractional change in mentions against the source's own baseline.
+
+        Clipped to the same +/-10 band ``sentiment.aggregation`` uses for its
+        post-rate version so the two are on one scale. ``None``/zero baseline
+        yields 0.0 rather than an invented infinity: a symbol appearing for
+        the first time has unknown acceleration, not infinite acceleration.
+        """
+        if not self.mentions_prev:
+            return 0.0
+        change = (self.mentions - self.mentions_prev) / self.mentions_prev
+        return max(-10.0, min(10.0, change))
+
+
+@dataclass(slots=True)
 class SymbolSentiment:
     """Aggregated, time-decayed sentiment for one symbol on one session."""
 

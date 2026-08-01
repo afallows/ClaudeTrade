@@ -269,24 +269,43 @@ def get_sentiment(pipeline: Pipeline, symbol: str, *, days: int = 7) -> dict[str
     }
 
 
-def get_trending(pipeline: Pipeline, *, limit: int = 20) -> dict[str, Any]:
+def get_trending(pipeline: Pipeline, *, limit: int = 20, source: str = "auto") -> dict[str, Any]:
     """Read-only. Symbols ranked by recent mention volume.
 
     No existing screen aggregates mention volume *across* symbols (the
     Screener/dashboard rank signals, not raw mention counts), so this sums
     ``symbol_sentiment_daily.post_count`` -- the same column
     ``ui.data_access.sentiment_timeline``/the ticker-detail sentiment panel
-    already reads -- across the source="all" combined rows (the same
-    aggregate ``sentiment_timeline``'s own default reads) over the last
-    ``DEFAULT_TRENDING_WINDOW_DAYS`` days, grouped by symbol. A read-only
-    aggregate query, not a new table or a write path.
+    already reads -- over the last ``DEFAULT_TRENDING_WINDOW_DAYS`` days,
+    grouped by symbol. A read-only aggregate query, not a new table or a
+    write path.
+
+    Args:
+        source: Which stored rows to rank.
+
+            * ``"auto"`` (default) prefers the ApeWisdom attention rows when
+              this installation has any in the window, and falls back to the
+              locally-derived ``"all"`` aggregate otherwise.
+            * ``"all"`` forces the locally-derived aggregate (posts this
+              application fetched and resolved itself).
+            * ``"apewisdom"`` forces the aggregator rows.
+
+            ``auto`` prefers ApeWisdom for two reasons, both of which QA hit
+            directly: its rows arrive as tickers, so they cannot contain the
+            common-word junk local extraction kept minting (AS/YOU/DAY --
+            F25), and it counts entire communities rather than the narrow,
+            rate-limited windows the local Reddit/X fetches see. The local
+            aggregate remains the fallback and the only source with polarity
+            -- ApeWisdom rows carry attention volume and nothing else, which
+            is why ``average_bull_bear_ratio`` reads as ``None`` for them
+            rather than a fabricated 1.0.
     """
     limit = max(1, min(int(limit), 200))
     end = utc_now().date()
     start = end - dt.timedelta(days=DEFAULT_TRENDING_WINDOW_DAYS)
 
-    with pipeline.db.read_session() as session:
-        rows = session.execute(
+    def _query(session, source_filter) -> list:
+        return session.execute(
             select(
                 SymbolSentimentDaily.symbol,
                 func.sum(SymbolSentimentDaily.post_count).label("mentions"),
@@ -302,7 +321,7 @@ def get_trending(pipeline: Pipeline, *, limit: int = 20) -> dict[str, Any]:
             # symbols that exist in the reference table rank.
             .join(Security, Security.symbol == SymbolSentimentDaily.symbol)
             .where(
-                SymbolSentimentDaily.source == "all",
+                source_filter,
                 SymbolSentimentDaily.session >= start,
                 SymbolSentimentDaily.session <= end,
             )
@@ -311,17 +330,55 @@ def get_trending(pipeline: Pipeline, *, limit: int = 20) -> dict[str, Any]:
             .limit(limit)
         ).all()
 
+    #: Attention rows are stored one per community (``apewisdom:4chan``,
+    #: ``apewisdom:all-stocks``), so ranking sums a symbol's mentions across
+    #: every community that named it.
+    apewisdom_filter = SymbolSentimentDaily.source.like("apewisdom:%")
+    local_filter = SymbolSentimentDaily.source == "all"
+
+    with pipeline.db.read_session() as session:
+        if source == "apewisdom":
+            rows, resolved = _query(session, apewisdom_filter), "apewisdom"
+        elif source == "all":
+            rows, resolved = _query(session, local_filter), "all"
+        else:
+            rows = _query(session, apewisdom_filter)
+            resolved = "apewisdom"
+            if not rows:
+                rows, resolved = _query(session, local_filter), "all"
+
+    # Attention rows have no polarity at all, so their bull/bear and
+    # confidence columns sit at their neutral defaults. Reporting those as
+    # numbers would read as "measured, and neutral" -- the exact
+    # misinterpretation QA drew from the all-1.0 ratios in v2/v3. ``None``
+    # says "not measured by this source", which is the truth.
+    attention_only = resolved == "apewisdom"
     symbols = [
         {
             "symbol": row.symbol,
             "mentions": int(row.mentions or 0),
-            "average_bull_bear_ratio": round(float(row.avg_bull_bear_ratio or 0.0), 4),
-            "average_confidence": round(float(row.avg_confidence or 0.0), 4),
+            "average_bull_bear_ratio": None
+            if attention_only
+            else round(float(row.avg_bull_bear_ratio or 0.0), 4),
+            "average_confidence": None
+            if attention_only
+            else round(float(row.avg_confidence or 0.0), 4),
             "latest_session": row.latest_session.isoformat() if row.latest_session else None,
         }
         for row in rows
     ]
-    return {"window_days": DEFAULT_TRENDING_WINDOW_DAYS, "count": len(symbols), "symbols": symbols}
+    return {
+        "window_days": DEFAULT_TRENDING_WINDOW_DAYS,
+        "count": len(symbols),
+        "source": resolved,
+        "note": (
+            "ApeWisdom aggregate mention counts across Reddit and 4chan -- attention "
+            "volume only, no sentiment direction (hence null bull/bear and confidence)."
+            if attention_only
+            else "Mention volume from posts this installation fetched and resolved itself."
+        ),
+        "symbols": symbols,
+    }
 
 
 def _market_session_state(now_et: dt.datetime) -> str:
@@ -725,14 +782,20 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
         description=(
             "Read-only. Symbols ranked by recent social mention volume "
             f"(last {DEFAULT_TRENDING_WINDOW_DAYS} days of stored daily sentiment "
-            "aggregates), most-mentioned first."
+            "aggregates), most-mentioned first. source='auto' (default) uses "
+            "ApeWisdom's Reddit/4chan mention counts when available -- broader "
+            "coverage, and pre-resolved tickers so ordinary English words can "
+            "never appear -- falling back to locally-resolved posts; 'all' forces "
+            "the local aggregate, 'apewisdom' forces the aggregator. ApeWisdom "
+            "rows carry attention volume only, so their bull/bear ratio and "
+            "confidence are null rather than a fabricated neutral value."
         ),
     )
-    async def _get_trending(limit: int = 20) -> dict[str, Any]:
+    async def _get_trending(limit: int = 20, source: str = "auto") -> dict[str, Any]:
         return await _call_bounded(
             "get_trending",
             config.mcp.tool_timeout_seconds,
-            lambda: get_trending(pipeline, limit=limit),
+            lambda: get_trending(pipeline, limit=limit, source=source),
         )
 
     @server.tool(

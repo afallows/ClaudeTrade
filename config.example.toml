@@ -179,6 +179,35 @@ rate_limit_per_minute = 3                 # 180/hour -- a working margin below t
 request_timeout_s = 20.0
 store_author_names = false
 
+[apewisdom]
+# ApeWisdom aggregate mention counts for Reddit and 4chan -- free, keyless,
+# documented at apewisdom.io/api.
+#
+# A different KIND of source from everything above. The providers above return
+# individual posts that this application resolves tickers from and classifies;
+# ApeWisdom publishes the finished tally instead (per ticker: mentions,
+# upvotes, and the same numbers 24h earlier). Two consequences:
+#
+#   * It carries ATTENTION ONLY, never direction. A mention count says people
+#     are talking, not what they are saying. These rows are stored under their
+#     own `apewisdom:<filter>` source labels and never contribute to the
+#     combined "all" aggregate that strategies score against, so this source
+#     cannot move a signal's score.
+#   * Its rows arrive as tickers, so they never pass through common-word
+#     entity resolution -- this source structurally cannot mint the AS/YOU/DAY
+#     junk that ordinary English produced in local extraction.
+#
+# It also keeps producing data when Reddit is rate-limited, X has no cookie
+# and the Stocktwits watchlist is empty, which is why it is not gated on them.
+enabled = true
+provider = "apewisdom"
+base_url = "https://apewisdom.io/api/v1.0"
+filters = ["all-stocks", "4chan"]         # ApeWisdom's own filter names; all-stocks = combined equity subreddits, 4chan = /biz/
+max_pages_per_filter = 2                  # 100 tickers per page; the tail is single-digit mention noise
+min_mentions = 5                          # Rows quieter than this are dropped before storage
+rate_limit_per_minute = 30
+request_timeout_s = 20.0
+
 [ai]
 # Optional LLM-assisted sentiment classification -- an ensemble ADJUNCT,
 # never the decision-maker. The system is fully functional with

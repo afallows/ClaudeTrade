@@ -1550,6 +1550,65 @@ source and also ends the cycle. This is exercised in
 reads; this adapter performs only that. Commercial or high-volume use may
 require Stocktwits' paid API tier and is out of scope here.
 
+### ApeWisdom -- Reddit + 4chan mention counts (Default, Live, No Credentials)
+
+**Module**: `src/claudetrade/providers/social/apewisdom.py`
+
+Reads [apewisdom.io](https://apewisdom.io/api)'s free, keyless JSON API, which
+counts how often each ticker is mentioned across a community in the last 24
+hours, alongside the same count 24 hours earlier.
+
+This is a different **kind** of source from every other entry in this section,
+and the difference matters more than the transport does.
+
+| | Post sources (Reddit, X, Stocktwits, News) | ApeWisdom |
+|---|---|---|
+| Returns | individual posts | per-ticker tallies |
+| Tickers | resolved here, from prose | already resolved upstream |
+| Direction | classified from text | **none — attention only** |
+| Corpus | narrow, rate-limited windows | whole communities, continuously |
+| Backfillable | yes, within provider limits | **no** — rolling 24h window, no history endpoint |
+
+**Why it is not a `SocialProvider`.** The protocol returns `SocialPost`
+objects. ApeWisdom has no post text, no authors and no timestamps, so
+implementing `fetch_posts` would mean inventing all three — and the invented
+values would not sit inertly: `unique_authors`, `duplicate_ratio`, `bot_risk`
+and `manipulation_risk` are all derived from post-level identity and text, so
+fabricated posts would feed the manipulation model confident-looking fiction.
+That is precisely the failure the synthetic providers were removed for. It
+implements `fetch_attention()` returning `domain.SymbolAttention` instead.
+
+**What it is good for.** Its rows are tickers, so it structurally cannot
+produce the common-word junk (`AS`, `YOU`, `DAY`) that local extraction minted
+out of ordinary English; it observes whole communities where the local Reddit
+and X fetches see narrow, rate-limited windows; and it keeps producing data
+when Reddit is rate-limited, X has no cookie, and the Stocktwits watchlist is
+empty. `get_trending`'s default `source="auto"` therefore prefers it and falls
+back to locally-resolved posts.
+
+**What it explicitly cannot tell you** is direction. Attention is a separate
+axis from polarity — `sentiment.aggregation` is explicit that counting
+mentions toward bullishness "is exactly the mistake this module exists to
+avoid". Stored rows use their own `apewisdom:<filter>` source labels and never
+write the combined `"all"` aggregate that strategies score against, so **this
+source cannot move a signal's score**. In `get_trending` its bull/bear ratio
+and confidence report as `null`, not as a neutral-looking `1.0`.
+
+**Privacy/licence**: aggregate counts only. No post text, no usernames, and no
+personal data is retrieved or stored.
+
+```toml
+[apewisdom]
+enabled = true
+filters = ["all-stocks", "4chan"]   # combined equity subreddits, and /biz/
+max_pages_per_filter = 2
+min_mentions = 5
+```
+
+Other filters ApeWisdom publishes include `wallstreetbets`, `stocks`,
+`options`, `investing`, and `stockmarket`; crypto-only filters are
+deliberately not defaults, since this application screens US equities.
+
 ### News RSS/Atom (Default, Live, No Credentials)
 
 **Module**: `src/claudetrade/providers/social/news_rss.py`

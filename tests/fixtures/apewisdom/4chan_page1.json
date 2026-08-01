@@ -1,0 +1,12 @@
+{
+  "_fixture_note": "Transcribed from ApeWisdom's published API schema (apewisdom.io/api) for the 4chan /biz/ filter; includes a malformed row and a row with no trailing baseline, both of which must be tolerated rather than abort the page.",
+  "count": 4,
+  "pages": 1,
+  "current_page": 1,
+  "results": [
+    {"rank": 1, "ticker": "MU", "name": "Micron Technology", "mentions": 96, "upvotes": 210, "rank_24h_ago": 1, "mentions_24h_ago": 96},
+    {"rank": 2, "ticker": "NVDA", "name": "NVIDIA", "mentions": 61, "upvotes": 140, "rank_24h_ago": null, "mentions_24h_ago": null},
+    {"rank": 3, "ticker": "", "name": "Malformed row with no ticker", "mentions": 55, "upvotes": 90},
+    "not-an-object"
+  ]
+}

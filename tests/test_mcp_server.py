@@ -272,13 +272,110 @@ def test_get_trending_respects_limit(pipeline: Pipeline, tmp_db: Database) -> No
     assert len(result["symbols"]) == 2
 
 
+def _seed_trending(tmp_db: Database, rows: list[tuple[str, str, int]]) -> None:
+    """``(symbol, source, post_count)`` rows for today, with securities."""
+    from claudetrade.db.models import Security
+
+    today = utc_now().date()
+    with tmp_db.session() as session:
+        for symbol in {r[0] for r in rows}:
+            session.merge(Security(symbol=symbol, name=symbol))
+        for symbol, source, count in rows:
+            session.add(
+                SymbolSentimentDaily(
+                    symbol=symbol, session=today, source=source, post_count=count
+                )
+            )
+
+
+def test_get_trending_auto_prefers_apewisdom_over_local_extraction(
+    pipeline: Pipeline, tmp_db: Database
+) -> None:
+    """ApeWisdom rows arrive as tickers, so they cannot carry the
+    common-word junk local extraction kept minting (QA F25). When both
+    exist, 'auto' ranks the aggregator's view."""
+    _seed_trending(
+        tmp_db,
+        [
+            ("AS", "all", 1741),  # the QA junk symbol, from local extraction
+            ("NVDA", "apewisdom:all-stocks", 812),
+            ("MU", "apewisdom:4chan", 96),
+        ],
+    )
+    result = mcp_server.get_trending(pipeline)
+
+    assert result["source"] == "apewisdom"
+    assert [row["symbol"] for row in result["symbols"]] == ["NVDA", "MU"]
+    assert "AS" not in {row["symbol"] for row in result["symbols"]}
+
+
+def test_get_trending_sums_a_symbol_across_communities(
+    pipeline: Pipeline, tmp_db: Database
+) -> None:
+    _seed_trending(
+        tmp_db,
+        [
+            ("MU", "apewisdom:all-stocks", 430),
+            ("MU", "apewisdom:4chan", 96),
+            ("NVDA", "apewisdom:all-stocks", 500),
+        ],
+    )
+    result = mcp_server.get_trending(pipeline)
+
+    assert [row["symbol"] for row in result["symbols"]] == ["MU", "NVDA"]
+    assert result["symbols"][0]["mentions"] == 526
+
+
+def test_get_trending_reports_null_polarity_for_attention_rows(
+    pipeline: Pipeline, tmp_db: Database
+) -> None:
+    """ApeWisdom measures no direction. Reporting its untouched column
+    defaults as numbers would read as 'measured, and neutral' -- exactly the
+    misreading QA drew from the all-1.0 bull/bear ratios."""
+    _seed_trending(tmp_db, [("NVDA", "apewisdom:4chan", 61)])
+    row = mcp_server.get_trending(pipeline)["symbols"][0]
+
+    assert row["average_bull_bear_ratio"] is None
+    assert row["average_confidence"] is None
+
+
+def test_get_trending_auto_falls_back_to_local_rows(
+    pipeline: Pipeline, tmp_db: Database
+) -> None:
+    """An installation with ApeWisdom disabled (or not yet refreshed) keeps
+    exactly its previous behaviour, polarity included."""
+    _seed_trending(tmp_db, [("AAPL", "all", 40)])
+    result = mcp_server.get_trending(pipeline)
+
+    assert result["source"] == "all"
+    assert [r["symbol"] for r in result["symbols"]] == ["AAPL"]
+    assert result["symbols"][0]["average_bull_bear_ratio"] is not None
+
+
+def test_get_trending_source_can_be_forced_either_way(
+    pipeline: Pipeline, tmp_db: Database
+) -> None:
+    _seed_trending(
+        tmp_db, [("AAPL", "all", 40), ("NVDA", "apewisdom:all-stocks", 812)]
+    )
+
+    local = mcp_server.get_trending(pipeline, source="all")
+    assert local["source"] == "all"
+    assert [r["symbol"] for r in local["symbols"]] == ["AAPL"]
+
+    aggregated = mcp_server.get_trending(pipeline, source="apewisdom")
+    assert aggregated["source"] == "apewisdom"
+    assert [r["symbol"] for r in aggregated["symbols"]] == ["NVDA"]
+
+
 def test_get_trending_empty_db_is_an_honest_empty_list(pipeline: Pipeline) -> None:
     result = mcp_server.get_trending(pipeline)
-    assert result == {
-        "window_days": mcp_server.DEFAULT_TRENDING_WINDOW_DAYS,
-        "count": 0,
-        "symbols": [],
-    }
+    assert result["count"] == 0
+    assert result["symbols"] == []
+    assert result["window_days"] == mcp_server.DEFAULT_TRENDING_WINDOW_DAYS
+    # With nothing stored under either source, 'auto' reports the local
+    # fallback rather than implying an aggregator answered.
+    assert result["source"] == "all"
 
 
 # --------------------------------------------------------------------------
@@ -687,7 +784,7 @@ def test_build_server_tool_schemas_match_the_documented_signatures(
 
     assert properties("get_signals") == {"min_score", "limit"}
     assert properties("get_sentiment") == {"symbol", "days"}
-    assert properties("get_trending") == {"limit"}
+    assert properties("get_trending") == {"limit", "source"}
     assert properties("get_market_status") == set()
     assert properties("run_scan") == set()
     assert properties("trigger_refresh") == set()
@@ -807,7 +904,12 @@ def test_a_slow_tool_does_not_wedge_the_server(
     tmp_app_config.mcp.tool_timeout_seconds = 1.0
     stuck = threading.Event()
 
-    def blocking_trending(_pipeline, *, limit=20):
+    # ``**_kw`` deliberately: pinning the real signature here makes this
+    # guard fail *open*. When get_trending later gained a ``source``
+    # argument, a fixed-signature stub raised TypeError instantly instead of
+    # blocking, so the tool returned promptly and this test would have
+    # reported the watchdog working while never exercising it.
+    def blocking_trending(_pipeline, **_kw):
         stuck.set()
         time.sleep(30.0)  # far past the deadline; never completes in-test
         return {}

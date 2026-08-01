@@ -158,6 +158,7 @@ class DataIngestor:
         market_provider=None,
         earnings_provider=None,
         social_providers=None,
+        attention_providers=None,
         progress_callback: ProgressCallback | None = None,
     ):
         self.config = config
@@ -165,6 +166,10 @@ class DataIngestor:
         self.market = market_provider
         self.earnings = earnings_provider
         self.social = list(social_providers or [])
+        #: Aggregate mention-count sources (ApeWisdom). Kept separate from
+        #: ``social`` because they return per-symbol tallies rather than
+        #: posts -- see ``providers.social.apewisdom``.
+        self.attention = list(attention_providers or [])
         self.checker = DataQualityChecker(config, db)
         #: Optional ``(phase, done, total)`` progress hook -- see
         #: ``webapi.routers.system``'s background refresh endpoint, the
@@ -1563,6 +1568,95 @@ class DataIngestor:
                         )
                         report.mentions_inserted += 1
 
+    def ingest_attention(
+        self, session_date: dt.date, report: IngestReport | None = None
+    ) -> int:
+        """Fetch aggregate mention counts and store them as attention rows.
+
+        Written into ``symbol_sentiment_daily`` under their own ``source``
+        labels (``apewisdom:all-stocks``, ``apewisdom:4chan``, ...), which is
+        what keeps them out of the strategy path: ``data.context.
+        _sentiment_for`` scores against the combined ``"all"`` row, and these
+        deliberately never write it. Nothing here can therefore move a
+        signal's score -- it adds a visible attention series (trending,
+        per-source breakdowns, diagnostics) without silently rewiring how
+        candidates are ranked.
+
+        Only the attention fields are populated. ``raw_sentiment``,
+        ``bull_bear_ratio`` and every other polarity column keep their
+        neutral defaults because the source carries no direction at all, and
+        ``unique_authors`` stays 0 because an aggregate tally genuinely does
+        not know how many distinct people spoke -- a guess there would feed
+        the manipulation model fiction. ``is_sufficient`` consequently reads
+        ``False`` for these rows, which is correct: they are not a
+        polarity sample.
+
+        Rows are only stored for symbols present in ``securities``, the same
+        guard ``mcp_server.get_trending`` applies -- an aggregator naming a
+        ticker this installation does not track is not evidence about
+        anything it screens.
+
+        Best-effort throughout: a provider failure is recorded on the report
+        and the refresh continues.
+        """
+        report = report or IngestReport()
+        if not self.attention:
+            return 0
+
+        observations: list = []
+        for provider in self.attention:
+            name = getattr(provider, "name", "attention")
+            try:
+                observations.extend(provider.fetch_attention())
+            except Exception as exc:
+                log.warning("attention provider %s failed: %s", name, exc)
+                report.provider_failures[name] = str(exc)
+        if not observations:
+            return 0
+
+        with self.db.read_session() as session:
+            known = {
+                row[0]
+                for row in session.execute(select(Security.symbol)).all()
+            }
+
+        written = 0
+        for chunk in _chunks(observations, PERSIST_CHUNK_ROWS):
+            with self.db.session() as session:
+                for obs in chunk:
+                    if obs.symbol not in known:
+                        continue
+                    source = f"apewisdom:{obs.community}"
+                    existing = (
+                        session.query(SymbolSentimentDaily)
+                        .filter_by(symbol=obs.symbol, session=session_date, source=source)
+                        .one_or_none()
+                    )
+                    row = existing or SymbolSentimentDaily(
+                        symbol=obs.symbol, session=session_date, source=source
+                    )
+                    row.post_count = obs.mentions
+                    row.total_engagement = float(obs.upvotes)
+                    row.mention_acceleration = obs.mention_acceleration
+                    row.labels = {
+                        "attention_only": 1.0,
+                        "rank": float(obs.rank) if obs.rank is not None else 0.0,
+                        "mentions_prev": float(obs.mentions_prev or 0),
+                    }
+                    row.computed_at = utc_now()
+                    if existing is None:
+                        session.add(row)
+                    written += 1
+
+        skipped = len(observations) - written
+        log.info(
+            "attention: stored %d row(s) for %s%s",
+            written,
+            session_date,
+            f"; {skipped} skipped (symbol not in the tracked universe)" if skipped else "",
+        )
+        return written
+
     def resolve_and_persist_mentions(
         self,
         posts: list[SocialPost],
@@ -1663,6 +1757,18 @@ class DataIngestor:
                 )
             self.resolve_and_persist_mentions(posts, reference, report)
             self._report_progress("sentiment", 1, 1)
+
+        # Attention runs independently of the post-level sources: it is the
+        # one sentiment-adjacent source that still produces data when Reddit
+        # is rate-limited, X has no cookie and Stocktwits' watchlist is empty
+        # (all three observed in QA), so gating it on ``self.social`` would
+        # throw away its main advantage. Keyed to the ET trading session
+        # because the API reports a rolling current 24h window with no
+        # history endpoint -- today's observation is only ever about today.
+        if self.attention:
+            self._report_progress("attention", 0, 1)
+            self.ingest_attention(current_trading_session(), report)
+            self._report_progress("attention", 1, 1)
 
         self.checker.persist(report.quality)
         report.finished_at = utc_now()
