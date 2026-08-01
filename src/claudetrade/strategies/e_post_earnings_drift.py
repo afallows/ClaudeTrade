@@ -97,7 +97,15 @@ class PostEarningsDriftStrategy(Strategy):
     def evaluate(self, ctx: StrategyContext) -> StrategyProposal | None:
         # --- hard vetoes ---------------------------------------------------
         if not self.has_sufficient_history(ctx):
-            self.decline(ctx, "insufficient_history", f"{len(ctx.bars)} bars")
+            self.decline(
+                ctx,
+                "insufficient_history",
+                f"{len(ctx.bars)} bars",
+                metrics={
+                    "bars_available": float(len(ctx.bars)),
+                    "bars_required": float(self.min_history_bars),
+                },
+            )
             return None
         adv = ctx.feature("avg_dollar_volume_20", 0.0)
         if adv < self.config.filters.min_avg_dollar_volume_usd:

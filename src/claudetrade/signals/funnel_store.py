@@ -68,6 +68,11 @@ def save(config: AppConfig, scan_result: ScanResult) -> None:
         "rejected_count": len(scan_result.rejected),
         "warnings": list(scan_result.warnings),
         "funnel": scan_result.funnel.to_dict(),
+        # Additive (QA F23.2): how much of the evaluated universe carried
+        # fresh sentiment this scan -- so a cross-process "why no picks?"
+        # reader can tell a warming-up sentiment store from a wired-and-
+        # bearish one. Older artifacts simply lack the key; readers .get() it.
+        "sentiment_coverage": dict(scan_result.sentiment_coverage),
     }
     path = artifact_path(config)
     try:

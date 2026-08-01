@@ -296,6 +296,14 @@ class StrategyRejection:
     symbol: str
     reason: str
     detail: str = ""
+    #: Optional structured numbers behind the human-readable ``detail`` --
+    #: e.g. ``{"bars_available": 3, "bars_required": 80}`` for an
+    #: ``insufficient_history`` decline. ``detail`` stays the display string;
+    #: this is what lets ``signals.engine.ScanFunnel`` aggregate *quantities*
+    #: per (strategy, reason) ("median 3/80 bars") instead of only counting
+    #: occurrences, without parsing prose. ``None`` (the default) means the
+    #: decline carries no structured numbers, exactly as before this field.
+    metrics: dict[str, float] | None = None
 
 
 class Strategy(ABC):
@@ -335,10 +343,31 @@ class Strategy(ABC):
 
     # --- helpers for subclasses ------------------------------------------
 
-    def decline(self, ctx: StrategyContext, reason: str, detail: str = "") -> None:
-        """Record why this symbol was passed over (diagnostics only)."""
+    def decline(
+        self,
+        ctx: StrategyContext,
+        reason: str,
+        detail: str = "",
+        metrics: dict[str, float] | None = None,
+    ) -> None:
+        """Record why this symbol was passed over (diagnostics only).
+
+        Args:
+            ctx: The context being declined.
+            reason: Stable, normalised reason code (what the funnel counts).
+            detail: Human-readable specifics with this candidate's own numbers.
+            metrics: Optional structured counterpart of ``detail`` (see
+                ``StrategyRejection.metrics``) so the funnel can aggregate the
+                numbers, not just the count.
+        """
         self._rejections.append(
-            StrategyRejection(strategy=self.name, symbol=ctx.symbol, reason=reason, detail=detail)
+            StrategyRejection(
+                strategy=self.name,
+                symbol=ctx.symbol,
+                reason=reason,
+                detail=detail,
+                metrics=metrics,
+            )
         )
 
     def drain_rejections(self) -> list[StrategyRejection]:
