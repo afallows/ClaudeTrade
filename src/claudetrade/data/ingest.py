@@ -21,17 +21,20 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from claudetrade.config import AppConfig
 from claudetrade.data.quality import DataQualityChecker, QualityReport
 from claudetrade.db.models import (
     CorporateActionRow,
     EarningsEventRow,
+    PaperTradeRow,
     PriceBar,
     Security,
+    SignalRow,
     SocialPostRow,
     SymbolAlias,
+    SymbolSentimentDaily,
     TickerMentionRow,
 )
 from claudetrade.db.session import Database
@@ -903,6 +906,116 @@ class DataIngestor:
 
     # --- social ---------------------------------------------------------------
 
+    def _social_symbol_hints(self, candidates: list[str] | None) -> list[str] | None:
+        """Per-cycle symbol priority hints for the social providers (QA F22).
+
+        Only ``StocktwitsProvider`` reads the ``symbols`` hint (its per-cycle
+        cap fetches the FIRST ``max_symbols_per_cycle`` entries); every other
+        social provider ignores it. With ``stocktwits.watchlist_symbols`` at
+        its default ``[]`` the hint used to be whatever order the universe
+        arrived in, so the capped budget was spent on an arbitrary
+        alphabetical-ish slice -- or, for callers passing no hint at all, on
+        nothing whatsoever. This method makes the empty-watchlist default
+        useful by seeding the front of the hint list from what the operator
+        demonstrably cares about, in priority order, deduped:
+
+        1. open paper-portfolio holdings (positions being actively tracked),
+        2. symbols from ledger signals over the last ~7 sessions,
+        3. top stored trending symbols by 7-day post volume -- restricted by
+           a ``securities`` join exactly like ``mcp_server.get_trending``,
+           so junk symbols from pre-fix extraction can never steer fetching
+           (and post-rebuild the stored rows are clean anyway).
+
+        The seed is capped at the Stocktwits per-cycle budget; the caller's
+        own candidates follow it so any remaining budget behaves exactly as
+        before. A configured NON-empty watchlist returns ``candidates``
+        untouched -- the operator's explicit list keeps the exact pre-change
+        behaviour (including the provider's own watchlist fallback when no
+        hint is passed). Read-only, best-effort: any query failure degrades
+        to the unseeded hint rather than failing a refresh over fetch
+        prioritisation.
+        """
+        if self.config.stocktwits.watchlist_symbols:
+            return candidates
+        try:
+            seeded = self._seed_social_symbols()
+        except Exception:
+            log.warning("social symbol-hint seeding failed; using unseeded hints", exc_info=True)
+            return candidates
+        if not seeded:
+            return candidates
+        log.info(
+            "stocktwits watchlist is empty; seeded %d priority symbol(s) for this "
+            "cycle from open positions / recent signals / stored trending: %s",
+            len(seeded),
+            ", ".join(seeded),
+        )
+        remainder = [s for s in (candidates or []) if s not in set(seeded)]
+        return seeded + remainder
+
+    def _seed_social_symbols(self) -> list[str]:
+        """The seed list itself: holdings, then recent signals, then trending.
+
+        Deduped preserving first (highest-priority) occurrence and capped to
+        ``stocktwits.max_symbols_per_cycle`` -- there is no point ranking
+        more names than the one provider that consumes the hint can fetch.
+        """
+        cap = max(0, self.config.stocktwits.max_symbols_per_cycle)
+        today = utc_now().date()
+        window_start = today - dt.timedelta(days=7)
+        with self.db.read_session() as session:
+            holdings = list(
+                session.execute(
+                    select(PaperTradeRow.symbol)
+                    .where(PaperTradeRow.exit_session.is_(None))
+                    .order_by(PaperTradeRow.entry_session.desc(), PaperTradeRow.symbol)
+                ).scalars()
+            )
+            # "Recent" is both senses at once: the last 7 distinct signal
+            # sessions, AND within the last 14 calendar days (~7 trading
+            # sessions plus weekend slack) -- a ledger idle for months must
+            # not keep steering the fetch budget toward long-expired ideas.
+            recent_sessions = list(
+                session.execute(
+                    select(SignalRow.session)
+                    .where(SignalRow.session >= today - dt.timedelta(days=14))
+                    .distinct()
+                    .order_by(SignalRow.session.desc())
+                    .limit(7)
+                ).scalars()
+            )
+            recent_signals: list[str] = []
+            if recent_sessions:
+                recent_signals = list(
+                    session.execute(
+                        select(SignalRow.symbol)
+                        .where(SignalRow.session.in_(recent_sessions))
+                        .order_by(SignalRow.session.desc(), SignalRow.overall_score.desc())
+                    ).scalars()
+                )
+            trending = list(
+                session.execute(
+                    select(SymbolSentimentDaily.symbol)
+                    # Same guard as mcp_server.get_trending: only symbols the
+                    # reference table knows may steer the fetch budget.
+                    .join(Security, Security.symbol == SymbolSentimentDaily.symbol)
+                    .where(
+                        SymbolSentimentDaily.source == "all",
+                        SymbolSentimentDaily.session >= window_start,
+                    )
+                    .group_by(SymbolSentimentDaily.symbol)
+                    .order_by(func.sum(SymbolSentimentDaily.post_count).desc())
+                    .limit(cap)
+                ).scalars()
+            )
+        seen: set[str] = set()
+        seeded: list[str] = []
+        for symbol in [*holdings, *recent_signals, *trending]:
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                seeded.append(symbol)
+        return seeded[:cap]
+
     def ingest_social(
         self,
         *,
@@ -923,8 +1036,14 @@ class DataIngestor:
         ``_fetch_social_posts_only``, on a background thread) while the
         market-data phases run, and only persists here-equivalent output
         once back on the main thread.
+
+        ``symbols`` is a fetch-priority hint (only Stocktwits consumes it);
+        with an empty configured Stocktwits watchlist it is seeded from open
+        positions / recent signals / stored trending first -- see
+        ``_social_symbol_hints``.
         """
         report = report or IngestReport()
+        symbols = self._social_symbol_hints(symbols)
         outcome = self._fetch_social_posts_only(since=since, until=until, symbols=symbols)
         report.provider_failures.update(outcome.provider_failures)
         posts = outcome.posts
@@ -1199,9 +1318,12 @@ class DataIngestor:
             # ahead of -- so the full candidate list is used here. Only
             # StocktwitsProvider actually reads `symbols` (as a fetch-priority
             # hint, internally capped); every other provider ignores it, so
-            # this does not change what gets fetched for them.
+            # this does not change what gets fetched for them. The hint is
+            # seeded (see ``_social_symbol_hints``) HERE, on the main thread,
+            # before the background fetch starts -- the fetch thread itself
+            # must never touch the database.
             social_thread, social_box = self._start_social_fetch(
-                since=since, until=until, symbols=list(symbols)
+                since=since, until=until, symbols=self._social_symbol_hints(list(symbols))
             )
 
         if securities:
