@@ -16,10 +16,11 @@ from __future__ import annotations
 from claudetrade.sentiment.aggregation import SentimentAggregator, time_decay_weight
 from claudetrade.sentiment.ai_classifier import AISentimentClassifier, InMemoryAICache
 from claudetrade.sentiment.classifiers import EnsembleSentimentClassifier, RuleSentimentClassifier
-from claudetrade.sentiment.entity_resolution import TickerResolver
+from claudetrade.sentiment.entity_resolution import EXTRACTION_VERSION, TickerResolver
 from claudetrade.sentiment.manipulation import ManipulationAssessment, ManipulationDetector
 
 __all__ = [
+    "EXTRACTION_VERSION",
     "AISentimentClassifier",
     "EnsembleSentimentClassifier",
     "InMemoryAICache",

@@ -1060,128 +1060,37 @@ def db_rebuild_sentiment(
     from the sanitised posts on disk, so one command brings the stored view
     in line with the current code. Ticker-mention provenance rows repopulate
     for newly fetched posts on subsequent refreshes.
+
+    Thin wrapper over ``sentiment.rebuild.rebuild_sentiment`` -- the same
+    core the bootstrap self-heal runs automatically when the stored
+    extraction version falls behind ``sentiment.EXTRACTION_VERSION``, so an
+    operator who never reads this help text is healed anyway; this command
+    remains for explicit/manual runs (e.g. a wider ``--days`` window).
     """
     cfg = _load(config)
-    import datetime as _dt
-
-    from sqlalchemy import delete, select
-
-    from claudetrade.db.models import (
-        Security,
-        SocialPostRow,
-        SymbolSentimentDaily,
-        TickerMentionRow,
-    )
     from claudetrade.db.session import get_database
-    from claudetrade.domain import SecurityInfo, SocialPost, SocialSource
-    from claudetrade.pipeline import Pipeline
-    from claudetrade.utils.timeutils import ensure_utc, utc_now
+    from claudetrade.sentiment.rebuild import RebuildUnavailableError, rebuild_sentiment
 
     db = get_database(cfg)
-    end = utc_now().date()
-    start = end - _dt.timedelta(days=days)
-    # Posts strictly older than the window cannot contribute to any rebuilt
-    # session (aggregation decay makes them weightless well before this), but
-    # the fetch is padded by the aggregation lookback so the earliest rebuilt
-    # sessions still see their own trailing context.
-    post_cutoff = _dt.datetime.combine(
-        start - _dt.timedelta(days=cfg.sentiment.lookback_days), _dt.time.min, tzinfo=_dt.UTC
-    )
-
-    def _read_utc(value: _dt.datetime) -> _dt.datetime:
-        # SQLite hands DateTime(timezone=True) columns back naive; every
-        # write went through ensure_utc, so re-attaching UTC reproduces the
-        # stored instant (same convention as signals.ledger's read path).
-        if value.tzinfo is None:
-            return value.replace(tzinfo=_dt.UTC)
-        return ensure_utc(value)
-
-    with db.session() as session:
-        securities = session.execute(select(Security)).scalars().all()
-        directory = {
-            r.symbol: SecurityInfo(
-                symbol=r.symbol,
-                name=r.name,
-                exchange=r.exchange,
-                sector=r.sector,
-                industry=r.industry,
-                market_cap_usd=r.market_cap_usd,
-                shares_outstanding=r.shares_outstanding,
-                is_etf=r.is_etf,
-                is_leveraged_or_inverse=r.is_leveraged_or_inverse,
-                listed_date=r.listed_date,
-                delisted_date=r.delisted_date,
-            )
-            for r in securities
-        }
-        if not directory:
-            # Checked BEFORE any delete: aborting must not leave the stored
-            # aggregates wiped with nothing rebuilt in their place.
-            typer.secho(
-                "No securities stored -- run 'claudetrade refresh' first.",
-                fg=typer.colors.RED,
-            )
-            raise typer.Exit(code=1)
-        # Datetime filtering happens in Python, after tz normalisation --
-        # comparing an aware bound against SQLite's naive storage in SQL is
-        # backend-dependent behaviour this maintenance command has no need
-        # to depend on.
-        post_rows = [
-            r
-            for r in session.execute(select(SocialPostRow)).scalars().all()
-            if _read_utc(r.created_at) >= post_cutoff
-        ]
-        posts = [
-            SocialPost(
-                source=SocialSource(r.source),
-                external_id=r.external_id,
-                created_at=_read_utc(r.created_at),
-                text=r.text,
-                community=r.community,
-                score=r.score,
-                num_comments=r.num_comments,
-                num_reposts=r.num_reposts,
-                num_replies=r.num_replies,
-                author_hash=r.author_hash,
-                author_age_days=r.author_age_days,
-                author_karma=r.author_karma,
-                author_followers=r.author_followers,
-                is_comment=r.is_comment,
-                parent_id=r.parent_id,
-                is_removed=r.is_removed,
-                is_crosspost=r.is_crosspost,
-                crosspost_parent=r.crosspost_parent,
-                text_hash=r.text_hash,
-                duplicate_group=r.duplicate_group,
-                injection_risk=r.injection_risk,
-                flair=r.flair,
-            )
-            for r in post_rows
-        ]
-        # Mentions are re-derivable diagnostics and are cleared wholesale;
-        # aggregates are only cleared inside the rebuild window, so history
-        # older than --days (whose posts may already be pruned) survives.
-        # Widen --days to reach further back.
-        mentions_deleted = session.execute(delete(TickerMentionRow)).rowcount
-        aggregates_deleted = session.execute(
-            delete(SymbolSentimentDaily).where(SymbolSentimentDaily.session >= start)
-        ).rowcount
-
-    pipeline = Pipeline(cfg, db)
-    rows_written = pipeline.build_sentiment(
-        posts=posts, directory=directory, start=start, end=end
-    )
+    try:
+        summary = rebuild_sentiment(cfg, db, days=days)
+    except RebuildUnavailableError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(code=1) from exc
     _echo_json(
         {
-            "posts_considered": len(posts),
-            "mentions_deleted": mentions_deleted,
-            "sentiment_aggregates_deleted": aggregates_deleted,
-            "sentiment_rows_rebuilt": rows_written,
+            "posts_considered": summary["posts_considered"],
+            "mentions_deleted": summary["mentions_deleted"],
+            "sentiment_aggregates_deleted": summary["sentiment_aggregates_deleted"],
+            "sentiment_rows_rebuilt": summary["sentiment_rows_rebuilt"],
+            "symbols_affected": summary["symbols_affected"],
         }
     )
     typer.secho(
-        f"Rebuilt {rows_written} sentiment row(s) from {len(posts)} stored post(s) "
-        f"(cleared {aggregates_deleted} stale aggregate(s), {mentions_deleted} stale mention(s)).",
+        f"Rebuilt {summary['sentiment_rows_rebuilt']} sentiment row(s) from "
+        f"{summary['posts_considered']} stored post(s) "
+        f"(cleared {summary['sentiment_aggregates_deleted']} stale aggregate(s), "
+        f"{summary['mentions_deleted']} stale mention(s)).",
         fg=typer.colors.GREEN,
     )
 

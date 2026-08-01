@@ -17,12 +17,16 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
 from claudetrade.db.models import Base, SchemaVersion
 from claudetrade.db.session import Database
+
+if TYPE_CHECKING:  # annotation-only; the hook imports lazily at call time
+    from claudetrade.config import AppConfig
 
 log = logging.getLogger(__name__)
 
@@ -292,10 +296,33 @@ def verify_schema(db: Database) -> list[str]:
     return sorted(expected - present)
 
 
-def init_database(db: Database) -> list[int]:
-    """Convenience: migrate to latest and assert the schema is complete."""
+def init_database(db: Database, config: AppConfig | None = None) -> list[int]:
+    """Migrate to latest, assert the schema is complete, then self-heal data.
+
+    Beyond schema migrations, this is also the seam for **stored-data fixes**
+    that a code upgrade makes necessary: every entry point (``Pipeline.
+    bootstrap`` -- CLI, web API, MCP server, UI -- and the bare CLI ``init``)
+    passes through here, so a fix hooked in below runs on the owner's next
+    command after a ``git pull`` with no runbook required.
+
+    Args:
+        db: Database handle.
+        config: Application config, when the caller has one. Optional so
+            schema-only callers (tests, ``claudetrade init``'s current call
+            shape) keep working; config-dependent data fixes simply defer
+            until a config-carrying bootstrap (``Pipeline.bootstrap`` passes
+            it) when it is absent.
+    """
     applied = migrate(db)
     missing = verify_schema(db)
     if missing:
         raise RuntimeError(f"schema incomplete after migration; missing tables: {missing}")
+    # Stored sentiment aggregates must have been built by the current
+    # extraction code (QA F25: junk common-word symbols and all-neutral
+    # ratios kept echoing out of symbol_sentiment_daily long after the
+    # extractor/classifier were fixed). Lazy import: the sentiment package
+    # (via pipeline) imports this module at load time.
+    from claudetrade.sentiment.rebuild import ensure_extraction_version
+
+    ensure_extraction_version(db, config)
     return applied

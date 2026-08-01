@@ -293,13 +293,24 @@ class RouterStrategy(Strategy):
 
 
 class HardVetoStrategy(RouterStrategy):
-    """Fires the strategy-stage hard-veto path (stage="strategy")."""
+    """Fires the strategy-stage hard-veto path (stage="strategy"), carrying
+    the same structured ``metrics`` the production strategies now attach to
+    their ``insufficient_history`` declines."""
 
     name = "hard_veto_stub"
     target_symbol = "VETO"
+    min_history_bars = 60
 
     def _act(self, ctx: StrategyContext) -> StrategyProposal | None:
-        self.decline(ctx, "insufficient_history", f"{len(ctx.bars)} bars")
+        self.decline(
+            ctx,
+            "insufficient_history",
+            f"{len(ctx.bars)} bars",
+            metrics={
+                "bars_available": float(len(ctx.bars)),
+                "bars_required": float(self.min_history_bars),
+            },
+        )
         return None
 
 
@@ -399,7 +410,7 @@ class TestScanFunnelEveryStage:
         engine = SignalEngine(cfg, strategies=strategies, generate_thesis=False)
 
         contexts = [
-            _ctx(cfg, "VETO"),
+            _ctx(cfg, "VETO", bars=3),  # 3 real bars: the metrics below cite them
             _ctx(cfg, "NEARSTRAT"),
             _ctx(cfg, "GATEFAIL"),
             _ctx(cfg, "SCOREFAIL"),
@@ -489,6 +500,30 @@ class TestScanFunnelEveryStage:
         assert gate_row.reason_codes == ["reward_risk_floor"]
         assert "reward:risk" in gate_row.reasons[0]
 
+        # --- F23.3: the insufficient_history bucket carries quantities -----
+        veto_metrics = funnel.metrics_by_strategy_reason["hard_veto_stub"]["insufficient_history"]
+        assert veto_metrics == {
+            "count": 1.0,
+            "bars_available": 3.0,
+            "bars_required": 60.0,
+        }
+        # ...and the log table renders them inline: "3 of WHAT" is answered.
+        assert any(
+            "insufficient_history=1 (median 3/60 bars)" in line
+            for line in funnel.table_lines()
+        )
+        # Reasons whose declines carry no metrics simply have no entry.
+        assert "gate_fail_stub" not in funnel.metrics_by_strategy_reason
+
+        # --- per-strategy requirements block: declared once per scan -------
+        assert funnel.strategy_requirements["hard_veto_stub"]["min_history_bars"] == 60
+        assert funnel.strategy_requirements["pass_stub"]["min_history_bars"] == 1
+
+        # --- F23.2: sentiment coverage for the evaluated session -----------
+        assert result.sentiment_coverage["symbols_evaluated"] == 7
+        assert result.sentiment_coverage["symbols_with_sentiment"] == 0
+        assert "warming up" in result.sentiment_coverage["note"]
+
     def test_limits_stage_fires_on_a_saturated_portfolio(self):
         """A portfolio already at the concurrent-position cap: the candidate
         sizes fine (no risk-budget issue) but ``check_new_position`` refuses
@@ -538,6 +573,160 @@ class TestScanFunnelEveryStage:
 
 
 # --------------------------------------------------------------------------
+# Quantitative rejection context (F23.3) + sentiment coverage (F23.2)
+# --------------------------------------------------------------------------
+
+
+class TestFunnelMetricsAggregation:
+    """``ScanFunnel.record(metrics=...)`` -> ``finalize()`` aggregation rules."""
+
+    def test_varying_samples_expand_constant_samples_collapse(self):
+        funnel = ScanFunnel()
+        for available in (1.0, 3.0, 12.0):
+            funnel.record(
+                strategy="s1",
+                reason_code="insufficient_history",
+                metrics={"bars_available": available, "bars_required": 60.0},
+            )
+        funnel.finalize()
+
+        summary = funnel.metrics_by_strategy_reason["s1"]["insufficient_history"]
+        assert summary == {
+            "count": 3.0,
+            "bars_required": 60.0,  # identical in every sample -> bare key
+            "bars_available_min": 1.0,
+            "bars_available_median": 3.0,
+            "bars_available_max": 12.0,
+        }
+        assert any(
+            "insufficient_history=3 (median 3/60 bars)" in line
+            for line in funnel.table_lines()
+        )
+
+    def test_metric_free_records_change_nothing(self):
+        funnel = ScanFunnel()
+        funnel.record(strategy="s1", reason_code="illiquid")
+        funnel.finalize()
+        assert funnel.metrics_by_strategy_reason == {}
+        assert funnel.table_lines()[1] == "  s1: 1 (illiquid=1)"
+
+    def test_to_dict_is_additive_over_the_previous_shape(self):
+        """The React RejectionFunnelPanel and stored artifacts read the
+        pre-existing keys; they must survive byte-for-byte, with the new
+        context under NEW keys only."""
+        funnel = ScanFunnel(top_n=5)
+        funnel.record(
+            strategy="s1",
+            reason_code="insufficient_history",
+            metrics={"bars_available": 3.0, "bars_required": 60.0},
+        )
+        funnel.strategy_requirements = {"s1": {"min_history_bars": 60}}
+        funnel.finalize()
+        payload = funnel.to_dict()
+
+        # The original contract, unchanged:
+        assert payload["top_n"] == 5
+        assert payload["total_rejections"] == 1
+        assert payload["by_reason"] == {"insufficient_history": 1}
+        assert payload["by_strategy_reason"] == {"s1": {"insufficient_history": 1}}
+        assert payload["near_misses"] == []
+        # The additive keys:
+        assert payload["metrics_by_strategy_reason"]["s1"]["insufficient_history"][
+            "bars_required"
+        ] == 60.0
+        assert payload["strategy_requirements"] == {"s1": {"min_history_bars": 60}}
+
+    def test_finalize_releases_the_raw_samples(self):
+        funnel = ScanFunnel()
+        funnel.record(
+            strategy="s1",
+            reason_code="insufficient_history",
+            metrics={"bars_available": 3.0},
+        )
+        funnel.finalize()
+        assert funnel._metric_samples == {}
+        assert funnel._metric_counts == {}
+
+
+class TestProductionStrategiesCarryMetrics:
+    """End to end with the real strategy classes: a 3-bar context makes every
+    production strategy decline ``insufficient_history`` with structured
+    numbers, and the funnel surfaces each strategy's own declared minimum --
+    so "insufficient_history (3/20)" is now "3 of sentiment_breakout's 80"."""
+
+    def test_short_history_scan_reports_available_vs_required(self):
+        from claudetrade.strategies.registry import build_strategies
+
+        cfg = AppConfig()
+        engine = SignalEngine(cfg, strategies=build_strategies(cfg), generate_thesis=False)
+        result = engine.scan([_ctx(cfg, "TINY", bars=3)], session=SESSION, regime=_regime())
+
+        metrics = result.funnel.metrics_by_strategy_reason
+        breakout = metrics["sentiment_breakout"]["insufficient_history"]
+        assert breakout["bars_available"] == 3.0
+        assert breakout["bars_required"] == 80.0
+        assert breakout["count"] == 1.0
+
+        # Every production strategy's declared minimum is surfaced once, so
+        # "is each minimum deliberate?" is answerable from scan output alone.
+        requirements = result.funnel.strategy_requirements
+        assert {
+            name: req["min_history_bars"] for name, req in requirements.items()
+        } == {
+            "sentiment_breakout": 80,
+            "sentiment_pullback": 100,
+            "capitulation_reversal": 100,
+            "hype_failure_short": 80,
+            "post_earnings_drift": 80,
+        }
+        # And each insufficient_history bucket cites ITS OWN strategy's bar.
+        for name, reasons in metrics.items():
+            summary = reasons.get("insufficient_history")
+            if summary is not None:
+                assert summary["bars_required"] == float(
+                    requirements[name]["min_history_bars"]
+                )
+
+
+class TestSentimentCoverage:
+    """F23.2: how much of the evaluated universe carried fresh sentiment."""
+
+    def test_mixed_coverage_is_counted(self):
+        import dataclasses
+
+        from claudetrade.domain import SymbolSentiment
+
+        cfg = _cfg()
+        engine = SignalEngine(cfg, strategies=[PassStrategy(cfg)], generate_thesis=False)
+        with_sentiment = _ctx(cfg, "PASS")
+        with_sentiment = dataclasses.replace(
+            with_sentiment,
+            sentiment=SymbolSentiment(symbol="PASS", session=SESSION, post_count=12),
+        )
+        without_sentiment = _ctx(cfg, "OTHER")
+
+        result = engine.scan(
+            [with_sentiment, without_sentiment], session=SESSION, regime=_regime()
+        )
+
+        assert result.sentiment_coverage == {
+            "symbols_with_sentiment": 1,
+            "symbols_evaluated": 2,
+            "note": (
+                "sentiment components score neutral for symbols without stored "
+                "sentiment (warming up)"
+            ),
+        }
+
+    def test_coverage_present_even_on_an_empty_scan(self):
+        cfg = _cfg()
+        engine = SignalEngine(cfg, strategies=[PassStrategy(cfg)], generate_thesis=False)
+        result = engine.scan([], session=SESSION, regime=_regime())
+        assert result.sentiment_coverage["symbols_evaluated"] == 0
+        assert result.sentiment_coverage["symbols_with_sentiment"] == 0
+
+
+# --------------------------------------------------------------------------
 # Cross-process persistence (signals.funnel_store)
 # --------------------------------------------------------------------------
 
@@ -558,6 +747,15 @@ class TestFunnelStore:
         assert loaded["rejected_count"] == 1
         assert loaded["funnel"]["by_reason"] == {"score_below_threshold": 1}
         assert loaded["funnel"]["near_misses"][0]["symbol"] == "SCOREFAIL"
+        # Additive context rides along for cross-process "why no picks?"
+        # readers: coverage of the sentiment warm-up plus each strategy's
+        # declared requirements.
+        assert loaded["sentiment_coverage"]["symbols_evaluated"] == 1
+        assert loaded["sentiment_coverage"]["symbols_with_sentiment"] == 0
+        assert loaded["funnel"]["strategy_requirements"]["score_fail_stub"][
+            "min_history_bars"
+        ] == 1
+        assert loaded["funnel"]["metrics_by_strategy_reason"] == {}
 
     def test_a_later_scan_overwrites_the_artifact(self, tmp_app_config: AppConfig):
         cfg = _cfg()

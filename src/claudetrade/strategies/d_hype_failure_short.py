@@ -105,7 +105,15 @@ class HypeFailureShortStrategy(Strategy):
             self.decline(ctx, "shorts_disabled")
             return None
         if not self.has_sufficient_history(ctx):
-            self.decline(ctx, "insufficient_history", f"{len(ctx.bars)} bars")
+            self.decline(
+                ctx,
+                "insufficient_history",
+                f"{len(ctx.bars)} bars",
+                metrics={
+                    "bars_available": float(len(ctx.bars)),
+                    "bars_required": float(self.min_history_bars),
+                },
+            )
             return None
         if self.earnings_blocked(ctx):
             self.decline(ctx, "earnings_window", f"{ctx.days_to_earnings()}d to earnings")

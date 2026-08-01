@@ -337,6 +337,73 @@ wait wedges the client. Other tool calls keep working while one is stuck.
    ```
    Synthetic data is guaranteed to produce signals.
 
+### Trending list shows common English words as tickers (AS, YOU, AN, DAY, ...)
+
+**Symptom**: `get_trending` (MCP) or the sentiment screens rank symbols like
+`AS`, `YOU`, `AN`, `DAY`, `NEXT`, `AM`, `REAL`, `CASH`, `TWO`, `WAY` at the top,
+typically with `bull_bear_ratio` of exactly `1.0` across the board.
+
+**Cause**: Not a live extraction bug — these are all *real* listings (Amer
+Sports, Clear Secure, AutoNation, Dayforce, NextDecade, Antero Midstream, The
+RealReal, Pathward, Two Harbors, Waystar), so the securities-table join cannot
+filter them out. What you are seeing is **stale stored aggregates**: rows in
+`symbol_sentiment_daily` written by an older extractor that resolved ordinary
+English into ticker mentions, plus an older classifier that scored everything
+neutral (which is what produces the tell-tale `bull_bear_ratio == 1.0`).
+`get_trending` sums the last 7 days of those stored rows, so old junk keeps
+surfacing long after the code was fixed.
+
+**Solution**: Nothing to do — this heals itself. Every entry point runs
+`init_database`, which compares the extraction version stamped in the database
+against the running code's `sentiment.EXTRACTION_VERSION` and, when stored
+aggregates predate it, rebuilds them from the posts already on disk. After a
+`git pull`, the next `claudetrade` command you run logs:
+
+```
+stored sentiment aggregates were built by extraction v1 < v2; rebuilding them
+from stored posts with the current resolver/classifier (offline aggregation --
+can take about a minute on a large database)...
+sentiment self-heal complete: rebuilt N aggregate row(s) across M symbol(s) ...
+```
+
+The rebuild is pure offline aggregation over stored posts — no network calls.
+To force one manually (e.g. over a wider window), run:
+
+```bash
+claudetrade db rebuild-sentiment --days 180
+```
+
+If the log instead says securities are not stored yet, run `claudetrade refresh`
+first; the rebuild runs automatically at the next start-up after that.
+
+### Stocktwits is "connected" but no Stocktwits posts appear
+
+**Symptom**: `claudetrade status` reports the Stocktwits source as available,
+but the database gains no posts from it.
+
+**Cause**: `stocktwits.watchlist_symbols` defaults to empty and the source is
+capped at `max_symbols_per_cycle` (20) requests per refresh, so with no
+configured watchlist there was nothing specific to fetch.
+
+**Solution**: Nothing to do by default — when the watchlist is empty the
+refresh now seeds each cycle's symbols automatically, in priority order:
+open paper-portfolio holdings, then symbols from recent ledger signals, then
+the top stored trending symbols (securities-join guarded). The seeded list is
+logged once per refresh:
+
+```
+stocktwits watchlist is empty; seeded 12 priority symbol(s) for this cycle
+from open positions / recent signals / stored trending: AAPL, NVDA, ...
+```
+
+To pin an explicit list instead — which disables the dynamic seeding entirely
+and keeps exactly the symbols you name — set:
+
+```toml
+[stocktwits]
+watchlist_symbols = ["AAPL", "NVDA", "TSLA"]
+```
+
 ### "win/loss ratio is degenerate"
 
 **Error**: Backtest produces high win rate but negative expectancy, flagged as suspicious.

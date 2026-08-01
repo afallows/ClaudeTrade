@@ -45,6 +45,26 @@ from claudetrade.sentiment.lexicon import AMBIGUOUS_TICKER_WORDS, FINANCE_CONTEX
 
 log = logging.getLogger(__name__)
 
+#: Version of the extraction pipeline (this resolver + the sentiment
+#: classifiers) whose output the stored ``symbol_sentiment_daily`` aggregates
+#: are allowed to have been built by. **Bump this integer whenever an
+#: entity-resolution or classifier change invalidates already-stored
+#: aggregates** -- i.e. whenever rows built by the previous code would now be
+#: *wrong*, not merely different (new ambiguity rules, confidence rescoring,
+#: a classifier polarity fix, ...). The stored aggregates outlive the code
+#: that wrote them: QA F14/F25 both found the trending list serving junk
+#: symbols (AS/YOU/DAY -- ordinary English resolved by a since-fixed
+#: extractor) and all-neutral ``bull_bear_ratio == 1.0`` rows long after the
+#: extractor and classifier were repaired, because nothing ever revisited the
+#: stored rows. ``sentiment.rebuild.ensure_extraction_version`` compares this
+#: constant against the version stamped in the database at every bootstrap
+#: and rebuilds stale aggregates from the stored posts automatically.
+#:
+#: History: 1 = everything before the common-words collision hardening
+#: (commit a3981ee) and the classifier polarity repair (b9fe566);
+#: 2 = both fixes in effect.
+EXTRACTION_VERSION = 2
+
 
 def is_ambiguous_symbol(symbol: str) -> bool:
     """Whether a symbol must take the ambiguous-mention path.
