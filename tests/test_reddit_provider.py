@@ -41,6 +41,7 @@ def _child(
     crosspost_parent: str | None = None,
     is_crosspostable: bool = True,
     removed_by_category: str | None = None,
+    link_flair_text: str | None = None,
 ) -> dict:
     """One Reddit listing child, shaped like the real API response."""
     data = {
@@ -54,6 +55,10 @@ def _child(
         "author": author,
         "is_crosspostable": is_crosspostable,
         "removed_by_category": removed_by_category,
+        # Reddit sends "" (not omitted) for a post with no flair set, same
+        # object as score/num_comments -- included unconditionally, like
+        # the real API, so tests can exercise both shapes.
+        "link_flair_text": link_flair_text if link_flair_text is not None else "",
     }
     if crosspost_parent:
         data["crosspost_parent"] = crosspost_parent
@@ -278,6 +283,69 @@ class TestFieldMapping:
         _install(monkeypatch, stub)
         posts = RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
         assert posts[0].is_removed is True
+
+
+class TestFlairCapture:
+    """``link_flair_text`` rides in the same listing payload as
+    score/num_comments; ``_to_post`` must capture it onto ``SocialPost.flair``
+    rather than discarding it as before."""
+
+    def test_flair_is_captured(self, reddit_config, credentials, monkeypatch):
+        stub = _RedditStub(
+            {"stocks": [_listing([_child("dd1", created=NOW, link_flair_text="DD")])]}
+        )
+        _install(monkeypatch, stub)
+        posts = RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+
+        assert len(posts) == 1
+        assert posts[0].flair == "DD"
+
+    def test_flair_preserves_original_case_and_text(
+        self, reddit_config, credentials, monkeypatch
+    ):
+        stub = _RedditStub(
+            {
+                "stocks": [
+                    _listing(
+                        [_child("yolo1", created=NOW, link_flair_text="YOLO \U0001f680")]
+                    )
+                ]
+            }
+        )
+        _install(monkeypatch, stub)
+        posts = RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+
+        assert posts[0].flair == "YOLO \U0001f680"
+
+    def test_missing_flair_is_none(self, reddit_config, credentials, monkeypatch):
+        """A post with no flair set (Reddit sends an empty string, not a
+        missing key) maps to ``None``, not ``""``."""
+        stub = _RedditStub({"stocks": [_listing([_child("nf1", created=NOW)])]})
+        _install(monkeypatch, stub)
+        posts = RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+
+        assert posts[0].flair is None
+
+    def test_flair_key_entirely_absent_is_none(self, reddit_config, credentials, monkeypatch):
+        """Defensive: even if a listing item omits the key altogether (some
+        third-party mirrors do), mapping degrades to ``None`` rather than
+        raising."""
+
+        class _NoFlairKeyStub(_RedditStub):
+            def handler(self, request: httpx.Request) -> httpx.Response:
+                response = super().handler(request)
+                if request.url.path in ("/r/stocks/new", "/r/stocks/new.json"):
+                    payload = response.json()
+                    for child in payload.get("data", {}).get("children", []):
+                        child["data"].pop("link_flair_text", None)
+                    return httpx.Response(200, json=payload)
+                return response
+
+        stub = _NoFlairKeyStub({"stocks": [_listing([_child("nk1", created=NOW)])]})
+        _install(monkeypatch, stub)
+        posts = RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+
+        assert posts[0].flair is None
 
 
 class TestRateLimiting:
@@ -537,6 +605,45 @@ class TestCookieSessionMode:
 
         RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
         assert stub.token_calls == 0
+
+    def test_has_token_v2_false_with_only_reddit_session(
+        self, reddit_config, cookie_credentials, monkeypatch
+    ):
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+        provider = RedditProvider(reddit_config)
+        assert provider.has_token_v2 is False
+
+    def test_single_cookie_backward_compatible_header(
+        self, reddit_config, cookie_credentials, monkeypatch
+    ):
+        """No token_v2 configured -- the Cookie header is unchanged from
+        before token_v2 support was added: reddit_session alone."""
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        RedditProvider(reddit_config).fetch_posts(since=NOW - dt.timedelta(days=1))
+        listing_calls = [r for r in stub.requests if "new.json" in r.url.path]
+        assert listing_calls[0].headers.get("cookie") == "reddit_session=owner-cookie-value"
+
+    def test_combined_cookie_header_with_token_v2(
+        self, reddit_config, cookie_credentials, monkeypatch
+    ):
+        """Both cookies configured -- the Cookie header combines them in
+        'reddit_session=...; token_v2=...' order, mirroring what a real
+        logged-in browser tab sends."""
+        monkeypatch.setenv("CLAUDETRADE_SECRET_REDDIT_TOKEN_V2", "owner-token-v2-value")
+        stub = _RedditStub({"stocks": [_listing([_child("a", created=NOW)])]})
+        _install(monkeypatch, stub)
+
+        provider = RedditProvider(reddit_config)
+        assert provider.has_token_v2 is True
+        provider.fetch_posts(since=NOW - dt.timedelta(days=1))
+        listing_calls = [r for r in stub.requests if "new.json" in r.url.path]
+        assert (
+            listing_calls[0].headers.get("cookie")
+            == "reddit_session=owner-cookie-value; token_v2=owner-token-v2-value"
+        )
 
 
 class TestModePriorityWithCookie:

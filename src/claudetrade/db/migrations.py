@@ -149,10 +149,32 @@ def _m003_performance_indexes(session: Session) -> None:
             log.warning("index creation skipped (%s): %s", bind.dialect.name, exc)
 
 
+def _m004_add_flair_column(session: Session) -> None:
+    """Add the nullable ``social_posts.flair`` column.
+
+    A brand-new database created via ``_m001_create_schema`` already has this
+    column -- ``Base.metadata.create_all`` always reflects the *current* ORM
+    model, ``flair`` included -- so this migration only does real work when
+    applied to a database that reached version 3 before the column existed.
+    Guarded by an inspector check so it is a no-op either way (fresh schema
+    or already-migrated database), matching the idempotence ``migrate()``
+    promises everywhere else.
+    """
+    bind = session.get_bind()
+    insp = inspect(bind)
+    if "social_posts" not in insp.get_table_names():
+        return
+    existing_columns = {col["name"] for col in insp.get_columns("social_posts")}
+    if "flair" in existing_columns:
+        return
+    session.execute(text("ALTER TABLE social_posts ADD COLUMN flair VARCHAR(80)"))
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_schema", _m001_create_schema, "Initial tables, indexes and constraints"),
     Migration(2, "immutability_triggers", _m002_immutability_triggers, "Append-only ledger guards"),
     Migration(3, "performance_indexes", _m003_performance_indexes, "Query indexes for scale"),
+    Migration(4, "add_flair_column", _m004_add_flair_column, "Nullable social_posts.flair column"),
 )
 
 LATEST_VERSION = max(m.version for m in MIGRATIONS)

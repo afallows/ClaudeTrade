@@ -1,0 +1,762 @@
+[
+ {
+  "volume": 166724,
+  "high": 10.55,
+  "low": 10.48,
+  "open": 10.55,
+  "close": 10.51,
+  "previousClose": 9.02,
+  "date": "2023-11-06T00:00:00",
+  "price": 8.97
+ },
+ {
+  "volume": 133511,
+  "high": 11.2,
+  "low": 11.1,
+  "open": 11.1,
+  "close": 11.17,
+  "previousClose": 9.53,
+  "date": "2023-11-20T00:00:00",
+  "price": 9.56
+ },
+ {
+  "volume": 219666,
+  "high": 11.64,
+  "low": 11.54,
+  "open": 11.56,
+  "close": 11.55,
+  "previousClose": 9.95,
+  "date": "2023-12-04T00:00:00",
+  "price": 9.89
+ },
+ {
+  "volume": 115913,
+  "high": 11.9,
+  "low": 11.84,
+  "open": 11.89,
+  "close": 11.87,
+  "previousClose": 10.19,
+  "date": "2023-12-18T00:00:00",
+  "price": 10.21
+ },
+ {
+  "volume": 407144,
+  "high": 11.99,
+  "low": 11.83,
+  "open": 11.84,
+  "close": 11.91,
+  "previousClose": 10.18,
+  "date": "2023-12-29T00:00:00",
+  "price": 10.24
+ },
+ {
+  "volume": 0,
+  "high": 11.99,
+  "low": 11.83,
+  "open": 11.84,
+  "close": 11.91,
+  "previousClose": 10.24,
+  "date": "2024-01-01T00:00:00",
+  "price": 10.24
+ },
+ {
+  "volume": 0,
+  "high": 11.85,
+  "low": 11.79,
+  "open": 11.8,
+  "close": 11.8,
+  "previousClose": 10.19,
+  "date": "2024-01-15T00:00:00",
+  "price": 10.19
+ },
+ {
+  "volume": 115778,
+  "high": 11.83,
+  "low": 11.65,
+  "open": 11.67,
+  "close": 11.83,
+  "previousClose": 10.08,
+  "date": "2024-01-29T00:00:00",
+  "price": 10.22
+ },
+ {
+  "volume": 69398,
+  "high": 12.0,
+  "low": 11.94,
+  "open": 11.96,
+  "close": 12.0,
+  "previousClose": 10.3,
+  "date": "2024-02-12T00:00:00",
+  "price": 10.36
+ },
+ {
+  "volume": 61780,
+  "high": 12.02,
+  "low": 11.87,
+  "open": 12.02,
+  "close": 11.88,
+  "previousClose": 10.42,
+  "date": "2024-02-26T00:00:00",
+  "price": 10.31
+ },
+ {
+  "volume": 74002,
+  "high": 12.18,
+  "low": 12.13,
+  "open": 12.18,
+  "close": 12.14,
+  "previousClose": 10.54,
+  "date": "2024-03-11T00:00:00",
+  "price": 10.53
+ },
+ {
+  "volume": 140856,
+  "high": 11.93,
+  "low": 11.9,
+  "open": 11.91,
+  "close": 11.9,
+  "previousClose": 10.42,
+  "date": "2024-03-25T00:00:00",
+  "price": 10.37
+ },
+ {
+  "volume": 96053,
+  "high": 11.9,
+  "low": 11.8,
+  "open": 11.83,
+  "close": 11.84,
+  "previousClose": 10.24,
+  "date": "2024-04-08T00:00:00",
+  "price": 10.32
+ },
+ {
+  "volume": 114998,
+  "high": 11.52,
+  "low": 11.45,
+  "open": 11.52,
+  "close": 11.48,
+  "previousClose": 10.08,
+  "date": "2024-04-22T00:00:00",
+  "price": 10.05
+ },
+ {
+  "volume": 100819,
+  "high": 11.73,
+  "low": 11.6,
+  "open": 11.6,
+  "close": 11.71,
+  "previousClose": 10.15,
+  "date": "2024-05-06T00:00:00",
+  "price": 10.25
+ },
+ {
+  "volume": 116543,
+  "high": 11.9,
+  "low": 11.83,
+  "open": 11.83,
+  "close": 11.86,
+  "previousClose": 10.44,
+  "date": "2024-05-20T00:00:00",
+  "price": 10.43
+ },
+ {
+  "volume": 56760,
+  "high": 11.79,
+  "low": 11.73,
+  "open": 11.78,
+  "close": 11.77,
+  "previousClose": 10.3,
+  "date": "2024-06-03T00:00:00",
+  "price": 10.35
+ },
+ {
+  "volume": 78741,
+  "high": 12.0,
+  "low": 11.94,
+  "open": 11.97,
+  "close": 11.96,
+  "previousClose": 10.57,
+  "date": "2024-06-17T00:00:00",
+  "price": 10.56
+ },
+ {
+  "volume": 69327,
+  "high": 12.1,
+  "low": 11.97,
+  "open": 12.08,
+  "close": 11.98,
+  "previousClose": 10.68,
+  "date": "2024-07-01T00:00:00",
+  "price": 10.58
+ },
+ {
+  "volume": 161995,
+  "high": 12.11,
+  "low": 12.03,
+  "open": 12.11,
+  "close": 12.05,
+  "previousClose": 10.75,
+  "date": "2024-07-15T00:00:00",
+  "price": 10.69
+ },
+ {
+  "volume": 101770,
+  "high": 12.07,
+  "low": 12.0,
+  "open": 12.01,
+  "close": 12.01,
+  "previousClose": 10.64,
+  "date": "2024-07-29T00:00:00",
+  "price": 10.65
+ },
+ {
+  "volume": 70082,
+  "high": 12.29,
+  "low": 12.21,
+  "open": 12.26,
+  "close": 12.25,
+  "previousClose": 10.87,
+  "date": "2024-08-12T00:00:00",
+  "price": 10.86
+ },
+ {
+  "volume": 53677,
+  "high": 12.39,
+  "low": 12.33,
+  "open": 12.38,
+  "close": 12.34,
+  "previousClose": 10.99,
+  "date": "2024-08-26T00:00:00",
+  "price": 10.99
+ },
+ {
+  "volume": 69107,
+  "high": 12.53,
+  "low": 12.4,
+  "open": 12.5,
+  "close": 12.51,
+  "previousClose": 11.11,
+  "date": "2024-09-09T00:00:00",
+  "price": 11.14
+ },
+ {
+  "volume": 67885,
+  "high": 12.9,
+  "low": 12.76,
+  "open": 12.9,
+  "close": 12.79,
+  "previousClose": 11.49,
+  "date": "2024-09-23T00:00:00",
+  "price": 11.44
+ },
+ {
+  "volume": 63027,
+  "high": 12.77,
+  "low": 12.65,
+  "open": 12.75,
+  "close": 12.67,
+  "previousClose": 11.36,
+  "date": "2024-10-07T00:00:00",
+  "price": 11.33
+ },
+ {
+  "volume": 55197,
+  "high": 12.74,
+  "low": 12.58,
+  "open": 12.73,
+  "close": 12.61,
+  "previousClose": 11.45,
+  "date": "2024-10-21T00:00:00",
+  "price": 11.33
+ },
+ {
+  "volume": 154834,
+  "high": 12.21,
+  "low": 12.11,
+  "open": 12.14,
+  "close": 12.13,
+  "previousClose": 10.9,
+  "date": "2024-11-04T00:00:00",
+  "price": 10.9
+ },
+ {
+  "volume": 128099,
+  "high": 12.17,
+  "low": 12.04,
+  "open": 12.17,
+  "close": 12.11,
+  "previousClose": 10.95,
+  "date": "2024-11-18T00:00:00",
+  "price": 10.93
+ },
+ {
+  "volume": 148642,
+  "high": 12.67,
+  "low": 12.53,
+  "open": 12.57,
+  "close": 12.61,
+  "previousClose": 11.37,
+  "date": "2024-12-02T00:00:00",
+  "price": 11.38
+ },
+ {
+  "volume": 183007,
+  "high": 12.36,
+  "low": 12.17,
+  "open": 12.31,
+  "close": 12.25,
+  "previousClose": 11.15,
+  "date": "2024-12-16T00:00:00",
+  "price": 11.11
+ },
+ {
+  "volume": 272523,
+  "high": 11.67,
+  "low": 11.59,
+  "open": 11.6,
+  "close": 11.65,
+  "previousClose": 10.52,
+  "date": "2024-12-30T00:00:00",
+  "price": 10.57
+ },
+ {
+  "volume": 111620,
+  "high": 11.72,
+  "low": 11.61,
+  "open": 11.71,
+  "close": 11.67,
+  "previousClose": 10.57,
+  "date": "2024-12-31T00:00:00",
+  "price": 10.59
+ },
+ {
+  "volume": 0,
+  "high": 11.72,
+  "low": 11.61,
+  "open": 11.71,
+  "close": 11.67,
+  "previousClose": 10.59,
+  "date": "2025-01-01T00:00:00",
+  "price": 10.59
+ },
+ {
+  "volume": 104160,
+  "high": 11.89,
+  "low": 11.79,
+  "open": 11.79,
+  "close": 11.87,
+  "previousClose": 10.64,
+  "date": "2025-01-15T00:00:00",
+  "price": 10.82
+ },
+ {
+  "volume": 65930,
+  "high": 12.08,
+  "low": 11.96,
+  "open": 12.03,
+  "close": 11.98,
+  "previousClose": 10.95,
+  "date": "2025-01-29T00:00:00",
+  "price": 10.92
+ },
+ {
+  "volume": 109059,
+  "high": 12.08,
+  "low": 11.98,
+  "open": 12.0,
+  "close": 12.07,
+  "previousClose": 11.08,
+  "date": "2025-02-12T00:00:00",
+  "price": 11.01
+ },
+ {
+  "volume": 108027,
+  "high": 12.1,
+  "low": 12.05,
+  "open": 12.07,
+  "close": 12.08,
+  "previousClose": 11.06,
+  "date": "2025-02-26T00:00:00",
+  "price": 11.07
+ },
+ {
+  "volume": 40367,
+  "high": 11.94,
+  "low": 11.85,
+  "open": 11.93,
+  "close": 11.89,
+  "previousClose": 10.9,
+  "date": "2025-03-12T00:00:00",
+  "price": 10.9
+ },
+ {
+  "volume": 70302,
+  "high": 11.77,
+  "low": 11.71,
+  "open": 11.76,
+  "close": 11.75,
+  "previousClose": 10.9,
+  "date": "2025-03-26T00:00:00",
+  "price": 10.82
+ },
+ {
+  "volume": 222782,
+  "high": 11.28,
+  "low": 10.84,
+  "open": 10.97,
+  "close": 11.22,
+  "previousClose": 10.17,
+  "date": "2025-04-09T00:00:00",
+  "price": 10.33
+ },
+ {
+  "volume": 109553,
+  "high": 11.12,
+  "low": 11.0,
+  "open": 11.05,
+  "close": 11.05,
+  "previousClose": 10.15,
+  "date": "2025-04-23T00:00:00",
+  "price": 10.23
+ },
+ {
+  "volume": 114092,
+  "high": 11.49,
+  "low": 11.35,
+  "open": 11.36,
+  "close": 11.44,
+  "previousClose": 10.52,
+  "date": "2025-05-07T00:00:00",
+  "price": 10.59
+ },
+ {
+  "volume": 51677,
+  "high": 11.6,
+  "low": 11.07,
+  "open": 11.25,
+  "close": 11.11,
+  "previousClose": 10.49,
+  "date": "2025-05-21T00:00:00",
+  "price": 10.34
+ },
+ {
+  "volume": 55254,
+  "high": 11.25,
+  "low": 11.14,
+  "open": 11.2,
+  "close": 11.18,
+  "previousClose": 10.43,
+  "date": "2025-06-04T00:00:00",
+  "price": 10.41
+ },
+ {
+  "volume": 148986,
+  "high": 11.23,
+  "low": 11.1,
+  "open": 11.2,
+  "close": 11.11,
+  "previousClose": 10.48,
+  "date": "2025-06-18T00:00:00",
+  "price": 10.4
+ },
+ {
+  "volume": 56871,
+  "high": 11.3,
+  "low": 11.22,
+  "open": 11.22,
+  "close": 11.3,
+  "previousClose": 10.51,
+  "date": "2025-07-02T00:00:00",
+  "price": 10.58
+ },
+ {
+  "volume": 72494,
+  "high": 11.09,
+  "low": 11.03,
+  "open": 11.08,
+  "close": 11.08,
+  "previousClose": 10.44,
+  "date": "2025-07-16T00:00:00",
+  "price": 10.42
+ },
+ {
+  "volume": 73785,
+  "high": 11.06,
+  "low": 11.01,
+  "open": 11.01,
+  "close": 11.04,
+  "previousClose": 10.37,
+  "date": "2025-07-30T00:00:00",
+  "price": 10.39
+ },
+ {
+  "volume": 28333,
+  "high": 11.28,
+  "low": 11.2,
+  "open": 11.26,
+  "close": 11.26,
+  "previousClose": 10.58,
+  "date": "2025-08-13T00:00:00",
+  "price": 10.6
+ },
+ {
+  "volume": 76451,
+  "high": 11.1,
+  "low": 11.03,
+  "open": 11.06,
+  "close": 11.06,
+  "previousClose": 10.44,
+  "date": "2025-08-27T00:00:00",
+  "price": 10.46
+ },
+ {
+  "volume": 108183,
+  "high": 11.63,
+  "low": 11.5,
+  "open": 11.5,
+  "close": 11.62,
+  "previousClose": 10.85,
+  "date": "2025-09-10T00:00:00",
+  "price": 10.99
+ },
+ {
+  "volume": 132288,
+  "high": 11.7,
+  "low": 11.61,
+  "open": 11.7,
+  "close": 11.64,
+  "previousClose": 11.17,
+  "date": "2025-09-24T00:00:00",
+  "price": 11.07
+ },
+ {
+  "volume": 72450,
+  "high": 11.76,
+  "low": 11.71,
+  "open": 11.74,
+  "close": 11.76,
+  "previousClose": 11.11,
+  "date": "2025-10-08T00:00:00",
+  "price": 11.18
+ },
+ {
+  "volume": 130699,
+  "high": 11.83,
+  "low": 11.78,
+  "open": 11.8,
+  "close": 11.78,
+  "previousClose": 11.31,
+  "date": "2025-10-22T00:00:00",
+  "price": 11.26
+ },
+ {
+  "volume": 157429,
+  "high": 11.84,
+  "low": 11.73,
+  "open": 11.81,
+  "close": 11.79,
+  "previousClose": 11.25,
+  "date": "2025-11-05T00:00:00",
+  "price": 11.27
+ },
+ {
+  "volume": 91473,
+  "high": 11.77,
+  "low": 11.7,
+  "open": 11.72,
+  "close": 11.7,
+  "previousClose": 11.29,
+  "date": "2025-11-19T00:00:00",
+  "price": 11.24
+ },
+ {
+  "volume": 208296,
+  "high": 11.7,
+  "low": 11.59,
+  "open": 11.61,
+  "close": 11.68,
+  "previousClose": 11.18,
+  "date": "2025-12-03T00:00:00",
+  "price": 11.22
+ },
+ {
+  "volume": 207398,
+  "high": 11.7,
+  "low": 11.63,
+  "open": 11.69,
+  "close": 11.7,
+  "previousClose": 11.2,
+  "date": "2025-12-17T00:00:00",
+  "price": 11.24
+ },
+ {
+  "volume": 213381,
+  "high": 11.76,
+  "low": 11.64,
+  "open": 11.76,
+  "close": 11.74,
+  "previousClose": 11.31,
+  "date": "2025-12-31T00:00:00",
+  "price": 11.33
+ },
+ {
+  "volume": 0,
+  "high": 11.76,
+  "low": 11.64,
+  "open": 11.76,
+  "close": 11.74,
+  "previousClose": 11.33,
+  "date": "2026-01-01T00:00:00",
+  "price": 11.33
+ },
+ {
+  "volume": 154991,
+  "high": 12.0,
+  "low": 11.94,
+  "open": 11.98,
+  "close": 11.94,
+  "previousClose": 11.56,
+  "date": "2026-01-15T00:00:00",
+  "price": 11.53
+ },
+ {
+  "volume": 88661,
+  "high": 11.93,
+  "low": 11.81,
+  "open": 11.92,
+  "close": 11.91,
+  "previousClose": 11.56,
+  "date": "2026-01-29T00:00:00",
+  "price": 11.55
+ },
+ {
+  "volume": 722838,
+  "high": 11.79,
+  "low": 11.65,
+  "open": 11.73,
+  "close": 11.67,
+  "previousClose": 11.41,
+  "date": "2026-02-12T00:00:00",
+  "price": 11.38
+ },
+ {
+  "volume": 292620,
+  "high": 11.93,
+  "low": 11.88,
+  "open": 11.9,
+  "close": 11.9,
+  "previousClose": 11.56,
+  "date": "2026-02-26T00:00:00",
+  "price": 11.6
+ },
+ {
+  "volume": 263477,
+  "high": 11.79,
+  "low": 11.73,
+  "open": 11.75,
+  "close": 11.74,
+  "previousClose": 11.47,
+  "date": "2026-03-12T00:00:00",
+  "price": 11.45
+ },
+ {
+  "volume": 457700,
+  "high": 11.49,
+  "low": 11.33,
+  "open": 11.46,
+  "close": 11.36,
+  "previousClose": 11.26,
+  "date": "2026-03-26T00:00:00",
+  "price": 11.13
+ },
+ {
+  "volume": 547590,
+  "high": 11.8,
+  "low": 11.62,
+  "open": 11.69,
+  "close": 11.8,
+  "previousClose": 11.46,
+  "date": "2026-04-09T00:00:00",
+  "price": 11.56
+ },
+ {
+  "volume": 184530,
+  "high": 11.83,
+  "low": 11.77,
+  "open": 11.82,
+  "close": 11.78,
+  "previousClose": 11.61,
+  "date": "2026-04-23T00:00:00",
+  "price": 11.6
+ },
+ {
+  "volume": 257263,
+  "high": 11.9,
+  "low": 11.82,
+  "open": 11.9,
+  "close": 11.86,
+  "previousClose": 11.68,
+  "date": "2026-05-07T00:00:00",
+  "price": 11.68
+ },
+ {
+  "volume": 304728,
+  "high": 11.47,
+  "low": 11.37,
+  "open": 11.45,
+  "close": 11.41,
+  "previousClose": 11.32,
+  "date": "2026-05-21T00:00:00",
+  "price": 11.3
+ },
+ {
+  "volume": 352449,
+  "high": 11.75,
+  "low": 11.69,
+  "open": 11.7,
+  "close": 11.7,
+  "previousClose": 11.54,
+  "date": "2026-06-04T00:00:00",
+  "price": 11.58
+ },
+ {
+  "volume": 349903,
+  "high": 11.77,
+  "low": 11.66,
+  "open": 11.72,
+  "close": 11.73,
+  "previousClose": 11.59,
+  "date": "2026-06-18T00:00:00",
+  "price": 11.67
+ },
+ {
+  "volume": 428099,
+  "high": 12.0,
+  "low": 11.84,
+  "open": 11.96,
+  "close": 11.92,
+  "previousClose": 11.85,
+  "date": "2026-07-02T00:00:00",
+  "price": 11.86
+ },
+ {
+  "volume": 337483,
+  "high": 11.87,
+  "low": 11.75,
+  "open": 11.87,
+  "close": 11.84,
+  "previousClose": 11.87,
+  "date": "2026-07-16T00:00:00",
+  "price": 11.84
+ },
+ {
+  "volume": 290895,
+  "high": 11.62,
+  "low": 11.51,
+  "open": 11.54,
+  "close": 11.54,
+  "previousClose": 11.5,
+  "date": "2026-07-29T00:00:00",
+  "price": 11.54
+ }
+]

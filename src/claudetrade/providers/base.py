@@ -19,8 +19,10 @@ from __future__ import annotations
 import datetime as dt
 import threading
 import time
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from claudetrade.domain import (
     Bar,
@@ -143,6 +145,58 @@ class RateLimiter:
     def reset(self) -> None:
         with self._lock:
             self._next_allowed = 0.0
+
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+def parallel_map(
+    items: Iterable[_T], fn: Callable[[_T], _R], *, max_workers: int = 8
+) -> dict[_T, _R]:
+    """Run ``fn(item)`` for every ``item``, across up to ``max_workers`` threads.
+
+    This is the mechanism behind item 2 of the parallel-fetch change: adapters
+    with a per-symbol fetch loop (``TipRanksProvider``, ``YahooMarketProvider``)
+    use this instead of a plain serial ``for`` loop so that, for a batch of
+    thousands of symbols, one symbol's network round-trip overlaps another's
+    rate-limiter wait rather than the two being paid for back-to-back. Actual
+    throughput is still capped by each adapter's own ``RateLimiter`` -- shared
+    across every worker thread here, since ``RateLimiter.acquire()`` is itself
+    thread-safe (see its docstring) -- so this changes *how much of the wall
+    clock is spent waiting on the network* and does not itself raise the
+    enforced calls/minute ceiling.
+
+    ``items`` must be hashable and unique; the return value is keyed by the
+    original item, not insertion order, so a caller iterating a *different*
+    ordering of the same items afterwards still gets the right result per item.
+
+    Falls back to a plain serial loop when ``max_workers <= 1`` or there is at
+    most one item -- no thread-pool overhead for the common small-batch case,
+    and a trivially reviewable non-concurrent code path.
+
+    If ``fn`` raises for any item, every not-yet-started submission is
+    cancelled (already-running ones are left to finish rather than killed
+    mid-request) and the exception is re-raised once the pool has wound down --
+    matching the pre-parallel behaviour where the first per-symbol exception
+    aborted the rest of the batch (e.g. ADR-0008 Decision 1's fail-closed rule
+    for a genuine block/challenge signal).
+    """
+    item_list = list(items)
+    if max_workers <= 1 or len(item_list) <= 1:
+        return {item: fn(item) for item in item_list}
+
+    results: dict[_T, _R] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_item = {pool.submit(fn, item): item for item in item_list}
+        try:
+            for future in as_completed(future_to_item):
+                results[future_to_item[future]] = future.result()
+        except BaseException:
+            for pending in future_to_item:
+                pending.cancel()
+            raise
+    return results
 
 
 @runtime_checkable

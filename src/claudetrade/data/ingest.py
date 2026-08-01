@@ -17,6 +17,8 @@ with its defects labelled.
 from __future__ import annotations
 
 import datetime as dt
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from sqlalchemy import select
@@ -46,6 +48,11 @@ from claudetrade.sentiment.entity_resolution import TickerResolver
 from claudetrade.utils.timeutils import ensure_utc, utc_now
 
 log = get_logger(__name__)
+
+#: ``(phase, symbols_done, symbols_total) -> None`` -- see
+#: ``DataIngestor.progress_callback``. Never required to succeed: a raising
+#: callback is caught and logged, never allowed to break ingestion itself.
+ProgressCallback = Callable[[str, int, int], None]
 
 
 @dataclass(slots=True)
@@ -86,6 +93,23 @@ class IngestReport:
         }
 
 
+@dataclass(slots=True)
+class _SocialFetchOutcome:
+    """Result of the network-only social fetch.
+
+    Produced entirely on the background fetch thread (see
+    ``DataIngestor._start_social_fetch``) and handed to the main thread only
+    after ``Thread.join()`` returns -- a single-writer-then-single-reader
+    handoff with no field ever touched by both threads at once. This is what
+    keeps SQLite writes single-threaded even though the *fetch* now overlaps
+    the market-data phases: nothing here is persisted until it is back on
+    the main thread, in ``DataIngestor._join_social_fetch``.
+    """
+
+    posts: list[SocialPost] = field(default_factory=list)
+    provider_failures: dict[str, str] = field(default_factory=dict)
+
+
 class DataIngestor:
     """Pulls from providers and persists into the database."""
 
@@ -97,6 +121,7 @@ class DataIngestor:
         market_provider=None,
         earnings_provider=None,
         social_providers=None,
+        progress_callback: ProgressCallback | None = None,
     ):
         self.config = config
         self.db = db
@@ -104,6 +129,19 @@ class DataIngestor:
         self.earnings = earnings_provider
         self.social = list(social_providers or [])
         self.checker = DataQualityChecker(config, db)
+        #: Optional ``(phase, done, total)`` progress hook -- see
+        #: ``webapi.routers.system``'s background refresh endpoint, the
+        #: caller that actually uses this. The CLI's ``claudetrade refresh``
+        #: passes none and is unaffected.
+        self.progress_callback = progress_callback
+
+    def _report_progress(self, phase: str, done: int, total: int) -> None:
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback(phase, done, total)
+        except Exception:
+            log.debug("progress callback raised; ignored", exc_info=True)
 
     # --- reference data ---------------------------------------------------
 
@@ -249,7 +287,30 @@ class DataIngestor:
         ``UniverseSelector.for_session`` later enforces the ADR-0008
         Decision 3 ">= $1B" floor against.
         """
-        securities = self.enrich_market_caps(securities, report)
+        self._report_progress("securities", 0, len(securities))
+        # The cap-enrichment pass below is the ~40-minute part of a first
+        # refresh, and enrich_market_caps only returns when it is entirely
+        # done -- so without a per-symbol hook the progress surface (webapi
+        # refresh-status, hence the UI banner) sits at 0/N the whole time
+        # while the provider's own console log counts up normally. Providers
+        # that expose ``on_symbol_progress`` (currently TipRanksProvider)
+        # get wired to the same callback for the duration of this phase.
+        hooked = [
+            p for p in self._market_cap_sources() if hasattr(p, "on_symbol_progress")
+        ]
+        total = len(securities)
+
+        def _symbol_progress(done: int, _provider_total: int) -> None:
+            self._report_progress("securities", min(done, total), total)
+
+        for provider in hooked:
+            provider.on_symbol_progress = _symbol_progress
+        try:
+            securities = self.enrich_market_caps(securities, report)
+        finally:
+            for provider in hooked:
+                provider.on_symbol_progress = None
+        self._report_progress("securities", len(securities), len(securities))
         with self.db.session() as session:
             for info in securities:
                 row = session.get(Security, info.symbol)
@@ -265,7 +326,18 @@ class DataIngestor:
                 row.is_etf = info.is_etf
                 row.is_leveraged_or_inverse = info.is_leveraged_or_inverse
                 row.listed_date = info.listed_date
-                row.delisted_date = info.delisted_date
+                if info.delisted_date is not None:
+                    row.delisted_date = info.delisted_date
+                # else: leave whatever is already stored untouched. Most
+                # providers' reference data never tracks a delisting date at
+                # all (info.delisted_date is simply None), and treating that
+                # absence as "confirmed still listed" would silently clear a
+                # deactivation this application made itself (see
+                # ``_deactivate_confirmed_unknown``) on the very next
+                # refresh -- undoing it before ``ingest_prices`` even runs
+                # again. Reactivation is instead the more precise trigger of
+                # "a refresh actually found real bars again" -- see
+                # ``_persist_bars``.
                 row.source = getattr(self.market, "name", "unknown")
                 row.updated_at = utc_now()
                 report.securities_upserted += 1
@@ -347,17 +419,45 @@ class DataIngestor:
             report.provider_failures["market_data"] = "no market-data provider configured"
             return {}
 
+        # The benchmark (regime classification, relative-strength features)
+        # is not a universe member and is typically an ETF, so it can be
+        # missing from ``symbols`` -- e.g. a caller that narrowed the
+        # universe before this call, or a universe source that simply never
+        # lists ETFs. A real refresh log showed exactly this: "benchmark SPY
+        # unavailable; regime reported as UNKNOWN for all sessions", because
+        # SPY's bars were never fetched at all. This bar-fetch loop is the
+        # one place that must never be missing it, regardless of what any
+        # upstream caller already did or forgot to do -- deduped so a caller
+        # that DID already include it (e.g. Pipeline.refresh) costs nothing
+        # extra.
+        benchmark = self.config.market_data.benchmark_symbol
+        symbols = list(dict.fromkeys([*symbols, benchmark]))
+
         batch_size = max(1, self.config.market_data.max_symbols_per_request)
         collected: dict[str, list[Bar]] = {}
-        for i in range(0, len(symbols), batch_size):
+        total = len(symbols)
+        self._report_progress("prices", 0, total)
+        for i in range(0, total, batch_size):
             chunk = symbols[i : i + batch_size]
             try:
                 fetched = self.market.get_daily_bars(chunk, start, end)
             except ProviderError as exc:
                 log.error("market provider failed for %d symbols: %s", len(chunk), exc)
                 report.provider_failures[getattr(self.market, "name", "market")] = str(exc)
+                self._report_progress("prices", min(i + batch_size, total), total)
                 continue
             collected.update(fetched)
+            self._report_progress("prices", min(i + batch_size, total), total)
+
+        # The merged-batch inclusion above is harmless when it works, but it
+        # ties the benchmark's fate to whatever else lands in its batch: a
+        # real refresh log showed 641/1,673 symbols (SPY included) degrade to
+        # close-only fallback bars because one batch's failure cascaded the
+        # whole chunk to the fallback provider. This dedicated, independent,
+        # single-symbol call is the actual guarantee.
+        self._ensure_benchmark_bars(benchmark, start, end, collected, report)
+
+        self._merge_current_session_bars(symbols, collected)
 
         self.checker.check_provider_gap(
             getattr(self.market, "name", "market"),
@@ -383,11 +483,259 @@ class DataIngestor:
             self.checker.check_staleness(symbol, bars, end, report=report.quality)
             self._persist_bars(symbol, bars, report)
 
+        self._deactivate_confirmed_unknown(symbols, report)
+
         self.checker.persist(report.quality)
         return collected
 
+    def _ensure_benchmark_bars(
+        self,
+        benchmark: str,
+        start: dt.date,
+        end: dt.date,
+        collected: dict[str, list[Bar]],
+        report: IngestReport,
+    ) -> None:
+        """Guarantee an independent attempt to fetch the benchmark's bars.
+
+        Only attempted when the merged-batch pass above did not already
+        yield real bars for ``benchmark`` -- the common case costs nothing
+        extra. When it was missing, this issues one dedicated, single-symbol
+        ``get_daily_bars`` call, entirely independent of whatever else was
+        in the benchmark's batch, so an unrelated failure elsewhere in that
+        batch cannot take the benchmark down with it. If bars are still
+        unavailable after this dedicated attempt -- i.e. no configured
+        source had anything for it -- an ERROR (not a warning) is logged,
+        because ``Pipeline.classify_regimes`` will report every session's
+        regime as UNKNOWN without it, and that is a materially worse outcome
+        than an ordinary missing-bars warning for an arbitrary symbol.
+        """
+        if collected.get(benchmark):
+            return
+        if self.market is None:
+            return
+        try:
+            fetched = self.market.get_daily_bars([benchmark], start, end)
+        except ProviderError as exc:
+            log.error(
+                "dedicated benchmark fetch for %s failed: %s -- regime classification will be "
+                "reported as UNKNOWN for every session in this run because no bars are "
+                "available for the benchmark",
+                benchmark, exc,
+            )
+            report.provider_failures.setdefault(f"benchmark:{benchmark}", str(exc))
+            return
+
+        bars = fetched.get(benchmark) or []
+        if bars:
+            collected[benchmark] = bars
+            log.info(
+                "dedicated benchmark fetch recovered %d bar(s) for %s", len(bars), benchmark
+            )
+            return
+
+        log.error(
+            "benchmark %s has no bars from any configured market-data source, even after a "
+            "dedicated fetch attempt -- regime classification will be reported as UNKNOWN for "
+            "every session in this run",
+            benchmark,
+        )
+
+    def _merge_current_session_bars(
+        self, symbols: list[str], collected: dict[str, list[Bar]]
+    ) -> None:
+        """Fill in today's daily bar from TipRanks GetQuotes for any symbol
+        whose already-collected series (Yahoo's historical chart, primarily
+        -- see ``providers.market.yahoo``) has nothing for today yet.
+
+        **Merge rule -- deliberately CONSERVATIVE (owner-directed; see this
+        change's own report for why)**: this only ever APPENDS a
+        GetQuotes-derived bar for a session date that is not already present
+        in ``collected[symbol]``. It never replaces, overwrites, or prefers
+        the GetQuotes bar over an existing one, even for today's own session
+        -- e.g. it does NOT implement "prefer GetQuotes over Yahoo when the
+        market is open or GetQuotes is newer" at all. Getting that richer
+        rule right (avoiding look-ahead, avoiding a downstream signal being
+        computed from one value and then silently recomputed from a
+        different one later in the same run) was judged not worth the risk
+        for this change; the safe subset -- "fill in today's bar only when
+        NOTHING else has any bar for that exact session at all" -- already
+        eliminates the common gap this exists for (Yahoo's chart endpoint
+        typically lagging by one session until after that day's close)
+        without any chance of silently overwriting a value a quality check
+        or a strategy signal may already have read earlier in this same run.
+
+        Deduped by exact session-date equality: a GetQuotes bar is appended
+        for symbol X only if ``collected[X]`` has no existing bar whose
+        ``.session`` matches it -- true whether that existing bar came from
+        Yahoo, TipRanks' own close-only last-resort bars, or a prior call
+        within this same run. A pre-filter (only symbols with no bar dated
+        exactly "today" per this process's own UTC clock) limits which
+        symbols GetQuotes is even queried for, purely to save calls; a
+        symbol wrongly included by that heuristic (e.g. a timezone edge
+        case) is still perfectly safe -- the dedupe check above is exact and
+        catches it regardless.
+
+        A no-op with zero network calls when there is no ``tipranks``
+        provider in the configured chain, or when it does not expose
+        ``get_current_session_bars`` (e.g. an older/foreign stand-in used in
+        a test), or when ``TipRanksConfig.use_getquotes_batch`` is off (in
+        which case ``get_current_session_bars`` itself already returns
+        nothing without any HTTP call -- see
+        ``providers.market.tipranks.TipRanksProvider.get_quotes``).
+        """
+        tipranks = self._market_provider_named("tipranks")
+        get_current = getattr(tipranks, "get_current_session_bars", None)
+        if not callable(get_current):
+            return
+
+        today = utc_now().date()
+        missing_today = [
+            symbol
+            for symbol in symbols
+            if not any(b.session == today for b in (collected.get(symbol) or []))
+        ]
+        if not missing_today:
+            return
+
+        try:
+            current_bars = get_current(missing_today)
+        except ProviderError as exc:
+            log.debug("tipranks current-session bar merge failed: %s", exc)
+            return
+        except Exception:
+            log.debug("tipranks current-session bar merge raised unexpectedly", exc_info=True)
+            return
+
+        filled = 0
+        for symbol, bar in (current_bars or {}).items():
+            existing = collected.setdefault(symbol, [])
+            if any(b.session == bar.session for b in existing):
+                continue  # dedupe by session date -- never a duplicate/overwrite
+            existing.append(bar)
+            existing.sort(key=lambda b: b.session)
+            filled += 1
+
+        if filled:
+            log.info(
+                "current-session bars: filled %d symbol(s) from tipranks GetQuotes "
+                "(conservative merge -- appended only where the daily-history source had "
+                "no bar for that exact session at all)",
+                filled,
+            )
+
+    def _market_provider_named(self, name: str) -> object | None:
+        """Find a provider instance by ``.name`` within ``self.market``.
+
+        Reaches through a ``FallbackMarketProvider``-shaped wrapper's
+        ``.primary``/``.fallbacks`` the same way ``_market_cap_sources``
+        does -- duck-typed rather than importing ``FallbackMarketProvider``
+        (``providers.registry``), which does not itself carry a ``.name``
+        matching any real adapter's.
+        """
+        if self.market is None:
+            return None
+        candidates: list[object] = [self.market]
+        primary = getattr(self.market, "primary", None)
+        if primary is not None:
+            candidates.append(primary)
+        candidates.extend(getattr(self.market, "fallbacks", None) or [])
+        for candidate in candidates:
+            if getattr(candidate, "name", None) == name:
+                return candidate
+        return None
+
+    def _deactivate_confirmed_unknown(self, symbols: list[str], report: IngestReport) -> None:
+        """Mark a symbol inactive when BOTH tipranks and yahoo report it
+        unknown in this same refresh, and it has no recently-stored bars.
+
+        Both adapters keep a per-refresh ``_not_found`` set of symbols they
+        had no data for this run (see
+        ``providers.market.tipranks.TipRanksProvider._not_found`` and
+        ``providers.market.yahoo.YahooMarketProvider._not_found``) -- a real
+        refresh log showed WBA/JNPR/SNV/HES/HOLX/ATA/INE hitting this on
+        every single refresh (a confirmed HTTP 404 from yahoo and no
+        analyst/overview coverage from tipranks), burning an API call and
+        polluting a batch every time for names that are, in fact, gone.
+
+        Deliberately conservative -- a single provider hiccup must never
+        deactivate a live name: both sources must agree in the SAME refresh
+        AND the symbol must have no ``price_bars`` row in the last 30 days.
+        Only ``Security.delisted_date`` is touched (the same column
+        ``UniverseSelector.for_session``/``SecurityInfo.is_active_on``
+        already use for point-in-time universe membership) -- never a new,
+        parallel flag -- and only for a security that is not already marked
+        inactive. Already-stored history is untouched, so a backtest
+        spanning the period the symbol WAS listed still sees it; this only
+        stops it from being offered to today's *scannable* universe.
+
+        Every symbol deactivated this way gets a WARNING data-quality
+        finding, so the change is visible, never silent.
+
+        This method does not itself stop a future refresh from attempting
+        the symbol again -- ``ingest_securities`` no longer clobbers an
+        existing ``delisted_date`` back to ``None`` from a source that
+        simply does not track delisting (see its docstring), but nothing
+        here filters the symbol out of a future ``get_daily_bars`` call
+        either. If a future refresh's fetch succeeds, ``_persist_bars``
+        clears ``delisted_date`` again automatically -- that is
+        reactivation's entire mechanism, deliberately with no separate flag
+        or scheduled re-probe to keep in sync.
+        """
+        tipranks = self._market_provider_named("tipranks")
+        yahoo = self._market_provider_named("yahoo")
+        if tipranks is None or yahoo is None:
+            return
+        tipranks_unknown = getattr(tipranks, "_not_found", None)
+        yahoo_unknown = getattr(yahoo, "_not_found", None)
+        if not tipranks_unknown or not yahoo_unknown:
+            return
+
+        both_unknown = sorted((tipranks_unknown & yahoo_unknown) & set(symbols))
+        if not both_unknown:
+            return
+
+        today = utc_now().date()
+        cutoff = today - dt.timedelta(days=30)
+        with self.db.session() as session:
+            for symbol in both_unknown:
+                row = session.get(Security, symbol)
+                if row is None or row.delisted_date is not None:
+                    continue  # nothing known about it, or already inactive
+                recent = session.execute(
+                    select(PriceBar.id)
+                    .where(PriceBar.symbol == symbol, PriceBar.session >= cutoff)
+                    .limit(1)
+                ).first()
+                if recent is not None:
+                    # A provider hiccup must not deactivate a name that was
+                    # trading as recently as last month.
+                    continue
+                row.delisted_date = today
+                report.quality.add(
+                    DataQualitySeverity.WARNING,
+                    "symbol_deactivated",
+                    f"{symbol}: both tipranks and yahoo report this ticker unknown this "
+                    f"refresh, and no price bars have been stored in the last 30 days; "
+                    f"marked delisted_date={today} so it drops out of the point-in-time-active "
+                    "universe. Reactivates automatically if a future refresh finds real bars "
+                    "for it again.",
+                    symbol=symbol,
+                )
+
     def _persist_bars(self, symbol: str, bars: list[Bar], report: IngestReport) -> None:
-        """Insert new bars; flag (but still apply) restatements of existing ones."""
+        """Insert new bars; flag (but still apply) restatements of existing ones.
+
+        Only ever called with a non-empty ``bars`` (see ``ingest_prices``'s
+        ``if not bars: continue`` guard), so reaching this method at all
+        means a provider found real data for ``symbol`` this refresh. That
+        is exactly the trigger this application uses for reactivation: if
+        the security was previously marked ``delisted_date`` by
+        ``_deactivate_confirmed_unknown`` (a provider hiccup must not
+        strand a name that comes back to life), it is cleared here so the
+        symbol re-enters the point-in-time-active set
+        ``UniverseSelector.for_session``/``SecurityInfo.is_active_on`` check.
+        """
         source = getattr(self.market, "name", "unknown")
         with self.db.session() as session:
             existing = {
@@ -441,6 +789,19 @@ class DataIngestor:
                 row.volume = bar.volume
                 row.ingested_at = utc_now()
                 report.bars_revised += 1
+
+            security = session.get(Security, symbol)
+            if security is not None and security.delisted_date is not None:
+                previous = security.delisted_date
+                security.delisted_date = None
+                report.quality.add(
+                    DataQualitySeverity.INFO,
+                    "symbol_reactivated",
+                    f"{symbol}: real bars found again this refresh (was marked "
+                    f"delisted_date={previous}); delisted_date cleared and the symbol "
+                    "re-enters the point-in-time-active universe.",
+                    symbol=symbol,
+                )
 
     def ingest_corporate_actions(
         self, symbols: list[str], start: dt.date, end: dt.date, report: IngestReport
@@ -546,26 +907,148 @@ class DataIngestor:
         symbols: list[str] | None = None,
         report: IngestReport | None = None,
     ) -> list[SocialPost]:
-        """Fetch posts from every enabled social provider.
+        """Fetch (synchronously, on this thread) and persist posts from every
+        enabled social provider.
 
         A provider that is not configured is skipped silently -- that is the
-        documented reduced-capability path, not an error.
+        documented reduced-capability path, not an error. This is the fully
+        sequential path: used directly whenever
+        ``config.sentiment.fetch_concurrently`` is ``False``, and still the
+        method any other caller gets by calling it directly. See
+        ``run_full_refresh`` for the concurrent path, which fetches (via
+        ``_fetch_social_posts_only``, on a background thread) while the
+        market-data phases run, and only persists here-equivalent output
+        once back on the main thread.
         """
         report = report or IngestReport()
-        posts: list[SocialPost] = []
-        for provider in self.social:
-            try:
-                fetched = provider.fetch_posts(since=since, until=until, symbols=symbols)
-            except ProviderError as exc:
-                name = getattr(provider, "name", "social")
-                log.warning("social provider %s unavailable: %s", name, exc)
-                report.provider_failures[name] = str(exc)
-                continue
-            posts.extend(fetched)
-
+        outcome = self._fetch_social_posts_only(since=since, until=until, symbols=symbols)
+        report.provider_failures.update(outcome.provider_failures)
+        posts = outcome.posts
         if posts:
             self._persist_posts(posts, report)
             report.posts.extend(posts)
+        return posts
+
+    def _fetch_social_posts_only(
+        self,
+        *,
+        since: dt.datetime,
+        until: dt.datetime | None,
+        symbols: list[str] | None,
+    ) -> _SocialFetchOutcome:
+        """Fetch from every enabled social provider -- network only, no
+        database access -- isolating one provider's failure from the rest.
+
+        Safe to call from a background thread (see ``_start_social_fetch``):
+        it never touches ``self.db`` or a shared ``IngestReport``, only the
+        freshly-constructed ``_SocialFetchOutcome`` it returns.
+        """
+        outcome = _SocialFetchOutcome()
+        for provider in self.social:
+            name = getattr(provider, "name", "social")
+            try:
+                fetched = provider.fetch_posts(since=since, until=until, symbols=symbols)
+            except ProviderError as exc:
+                log.warning("social provider %s unavailable: %s", name, exc)
+                outcome.provider_failures[name] = str(exc)
+                continue
+            outcome.posts.extend(fetched)
+        return outcome
+
+    def _start_social_fetch(
+        self,
+        *,
+        since: dt.datetime,
+        until: dt.datetime | None,
+        symbols: list[str] | None,
+    ) -> tuple[threading.Thread, list[_SocialFetchOutcome]]:
+        """Kick off the network-only social fetch on a background thread.
+
+        Returns the thread (already started) and the single-item list it
+        will append its ``_SocialFetchOutcome`` to when done -- a list
+        rather than a plain attribute so the "has it finished" question is
+        answerable without a lock: ``run_full_refresh`` only ever reads it
+        after ``thread.join()`` returns (see ``_join_social_fetch``), by
+        which point the append has already happened-before that return, per
+        ``threading.Thread``'s join/append happens-before guarantee. If the
+        thread is still alive at the join timeout, the box is deliberately
+        left unread and its eventual contents (should the thread finish
+        later) are simply never collected -- the daemon thread is allowed to
+        finish and be discarded, not killed, and not raced with the main
+        thread's use of ``self.db``.
+
+        A bug that raises something other than ``ProviderError`` out of
+        ``_fetch_social_posts_only`` itself (not just out of one provider,
+        which is already isolated there) is still caught here and turned
+        into a single degraded-source entry -- the sequential path would
+        have let such a bug abort the whole refresh loudly; on a background
+        thread that is not an option (an unhandled exception on a thread
+        just terminates it silently), so it is logged with its traceback and
+        surfaced through the normal ``provider_failures``/``degraded`` path
+        instead.
+        """
+        box: list[_SocialFetchOutcome] = []
+
+        def _worker() -> None:
+            try:
+                box.append(
+                    self._fetch_social_posts_only(since=since, until=until, symbols=symbols)
+                )
+            except Exception:
+                log.exception(
+                    "unexpected error in background social fetch; degrading the social "
+                    "source for this refresh rather than losing it silently"
+                )
+                failure = _SocialFetchOutcome()
+                failure.provider_failures["social_fetch"] = (
+                    "unexpected error in background social fetch -- see log for traceback"
+                )
+                box.append(failure)
+
+        thread = threading.Thread(
+            target=_worker, name="claudetrade-social-fetch", daemon=True
+        )
+        log.info("social fetch started in background (%d provider(s))", len(self.social))
+        thread.start()
+        return thread, box
+
+    def _join_social_fetch(
+        self,
+        thread: threading.Thread,
+        box: list[_SocialFetchOutcome],
+        report: IngestReport,
+    ) -> list[SocialPost]:
+        """Wait for the background social fetch and persist what it found.
+
+        Called once the market-data phases (securities/prices/earnings) are
+        done, so persistence -- and the mention resolution that follows it
+        in ``run_full_refresh`` -- happens after ``ingest_securities`` has
+        committed the alias table those mentions resolve against, exactly as
+        it does in the sequential path. Only the *fetch* ran earlier.
+        """
+        timeout = self.config.sentiment.fetch_join_timeout_s
+        thread.join(timeout)
+        if thread.is_alive():
+            log.warning(
+                "social fetch still running after %.0fs timeout; proceeding with no posts "
+                "from this run's background fetch -- it is left running in the background "
+                "and its results are simply picked up on the next refresh instead of "
+                "hanging this one",
+                timeout,
+            )
+            return []
+
+        outcome = box[0] if box else _SocialFetchOutcome()
+        report.provider_failures.update(outcome.provider_failures)
+        posts = outcome.posts
+        if posts:
+            self._persist_posts(posts, report)
+            report.posts.extend(posts)
+        ok_providers = len(self.social) - len(outcome.provider_failures)
+        log.info(
+            "social fetch complete: %d post(s) from %d/%d provider(s)",
+            len(posts), ok_providers, len(self.social),
+        )
         return posts
 
     def _persist_posts(self, posts: list[SocialPost], report: IngestReport) -> None:
@@ -604,6 +1087,7 @@ class DataIngestor:
                         duplicate_group=post.duplicate_group,
                         injection_risk=post.injection_risk,
                         raw_ref=post.raw_ref,
+                        flair=post.flair,
                     )
                 )
                 report.posts_inserted += 1
@@ -682,9 +1166,40 @@ class DataIngestor:
         securities: list[SecurityInfo] | None = None,
         social_lookback_hours: int | None = None,
     ) -> IngestReport:
-        """One complete refresh cycle across every configured source."""
+        """One complete refresh cycle across every configured source.
+
+        Reddit/news-RSS/X/Stocktwits hit entirely different hosts than the
+        market-data provider (TipRanks/Yahoo), so by default
+        (``config.sentiment.fetch_concurrently``, true unless overridden) the
+        social *fetch* is started on a background thread before the
+        securities/prices/earnings phases run, and only joined once they are
+        done -- hiding the social fetch's wall-clock cost behind the market
+        pass instead of paying for both in sequence. Persistence (posts,
+        mentions, daily sentiment aggregates) always happens on this thread,
+        after the join: SQLite writes stay single-threaded, and mention
+        resolution still runs strictly after ``ingest_securities`` has
+        committed the alias table it depends on -- only the network fetch
+        moved earlier. Setting the config flag to ``False`` restores the
+        original strictly sequential order.
+        """
         report = IngestReport()
         reference = {s.symbol: s for s in (securities or [])}
+
+        concurrent_social = bool(self.social) and self.config.sentiment.fetch_concurrently
+        social_thread: threading.Thread | None = None
+        social_box: list[_SocialFetchOutcome] = []
+        if concurrent_social:
+            since, until = _social_fetch_window(start, end, social_lookback_hours)
+            # The market-cap-floor filter isn't known yet -- it depends on
+            # ingest_securities, which this fetch is deliberately running
+            # ahead of -- so the full candidate list is used here. Only
+            # StocktwitsProvider actually reads `symbols` (as a fetch-priority
+            # hint, internally capped); every other provider ignores it, so
+            # this does not change what gets fetched for them.
+            social_thread, social_box = self._start_social_fetch(
+                since=since, until=until, symbols=list(symbols)
+            )
+
         if securities:
             enriched = self.ingest_securities(securities, report)
             reference = {s.symbol: s for s in enriched}
@@ -694,24 +1209,42 @@ class DataIngestor:
         self.ingest_earnings(symbols, start, end, report)
 
         if self.social:
-            # Backfill social over the same window as the price history when a
-            # lookback is not given explicitly, so a historical refresh produces
-            # sentiment covering the same period as its bars.
-            if social_lookback_hours is not None:
-                since = utc_now() - dt.timedelta(hours=social_lookback_hours)
-                until = None
+            self._report_progress("sentiment", 0, 1)
+            if concurrent_social and social_thread is not None:
+                posts = self._join_social_fetch(social_thread, social_box, report)
             else:
-                since = dt.datetime.combine(start, dt.time.min, tzinfo=dt.UTC)
-                until = dt.datetime.combine(end, dt.time.max, tzinfo=dt.UTC)
-            posts = self.ingest_social(
-                since=since, until=until, symbols=symbols, report=report
-            )
+                # Backfill social over the same window as the price history
+                # when a lookback is not given explicitly, so a historical
+                # refresh produces sentiment covering the same period as its
+                # bars.
+                since, until = _social_fetch_window(start, end, social_lookback_hours)
+                posts = self.ingest_social(
+                    since=since, until=until, symbols=symbols, report=report
+                )
             self.resolve_and_persist_mentions(posts, reference, report)
+            self._report_progress("sentiment", 1, 1)
 
         self.checker.persist(report.quality)
         report.finished_at = utc_now()
         log.info("ingestion complete: %s", report.summary())
         return report
+
+
+def _social_fetch_window(
+    start: dt.date, end: dt.date, social_lookback_hours: int | None
+) -> tuple[dt.datetime, dt.datetime | None]:
+    """The ``(since, until)`` window ``run_full_refresh`` fetches social over.
+
+    A lookback given in hours backfills only recent activity (``until`` is
+    open-ended, i.e. "up to now"); otherwise social is fetched over the same
+    calendar window as the price history, so a historical refresh produces
+    sentiment covering the same period as its bars.
+    """
+    if social_lookback_hours is not None:
+        return utc_now() - dt.timedelta(hours=social_lookback_hours), None
+    since = dt.datetime.combine(start, dt.time.min, tzinfo=dt.UTC)
+    until = dt.datetime.combine(end, dt.time.max, tzinfo=dt.UTC)
+    return since, until
 
 
 def _normalise_alias(alias: str) -> str:

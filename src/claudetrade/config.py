@@ -173,6 +173,25 @@ class MarketDataConfig(BaseModel):
     max_symbols_per_request: int = 100
     request_timeout_s: float = 20.0
     rate_limit_per_minute: int = 60
+    #: Yahoo's undocumented chart endpoint gets its own bucket, separate from
+    #: the field above (which stooq -- an opt-in-only fallback -- still reads).
+    #: 120/min is still conservative for a single-symbol-per-call, keyless,
+    #: undocumented endpoint, but was the second-biggest driver (after
+    #: TipRanks' own rate limit -- see ``TipRanksConfig.rate_limit_per_minute``)
+    #: of the owner's first live refresh taking 80+ minutes for ~2,400 symbols.
+    yahoo_rate_limit_per_minute: int = 120
+    #: Worker threads used for the per-symbol fetch loops in
+    #: ``TipRanksProvider``/``YahooMarketProvider`` (market caps, security
+    #: info, earnings, and the last-resort bars cascade). Each provider's own
+    #: ``RateLimiter`` is shared across every worker thread -- see
+    #: ``providers.base.RateLimiter`` and ``providers.base.parallel_map`` --
+    #: so raising this overlaps request *latency* across symbols; it does not
+    #: raise the enforced calls/minute ceiling, which is what
+    #: ``rate_limit_per_minute``/``yahoo_rate_limit_per_minute`` control.
+    #: 12 gives enough in-flight requests to actually saturate the 300/min
+    #: tipranks budget at ~1-2 s per response; the limiter, not this, is the
+    #: throughput ceiling.
+    max_workers: int = 12
     benchmark_symbol: str = "SPY"
     #: Sector ETF proxies used for relative-strength comparisons.
     sector_etfs: dict[str, str] = Field(
@@ -229,9 +248,24 @@ class TipRanksConfig(BaseModel):
     one call per symbol rather than four.
     """
 
-    #: Conservative default for an unauthenticated, undocumented endpoint --
-    #: same posture as stooq/yahoo's own defaults.
-    rate_limit_per_minute: int = 30
+    #: Raised from the original conservative default of 30/min (ADR-0008
+    #: Decision 1's launch posture) to 60/min after the owner confirmed their
+    #: own brokerage app calls this same public eToro widget endpoint freely
+    #: at that kind of cadence with no observed pushback -- it is still a
+    #: fraction of what a browser tab idly refreshing a watchlist would issue,
+    #: and remains fully self-imposed and operator-configurable, not a vendor
+    #: published ceiling. This was the single biggest driver of the owner's
+    #: first live refresh taking 80+ minutes for ~2,400 symbols (roughly
+    #: symbol_count / rate_limit_per_minute at that rate); see also
+    #: ``MarketDataConfig.max_workers``, which overlaps request latency across
+    #: symbols but does not itself raise this ceiling.
+    #:
+    #: Raised 60 -> 300 at the owner's explicit direction ("we should be able
+    #: to hit tipranks way harder and faster"): ~2,400 symbols now pace out
+    #: at roughly 8 minutes instead of 40. Still self-imposed; if TipRanks
+    #: ever pushes back the adapter's 429/403 handling backs off and fails
+    #: closed rather than hammering on.
+    rate_limit_per_minute: int = 300
     request_timeout_s: float = 20.0
     #: Cached ``overview`` responses are reused until this many trading
     #: sessions have elapsed since they were fetched (see
@@ -240,20 +274,49 @@ class TipRanksConfig(BaseModel):
     #: refresh within the same trading day -- only once a new session begins.
     #: Stored under ``paths.cache_dir/tipranks/``.
     cache_ttl_trading_days: int = 1
-    #: OPTIONAL, UNVERIFIED batching optimisation for Canadian market caps via
-    #: ``marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=TSE:A,TSE:B,...``
-    #: (the CIBC-app endpoint, not the widget). Off by default: this sandbox
-    #: never obtained a real response body for this endpoint, so the parser
-    #: is defensive-but-unverified (see
-    #: ``providers.market.tipranks._parse_getquotes_response``). Canadian cap
-    #: coverage never depends on this -- ``dataForTicker`` (with the
-    #: ``TSE:SYMBOL`` ticker notation) is the primary path for every symbol,
-    #: US and Canadian alike; this is purely a call-count optimisation for a
-    #: large TSX universe, and any failure here falls straight back to the
-    #: per-symbol ``dataForTicker`` path with no user-visible effect beyond
-    #: one extra batch of calls.
-    use_getquotes_batch: bool = False
-    getquotes_batch_size: int = 25
+    #: A confirmed "TipRanks has no data for this symbol" result (a clean
+    #: HTTP 404 from BOTH ``dataForTicker`` and the ``historicalprices``
+    #: fallback probe -- see ``TipRanksProvider._resolve``) is cached under
+    #: this much longer TTL instead of ``cache_ttl_trading_days``. Without
+    #: this, a genuinely delisted/renamed name (the owner's log showed ANSS,
+    #: JNPR, FLT, SQ, K, WBA, HES, DFS, PARA and others) gets re-probed on
+    #: EVERY refresh forever, paying a full round trip for a symbol that will
+    #: never resolve. 30 trading days means a name that later regains
+    #: coverage (a re-listing, a data-vendor backfill) is picked up within
+    #: that window at worst -- an accepted trade-off, not an oversight. Also
+    #: applied to the "prices_only" state (a real, still-listed security with
+    #: no analyst/overview coverage -- typically a closed-end fund -- that
+    #: only ``historicalprices`` can serve): that gap is no more likely to
+    #: close from one day to the next than a fully unknown ticker is.
+    unknown_ticker_ttl_days: int = 30
+    #: PRIMARY market-data batching path (owner directive, confirmed by live
+    #: probes): ``marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=A,B,C``
+    #: (the CIBC-app endpoint, not the widget) returns a real-time quote
+    #: snapshot -- current-session OHLCV plus caps -- for every ticker in one
+    #: HTTP call, confirmed envelope shape ``{"quotes": [...], "errors":
+    #: [...], "metadata": {...}}`` (see
+    #: ``providers.market.tipranks._parse_getquotes_envelope`` and the module
+    #: docstring's GetQuotes section). ``TipRanksProvider.get_market_caps``
+    #: tries this for the WHOLE requested symbol list first -- turning what
+    #: used to be one ``dataForTicker`` call per symbol (~2,400 calls for a
+    #: full universe refresh) into roughly a dozen batch calls -- before
+    #: falling back to the pre-existing per-symbol ``dataForTicker`` path for
+    #: anything GetQuotes did not cover. Was ``False`` (an off-by-default,
+    #: Canadian-only, UNVERIFIED optimisation) before this confirmation;
+    #: flipped to ``True`` now that GetQuotes is the primary path, not an
+    #: opt-in extra. Market-cap coverage never depends on this succeeding
+    #: regardless -- ``dataForTicker`` remains the fallback for every symbol,
+    #: US and Canadian alike, and any GetQuotes failure (bad shape, network
+    #: error, a chunk failing outright) is caught and logged, degrading to
+    #: that pre-existing per-symbol path with no user-visible effect beyond
+    #: the wasted batch call(s).
+    use_getquotes_batch: bool = True
+    #: Symbols per GetQuotes HTTP call. 200 is conservative-but-batched: the
+    #: owner's own brokerage integration batches far more heavily than this
+    #: without issue, but this stays deliberately smaller and fully
+    #: operator-configurable rather than matching that ceiling exactly, per
+    #: this module's self-imposed-limits posture (ADR-0008 Decision 1).
+    getquotes_batch_size: int = 200
 
 
 class RedditConfig(BaseModel):
@@ -291,13 +354,18 @@ class RedditConfig(BaseModel):
     OAuth credentials work, this class prefers them automatically.
     """
 
-    #: On by default pointing at the *synthetic* generator, so a fresh install
-    #: exercises the whole sentiment pipeline with no credentials and no
-    #: network. Set ``provider = "reddit"`` and store credentials to go live;
-    #: if those credentials do not resolve the source disables itself cleanly
-    #: rather than failing the run.
+    #: ``provider = "reddit"`` (the default, mirroring
+    #: ``MarketDataConfig.provider = "tipranks"``) points at the live OAuth/
+    #: cookie-session adapter; with no credentials configured it disables
+    #: itself cleanly (``NotConfiguredError``, logged, pipeline continues) --
+    #: never silently fabricating sentiment. A real refresh log showed the
+    #: previous ``"synthetic"`` default storing tens of thousands of
+    #: fabricated posts on an install the owner believed was fully live (the
+    #: same footgun ``market_data.provider`` used to have before it defaulted
+    #: to ``"tipranks"``). Set ``provider = "synthetic"`` explicitly for an
+    #: offline/demo install with no credentials and no network.
     enabled: bool = True
-    provider: str = "synthetic"
+    provider: str = "reddit"
     client_id_credential: str = "reddit_client_id"
     client_secret_credential: str = "reddit_client_secret"
     #: Owner's own Reddit account credentials (ADR-0008 Decision 1: "own
@@ -316,6 +384,19 @@ class RedditConfig(BaseModel):
     #: resolve. See ``docs/api-providers.md`` for how to export it (F12 ->
     #: Application -> Cookies -> reddit.com -> reddit_session).
     session_cookie_credential: str = "reddit_session_cookie"
+    #: Optional second cookie for cookie-session mode. Reddit's own web
+    #: frontend sends BOTH ``reddit_session`` and ``token_v2`` (an HttpOnly
+    #: OAuth JWT cookie -- invisible to ``document.cookie``, only visible via
+    #: DevTools' Application/Storage -> Cookies panel, never the Console).
+    #: CONFIRMED (owner-validated 2026-07-31): ``reddit_session`` alone,
+    #: correctly attached, is sufficient for a 200 from a non-browser client
+    #: -- this is an optional extra, not a requirement. ``reddit_session`` is
+    #: long-lived (weeks+); ``token_v2`` is short-lived (hours, not weeks),
+    #: so try ``reddit_session`` alone first and only add this if that stops
+    #: working. When this does not resolve, cookie-session mode behaves
+    #: exactly as before (``Cookie: reddit_session=<v>`` only) -- see
+    #: ``RedditProvider._cookie_header``.
+    token_v2_credential: str = "reddit_token_v2"
     #: Cookie-session mode shares the same public listing endpoint as the
     #: public-JSON fallback below (an unauthenticated-by-design endpoint,
     #: just authenticated here via the owner's own cookie rather than
@@ -331,6 +412,12 @@ class RedditConfig(BaseModel):
             "SecurityAnalysis",
             "options",
             "swingtrading",
+            # Highest-volume hype venue; strategies A (sentiment breakout)
+            # and D (hype-failure short) need visibility into it.
+            "wallstreetbets",
+            # Half the universe is TSX-listed; US-centric subreddits barely
+            # mention Canadian names.
+            "CanadianInvestor",
         ]
     )
     #: Reddit caps a listing page at 100 items, so a busy subreddit needs
@@ -387,10 +474,38 @@ class XConfig(BaseModel):
 
     When neither path is configured the source is disabled cleanly and the
     remaining sources continue to operate.
+
+    **Auto-enable (owner directive, 2026-07-31)**: mirroring
+    ``RedditConfig.enabled``, both ``enabled`` and ``session_enabled`` now
+    default to ``True`` -- "use if credentialed", not "on unconditionally".
+    Nothing changes for an operator with no X credentials configured at all:
+    both live paths still resolve nothing, ``XProvider.__init__`` still
+    raises ``NotConfiguredError``, and ``get_social_providers`` still catches
+    that and continues without X, exactly as it did when ``enabled`` was
+    ``False`` by default. What changes is that the *moment* the owner's own
+    ``x_auth_token``/``x_ct0`` cookies (or a bearer token) resolve from the
+    secrets store, the source activates on the next refresh with no
+    additional flag to flip -- the same self-selecting posture
+    ``RedditProvider`` already has for its cookie-session mode. Both fields
+    remain explicit, operator-settable disable knobs (``enabled = false``
+    turns the whole source off regardless of credentials; ``session_enabled
+    = false`` keeps the official-API path while refusing the ToS-risking
+    cookie-session path even if cookies are configured).
     """
 
-    enabled: bool = False
-    provider: str = "synthetic"
+    #: ``provider = "x"`` (the default, mirroring ``RedditConfig.provider =
+    #: "reddit"``) points at the live API/cookie-session adapter; with no
+    #: credentials configured it disables itself cleanly
+    #: (``NotConfiguredError``, logged, pipeline continues) -- never silently
+    #: fabricating sentiment. The previous ``"synthetic"`` default had the
+    #: exact footgun RedditConfig documents: combined with ``enabled = True``
+    #: it wrote seeded fake posts into a live install's aggregates (QA found
+    #: the fabricated ticker BLSH carrying engagement-weighted sentiment while
+    #: every real ticker read 0.0). Set ``provider = "synthetic"`` explicitly
+    #: for an offline/demo install, and run ``claudetrade db purge-synthetic``
+    #: to clear fabricated rows an old default left behind.
+    enabled: bool = True
+    provider: str = "x"
     bearer_credential: str = "x_bearer_token"
     query_terms: list[str] = Field(default_factory=list)
     max_results_per_query: int = 100
@@ -400,9 +515,14 @@ class XConfig(BaseModel):
     store_author_names: bool = False
 
     # --- Cookie-session mode (ADR-0008 Decision 1; owner-accepted risk) -----
-    #: Off by default. Only consulted when ``bearer_credential`` does not
-    #: resolve -- the official API path is always preferred when available.
-    session_enabled: bool = False
+    #: Auto-enabled (owner directive, 2026-07-31): consulted whenever
+    #: ``bearer_credential`` does not resolve -- the official API path is
+    #: always preferred when available -- AND the two session cookies below
+    #: resolve from the secrets store. Set to ``False`` to keep the official
+    #: API path (if configured) while refusing to ever attempt the
+    #: ToS-risking cookie-session path, no matter what is stored under
+    #: ``auth_token_credential``/``ct0_credential``.
+    session_enabled: bool = True
     #: Exported from the browser's devtools -> Application/Storage -> Cookies
     #: for x.com, after logging in as the owner: ``auth_token`` and ``ct0``
     #: (the CSRF token cookie). See docs/api-providers.md for the exact
@@ -427,18 +547,48 @@ class XConfig(BaseModel):
 class StocktwitsConfig(BaseModel):
     """Stocktwits public symbol-stream API (ADR-0008 Decision 1's "official
     APIs first-choice" path for this source): keyless for basic reads, no
-    scraping, no ToS boundary crossed.
+    credential used or bypassed, no paywall touched.
 
     Reads ``api.stocktwits.com/api/2/streams/symbol/{SYMBOL}.json``, which is
-    Stocktwits' own documented, unauthenticated basic-read endpoint. Off by
-    default: even though no credential is at risk here, the vendor's
-    published unauthenticated budget (200 requests/hour) is easy to exhaust
-    across a large universe, so this is an explicit opt-in with a hard cap on
-    symbols scanned per cycle rather than a silent default.
+    Stocktwits' own documented, unauthenticated basic-read endpoint -- open
+    to anyone, which is why a logged-out browser tab is served HTTP 200 JSON
+    from it.
+
+    **Browser-TLS impersonation (owner directive, 2026-07-31; ADR-0008
+    Decision 1 Amendment 1).** That same endpoint answers HTTP 403 to a plain
+    Python client from the same machine and IP. The confirmed cause is
+    Cloudflare bot management gating on the TLS ClientHello fingerprint
+    (JA3): a stdlib-``ssl``-backed client presents a handshake no browser
+    produces. The provider therefore issues its GET through ``curl_cffi``'s
+    browser impersonation (``impersonate`` below), reproducing the
+    handshake of the browser the endpoint already serves. This is a scoped,
+    owner-authorised exception for this one keyless source; it does not
+    extend to credentialed sources (X, Reddit), and every other fail-closed
+    guarantee still holds -- conservative human-scale rates with jitter, a
+    hard per-cycle symbol cap, no CAPTCHA solving, no proxy rotation, no
+    Cloudflare cookie harvesting, and ``SourceBlockedError`` (cycle over, no
+    retry loop) if the edge blocks anyway. Impersonation makes a block
+    unlikely, not impossible.
+
+    ``curl_cffi`` is an **optional** dependency, lazy-imported at request
+    time. Without it the whole application still runs; this source simply
+    reports itself unavailable with an install hint.
+
+    On by default (owner directive): the vendor's published unauthenticated
+    budget (200 requests/hour) is respected by ``rate_limit_per_minute`` and
+    ``max_symbols_per_cycle`` rather than by leaving the source switched off.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     provider: str = "stocktwits"
+    #: curl_cffi browser-impersonation profile supplying the TLS/JA3
+    #: fingerprint (and the matching User-Agent + client hints). ``"chrome"``
+    #: is curl_cffi's alias for its current newest Chrome build, so it tracks
+    #: library upgrades instead of pinning a version that goes stale; explicit
+    #: profiles (``"chrome142"``, ``"safari180"``, ``"firefox135"``, ...) are
+    #: accepted too -- see curl_cffi's ``BrowserType`` for the full list.
+    #: Worth changing only if the edge starts blocking the default profile.
+    impersonate: str = "chrome"
     #: Symbols fetched when the caller does not supply a more specific
     #: (recent-signal / watchlist) hint via ``fetch_posts(symbols=...)``.
     watchlist_symbols: list[str] = Field(default_factory=list)
@@ -456,9 +606,11 @@ class StocktwitsConfig(BaseModel):
     #: Kept for config-file backwards compatibility, but no longer sent:
     #: live-probe evidence (2026-07-30) showed this endpoint's edge rejecting
     #: this descriptive app UA (and generic non-browser UAs) with HTTP 403
-    #: while accepting a real browser tab, so the provider now sends a fixed
-    #: browser-style User-Agent instead -- see
-    #: ``providers.social.stocktwits._BROWSER_HEADERS``.
+    #: while accepting a real browser tab. The User-Agent (and matching
+    #: ``sec-ch-ua*`` client hints) now come from the ``impersonate`` profile
+    #: itself, so they cannot disagree with the TLS fingerprint on the wire --
+    #: a mismatch that would be a bot signal in its own right. See
+    #: ``providers.social.stocktwits._http_get``/``_browser_headers``.
     user_agent: str = "windows:claudetrade:0.1.0 (research; contact configured by operator)"
     store_author_names: bool = False
 
@@ -520,18 +672,55 @@ class NewsConfig(BaseModel):
 
 
 class AIConfig(BaseModel):
-    """Optional LLM assistance.
+    """Optional LLM sentiment assistance -- an ensemble ADJUNCT, never the
+    decision-maker.
 
-    The system is fully functional with ``provider = "null"``: sentiment falls
-    back to the deterministic rule ensemble and theses are template-generated.
-    AI output can never relax a risk control.
+    The system is fully functional with ``provider = "none"`` (the default):
+    sentiment falls back entirely to the deterministic RULES-based ensemble
+    (``sentiment.classifiers.RuleSentimentClassifier``), which remains the
+    MANDATORY floor whether or not AI is configured -- see
+    ``sentiment.ai_classifier``'s module docstring. AI is strictly opt-in
+    (owner directive, 2026-07-31: "configuration for Claude or ChatGPT, user
+    prompted to set one up at setup" -- see ``scripts/setup.ps1``'s
+    end-of-run prompt and ``docs/ai-setup.md``); AI output can never relax a
+    risk control and a malformed/failed AI response always degrades to the
+    rule classifier, never raises into the pipeline.
+
+    **Provider choice and cost**: ``model`` is empty by default, which each
+    provider adapter resolves to its own sensible default (see
+    ``providers.ai.anthropic_provider.AnthropicProvider`` and
+    ``providers.ai.openai_provider.OpenAIProvider``) -- set it explicitly to
+    override. For Anthropic, the default is ``"claude-opus-5"``
+    ($5/$25 per MTok input/output); ``"claude-haiku-4-5"`` ($1/$5 per MTok)
+    is the economical choice for high-volume PER-POST classification at a
+    real quality/cost tradeoff -- the owner picks based on post volume and
+    budget, this module does not choose for them. For OpenAI, check current
+    model names/pricing at platform.openai.com before relying on the default
+    here (OpenAI's lineup and pricing move faster than this comment).
     """
 
-    provider: Literal["null", "openai", "anthropic"] = "null"
-    model: str = "claude-sonnet-5"
-    api_key_credential: str = "anthropic_api_key"
+    provider: Literal["anthropic", "openai", "none"] = "none"
+    #: Empty means "use the provider adapter's own default" -- see the class
+    #: docstring. Set explicitly to pin a specific model.
+    model: str = ""
+    #: Credential name for the Anthropic API key (see ``claudetrade.secrets``).
+    #: Consulted only when ``provider == "anthropic"``.
+    anthropic_api_key_credential: str = "anthropic_api_key"
+    #: Credential name for the OpenAI API key. Consulted only when
+    #: ``provider == "openai"``.
+    openai_api_key_credential: str = "openai_api_key"
+    #: Non-Anthropic-default base URL override (Anthropic-compatible proxy,
+    #: self-hosted gateway, etc.). ``None`` uses each SDK's own default.
     base_url: str | None = None
-    max_output_tokens: int = 900
+    max_output_tokens: int = 1024
+    #: Reserved, currently unused by either shipped adapter: NOT sent to
+    #: Anthropic (temperature/top_p/top_k are removed on current Claude
+    #: models -- Opus 5/Sonnet 5 return 400 -- see
+    #: ``providers.ai.anthropic_provider``), and deliberately not sent to
+    #: OpenAI either -- reasoning-tier OpenAI models reject non-default
+    #: sampling parameters the same way current Claude models do, and this
+    #: field's default model is reasoning-tier. Kept on the config for a
+    #: future non-reasoning-model path; not wired into either request today.
     temperature: float = 0.0
     request_timeout_s: float = 45.0
     max_calls_per_run: int = 250
@@ -543,10 +732,27 @@ class AIConfig(BaseModel):
     #: Batch size for classification requests.
     batch_size: int = 12
     prompt_version: str = "v1"
-    #: Per-1M-token prices used only for local cost accounting; update to match
-    #: the provider's current published pricing.
-    input_cost_per_mtok_usd: float = 3.0
-    output_cost_per_mtok_usd: float = 15.0
+    #: Per-1M-token prices used only for local cost accounting; defaults are
+    #: Claude Opus 5's published rate. Update to match the configured model's
+    #: current pricing -- e.g. claude-haiku-4-5 is $1.00/$5.00 per MTok, not
+    #: $5.00/$25.00. Check platform.openai.com for current OpenAI pricing.
+    input_cost_per_mtok_usd: float = 5.0
+    output_cost_per_mtok_usd: float = 25.0
+
+    @property
+    def api_key_credential(self) -> str:
+        """Credential name for the currently-selected provider.
+
+        Convenience accessor (not a model field, so it never round-trips
+        through ``model_dump``/TOML) for callers that just want "the one
+        relevant AI credential name" without branching on ``provider``
+        themselves -- e.g. ``cli.py``'s ``probe``/``secrets list`` commands.
+        Defaults to the Anthropic credential name when ``provider ==
+        "none"``, matching this class's Anthropic-first historical default.
+        """
+        if self.provider == "openai":
+            return self.openai_api_key_credential
+        return self.anthropic_api_key_credential
 
 
 class UniverseConfig(BaseModel):
@@ -589,7 +795,13 @@ class UniverseConfig(BaseModel):
     #: again later at signal-scoring time (see ``signals.scoring``). Raising
     #: or lowering this one changes who is even eligible to be scanned at
     #: all; it does not touch the scoring-time gate.
-    min_market_cap_usd: float = 1_000_000_000.0
+    #:
+    #: Lowered $1B -> $500M at the owner's direction (2026-07-31) to widen the
+    #: net to mid-caps. Safe because this is only *eligibility*: the thin-name
+    #: guardrails (``FilterConfig.min_avg_dollar_volume_usd``, ``min_price``,
+    #: ``exclude_penny_stocks``, ``min_atr_pct``) live at the filter/scoring
+    #: layer and are unchanged, so illiquid 500M-1B names are still vetoed there.
+    min_market_cap_usd: float = 500_000_000.0
     #: What to do with a security for which NO configured market-data
     #: provider could establish a market cap at all (as opposed to one priced
     #: below the floor above). "include" (default) keeps it in the universe --
@@ -616,7 +828,11 @@ class FilterConfig(BaseModel):
     exclude_binary_event_sectors: bool = False
     binary_event_sectors: list[str] = Field(default_factory=lambda: ["Biotechnology"])
 
-    min_unique_authors: int = 5
+    #: Kept equal to ``SentimentConfig.min_unique_authors_for_signal``: this
+    #: is the HARD veto layer for the same underlying adequacy question that
+    #: layer already answers softly, and a stricter value here silently
+    #: hard-failed samples the sentiment module itself considered adequate.
+    min_unique_authors: int = 4
     min_sentiment_confidence: float = 0.35
     max_manipulation_risk: float = 0.60
     max_annualised_volatility: float = 1.20
@@ -749,6 +965,31 @@ class SentimentConfig(BaseModel):
     duplicate_ratio_alert: float = 0.35
     use_ai_classifier: bool = True
     ai_sample_per_symbol: int = 20
+    #: Fetch every social provider (Reddit, news RSS, X, Stocktwits, ...)
+    #: concurrently with the market-data phases of a refresh (securities /
+    #: prices / earnings) rather than strictly after them. Social sources hit
+    #: completely different hosts than the market-data provider (TipRanks/
+    #: Yahoo), so there is no reason the ~minutes-long social fetch should sit
+    #: behind the ~8-minute market pass instead of overlapping it. Only the
+    #: NETWORK FETCH moves earlier -- persistence (posts, mentions, daily
+    #: sentiment aggregates) still happens on the main refresh thread, after
+    #: the securities phase has committed (mention resolution depends on the
+    #: alias table ``ingest_securities`` writes), exactly as it does today.
+    #: See ``data.ingest.DataIngestor.run_full_refresh``. Set False to
+    #: restore the fully sequential order (securities -> prices -> earnings
+    #: -> social fetch -> sentiment persist) -- useful for tests/debugging
+    #: where a strict, single-threaded ordering is easier to reason about.
+    fetch_concurrently: bool = True
+    #: How long ``run_full_refresh`` waits, once the market-data phases are
+    #: done, for a still-running background social fetch before giving up on
+    #: it for this refresh. A social fetch is minutes at most in practice --
+    #: this is deliberately generous so it is essentially never hit in
+    #: normal operation, not a tuning knob. On timeout the refresh proceeds
+    #: with zero posts from the abandoned fetch (a warning is logged); the
+    #: background thread is a daemon and is not killed, but its result is
+    #: discarded rather than raced with the main thread -- the same ground
+    #: gets covered on the next refresh.
+    fetch_join_timeout_s: float = 300.0
 
 
 class RegimeConfig(BaseModel):
@@ -1080,7 +1321,7 @@ class AppConfig(BaseSettings):
             "x": self.x.enabled,
             "stocktwits": self.stocktwits.enabled,
             "news": self.news.enabled,
-            "ai": self.ai.provider != "null",
+            "ai": self.ai.provider != "none",
             "notifications": self.notifications.enabled,
             "scheduler": self.scheduler.enabled,
         }

@@ -128,12 +128,54 @@ describe('Screener row click navigation', () => {
       generated_at: null,
       evaluated_symbols: 0,
       rejected: [],
+      funnel: null,
     });
 
     renderScreener();
 
     expect(await screen.findByText(/ledger is empty/i)).toBeInTheDocument();
     expect(screen.getByText('claudetrade scan')).toBeInTheDocument();
+  });
+
+  it('shows the rejection funnel panel alongside the empty state when a scan ran with rejections', async () => {
+    listSignals.mockResolvedValue({ signals: [], total: 0 });
+    rejectedCandidates.mockResolvedValue({
+      available: true,
+      reason: null,
+      generated_at: '2026-07-31T13:00:00Z',
+      evaluated_symbols: 1673,
+      rejected: [],
+      funnel: {
+        top_n: 20,
+        total_rejections: 8365,
+        by_reason: { illiquid: 4000, score_below_threshold: 4365 },
+        by_strategy_reason: {
+          sentiment_breakout: { illiquid: 4000 },
+          sentiment_pullback: { score_below_threshold: 4365 },
+        },
+        near_misses: [
+          {
+            symbol: 'ZZZZ',
+            strategy: 'sentiment_pullback',
+            reason_code: 'score_below_threshold',
+            metric: 46.2,
+            threshold: 48.0,
+            margin: -1.8,
+            overall_score: 46.2,
+            confidence: 0.55,
+            weakest_components: [['volume_confirmation', 1.0]],
+            strongest_components: [['technical_setup', 20.0]],
+          },
+        ],
+      },
+    });
+
+    renderScreener();
+
+    expect(await screen.findByText(/ledger is empty/i)).toBeInTheDocument();
+    expect(screen.getByText('Why no signals?')).toBeInTheDocument();
+    expect(screen.getByText('illiquid')).toBeInTheDocument();
+    expect(screen.getByText('ZZZZ')).toBeInTheDocument();
   });
 
   it('opens sentiment detail for a directly entered ticker', async () => {

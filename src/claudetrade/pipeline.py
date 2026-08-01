@@ -21,6 +21,7 @@ result; it does not abort the run.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -56,9 +57,16 @@ from claudetrade.regime.market_regime import RegimeClassifier
 from claudetrade.sentiment.aggregation import SentimentAggregator
 from claudetrade.sentiment.classifiers import RuleSentimentClassifier
 from claudetrade.sentiment.entity_resolution import TickerResolver
+from claudetrade.signals import funnel_store
 from claudetrade.signals.engine import ScanResult, SignalEngine
 from claudetrade.signals.ledger import SignalLedger
-from claudetrade.utils.timeutils import trading_day_range, utc_now
+from claudetrade.utils.timeutils import (
+    ensure_utc,
+    previous_trading_day,
+    session_close_utc,
+    trading_day_range,
+    utc_now,
+)
 
 log = get_logger(__name__)
 
@@ -124,8 +132,23 @@ class Pipeline:
         start: dt.date,
         end: dt.date,
         symbols: list[str] | None = None,
+        social_lookback_hours: int | None = None,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> PipelineResult:
-        """Pull, validate and store data from every configured source."""
+        """Pull, validate and store data from every configured source.
+
+        Args:
+            social_lookback_hours: When given, social sources fetch only this
+                many hours back (up to now) instead of the full ``start``--
+                ``end`` calendar window. Lets the price-history window be
+                sized for context building (90+ days) without asking social
+                providers for months of posts they cannot supply anyway.
+            progress_callback: Optional ``(phase, done, total)`` hook, see
+                ``data.ingest.DataIngestor.progress_callback`` -- used by the
+                web API's background-refresh endpoint
+                (``webapi.routers.system``) to expose live progress; the CLI
+                does not pass one and is unaffected.
+        """
         result = PipelineResult()
 
         # Deliberately NOT `as_of=end`: that returns point-in-time membership and
@@ -149,12 +172,14 @@ class Pipeline:
             market_provider=self.market,
             earnings_provider=self.earnings,
             social_providers=self.social,
+            progress_callback=progress_callback,
         )
         report = ingestor.run_full_refresh(
             symbols=[s.symbol for s in securities],
             start=start,
             end=end,
             securities=securities,
+            social_lookback_hours=social_lookback_hours,
         )
         result.ingest = report
         result.universe_size = len(securities)
@@ -192,6 +217,29 @@ class Pipeline:
     ) -> int:
         """Resolve mentions, classify posts and store daily aggregates.
 
+        A row is written for a (symbol, session) pair only when at least one
+        of this run's posts for the symbol actually falls inside that
+        session's own window -- after the previous session's close, at or
+        before its own. Two failure modes this prevents, both observed live:
+
+        * **Fabricated freshness.** Aggregating one static post set for every
+          session in the range produced a current-session row byte-identical
+          to yesterday's whenever nothing new had been fetched yet (weighted
+          means are invariant to the uniform extra decay between two closes).
+          A session that gained no posts now simply has no row, which
+          downstream correctly reads as "no fresh sentiment", rather than a
+          silently duplicated one.
+        * **History rewrites.** A later refresh whose providers only look
+          back ~72 hours used to recompute (and overwrite) every session in
+          the whole refresh window from just the posts it happened to
+          re-fetch, degrading historical rows originally built from richer
+          live data. Sessions outside this fetch's real post coverage are now
+          left untouched.
+
+        Each written row still aggregates the full decayed post set as of its
+        session close (a rolling read, not a one-day slice) -- only *which*
+        sessions get written is bounded by post coverage.
+
         Returns:
             Number of ``symbol_sentiment_daily`` rows written.
         """
@@ -220,10 +268,21 @@ class Pipeline:
                 )
 
         sessions = trading_day_range(start, end)
+        # Per-session freshness window: (previous session's close, own close].
+        session_windows: list[tuple[dt.date, dt.datetime, dt.datetime]] = []
+        for trading_session in sessions:
+            lower = session_close_utc(previous_trading_day(trading_session))
+            session_windows.append(
+                (trading_session, lower, session_close_utc(trading_session))
+            )
+
         written = 0
         with self.db.session() as session:
             for symbol, symbol_posts in by_symbol.items():
-                for trading_session in sessions:
+                post_times = [ensure_utc(p.created_at) for p in symbol_posts]
+                for trading_session, lower, upper in session_windows:
+                    if not any(lower < t <= upper for t in post_times):
+                        continue  # no fresh post for this session -- see docstring
                     snapshot = aggregator.aggregate(
                         symbol,
                         trading_session,
@@ -235,6 +294,9 @@ class Pipeline:
                     if snapshot.post_count == 0:
                         continue
                     written += _upsert_sentiment(session, snapshot)
+        drop_summary = aggregator.drain_drop_summary()
+        if drop_summary:
+            log.warning(drop_summary)
         log.info("stored %d daily sentiment rows across %d symbols", written, len(by_symbol))
         return written
 
@@ -290,8 +352,43 @@ class Pipeline:
         record: bool = True,
         generate_thesis: bool = True,
     ) -> PipelineResult:
-        """Generate ranked signals for one session."""
+        """Generate ranked signals for one session.
+
+        When ``session`` has no stored price bars -- the normal intraday case
+        (daily bars land after the close), a weekend/holiday date, or simply
+        a database that has not been refreshed today -- the scan falls back
+        to the most recent stored session within the last 7 calendar days and
+        says so in ``result.warnings``, instead of silently evaluating zero
+        symbols. A scanner that answers "no data yet, here is the latest
+        complete session's read" is useful; one that returns an empty list
+        with no explanation is indistinguishable from a broken one.
+        """
         result = PipelineResult()
+
+        latest_bar_session = self._latest_bar_session(upto=session)
+        if latest_bar_session is None:
+            result.warnings.append(
+                f"No price bars are stored at or before {session}. "
+                "Run a data refresh before scanning."
+            )
+            result.finished_at = utc_now()
+            return result
+        if latest_bar_session != session:
+            if (session - latest_bar_session).days > 7:
+                result.warnings.append(
+                    f"No price bars stored for {session}; the latest stored session "
+                    f"{latest_bar_session} is more than 7 days old. Refusing to scan "
+                    "stale data -- run a data refresh."
+                )
+                result.finished_at = utc_now()
+                return result
+            result.warnings.append(
+                f"No price bars stored for {session} (data not yet ingested for that "
+                f"session); scanning the latest stored session {latest_bar_session} "
+                "instead. Run a refresh to evaluate the current session."
+            )
+            session = latest_bar_session
+
         start = session - dt.timedelta(days=lookback_days)
 
         universe_report = self.universe.for_session(session)
@@ -322,7 +419,7 @@ class Pipeline:
             providers={
                 "market": getattr(self.market, "name", "unknown"),
                 "earnings": getattr(self.earnings, "name", "unknown"),
-                "ai": getattr(self.ai, "name", "null"),
+                "ai": getattr(self.ai, "name", "none"),
             },
             universe_size=len(candidates),
         )
@@ -333,6 +430,15 @@ class Pipeline:
             context = provider.build_context(symbol, session)
             if context is not None:
                 contexts.append(context)
+        if not contexts:
+            # The engine's own "no candidate cleared the thresholds" warning
+            # only fires when at least one symbol was evaluated; zero contexts
+            # would otherwise return a completely silent empty scan.
+            result.warnings.append(
+                f"No symbol produced an evaluable context for {session} "
+                f"(each needs 30+ bars of history ending exactly on that session). "
+                "The stored data is likely incomplete -- run a data refresh."
+            )
 
         engine = SignalEngine(self.config, ai_provider=self.ai)
         scan_result = engine.scan(
@@ -344,12 +450,32 @@ class Pipeline:
         )
         result.scan = scan_result
         result.warnings.extend(scan_result.warnings)
+        # Cross-process diagnosability (see `signals.funnel_store`'s module
+        # docstring): the CLI, the web API server and the MCP server each
+        # bootstrap their own `Pipeline`, so a rejection funnel that only
+        # lived on this in-memory `scan_result` would be invisible to "why no
+        # picks today?" asked from a different one of those processes.
+        # Best-effort -- never raises. A degenerate zero-context scan writes
+        # nothing so it cannot clobber the previous, informative funnel.
+        if scan_result.evaluated_symbols:
+            funnel_store.save(self.config, scan_result)
 
         if record:
             for signal in scan_result.signals:
+                # Same-session re-scans are now routine (the intraday
+                # fallback above targets the latest stored session every
+                # time), and a signal's id is deterministic per (symbol,
+                # strategy, session, config, code) while its content embeds
+                # ``created_at`` -- so re-recording an id that already exists
+                # would always trip the immutability check. First write wins:
+                # an already-recorded id is an idempotent re-scan, not an
+                # error.
+                if self.ledger.get(signal.signal_id, verify=False) is not None:
+                    continue
                 # One unrecordable signal (a true same-id/different-content
-                # collision now indicates corruption, not a routine rescan)
-                # must not abort recording the rest of the batch.
+                # collision indicates corruption at this point, since
+                # already-recorded ids were skipped above) must not abort
+                # recording the rest of the batch.
                 outcome = self.ledger.record_or_report(signal)
                 if not outcome.ok:
                     scan_result.record_errors[signal.signal_id] = outcome.error or "unknown"
@@ -363,6 +489,17 @@ class Pipeline:
         result.finished_at = utc_now()
         log.info("scan complete for %s: %s", session, result.summary())
         return result
+
+    def _latest_bar_session(self, *, upto: dt.date) -> dt.date | None:
+        """Most recent session at or before ``upto`` with stored price bars."""
+        from sqlalchemy import func, select
+
+        from claudetrade.db.models import PriceBar
+
+        with self.db.session() as db_session:
+            return db_session.execute(
+                select(func.max(PriceBar.session)).where(PriceBar.session <= upto)
+            ).scalar()
 
     # --- backtest -----------------------------------------------------------
 

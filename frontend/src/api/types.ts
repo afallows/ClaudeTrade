@@ -79,6 +79,28 @@ export interface RejectedCandidate {
   strategy: string;
   stage: string;
   reasons: string[];
+  reason_codes: string[];
+}
+
+export interface NearMiss {
+  symbol: string;
+  strategy: string;
+  reason_code: string;
+  metric: number;
+  threshold: number;
+  margin: number;
+  overall_score: number | null;
+  confidence: number | null;
+  weakest_components: [string, number][];
+  strongest_components: [string, number][];
+}
+
+export interface ScanFunnel {
+  top_n: number;
+  total_rejections: number;
+  by_reason: Record<string, number>;
+  by_strategy_reason: Record<string, Record<string, number>>;
+  near_misses: NearMiss[];
 }
 
 export interface RejectedResponse {
@@ -87,6 +109,7 @@ export interface RejectedResponse {
   generated_at: string | null;
   evaluated_symbols: number;
   rejected: RejectedCandidate[];
+  funnel: ScanFunnel | null;
 }
 
 export interface ScanRequest {
@@ -295,3 +318,34 @@ export interface PipelineDiagnostic {
   detail: string;
 }
 export interface DiagnosticsResponse { pipelines: PipelineDiagnostic[]; probe_note: string; }
+
+export interface CredentialTestResult {
+  ok: boolean;
+  mode: string | null;
+  status_detail: string;
+}
+
+export interface AIConfig {
+  provider: 'anthropic' | 'openai' | 'none';
+  model: string;
+  anthropic_default_model: string;
+  openai_default_model: string;
+  anthropic_api_key_credential: string;
+  openai_api_key_credential: string;
+}
+export interface AIConfigUpdateResult {
+  provider: string;
+  model: string;
+  persisted: boolean;
+  note: string;
+}
+
+export interface RefreshStatus {
+  running: boolean;
+  phase: string;
+  symbols_done: number;
+  symbols_total: number;
+  started_at: string | null;
+  finished_at: string | null;
+  last_error: string | null;
+}

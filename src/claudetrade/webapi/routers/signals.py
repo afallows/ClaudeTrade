@@ -17,10 +17,12 @@ from claudetrade.pipeline import Pipeline
 from claudetrade.utils.timeutils import utc_now
 from claudetrade.webapi.deps import get_config, get_last_scan, get_pipeline, set_last_scan
 from claudetrade.webapi.schemas import (
+    NearMissOut,
     RefreshRequest,
     RefreshResponse,
     RejectedCandidateOut,
     RejectedResponse,
+    ScanFunnelOut,
     ScanRequest,
     ScanResponse,
     SignalDetailOut,
@@ -88,16 +90,42 @@ def rejected_candidates(scan_result=Depends(get_last_scan)) -> RejectedResponse:
                 "POST /api/scan to populate this list."
             ),
         )
+    funnel = scan_result.funnel
     return RejectedResponse(
         available=True,
         generated_at=scan_result.generated_at,
         evaluated_symbols=scan_result.evaluated_symbols,
         rejected=[
             RejectedCandidateOut(
-                symbol=r.symbol, strategy=r.strategy, stage=r.stage, reasons=list(r.reasons)
+                symbol=r.symbol,
+                strategy=r.strategy,
+                stage=r.stage,
+                reasons=list(r.reasons),
+                reason_codes=list(r.reason_codes),
             )
             for r in scan_result.rejected
         ],
+        funnel=ScanFunnelOut(
+            top_n=funnel.top_n,
+            total_rejections=funnel.total_rejections,
+            by_reason=dict(funnel.by_reason),
+            by_strategy_reason={k: dict(v) for k, v in funnel.by_strategy_reason.items()},
+            near_misses=[
+                NearMissOut(
+                    symbol=nm.symbol,
+                    strategy=nm.strategy,
+                    reason_code=nm.reason_code,
+                    metric=nm.metric,
+                    threshold=nm.threshold,
+                    margin=nm.margin,
+                    overall_score=nm.overall_score,
+                    confidence=nm.confidence,
+                    weakest_components=nm.weakest_components,
+                    strongest_components=nm.strongest_components,
+                )
+                for nm in funnel.near_misses
+            ],
+        ),
     )
 
 
@@ -132,7 +160,10 @@ def run_scan(
     )
     set_last_scan(request, result.scan)
     return ScanResponse(
-        session=session_date,
+        # The session actually evaluated -- the pipeline may fall back to the
+        # latest stored session when the requested one has no data (the
+        # warnings explain when it does).
+        session=result.scan.session if result.scan else session_date,
         evaluated_symbols=result.scan.evaluated_symbols if result.scan else 0,
         signal_count=len(result.scan.signals) if result.scan else 0,
         rejected_count=len(result.scan.rejected) if result.scan else 0,
@@ -148,8 +179,16 @@ def run_refresh(
 ) -> RefreshResponse:
     """Run ``Pipeline.refresh`` -- identical to ``claudetrade refresh``."""
     end = body.end or utc_now().date()
-    start = body.start or (end - dt.timedelta(days=config.sentiment.lookback_days))
-    result = pipeline.refresh(start=start, end=end)
+    # Default price window is 90 days -- context building needs 30+ bars, so
+    # defaulting to the 14-day social lookback guaranteed empty scans on a
+    # fresh install (same fix as the background-refresh endpoint and the MCP
+    # server). Social sources stay bounded to the sentiment window.
+    start = body.start or (end - dt.timedelta(days=90))
+    result = pipeline.refresh(
+        start=start,
+        end=end,
+        social_lookback_hours=config.sentiment.lookback_days * 24,
+    )
     return RefreshResponse(
         universe_size=result.universe_size,
         sentiment_rows=result.sentiment_rows,

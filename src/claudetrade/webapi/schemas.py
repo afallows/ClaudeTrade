@@ -102,6 +102,47 @@ class RejectedCandidateOut(BaseModel):
     strategy: str
     stage: str
     reasons: list[str]
+    reason_codes: list[str] = Field(default_factory=list)
+
+
+class NearMissOut(BaseModel):
+    """One below-threshold candidate close enough to be worth a second look.
+
+    ``metric``/``threshold``/``margin`` mirror ``signals.engine.NearMiss``:
+    ``margin`` is ``metric - threshold`` (negative; closer to zero is closer
+    to clearing the bar). ``weakest_components``/``strongest_components`` are
+    the 3 lowest/highest-valued entries from whichever component breakdown
+    produced the rejection -- a strategy's own setup score, or the engine's
+    blended score -- each as ``[label, value]``.
+    """
+
+    symbol: str
+    strategy: str
+    reason_code: str
+    metric: float
+    threshold: float
+    margin: float
+    overall_score: float | None
+    confidence: float | None
+    weakest_components: list[tuple[str, float]]
+    strongest_components: list[tuple[str, float]]
+
+
+class ScanFunnelOut(BaseModel):
+    """Aggregated ``why zero (or few) signals`` breakdown for the last scan.
+
+    See ``signals.engine.ScanFunnel``: ``by_reason``/``by_strategy_reason``
+    are full counts across every rejection in the scan (small, bounded by the
+    fixed set of reason codes the code produces); ``near_misses`` is
+    deliberately capped (``top_n``, default 20) rather than every
+    below-threshold candidate.
+    """
+
+    top_n: int
+    total_rejections: int
+    by_reason: dict[str, int]
+    by_strategy_reason: dict[str, dict[str, int]]
+    near_misses: list[NearMissOut]
 
 
 class RejectedResponse(BaseModel):
@@ -110,7 +151,10 @@ class RejectedResponse(BaseModel):
     ``ScanResult.rejected`` is never persisted (see ``signals/ledger.py``'s
     module docstring) -- so, exactly like the Streamlit Scanner's expander,
     this is only ever populated by a scan that ran in this process, and says
-    so honestly when it hasn't.
+    so honestly when it hasn't. ``funnel`` is the aggregated counterpart of
+    ``rejected`` (see ``ScanFunnelOut``) and follows the same availability
+    rule -- ``None`` until a scan has run here, never a misleadingly-empty
+    funnel.
     """
 
     available: bool
@@ -118,6 +162,7 @@ class RejectedResponse(BaseModel):
     generated_at: dt.datetime | None = None
     evaluated_symbols: int = 0
     rejected: list[RejectedCandidateOut] = Field(default_factory=list)
+    funnel: ScanFunnelOut | None = None
 
 
 class ScanRequest(BaseModel):
@@ -197,6 +242,39 @@ class TickerDetailOut(BaseModel):
     signal_history: list[SignalRowOut]
     price_note: str | None = None
     sentiment_note: str | None = None
+
+
+# --------------------------------------------------------------------------
+# AI Analysis configuration (Configuration screen's "AI Analysis" section)
+# --------------------------------------------------------------------------
+
+
+class AIConfigOut(BaseModel):
+    """Current effective AI-provider selection, plus enough to render the
+    Configuration screen's "AI Analysis" section without a second round trip:
+    each provider's operator-configurable default model (shown as the model
+    field's placeholder when ``model`` is empty) and per-provider credential
+    names (already present in ``/api/system/credentials`` too, repeated here
+    for convenience).
+
+    ``persisted`` is always ``false`` from this endpoint's own GET/PUT --
+    see ``PUT /api/system/ai-config``'s docstring for why a selection here
+    is honestly scoped to "takes effect immediately, for this running
+    server process" rather than a config.toml rewrite.
+    """
+
+    provider: str
+    model: str
+    anthropic_default_model: str
+    openai_default_model: str
+    anthropic_api_key_credential: str
+    openai_api_key_credential: str
+
+
+class AIConfigUpdate(BaseModel):
+    provider: str = Field(pattern="^(anthropic|openai|none)$")
+    #: Empty string means "use the selected provider's own default".
+    model: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -321,12 +399,15 @@ class PaperOpenResponse(BaseModel):
 
 
 __all__ = [
+    "AIConfigOut",
+    "AIConfigUpdate",
     "BarOut",
     "ClosedTradeOut",
     "ComponentScoresOut",
     "DashboardOut",
     "EquityPointOut",
     "IndicatorsOut",
+    "NearMissOut",
     "PaperAccountOut",
     "PaperAccountResponse",
     "PaperOpenRequest",
@@ -339,6 +420,7 @@ __all__ = [
     "RegimeCardOut",
     "RejectedCandidateOut",
     "RejectedResponse",
+    "ScanFunnelOut",
     "ScanRequest",
     "ScanResponse",
     "SentimentPointOut",

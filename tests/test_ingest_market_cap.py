@@ -196,7 +196,7 @@ class TestIngestSecuritiesStoresResolvedCap:
 class TestHistoricalRequestMarketCapFloor:
     def test_current_cap_filters_history_request_universe(self, memory_db):
         config = AppConfig()
-        provider = _CapProvider({"BIG": 2_000_000_000.0, "SMALL": 900_000_000.0})
+        provider = _CapProvider({"BIG": 2_000_000_000.0, "SMALL": 400_000_000.0})
         ingestor = _ingestor(config, memory_db, provider)
         report = IngestReport()
         enriched = ingestor.ingest_securities(

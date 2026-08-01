@@ -39,6 +39,17 @@ def tmp_app_config(tmp_path: Path, monkeypatch) -> AppConfig:
     config.market_data.provider = "synthetic"
     config.market_data.fallbacks = []
     config.earnings.provider = "synthetic"
+    # Production defaults reddit.provider to the live adapter (mirroring
+    # market_data/earnings above); pin it back to synthetic here for the same
+    # reason -- deterministic, network-free unit tests.
+    config.reddit.provider = "synthetic"
+    # Stocktwits is on-by-default and its only adapter is live (curl_cffi to
+    # api.stocktwits.com); unlike reddit it has no synthetic variant to pin,
+    # so disable it here or any test that calls Pipeline.refresh would spend
+    # its time on doomed 20s-per-symbol outbound requests (the same reason
+    # refresh tests already disable news_rss/X). Tests that specifically want
+    # it re-enable it themselves.
+    config.stocktwits.enabled = False
     config.logging.console = False
     config.paths.app_dir = tmp_path
 

@@ -77,8 +77,28 @@ REQUIRED_FEATURES = (
     "hh_hl_score",
     "vol_contraction_pct",
     "gap_pct",
+    "gap_filled",
+    "gap_continuation_up",
+    "gap_continuation_down",
     "consecutive_up",
     "consecutive_down",
+    "volume_divergence",
+    # ---- Pivot points, Fibonacci retracements, round-number levels ----
+    # Additional causal S/R candidate inputs (ADR market-signal adoption
+    # package item 3) -- see the docstrings of ``patterns.pivot_points``,
+    # ``patterns.fibonacci_levels`` and ``patterns.round_number_level``.
+    "pivot",
+    "pivot_r1",
+    "pivot_s1",
+    "pivot_r2",
+    "pivot_s2",
+    "fib_23_6",
+    "fib_38_2",
+    "fib_50_0",
+    "fib_61_8",
+    "fib_78_6",
+    "round_number_level",
+    "level_confluence_count",
     "rs_vs_benchmark_20",
     "rs_vs_benchmark_60",
     "rs_percentile",
@@ -268,6 +288,14 @@ class FeatureBuilder:
         result["ad_line"] = indicators.accumulation_distribution(high, low, close, volume)
         result["vwap_20"] = indicators.vwap(high, low, close, volume, 20)
 
+        # ---- Volume divergence (market-signal adoption package item 4) ----
+        # Elevated relative volume with little same-day price follow-through
+        # -- a possible absorption/distribution warning. See
+        # ``patterns.volume_divergence``.
+        result["volume_divergence"] = patterns.volume_divergence(
+            df, result["rel_volume_20"]
+        ).astype(float)
+
         # ---- Price Levels ----
         result["dist_from_sma20_pct"] = indicators.distance_from_ma_pct(
             close, result["sma_20"]
@@ -300,6 +328,60 @@ class FeatureBuilder:
         result["resistance_level"] = sr_df["resistance_level"]
         result["support_level"] = sr_df["support_level"]
 
+        # ---- Pivot points, Fibonacci retracements, round-number levels ----
+        # Additional causal S/R candidate inputs (market-signal adoption
+        # package item 3). Pivots use only the PRIOR session's H/L/C; the
+        # Fibonacci levels are pure arithmetic off the already-causal
+        # swing_high_recent/swing_low_recent series computed just above.
+        pivot_df = patterns.pivot_points(df)
+        result["pivot"] = pivot_df["pivot"]
+        result["pivot_r1"] = pivot_df["pivot_r1"]
+        result["pivot_s1"] = pivot_df["pivot_s1"]
+        result["pivot_r2"] = pivot_df["pivot_r2"]
+        result["pivot_s2"] = pivot_df["pivot_s2"]
+
+        fib_df = patterns.fibonacci_levels(result["swing_high_recent"], result["swing_low_recent"])
+        result["fib_23_6"] = fib_df["fib_23_6"]
+        result["fib_38_2"] = fib_df["fib_38_2"]
+        result["fib_50_0"] = fib_df["fib_50_0"]
+        result["fib_61_8"] = fib_df["fib_61_8"]
+        result["fib_78_6"] = fib_df["fib_78_6"]
+
+        result["round_number_level"] = patterns.round_number_level(close)
+
+        # How many independent methods (clustered swings, pivots, Fibonacci,
+        # round-number, moving averages) place a level within tolerance of
+        # today's close -- consumed as a small confluence bonus by Strategies
+        # A and B. Feeding this into support_resistance_levels' own
+        # clustering was considered and rejected: that clustering result is a
+        # hard structural input elsewhere (Strategy A's "no reference level"
+        # veto, both A's and B's stop placement), and folding pivot/fib/
+        # round-number candidates into it would silently change that
+        # existing, load-bearing level selection. A separate count keeps the
+        # new signal purely additive.
+        result["level_confluence_count"] = patterns.level_confluence_count(
+            close,
+            {
+                "swings": [result["support_level"], result["resistance_level"]],
+                "pivots": [
+                    result["pivot"],
+                    result["pivot_r1"],
+                    result["pivot_s1"],
+                    result["pivot_r2"],
+                    result["pivot_s2"],
+                ],
+                "fib": [
+                    result["fib_23_6"],
+                    result["fib_38_2"],
+                    result["fib_50_0"],
+                    result["fib_61_8"],
+                    result["fib_78_6"],
+                ],
+                "round_number": [result["round_number_level"]],
+                "ma": [result["sma_20"], result["sma_50"], result["sma_200"]],
+            },
+        )
+
         # ---- Breakouts ----
         result["breakout_20d"] = patterns.detect_breakout(df, lookback=20).astype(float)
         result["failed_breakout"] = patterns.detect_failed_breakout(df, lookback=20).astype(float)
@@ -311,6 +393,19 @@ class FeatureBuilder:
         # ---- Gap Analysis ----
         gap_df = patterns.gap_analysis(df, fill_lookahead_bars=10)
         result["gap_pct"] = gap_df["gap_pct"]
+        result["gap_filled"] = gap_df["gap_filled"].astype(float)
+
+        # ---- Gap continuation (market-signal adoption package item 2) ----
+        # Does a LATER session open beyond a breakout/breakdown level with an
+        # actual overnight gap, extending the move. See
+        # ``patterns.gap_continuation`` for the causal confirmation-delay
+        # mechanics (mirrors ``detect_failed_breakout``).
+        result["gap_continuation_up"] = patterns.gap_continuation(
+            df, direction="up", lookback=20
+        ).astype(float)
+        result["gap_continuation_down"] = patterns.gap_continuation(
+            df, direction="down", lookback=20
+        ).astype(float)
 
         # ---- Consecutive Bars ----
         cu_cd_df = indicators.consecutive_up_down(close)

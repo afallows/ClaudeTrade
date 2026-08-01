@@ -46,7 +46,9 @@ buffer.
 
 from __future__ import annotations
 
-from claudetrade.domain import Direction
+import datetime as dt
+
+from claudetrade.domain import Direction, EarningsSession
 from claudetrade.strategies.base import Strategy, StrategyContext, StrategyProposal
 from claudetrade.strategies.registry import register_strategy
 from claudetrade.strategies.scoring_utils import (
@@ -115,7 +117,7 @@ class PostEarningsDriftStrategy(Strategy):
             return None
         surprise = event.surprise_pct
 
-        event_move = self._event_day_move(ctx, event.report_date)
+        event_move = self._event_day_move(ctx, event)
         if event_move is None:
             self.decline(ctx, "no_event_bar")
             return None
@@ -231,7 +233,7 @@ class PostEarningsDriftStrategy(Strategy):
 
         # --- levels ------------------------------------------------------------
         if direction is Direction.LONG:
-            stop = min(price - self.ATR_STOP_MULTIPLE * atr, self._event_bar_low(ctx, event.report_date))
+            stop = min(price - self.ATR_STOP_MULTIPLE * atr, self._event_bar_low(ctx, event))
             entry_low = price - 0.3 * atr
             entry_high = price + 0.4 * atr
             risk_per_share = ((entry_low + entry_high) / 2.0) - stop
@@ -243,7 +245,7 @@ class PostEarningsDriftStrategy(Strategy):
                 round(entry_high + 2.8 * risk_per_share, 2),
             ]
         else:
-            stop = max(price + self.ATR_STOP_MULTIPLE * atr, self._event_bar_high(ctx, event.report_date))
+            stop = max(price + self.ATR_STOP_MULTIPLE * atr, self._event_bar_high(ctx, event))
             entry_high = price + 0.3 * atr
             entry_low = price - 0.4 * atr
             reference = (entry_low + entry_high) / 2.0
@@ -299,29 +301,44 @@ class PostEarningsDriftStrategy(Strategy):
 
     # --- helpers -----------------------------------------------------------
 
-    def _event_day_move(self, ctx: StrategyContext, report_date) -> float | None:
-        """Percentage move on the first session that priced the report.
+    @staticmethod
+    def _first_reaction_session(event) -> object:
+        """Earliest bar session that can have priced ``event``.
 
-        For an after-close report the reaction lands on the following session,
-        so the first bar strictly after the report date is used.
+        An after-close report cannot move its own day's regular session --
+        the reaction lands on the NEXT bar. Using ``>= report_date`` for an
+        AMC report returned the pre-reaction bar: a genuine +14% beat then
+        scored a near-zero (or wrong-signed) event move, tripping the
+        ``reaction_contradicts_surprise`` hard veto on exactly the setups
+        this strategy exists to catch, and anchored the stop to the pre-gap
+        bar. Before-open and unknown timings keep the report day itself.
         """
+        if event.session is EarningsSession.AFTER_CLOSE:
+            return event.report_date + dt.timedelta(days=1)
+        return event.report_date
+
+    def _event_day_move(self, ctx: StrategyContext, event) -> float | None:
+        """Percentage move on the first session that priced the report."""
+        earliest = self._first_reaction_session(event)
         for i, bar in enumerate(ctx.bars):
-            if bar.session >= report_date and i > 0:
+            if bar.session >= earliest and i > 0:
                 prior_close = ctx.bars[i - 1].close
                 if prior_close <= 0:
                     return None
                 return 100.0 * (bar.close - prior_close) / prior_close
         return None
 
-    def _event_bar_low(self, ctx: StrategyContext, report_date) -> float:
+    def _event_bar_low(self, ctx: StrategyContext, event) -> float:
+        earliest = self._first_reaction_session(event)
         for bar in ctx.bars:
-            if bar.session >= report_date:
+            if bar.session >= earliest:
                 return bar.low
         return ctx.price * 0.9
 
-    def _event_bar_high(self, ctx: StrategyContext, report_date) -> float:
+    def _event_bar_high(self, ctx: StrategyContext, event) -> float:
+        earliest = self._first_reaction_session(event)
         for bar in ctx.bars:
-            if bar.session >= report_date:
+            if bar.session >= earliest:
                 return bar.high
         return ctx.price * 1.1
 

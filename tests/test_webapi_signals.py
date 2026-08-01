@@ -129,7 +129,58 @@ def test_rejected_unavailable_before_any_scan_this_process(client: TestClient):
     body = resp.json()
     assert body["available"] is False
     assert body["rejected"] == []
+    assert body["funnel"] is None
     assert "POST /api/scan" in body["reason"]
+
+
+def test_rejected_serves_the_funnel_from_the_last_in_process_scan(client: TestClient):
+    """The funnel travels alongside `rejected` on the same in-process
+    ScanResult cache (see webapi.deps.get_last_scan) -- this injects one
+    directly rather than needing a full real scan to produce rejections."""
+    from claudetrade.signals.engine import NearMiss, ScanResult
+    from claudetrade.utils.timeutils import utc_now
+
+    scan_result = ScanResult(
+        session=dt.date(2026, 7, 31), generated_at=utc_now(), regime=None, evaluated_symbols=1673
+    )
+    scan_result.funnel.record(strategy="sentiment_breakout", reason_code="illiquid")
+    scan_result.funnel.record(strategy="sentiment_breakout", reason_code="illiquid")
+    scan_result.funnel.record(strategy="sentiment_pullback", reason_code="score_below_threshold")
+    scan_result.funnel.offer_near_miss(
+        NearMiss(
+            symbol="ZZZZ",
+            strategy="sentiment_pullback",
+            reason_code="score_below_threshold",
+            metric=46.2,
+            threshold=48.0,
+            margin=-1.8,
+            overall_score=46.2,
+            confidence=0.55,
+            weakest_components=[("volume_confirmation", 1.0)],
+            strongest_components=[("technical_setup", 20.0)],
+        )
+    )
+    scan_result.funnel.finalize()
+    client.app.state.last_scan_result = scan_result
+
+    resp = client.get("/api/signals/rejected")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["available"] is True
+    assert body["evaluated_symbols"] == 1673
+    funnel = body["funnel"]
+    assert funnel["total_rejections"] == 3
+    assert funnel["by_reason"] == {"illiquid": 2, "score_below_threshold": 1}
+    assert funnel["by_strategy_reason"] == {
+        "sentiment_breakout": {"illiquid": 2},
+        "sentiment_pullback": {"score_below_threshold": 1},
+    }
+    [near_miss] = funnel["near_misses"]
+    assert near_miss["symbol"] == "ZZZZ"
+    assert near_miss["metric"] == pytest.approx(46.2)
+    assert near_miss["threshold"] == pytest.approx(48.0)
+    assert near_miss["weakest_components"] == [["volume_confirmation", 1.0]]
 
 
 # --- POST /api/scan / /api/refresh: honest degradation on an empty universe -
@@ -140,8 +191,8 @@ def test_scan_with_no_stored_market_data_evaluates_nothing_but_does_not_crash(
 ):
     """The bootstrap seed universe is non-empty (ADR-0008 Decision 3: seeds are
     always present), but with zero stored price bars nothing can be evaluated
-    -- so the honest outcome is zero signals, zero evaluated symbols, and a
-    real (if empty) cached ``ScanResult`` rather than a crash.
+    -- so the scan refuses loudly (an explicit warning naming the missing
+    data) instead of fabricating an empty-but-"successful" result.
     """
     resp = client.post("/api/scan", json={"session": "2024-06-28"})
     assert resp.status_code == 200
@@ -149,12 +200,13 @@ def test_scan_with_no_stored_market_data_evaluates_nothing_but_does_not_crash(
     assert body["signal_count"] == 0
     assert body["evaluated_symbols"] == 0
     assert body["rejected_count"] == 0
+    assert any("No price bars" in w for w in body["warnings"])
 
-    # A scan genuinely ran in this process, so the near-miss cache is now
-    # populated (even though it's empty) rather than reporting "unavailable".
+    # No scan actually ran (there was nothing to evaluate), so the near-miss
+    # cache honestly reports unavailable rather than caching a fabricated
+    # empty result.
     rejected = client.get("/api/signals/rejected").json()
-    assert rejected["available"] is True
-    assert rejected["rejected"] == []
+    assert rejected["available"] is False
 
 
 def test_refresh_degrades_without_configured_providers(client: TestClient):

@@ -20,7 +20,7 @@ Then in config:
 
 ```toml
 [ai]
-api_key_credential = "anthropic_api_key"
+anthropic_api_key_credential = "anthropic_api_key"
 ```
 
 The system looks up `CLAUDETRADE_SECRET_ANTHROPIC_API_KEY` at runtime.
@@ -282,21 +282,33 @@ integration widget calls) that returns one rich `overview` object per
 symbol. One HTTP call per symbol serves all four capabilities, because they
 are all different views onto that same object.
 
+Market caps and a current-session bar are now sourced primarily from a
+second, genuinely *batched* endpoint, GetQuotes -- one HTTP call serves an
+entire chunk of tickers, not one per symbol -- with the per-symbol
+`dataForTicker` path above as the fallback for whatever it does not cover.
+See "GetQuotes batching" below; this is the change that cuts a
+~2,400-symbol universe refresh from roughly one `dataForTicker` call per
+symbol down to a handful of batch calls plus a much smaller fallback tail.
+
 **Configuration**:
 
 ```toml
 [market_data]
 provider = "tipranks"          # the default
 fallbacks = ["yahoo", "csv"]
+max_workers = 8                 # per-symbol fetch parallelism, shared across TipRanks + Yahoo
+yahoo_rate_limit_per_minute = 120
 
 [earnings]
 provider = "tipranks"          # also the default
 
 [tipranks]
-rate_limit_per_minute = 30
+rate_limit_per_minute = 60      # raised from the original 30 -- see below
 request_timeout_s = 20.0
-cache_ttl_trading_days = 1     # response cache under paths.cache_dir/tipranks/
-use_getquotes_batch = false    # optional Canadian cap batching, see below
+cache_ttl_trading_days = 1      # response cache under paths.cache_dir/tipranks/
+unknown_ticker_ttl_days = 30    # negative/limited-result cache TTL, see below
+use_getquotes_batch = true      # primary batched cap + current-bar path, see below
+getquotes_batch_size = 200      # symbols per GetQuotes call
 ```
 
 **Credentials**: None required (no authentication).
@@ -307,19 +319,78 @@ published, contracted API. TipRanks could restrict, reshape, rate-limit or
 withdraw it at any time with no notice and no deprecation window. This is
 the same posture this codebase already applies to stooq's free CSV endpoint,
 Yahoo's undocumented chart JSON, and Stocktwits' keyless stream: personal/
-research use only, a conservative self-imposed rate limit (default
-30/minute), and a **fail-closed** response to anything that looks like a
-block or an unexpected shape -- see the fail-closed rules below. Nothing
-here bypasses authentication, defeats a paywall, or solves a challenge.
+research use only, a conservative self-imposed rate limit, and a
+**fail-closed** response to anything that looks like a block or an
+unexpected shape -- see the fail-closed rules below. Nothing here bypasses
+authentication, defeats a paywall, or solves a challenge.
 
-**Symbol notation**: a bare US ticker is passed through unchanged (`AAPL`).
-A Canadian (TSX/TSXV) one is rewritten to `TSE:<SYMBOL-WITH-DOTS>` -- this
-codebase's hyphenated share-class convention (`TECK-B`) becomes TipRanks'
-dotted one (`TSE:TECK.B`) -- confirmed against a real Canadian-listing
-fixture (`tests/fixtures/tipranks/dataForTicker_TECK_B.json`), whose
+`rate_limit_per_minute` was raised from the original launch default of
+30/minute to **60/minute** after the owner confirmed their own brokerage app
+calls this same public eToro widget endpoint at that kind of cadence with no
+observed pushback -- still a fraction of an idly-refreshing browser tab, and
+fully self-imposed and operator-configurable, not a vendor-published
+ceiling. This was the single biggest driver of a real first refresh across
+~2,400 symbols taking 80+ minutes (roughly `symbol_count / rate_limit`).
+`market_data.max_workers` (default 8) additionally lets the per-symbol fetch
+loop (`TipRanksProvider`/`YahooMarketProvider`) overlap request *latency*
+across symbols on a shared, thread-safe `RateLimiter` -- it does not itself
+raise the enforced calls/minute ceiling, only how much of the wall clock is
+spent idly waiting on one request at a time. `yahoo_rate_limit_per_minute`
+(default 120) is Yahoo's own separate bucket -- the bars cascade tries it
+before TipRanks (see `bars_last_resort` below), so it was the other major
+contributor to that 80-minute figure.
+
+**Symbol notation**: a bare US ticker is passed through unchanged (`AAPL`),
+**except** a dash-suffixed single-letter share class, which TipRanks also
+expects in dot notation: `BRK-B` -> `BRK.B`, `BF-B` -> `BF.B` -- confirmed
+by a real refresh log showing plain 404s for both under this codebase's own
+dash convention (`tipranks_ticker`'s `_US_CLASS_SHARE_RE` matches only a
+genuine single-letter suffix, so e.g. `LILAP` is never mistaken for one).
+**Yahoo, by contrast, wants the dash form for these same symbols** (see
+`YahooMarketProvider.yahoo_symbol`) -- this mapping is local to the TipRanks
+adapter only. A Canadian (TSX/TSXV) listing is rewritten to
+`TSE:<SYMBOL-WITH-DOTS>` -- this codebase's hyphenated share-class
+convention (`TECK-B`) becomes TipRanks' dotted one (`TSE:TECK.B`) --
+confirmed against a real Canadian-listing fixture
+(`tests/fixtures/tipranks/dataForTicker_TECK_B.json`), whose
 `overview.ticker` echoes exactly that form back. This is a *different*
 convention from both stooq's (`teck-b.to`) and Yahoo's (`TECK-B.TO`) --
 each adapter owns its own mapping table.
+
+**Unknown-ticker caching (`unknown_ticker_ttl_days`, default 30)**: a
+confirmed "TipRanks has no data for this symbol" result -- a clean HTTP 404
+from BOTH `dataForTicker` and the `historicalprices` fallback probe below --
+is cached under this much longer TTL instead of the ordinary
+`cache_ttl_trading_days`. Without this, a genuinely delisted/renamed name (a
+real refresh log showed ANSS, JNPR, FLT, SQ, K, WBA, HES, DFS, PARA and
+others) gets re-probed on every single refresh forever. A name that later
+regains coverage is picked up within that 30-trading-day window at worst --
+an accepted trade-off, not an oversight.
+
+**Closed-end funds and other "prices_only" symbols**: some real, still-listed
+securities (closed-end funds like MHD, GAB, BDJ, BKT are the common case) have
+no analyst/overview coverage at all -- `dataForTicker` 404s for them -- but
+DO have real price history at
+`https://widgets.tipranks.com/api/etoro/historicalprices?ticker={SYMBOL}`
+(verbatim owner-captured fixture committed at
+`tests/fixtures/tipranks/historicalprices_MHD.json`). When `dataForTicker`
+404s, this adapter tries that endpoint before caching the symbol as fully
+unknown; a non-empty result is cached as a distinct `"prices_only"` state
+(same long TTL as unknown). For such a symbol: market cap stays unresolved
+(`unknown_cap_policy` applies as for any unresolved cap) and earnings are
+unavailable, but bars are served from `historicalprices` -- real OHLCV,
+**preferred over close-only synthesis** -- at the same last-resort cascade
+position as the close-only bars below. Parsing rules: `volume == 0` rows are
+Jan-1 holiday padding and are dropped; `price` (the dividend/split-adjusted
+close) maps to `adj_close`, `close` maps to `close`. **Cadence guard**: the
+real cadence observed in the fixture is biweekly (~14 calendar days), not
+daily -- if the requested date range's rows have a median gap over 4
+calendar days, the series is flagged as downsampled (a `sparse_bars`
+data-quality WARNING) rather than served silently as if it were ordinary
+daily data; the rows are still returned as-is (no interpolation), and the
+existing `MIN_CONTEXT_BARS` / exact-session-match guards in
+`data.context.ContextBuilder` mean a series this sparse naturally fails to
+produce a usable context for most sessions regardless.
 
 **Earnings (the headline capability)**: `get_upcoming_earnings` /
 `get_historical_earnings` map `overview.portfolioHoldingData.
@@ -342,13 +413,22 @@ series or a hand-maintained CSV. Two mapping details worth knowing:
   `providers.market.tipranks._TIME_OF_DAY_MAP` if TipRanks' own
   documentation, or further real captures, clarify this.
 
-**Market caps**: prefers `overview.marketCapUSD`; falls back to
-`overview.marketCap` as-is with **no currency gating** -- the >= $1B
-universe floor is currency-agnostic by explicit owner decision (a nominal
-$1B in either USD or CAD clears it). Nested blocks that also happen to carry
-a `marketCap` field (e.g. `portfolioHoldingData.nextDividendDate.marketCap`
-in the Canadian fixture, a *different*, CAD-only figure from the top-level
-cap) are never used as a cap source.
+**Market caps -- GetQuotes first, `dataForTicker` fallback (the primary
+speed win of this change)**: `get_market_caps` tries the batched GetQuotes
+endpoint (below) for the WHOLE requested symbol list first -- turning what
+used to be one `dataForTicker` call per symbol into roughly a dozen batch
+calls for a full ~2,400-symbol universe refresh -- then falls back to the
+per-symbol `dataForTicker` path (`overview.marketCapUSD`, else
+`overview.marketCap` as-is with **no currency gating** -- the market-cap
+universe floor is currency-agnostic by explicit owner decision, a nominal
+figure in either USD or CAD clears it) for anything GetQuotes did not
+resolve. Nested blocks that also happen to carry a `marketCap` field (e.g.
+`portfolioHoldingData.nextDividendDate.marketCap` in the Canadian fixture, a
+*different*, CAD-only figure from the top-level cap) are never used as a cap
+source. `tipranks.use_getquotes_batch` defaults to `true` now -- see
+"GetQuotes batching" below for the confirmed envelope shape, the USD
+normalisation rule, and the current-session-bar capability built on the same
+endpoint.
 
 **Reference data**: `get_security_info` maps `overview.companyName` / market
 / `companyData.sector` / `.industry` / cap. `overview.market` is
@@ -392,25 +472,96 @@ trading day, shared across all four capabilities, rather than one call per
 symbol per capability per run. An "unknown ticker" result is cached too, so
 a universe's always-a-few unresolvable names don't get re-probed every run.
 
-**GetQuotes batching (optional, off by default)**: TipRanks also exposes a
+**GetQuotes batching -- CONFIRMED, now the PRIMARY market-cap path (owner
+directive, confirmed by live probes)**: TipRanks also exposes a
 CIBC-integration batch endpoint,
-`https://marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=TSE:A,TSE:B,...`,
-that can reduce Canadian cap enrichment to a handful of calls instead of one
-per symbol. A real probe (7 mixed US/TSX tickers) confirmed it works and
-that requested tickers are echoed back exactly as sent, but this repository
-still has no committed fixture of the exact response body, so the parser
-(`providers.market.tipranks._parse_getquotes_response`) stays defensive and
-the feature stays behind `tipranks.use_getquotes_batch = false`.
-**Confirmed currency trap**: GetQuotes' own `marketCap` field is in the
-listing's *local* currency, not USD (`TSE:TECK.B`'s GetQuotes `marketCap` is
-~40.6B CAD with an `exchangeRate` of ~0.712, while `dataForTicker`'s
-`marketCapUSD` is the already-converted ~28.9B USD figure -- the two are
-consistent once converted). The parser therefore only trusts a GetQuotes cap
-via `marketCapUSD` when present, or `marketCap * exchangeRate` when both
-fields are present and positive; a bare, un-converted `marketCap` is never
-used for a non-USD listing. Canadian cap coverage never depends on this
-optimisation succeeding -- `dataForTicker` (with the `TSE:SYMBOL` notation)
-is the primary path for every symbol regardless.
+`https://marketsv3.tipranks.com/api/quotes/GetQuotes?tickers=A,B,C,...`,
+that is genuinely batched -- one HTTP call serves every ticker in the
+request, unlike `dataForTicker`'s one-call-per-symbol. It returns a
+real-time snapshot per ticker (current-session OHLCV plus caps), never
+history. The envelope shape is now CONFIRMED from the owner's own probes:
+
+- Top level: `{"quotes": [...], "errors": [...], "metadata": {"count",
+  "success", "errors"}}`.
+- Each `quotes[]` row: `{ticker, currency, exchangeRate, isomic,
+  marketName, price, open, low, high, volume, changeAmount, changePercent,
+  lastTradeDate, lastClose, marketCap, realTimeMarketCap, isRealTime,
+  isMarketOpen, isPremarket, isAfterMarket, prePostMarket,
+  lastCacheUpdate}`.
+- Requested tickers are echoed back exactly as sent, including `TSE:`
+  notation for Canadian names -- the same `tipranks_ticker` mapping
+  `dataForTicker` uses is reused here, comma-joined per chunk.
+- A ticker TipRanks has nothing for comes back either in `errors[]` or
+  simply absent from `quotes[]` -- both are skipped, never fatal to the
+  rest of the batch.
+
+`tipranks.use_getquotes_batch` now defaults to **`true`** (it was an
+off-by-default, Canadian-only, UNVERIFIED optimisation before this
+confirmation) -- `get_market_caps` chunks the FULL requested symbol list at
+`tipranks.getquotes_batch_size` (default 200) and tries GetQuotes before
+falling back to `dataForTicker` for whatever it did not cover. This
+repository still has no committed fixture of a *raw* captured response body
+(the owner's probe output was relayed as a confirmed field list/shape, not
+pasted verbatim) -- see each `tests/fixtures/tipranks/getquotes_*.json`
+file's own `_fixture_note`. Every field access stays defensive regardless.
+
+**Confirmed currency trap**: GetQuotes has no `marketCapUSD` field at all
+(unlike `dataForTicker`'s `overview`) -- `marketCap`/`realTimeMarketCap` are
+always in the listing's *local* currency (`TSE:TECK.B`'s GetQuotes
+`marketCap` is CAD with a non-1 `exchangeRate`, and `local_cap *
+exchangeRate` recovers the same USD figure `dataForTicker.marketCapUSD`
+reports directly; a US entry's `exchangeRate` is confirmed to be 1). The
+exact rule (`providers.market.tipranks._getquotes_market_cap_usd`): prefer
+`realTimeMarketCap` over `marketCap` when both are present and positive;
+if `currency` is `"USD"` (or absent) use that raw cap as-is; otherwise
+multiply by `exchangeRate` if it is present and positive; a non-USD cap with
+no usable `exchangeRate` contributes nothing -- a raw, un-normalised
+non-USD cap is never returned by this adapter, from either endpoint. Market
+cap coverage never depends on GetQuotes succeeding -- `dataForTicker` (with
+the `TSE:SYMBOL` notation) remains the fallback path for every symbol, US
+and Canadian alike, and any GetQuotes failure (bad shape, network error, a
+whole chunk failing) is caught and logged, falling straight back with no
+user-visible effect beyond the wasted batch call(s).
+
+**Current-session bar (`get_current_session_bars`)**: the same GetQuotes
+row also yields today's (or the most recently completed session's) OHLCV
+bar -- `open`/`high`/`low` as reported, `price` as the close, `volume` as
+reported, session date from `lastTradeDate`. This is a capability distinct
+from `get_daily_bars` (still close-only/last-resort, unaffected by any of
+this) and is not part of the `MarketDataProvider` protocol; `DataIngestor.
+ingest_prices` merges it in explicitly and conservatively (see "Current-bar
+merge rule" immediately below) to reduce reliance on Yahoo's historical
+chart for "today" specifically, since that endpoint typically lags by one
+session until after the close.
+
+**Current-bar merge rule (`DataIngestor._merge_current_session_bars`) --
+deliberately CONSERVATIVE**: after the normal `get_daily_bars` cascade
+(Yahoo primarily) and the dedicated benchmark fetch both run, this appends a
+TipRanks GetQuotes current-session bar for any symbol whose collected series
+has no bar for today's session at all. It is append-only: it never replaces
+or overwrites an existing bar, even for today's own session, and does NOT
+implement "prefer GetQuotes over Yahoo when the market is open or GetQuotes
+is newer" -- that richer rule was judged not worth the look-ahead/
+double-counting risk (a downstream signal being computed from one value and
+then silently recomputed from a different one later in the same run) for
+this change. Deduping is by exact session-date equality, so even a symbol
+included in the GetQuotes query by an imprecise "today" pre-filter is still
+safe: a GetQuotes bar is only ever appended when nothing in the collected
+series already carries that exact date. A GetQuotes failure here (bad
+shape, network error, provider missing/misconfigured) degrades silently to
+"no bar added" -- it never fails the run.
+
+**Why there's no TipRanks daily-history feed (the CIBC finding)**: a
+separate probe into the CIBC brokerage integration TipRanks' GetQuotes and
+`historicalprices` endpoints originate from confirmed that TipRanks serves
+CIBC's *ratings/analyst widgets*, not CIBC's own price-chart data -- there is
+no TipRanks endpoint, confirmed or hypothesised, that returns a genuine
+daily OHLCV series. `historicalprices` (above) is a fixed ~biweekly cadence
+regardless of any request parameter, not a daily source, and GetQuotes is a
+single real-time snapshot, not history. Yahoo's chart endpoint remains the
+only daily-history source in this codebase; TipRanks' role is real-time
+(GetQuotes) and last-resort close-only/`prices_only` backfill, never the
+historical backbone.
 
 **Limitations**:
 
@@ -450,7 +601,7 @@ tiers; unsuitable for commercial use; fails closed per ADR-0008 Decision 1.
 CSVs below are bootstrap seeds only. The authoritative universe is the one
 computed at refresh time: every US + Canadian listing on a permitted exchange
 for which the market-data path can establish a real market cap, filtered to
-`>= universe.min_market_cap_usd` (default $1B) -- see
+`>= universe.min_market_cap_usd` (default $500M) -- see
 [Runtime Market-Cap Filter](#runtime-market-cap-filter-adr-0008-decision-3)
 below. A name missing from the seeds but present in provider data joins the
 universe on the next refresh; a seeded name that delists falls out. The
@@ -558,7 +709,7 @@ synthetic data and run `claudetrade refresh`.
 source = "database"                          # default
 packaged_universes = ["us_default", "ca_default"]  # set to [] to disable the fallback
 permitted_exchanges = ["NYSE", "NASDAQ", "AMEX", "TSX"]  # TSXV/CSE/NEO excluded
-min_market_cap_usd = 1000000000              # ADR-0008 Decision 3 runtime floor, default $1B
+min_market_cap_usd = 500000000               # ADR-0008 Decision 3 runtime floor, default $500M (owner-lowered 2026-07-31)
 unknown_cap_policy = "include"               # "include" | "exclude" -- see below
 ```
 
@@ -593,12 +744,18 @@ production and was removed outright), then, if it is a cascading fallback
 wrapper, each of its fallbacks in turn (a provider's `get_market_caps` is an
 **optional** capability -- see `providers.base.MarketDataProvider.get_market_caps`
 -- so a provider that does not support it, the default for every adapter
-except `tipranks`, simply contributes nothing rather than erroring). The
-resolved figure is stored on `Security.market_cap_usd`. The enriched floor is
-also applied **before** price, corporate-action, earnings and sentiment
-requests, so a company that currently resolves below $1B does not consume a
-bars-history request. The benchmark is retained because regime and
-relative-strength calculations require it even though it is an ETF.
+except `tipranks`, simply contributes nothing rather than erroring). Inside
+`TipRanksProvider.get_market_caps` itself, the batched GetQuotes endpoint is
+tried for the whole symbol list first, with the per-symbol `dataForTicker`
+path as the fallback for anything it did not cover -- see "GetQuotes
+batching" in the TipRanks section above; this is what turns a ~2,400-symbol
+refresh's cap sweep from thousands of individual calls into a handful of
+batches plus a much smaller fallback tail. The resolved figure is stored on
+`Security.market_cap_usd`. The enriched floor is also applied **before**
+price, corporate-action, earnings and sentiment requests, so a company that
+currently resolves below $1B does not consume a bars-history request. The
+benchmark is retained because regime and relative-strength calculations
+require it even though it is an ETF.
 
 `UniverseSelector.for_session` then applies `universe.min_market_cap_usd`
 (default $1B) against that stored figure:
@@ -827,11 +984,18 @@ claudetrade secrets set reddit_password
 Reads the same public listing endpoint as the public-JSON fallback, but
 authenticated with the owner's own `reddit_session` cookie -- copied from a
 logged-in browser -- plus a browser-style User-Agent, instead of anonymous
-requests with the descriptive app UA. **Live-probe evidence (2026-07-30)**
-showed Reddit's public JSON endpoint 403ing every non-browser client tested
-(both a generic UA and this codebase's descriptive app UA) while a
-logged-in Chrome tab got a clean 200 -- the gate is the session cookie, not
-the User-Agent string.
+requests with the descriptive app UA.
+
+**CONFIRMED WORKING from a non-browser client (owner-validated 2026-07-31)**:
+a properly-attached `reddit_session` cookie plus a browser-style User-Agent
+gets a clean HTTP 200 with real JSON from a plain HTTP client -- this is not
+a browser-only endpoint, it is a *cookie-gated* one, and a correctly
+configured, current cookie works from this codebase's own `httpx` client
+exactly as it does from a logged-in browser tab. (Two earlier apparent
+403s during validation both turned out to be tooling artifacts, not a real
+block: PowerShell 5.1 silently drops a `Cookie` header passed via
+`-Headers`, and a separate run used an empty cookie value -- neither
+reflects how this adapter actually sends the header.)
 
 **This is the owner's own personal Reddit session, for personal use only**
 (ADR-0008 Decision 1: "own credentials only" -- never a shared/default
@@ -846,8 +1010,13 @@ integration path.
 1. Log in to reddit.com in your browser as normal.
 2. Open devtools (F12) -> **Application** tab -> **Storage** -> **Cookies**
    -> `https://www.reddit.com` (Firefox: **Storage** tab instead of
-   **Application**).
-3. Find the cookie named `reddit_session`; copy its **Value**.
+   **Application**). Both `reddit_session` and `token_v2` (see below) are
+   **HttpOnly** cookies -- they are invisible to `document.cookie` in the
+   Console; the Application/Storage -> Cookies panel is the only place to
+   read their values.
+3. Find the cookie named `reddit_session`; copy its **Value** exactly as
+   shown (it is already URL-encoded where needed -- paste it verbatim, do
+   not re-encode or otherwise edit it).
 4. Store it via the credential store, never in `config.toml`:
 
 ```bash
@@ -856,17 +1025,60 @@ claudetrade secrets set reddit_session_cookie
 export CLAUDETRADE_SECRET_REDDIT_SESSION_COOKIE="..."
 ```
 
+`reddit_session` alone is sufficient -- try it by itself first. Reddit's own
+web frontend additionally sends a second cookie, `token_v2` (an HttpOnly
+OAuth JWT), captured the same way from the same Cookies panel. It is
+**optional** and only worth adding if `reddit_session` alone stops working:
+
+```bash
+claudetrade secrets set reddit_token_v2
+# or: export CLAUDETRADE_SECRET_REDDIT_TOKEN_V2="..."
+```
+
+Cookie lifetimes differ significantly: `reddit_session` is long-lived (weeks
+or more), while `token_v2` is a short-lived JWT (typically hours to about a
+day). Because `token_v2` expires so much faster, configuring it does not
+make cookie-session mode *more* reliable over time -- it is an extra value
+that itself needs re-exporting far more often than `reddit_session` does, so
+only add it if you have observed `reddit_session` alone being rejected. When
+both are configured, the Cookie header sent is
+`reddit_session=<value>; token_v2=<value>` (both values sent verbatim, in
+that order); with only `reddit_session` configured, the header is unchanged
+from before `token_v2` support existed (`reddit_session=<value>` alone).
+
 No separate enable flag is needed -- like the password and client-credentials
 grants above, this mode is picked up automatically the moment the cookie
 resolves and the password-grant credentials do not (see the mode order
 above). `reddit.session_rate_limit_per_minute` (default 30) governs its
 pace, same conservative, human-scale budget as the public-JSON fallback.
 
+**Testing your cookie from the app**: the Configuration screen has a "Test"
+button next to the Reddit credential fields (`POST
+/api/system/credentials/reddit/test`), which makes one small live request
+using whichever mode your current credentials select and reports
+`{ok, mode, status_detail}` without ever echoing the credential value back.
+Use it after pasting a fresh cookie to confirm it works before waiting for
+a full scheduled refresh.
+
+**If the cookie test reports blocked**: given the confirmation above, a
+block from a correctly-configured client now most likely means the pasted
+`reddit_session` value has **expired or was mistyped/truncated** -- re-export
+a fresh one from DevTools (step 3 above) and test again. It is not expected
+to mean TLS-fingerprinting or a browser-only requirement; that theory was
+considered during validation and ruled out. If you have `token_v2`
+configured and only recently started seeing blocks, its shorter lifetime
+makes it the more likely culprit -- try removing it (`reddit_session` alone
+is sufficient) before re-exporting both. If cookie-session mode remains
+blocked after a fresh export, the password-grant OAuth path
+(`reddit_client_id`/`reddit_client_secret`/`reddit_username`/`reddit_password`,
+see above) is the sanctioned, durable alternative once your Reddit API app
+is approved; news RSS keeps sentiment flowing in the meantime regardless.
+
 **Fail-closed behaviour (cookie-session and public-JSON modes, ADR-0008
 Decision 1)**: any HTTP 401/403 (a 401/403 here usually means the pasted
-cookie has expired or been logged out -- re-export a fresh one), a non-JSON
-response body, or any other unexpected/non-2xx response immediately disables
-the source **for the rest of that fetch cycle** -- no retry loop, no
+cookie(s) have expired or been logged out -- re-export a fresh one), a
+non-JSON response body, or any other unexpected/non-2xx response immediately
+disables the source **for the rest of that fetch cycle** -- no retry loop, no
 fingerprint or proxy rotation, no CAPTCHA handling. The next scheduled cycle
 tries again from scratch. A 429 is handled the same way as the OAuth path (a
 `RateLimitError` carrying `Retry-After`, also ending the cycle). This is
@@ -881,23 +1093,37 @@ exercised in `tests/test_reddit_provider.py`.
 - Author names are stored as salted hashes only (never plaintext), per config `store_author_names = false`
 - Cookie-session mode carries no delivery guarantee at all -- it can be
   throttled or blocked by Reddit at any time with no notice, and the pasted
-  cookie will eventually expire and need re-exporting
+  cookie(s) will eventually expire and need re-exporting (`reddit_session`
+  on the order of weeks; `token_v2`, if used, on the order of hours)
 - The public-JSON fallback carries no delivery guarantee at all -- it can be
   throttled or blocked by Reddit at any time with no notice, by design
 
 **Licence**: Reddit data is subject to Reddit's API terms and user agreement. Commercial use of aggregated social data may require permission. The cookie-session and public-JSON paths are additionally ToS-gray for automated use -- see above.
 
-### X/Twitter (Paid API v2, or an opt-in cookie-session mode)
+### X/Twitter (Paid API v2, or the owner's own session -- on by default when credentialed)
 
 **Module**: `src/claudetrade/providers/social/x_provider.py`
+
+**Auto-enabled (owner directive, 2026-07-31)**: mirroring Reddit's
+cookie-session self-selection, both `x.enabled` and `x.session_enabled`
+default to `true` -- "use if credentialed", not "on unconditionally". With
+no bearer token and no session cookies configured, this source stays
+disabled cleanly exactly as before; the moment either resolves from the
+secrets store, it activates on the next refresh with no separate flag to
+flip. Both remain explicit, operator-settable disable knobs: `x.enabled =
+false` turns X off outright regardless of credentials, and
+`x.session_enabled = false` keeps the official-API path (if configured)
+while refusing to ever attempt the ToS-risking cookie-session path even if
+`x_auth_token`/`x_ct0` are stored.
 
 Two independent live paths, tried in this order at construction time:
 
 1. **Official API v2** (`bearer_credential`). Requires a paid tier for
    meaningful search volume. Always preferred when configured -- ADR-0008
    Decision 1 requires the official API remain first-choice.
-2. **Cookie-session mode** (`x.session_enabled = true`), only reached when
-   no bearer token is configured. See below.
+2. **Cookie-session mode** (`x.session_enabled`, default `true`), only
+   reached when no bearer token is configured and both session cookies
+   resolve. See below.
 
 **Setup (official API)**:
 
@@ -938,7 +1164,7 @@ claudetrade secrets set x_bearer_token
 
 **Licence**: X/Twitter data is subject to X's API terms. Redistribution restrictions apply.
 
-#### X cookie-session mode (opt-in, off by default -- ADR-0008 Decision 1)
+#### X cookie-session mode (auto-enabled when credentialed -- ADR-0008 Decision 1)
 
 **PLAIN ACCOUNT-RISK STATEMENT**: this mode automates the owner's own
 logged-in x.com session against the internal, unversioned GraphQL endpoints
@@ -947,17 +1173,30 @@ can lead to suspension of that X account.** This application never bundles
 or defaults these credentials, never solves a CAPTCHA or challenge, and
 never rotates a fingerprint or proxy to work around a block -- it disables
 the source for the rest of the cycle instead. The owner accepts this risk
-for their own account; this mode is off by default
-(`x.session_enabled = false`) and must be explicitly turned on.
+for their own account, for personal use only, and per the owner's explicit
+2026-07-31 directive this mode now **auto-activates** the moment both
+session cookies resolve from the secrets store -- `x.session_enabled`
+defaults to `true` (an explicit disable knob, not a required opt-in), the
+same posture Reddit's cookie-session mode already has. Set
+`x.session_enabled = false` to refuse this path outright regardless of
+whether the cookies are configured.
 
-**How to export your session cookies** (Chrome/Edge/Firefox devtools):
+**How to export your session cookies** (Chrome/Edge/Firefox devtools -- this
+is also exactly what the Configuration screen's inline instructions and the
+"Test" button next to the X credential fields expect):
 
-1. Log in to x.com in your browser as normal.
+1. Log in to x.com in your browser as normal, using your own account.
 2. Open devtools (F12) -> **Application** tab (Chrome/Edge) or **Storage**
    tab (Firefox) -> **Cookies** -> `https://x.com`.
-3. Find the cookie named `auth_token`; copy its **Value**.
+3. Find the cookie named `auth_token`; copy its **Value**. This cookie is
+   **long-lived** (weeks), similar to Reddit's `reddit_session` cookie.
 4. Find the cookie named `ct0` (the CSRF token cookie); copy its **Value**.
-5. Store both via the credential store, never in `config.toml`:
+   `ct0` is the CSRF token paired with `auth_token` for this same session --
+   both are sent together on every session-mode request (see
+   `x_provider.py`'s `_fetch_session_query`), so re-export both together if
+   session mode starts failing after a while.
+5. Store both via the credential store, never in `config.toml`, or via the
+   Configuration screen's X credential fields:
 
 ```bash
 claudetrade secrets set x_auth_token
@@ -967,11 +1206,17 @@ export CLAUDETRADE_SECRET_X_AUTH_TOKEN="..."
 export CLAUDETRADE_SECRET_X_CT0="..."
 ```
 
-**Configuration**:
+6. Use the Configuration screen's **Test** button next to the X credential
+   fields (or `POST /api/system/credentials/x/test`) to confirm the
+   cookies work -- see "Validating the internal endpoint constants" below.
+
+**Configuration** (only `session_symbols` needs setting -- the rest are the
+defaults):
 
 ```toml
 [x]
-session_enabled = true
+enabled = true                         # default; explicit disable knob
+session_enabled = true                 # default; explicit disable knob
 auth_token_credential = "x_auth_token"
 ct0_credential = "x_ct0"
 session_symbols = ["AAPL", "MSFT"]     # cashtag-searched; leading $ added automatically
@@ -979,6 +1224,20 @@ session_max_results_per_query = 40
 session_rate_limit_per_minute = 6      # deliberately stricter than the official API default
 session_request_timeout_s = 20.0
 ```
+
+**Validating the internal endpoint constants (`x_provider.py`'s "expected
+maintenance" note)**: session mode calls x.com's internal, unversioned
+GraphQL API, whose path and query ID (`_SEARCH_GRAPHQL_QUERY_ID` in
+`x_provider.py`) x.com changes without notice -- see the "Endpoint
+stability" note below for the full explanation and why this sandbox could
+not verify a live query ID while building this adapter. The
+Configuration screen's **Test** button (`POST
+/api/system/credentials/x/test`) is the owner's fast, low-risk way to
+validate those constants against the real API: it makes exactly one small
+live fetch using the configured mode and reports pass/fail plus a short
+detail string, without waiting for a full scheduled refresh to discover the
+same failure. A `SourceBlockedError` result there is the first, fastest
+signal that the constants block needs a fresh browser capture.
 
 **Endpoint stability (read before relying on this mode)**: the GraphQL
 endpoint path and query ID this adapter calls are internal to x.com's web
@@ -1011,18 +1270,18 @@ cycle (429) to resume. This is exercised in `tests/test_x_provider.py`.
 - The official API path above remains intact and is always preferred the
   moment a bearer token is configured
 
-### Stocktwits (Live, Keyless, Opt-in)
+### Stocktwits (Live, Keyless, On by Default)
 
 **Module**: `src/claudetrade/providers/social/stocktwits.py`
 
 Stocktwits' own documented, **keyless** public symbol-stream API
 (`api.stocktwits.com/api/2/streams/symbol/{SYMBOL}.json`) -- ADR-0008
 Decision 1's "official API first-choice" applies in the fullest sense here:
-this is not scraping at all, no authentication is bypassed, and no ToS
-boundary is tested. Off by default only because the vendor's published
-unauthenticated budget (200 requests/hour) is easy to exhaust across a large
-universe, not because of any risk to the account or credentials (there are
-none).
+no credential is used, none is bypassed, and no paywall or authentication
+boundary is touched. **On by default** (owner directive, 2026-07-31): the
+vendor's published unauthenticated budget (200 requests/hour) is respected by
+`rate_limit_per_minute` and `max_symbols_per_cycle` rather than by leaving
+the source switched off.
 
 **Sentiment tags are a prior hint, not ground truth**: a message may carry a
 self-declared `entities.sentiment.basic` tag ("Bullish"/"Bearish") the
@@ -1033,35 +1292,85 @@ unconditionally for every post, Stocktwits included. Treating a self-declared
 label as truth would let anyone paint their own post's sentiment without the
 classifier ever checking it against the actual content.
 
-**Browser-style request headers (best-effort only)**: **live-probe evidence
-(2026-07-30)** showed this endpoint returning HTTP 403 to PowerShell/.NET
-clients regardless of User-Agent (both a generic UA and this codebase's
-descriptive app UA), but HTTP 200 JSON to a plain browser tab -- consistent
-with an edge filter keyed on browser-shaped request headers and/or TLS
-fingerprint, not a credential or API-contract check (the API itself remains
-keyless and open, per the vendor's own documentation). This adapter
-therefore sends a realistic desktop-browser User-Agent plus
-`Accept`/`Accept-Language` headers matching what a browser sends, instead of
-the descriptive app UA used elsewhere in this codebase. **This is
-best-effort only**: a header swap cannot fix a TLS-fingerprint-based block,
-since the HTTP client's TLS handshake doesn't look like a browser's no
-matter what headers ride on top of it. If the edge still blocks despite the
-browser-style headers, the existing fail-closed path below
-(`SourceBlockedError` on 401/403/non-JSON) handles it exactly as before, and
-`claudetrade diagnostics`/the Diagnostics screen report the source blocked
--- no cookie support is added for this source, unlike Reddit's cookie-session
-mode above.
+**Browser-TLS (JA3) impersonation** -- see ADR-0008 Decision 1
+**Amendment 1** (owner directive, 2026-07-31): **live-probe evidence
+(2026-07-30)** showed this endpoint returning HTTP 403 to PowerShell/.NET and
+Python clients regardless of User-Agent (both a generic UA and this
+codebase's descriptive app UA), but HTTP 200 JSON to a plain, logged-out
+browser tab on the same machine and IP. **Confirmed cause**: Cloudflare bot
+management gating on the client's **TLS ClientHello fingerprint (JA3)**. A
+stdlib-`ssl`-backed client (`httpx`, `requests`, .NET) presents a
+cipher/extension ordering no browser produces, and the edge rejects the
+connection before any application-layer header is considered -- which is why
+the earlier header-only approach could never have worked. This is a
+client-shape heuristic on a keyless-open endpoint, not an auth or
+API-contract check.
+
+The adapter therefore issues its GET through
+[`curl_cffi`](https://github.com/lexiforest/curl_cffi)'s browser
+impersonation (`impersonate = "chrome"` by default -- the library's alias for
+its current newest Chrome profile, so it tracks `curl_cffi` upgrades instead
+of pinning a version that goes stale). That reproduces the browser's TLS
+ClientHello and HTTP/2 settings, i.e. it makes our client look like the
+client this endpoint **already serves**.
+
+`curl_cffi` also supplies the profile-consistent `User-Agent` and
+`sec-ch-ua*` client hints, so this adapter deliberately does **not** override
+the User-Agent: a hand-written UA that disagrees with the profile's client
+hints or its TLS fingerprint is itself a bot signal. What the adapter adds is
+the request-context headers a stocktwits.com XHR carries (`Accept`,
+`Accept-Language`, `Referer`, `Origin`, `Sec-Fetch-*`).
+
+**What this deliberately does not do**: no Cloudflare clearance cookie is
+captured, stored or replayed (no `cf_clearance`/`__cf_bm` harvesting, no
+session persistence -- each request stands alone); no CAPTCHA solving; no
+fingerprint *rotation* (one honest, configured, documented profile, never a
+shuffling pool) and no proxy rotation; no credential of any party. Rates stay
+conservative and human-scale with jitter, and the per-cycle symbol cap still
+applies. **Impersonation makes a block unlikely, not impossible** -- if the
+edge blocks anyway, the fail-closed path below is unchanged
+(`SourceBlockedError`, cycle over, no retry loop), and "Stocktwits
+unavailable" remains a fully supported state.
+
+**`curl_cffi` is an OPTIONAL dependency**, lazy-imported at request time
+(same pattern as the `anthropic`/`openai` SDKs, or `scikit-learn` for the ML
+extras). Without it installed: the module still imports, the provider still
+constructs, the registry still builds it, the whole test suite still passes
+-- Diagnostics simply reports the source **unavailable** with the install
+hint (`pip install curl_cffi`), and any fetch attempt raises
+`SourceBlockedError` naming the missing package rather than a bare
+`ImportError`. Install it with:
+
+```
+pip install curl_cffi
+```
+
+**Sentiment coverage in practice**: Reddit's cookie-session mode
+(owner-verified working, see above) and the four default news RSS feeds
+remain this application's other social-sentiment sources; with the TLS
+fingerprint matched, Stocktwits is expected to contribute reliably rather
+than opportunistically -- but the application stays fully functional with it
+contributing nothing at all, which is exactly what happens if `curl_cffi` is
+absent or the edge tightens.
 
 **Configuration**:
 
 ```toml
 [stocktwits]
-enabled = true
+enabled = true                  # on by default since 2026-07-31
+impersonate = "chrome"          # curl_cffi browser profile supplying the TLS/JA3 fingerprint
 watchlist_symbols = ["AAPL", "MSFT", "TSLA"]
 max_symbols_per_cycle = 20      # hard budget guard, see below
 rate_limit_per_minute = 3       # 180/hour -- a margin below the 200/hour vendor cap
 request_timeout_s = 20.0
 ```
+
+`impersonate` accepts any profile `curl_cffi` supports -- the aliases
+`"chrome"`, `"safari"`, `"firefox"`, `"edge"` (each resolving to that
+browser's newest bundled profile) or an explicit build such as
+`"chrome142"` / `"safari180"` / `"firefox135"`. It is worth changing only if
+the edge starts blocking the default; **rotating** it per request is not
+supported and is explicitly out of bounds (ADR-0008 Decision 1).
 
 **Rate budget**: Stocktwits documents 200 requests/hour for unauthenticated
 reads. The default `rate_limit_per_minute = 3` (180/hour) keeps a working
@@ -1097,6 +1406,12 @@ source and also ends the cycle. This is exercised in
 - Author handles are stored as salted hashes only, never plaintext
 - The self-declared sentiment tag is optional per-message; most messages
   carry no tag at all, in which case `sentiment_prior` is `None`
+- Requires the optional `curl_cffi` package; without it the source reports
+  itself unavailable (everything else keeps working)
+- The impersonation profile is only as current as the installed `curl_cffi`.
+  As Chrome advances, an old bundled profile drifts from the real browser
+  fleet and can start being challenged -- `pip install -U curl_cffi` is the
+  first thing to try if Stocktwits starts showing as blocked
 
 **Licence**: Stocktwits' public stream is documented for keyless basic
 reads; this adapter performs only that. Commercial or high-volume use may
@@ -1284,9 +1599,17 @@ point of a stub.
 
 ## AI Providers
 
-### Null (Default, Rules-Based)
+**Full setup walkthrough (key creation, cost caps, privacy, what AI does and
+does not influence): see [`docs/ai-setup.md`](ai-setup.md).** This section
+is the provider-adapter reference; that guide is the operator-facing
+how-to, including the Configuration screen's "AI Analysis" section and its
+Test button.
 
-**Module**: `src/claudetrade/providers/ai/null_provider.py`
+AI is an **opt-in ensemble adjunct** for sentiment classification, never
+the decision-maker -- `sentiment.classifiers.RuleSentimentClassifier` is
+the mandatory, always-on rule-based floor regardless of `ai.provider`.
+
+### None (Default, Rules-Based)
 
 No external AI calls. Sentiment is computed deterministically using rule-based classifiers.
 
@@ -1294,7 +1617,7 @@ No external AI calls. Sentiment is computed deterministically using rule-based c
 
 ```toml
 [ai]
-provider = "null"
+provider = "none"
 ```
 
 **Characteristics**:
@@ -1308,23 +1631,37 @@ provider = "null"
 
 **Module**: `src/claudetrade/providers/ai/anthropic_provider.py`
 
-Uses Claude (Sonnet, Haiku, Opus) for sentiment classification.
+Uses the **official `anthropic` Python SDK** (an optional dependency --
+`pip install claudetrade[anthropic]`, lazy-imported so the base install
+never needs it; a clear, actionable error is raised only if you select
+`provider = "anthropic"` without it installed). Calls
+`client.messages.create(...)` with **structured outputs**
+(`output_config.format`, a JSON Schema) so the per-post sentiment JSON
+parses reliably; `temperature`/`top_p`/`top_k` are never sent (removed on
+current Claude models -- sending them returns an error). Thinking is
+explicitly disabled for this call (a short, bounded classification task
+does not benefit from it). Typed SDK exceptions
+(`anthropic.RateLimitError`, `anthropic.APIStatusError`,
+`anthropic.APIConnectionError`) are all mapped into the same
+degrade-to-rules contract every other failure mode uses -- this module
+never raises into the pipeline.
 
 **Setup**:
 
-1. Go to https://console.anthropic.com/
-2. Create an account and generate an API key
-3. Note your **API Key** (starts with `sk-ant-`)
+1. Go to **platform.claude.com** (formerly console.anthropic.com)
+2. Create an account (or sign in) and open **API Keys**
+3. Create a new key -- it starts with `sk-ant-`
+4. Paste it into the Configuration screen's "Anthropic (Claude) API key"
+   field, or store it via the credential store (below)
 
 **Configuration**:
 
 ```toml
 [ai]
 provider = "anthropic"
-model = "claude-sonnet-5"
-api_key_credential = "anthropic_api_key"
-max_output_tokens = 900
-temperature = 0.0
+model = ""                                # blank = "claude-opus-5" (the built-in default)
+anthropic_api_key_credential = "anthropic_api_key"
+max_output_tokens = 1024
 request_timeout_s = 45.0
 max_calls_per_run = 250
 daily_cost_limit_usd = 5.0
@@ -1341,11 +1678,17 @@ export CLAUDETRADE_SECRET_ANTHROPIC_API_KEY="sk-ant-..."
 claudetrade secrets set anthropic_api_key
 ```
 
+**Model choice**: the built-in default is `claude-opus-5` ($5.00/$25.00 per
+million input/output tokens). `claude-haiku-4-5` ($1.00/$5.00 per million
+tokens) is the economical choice for high-volume per-post classification --
+set `model = "claude-haiku-4-5"` explicitly. This tradeoff is an operator
+decision this module does not make for you.
+
 **Cost Tracking**:
 
 ```toml
-input_cost_per_mtok_usd = 3.0    # Update to current pricing
-output_cost_per_mtok_usd = 15.0
+input_cost_per_mtok_usd = 5.0     # Claude Opus 5's published rate; update to match your model
+output_cost_per_mtok_usd = 25.0   # e.g. 1.0 / 5.0 for claude-haiku-4-5
 daily_cost_limit_usd = 5.0
 ```
 
@@ -1353,10 +1696,11 @@ The system tracks costs locally and refuses requests once the daily limit is exc
 
 **Limitations**:
 
-- Requires API key and account
+- Requires the `anthropic` package installed (`pip install
+  claudetrade[anthropic]`) and an API key/account
 - Token usage is billable
 - No real-time rate limiting on the server; respect the configured limits
-- LLM outputs are non-deterministic (even with `temperature=0.0`, precision varies)
+- LLM outputs are non-deterministic
 
 **Licence**: Subject to Anthropic's API terms and privacy policy.
 
@@ -1364,23 +1708,30 @@ The system tracks costs locally and refuses requests once the daily limit is exc
 
 **Module**: `src/claudetrade/providers/ai/openai_provider.py`
 
-Uses GPT-4, GPT-3.5, etc.
+Uses the **official `openai` Python SDK** (an optional dependency -- `pip
+install claudetrade[openai]`, lazy-imported the same way as the Anthropic
+adapter). Calls `client.chat.completions.create(...)` with JSON-schema
+structured output mode against the same sentiment schema the Anthropic
+adapter uses. The same typed-exception degrade contract applies
+(`openai.RateLimitError`, `openai.APIStatusError`,
+`openai.APIConnectionError`).
 
 **Setup**:
 
-1. Go to https://platform.openai.com/
-2. Create an account and generate an API key
-3. Note your **API Key** (starts with `sk-`)
+1. Go to **platform.openai.com**
+2. Create an account (or sign in), add a payment method, and open **API keys**
+3. Create a new key -- it starts with `sk-`
+4. Paste it into the Configuration screen's "OpenAI (ChatGPT) API key"
+   field, or store it via the credential store (below)
 
 **Configuration**:
 
 ```toml
 [ai]
 provider = "openai"
-model = "gpt-4"
-api_key_credential = "openai_api_key"
-max_output_tokens = 900
-temperature = 0.0
+model = ""                                # blank = the built-in default; verify at platform.openai.com
+openai_api_key_credential = "openai_api_key"
+max_output_tokens = 1024
 request_timeout_s = 45.0
 max_calls_per_run = 250
 daily_cost_limit_usd = 5.0
@@ -1398,17 +1749,21 @@ claudetrade secrets set openai_api_key
 
 **Cost Tracking**:
 
-Update the per-token costs to match OpenAI's current pricing (changes frequently):
+OpenAI's model lineup and pricing move faster than this document can track
+-- check https://platform.openai.com before relying on the built-in default
+model name, and update the per-token costs to match whichever model you
+configure:
 
 ```toml
-input_cost_per_mtok_usd = 0.005    # GPT-4 example; check OpenAI's pricing
-output_cost_per_mtok_usd = 0.015
+input_cost_per_mtok_usd = 0.15    # example only -- check current pricing
+output_cost_per_mtok_usd = 0.60
 daily_cost_limit_usd = 5.0
 ```
 
 **Limitations**:
 
-- Requires API key and account with payment method
+- Requires the `openai` package installed (`pip install
+  claudetrade[openai]`) and an API key/account with a payment method
 - Token usage is billable
 - LLM outputs are non-deterministic
 
@@ -1436,7 +1791,7 @@ provider = "synthetic"
 provider = "synthetic"
 
 [ai]
-provider = "null"
+provider = "none"
 ```
 
 Everything runs offline, deterministically, and requires no credentials.
@@ -1462,7 +1817,7 @@ provider = "synthetic"
 provider = "synthetic"
 
 [ai]
-provider = "null"
+provider = "none"
 ```
 
 This lets you test with real bars but still runs offline.
@@ -1487,7 +1842,7 @@ provider = "reddit"
 enabled = false
 
 [ai]
-provider = "null"
+provider = "none"
 ```
 
 This costs nothing and provides real data + social sentiment.
@@ -1574,6 +1929,7 @@ Market data is older than `market_data.stale_after_hours`.
 - **Social media**: Posts are sanitised; usernames are hashed. Raw text is not logged.
 - **News**: Item text is sanitised the same way; there is no username to hash, so the author hash is a salted digest of the feed's own domain (publisher-level, not personal data).
 - **Sentiment**: Aggregated; individual posts are not visible in output.
+- **AI providers** (`ai.provider != "none"`): the sanitised post text and target symbol -- never usernames, author ids, karma, follower counts, or post history -- are sent to the configured provider's API (Anthropic or OpenAI). See [docs/ai-setup.md](ai-setup.md) for the full privacy note. With the default `ai.provider = "none"`, nothing is ever sent to an external AI provider.
 - **Audit log**: Credential access is logged but not the value.
 - **Database**: Market and earnings data is retained indefinitely for backtesting.
 

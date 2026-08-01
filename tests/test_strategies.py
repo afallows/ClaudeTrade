@@ -302,6 +302,118 @@ class TestSentimentBreakout:
         assert "trend_strength_pctl=" in rejection.detail
         assert "volume_pctl=" in rejection.detail
 
+    # ---- market-signal adoption package: gap / confluence / volume-quality ----
+
+    def test_gap_up_bonus_scales_with_gap_size(self, cfg: AppConfig):
+        """A gap_pct at or beyond GAP_UP_FULL_CREDIT_PCT earns full W_GAP_UP
+        credit; no gap (the feature absent, defaulting to 0.0) earns none --
+        proving both direction and the exact magnitude bound."""
+        bars = make_bars(90, close=101.5)
+        strategy = SentimentBreakoutStrategy(cfg)
+
+        features_no_gap = self._good_features()
+        proposal_no_gap = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_no_gap))
+        assert proposal_no_gap is not None
+        assert "gap_up=+0.0/6" in proposal_no_gap.extras["score_breakdown"]
+
+        features_gap = self._good_features()
+        features_gap["gap_pct"] = 5.0  # well beyond GAP_UP_FULL_CREDIT_PCT (2.5)
+        proposal_gap = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_gap))
+        assert proposal_gap is not None
+        assert f"gap_up=+{SentimentBreakoutStrategy.W_GAP_UP:.1f}/{SentimentBreakoutStrategy.W_GAP_UP:.0f}" in (
+            proposal_gap.extras["score_breakdown"]
+        )
+        assert "Gapped up" in " ".join(proposal_gap.evidence)
+
+    def test_gap_continuation_up_is_boolean_full_credit(self, cfg: AppConfig):
+        bars = make_bars(90, close=101.5)
+        strategy = SentimentBreakoutStrategy(cfg)
+
+        features_off = self._good_features()
+        proposal_off = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_off))
+        assert proposal_off is not None
+        assert "gap_continuation=+0.0/5" in proposal_off.extras["score_breakdown"]
+
+        features_on = self._good_features()
+        features_on["gap_continuation_up"] = 1.0
+        proposal_on = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_on))
+        assert proposal_on is not None
+        assert (
+            f"gap_continuation=+{SentimentBreakoutStrategy.W_GAP_CONTINUATION:.1f}"
+            f"/{SentimentBreakoutStrategy.W_GAP_CONTINUATION:.0f}"
+        ) in proposal_on.extras["score_breakdown"]
+
+    def test_level_confluence_ramps_between_one_and_three_methods(self, cfg: AppConfig):
+        bars = make_bars(90, close=101.5)
+        strategy = SentimentBreakoutStrategy(cfg)
+
+        # 1 agreeing method (or fewer) earns zero credit -- a single level is
+        # not "confluence".
+        features_one = self._good_features()
+        features_one["level_confluence_count"] = 1.0
+        proposal_one = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_one))
+        assert proposal_one is not None
+        assert "level_confluence=+0.0/6" in proposal_one.extras["score_breakdown"]
+
+        # 3+ agreeing methods earns full credit.
+        features_three = self._good_features()
+        features_three["level_confluence_count"] = 3.0
+        proposal_three = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_three))
+        assert proposal_three is not None
+        assert "level_confluence=+6.0/6" in proposal_three.extras["score_breakdown"]
+        assert "independent methods" in " ".join(proposal_three.evidence)
+
+    def test_volume_divergence_is_a_penalty_not_a_veto(self, cfg: AppConfig):
+        """A moderate (non-saturating) scenario so the penalty is visible on
+        the clamped setup_score too, not just in the raw breakdown."""
+        bars = make_bars(90, close=101.5)
+        strategy = SentimentBreakoutStrategy(cfg)
+        moderate = self._good_features()
+        moderate.update({"adx_pctl_120": 0.5, "rel_volume_pctl_120": 0.55, "rs_percentile": 60.0})
+
+        features_clean = dict(moderate)
+        proposal_clean = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_clean))
+        assert proposal_clean is not None
+
+        features_divergent = dict(moderate)
+        features_divergent["volume_divergence"] = 1.0
+        proposal_divergent = strategy.evaluate(
+            make_context(config=cfg, bars=bars, features=features_divergent)
+        )
+        assert proposal_divergent is not None
+        assert (
+            f"volume_divergence={SentimentBreakoutStrategy.PENALTY_VOLUME_DIVERGENCE:.1f}"
+            in proposal_divergent.extras["score_breakdown"]
+        )
+        # Direction: strictly lower score. Magnitude bound: never more than
+        # the configured penalty.
+        assert proposal_divergent.setup_score < proposal_clean.setup_score
+        assert proposal_clean.setup_score - proposal_divergent.setup_score <= abs(
+            SentimentBreakoutStrategy.PENALTY_VOLUME_DIVERGENCE
+        )
+        assert any("absorption" in r for r in proposal_divergent.risks)
+
+    def test_new_gap_and_confluence_features_absent_degrades_gracefully(self, cfg: AppConfig):
+        """None of the new features are required: a feature frame that
+        predates this package (none of gap_pct/gap_continuation_up/
+        level_confluence_count/volume_divergence present) must still produce
+        a coherent proposal -- degrade to zero contribution, never crash."""
+        bars = make_bars(90, close=101.5)
+        features = self._good_features()
+        for key in (
+            "gap_pct",
+            "gap_continuation_up",
+            "level_confluence_count",
+            "volume_divergence",
+        ):
+            features.pop(key, None)
+        strategy = SentimentBreakoutStrategy(cfg)
+
+        proposal = strategy.evaluate(make_context(config=cfg, bars=bars, features=features))
+
+        assert proposal is not None
+        proposal.validate()
+
 
 # --------------------------------------------------------------------------
 # Strategy B -- sentiment_pullback
@@ -423,6 +535,46 @@ class TestSentimentPullback:
         assert rejections[0].reason == "score_below_threshold"
         assert "trend_strength_pctl=" in rejections[0].detail
         assert "price_confirmation=" in rejections[0].detail
+
+    # ---- market-signal adoption package item 3: level confluence ----------
+
+    def test_level_confluence_ramps_between_one_and_three_methods(self, cfg: AppConfig):
+        bars = self._bars_with_confirmation()
+        sentiment = make_sentiment(raw_sentiment=0.2, sentiment_acceleration=0.05)
+        history = make_sentiment_history(final=sentiment)
+        strategy = SentimentPullbackStrategy(cfg)
+
+        features_one = self._good_features()
+        features_one["level_confluence_count"] = 1.0
+        proposal_one = strategy.evaluate(
+            make_context(
+                config=cfg, bars=bars, features=features_one, sentiment=sentiment, sentiment_history=history
+            )
+        )
+        assert proposal_one is not None
+        assert "level_confluence=+0.0/6" in proposal_one.extras["score_breakdown"]
+
+        features_three = self._good_features()
+        features_three["level_confluence_count"] = 3.0
+        proposal_three = strategy.evaluate(
+            make_context(
+                config=cfg, bars=bars, features=features_three, sentiment=sentiment, sentiment_history=history
+            )
+        )
+        assert proposal_three is not None
+        assert "level_confluence=+6.0/6" in proposal_three.extras["score_breakdown"]
+        assert "independent methods" in " ".join(proposal_three.evidence)
+
+    def test_level_confluence_absent_degrades_gracefully(self, cfg: AppConfig):
+        bars = self._bars_with_confirmation()
+        features = self._good_features()
+        features.pop("level_confluence_count", None)
+        strategy = SentimentPullbackStrategy(cfg)
+
+        proposal = strategy.evaluate(make_context(config=cfg, bars=bars, features=features))
+
+        assert proposal is not None
+        proposal.validate()
 
 
 # --------------------------------------------------------------------------
@@ -547,6 +699,68 @@ class TestCapitulationReversal:
         assert rejections[0].reason == "score_below_threshold"
         assert "extension_below_sma50_pctl=" in rejections[0].detail
         assert "climax_volume_pctl=" in rejections[0].detail
+
+    # ---- market-signal adoption package item 1(c): gap-down capitulation ----
+
+    def test_gap_down_bonus_scales_with_gap_size(self, cfg: AppConfig):
+        bars = self._reversal_bars()
+        sentiment = self._good_sentiment()
+        history = make_sentiment_history(final=sentiment)
+        strategy = CapitulationReversalStrategy(cfg)
+
+        features_no_gap = self._good_features()
+        proposal_no_gap = strategy.evaluate(
+            make_context(
+                config=cfg, bars=bars, features=features_no_gap, sentiment=sentiment, sentiment_history=history
+            )
+        )
+        assert proposal_no_gap is not None
+        assert "gap_down_capitulation=+0.0/8" in proposal_no_gap.extras["score_breakdown"]
+
+        features_gap = self._good_features()
+        features_gap["gap_pct"] = -6.0  # well beyond GAP_DOWN_FULL_CREDIT_PCT (-4.0)
+        proposal_gap = strategy.evaluate(
+            make_context(
+                config=cfg, bars=bars, features=features_gap, sentiment=sentiment, sentiment_history=history
+            )
+        )
+        assert proposal_gap is not None
+        assert (
+            f"gap_down_capitulation=+{CapitulationReversalStrategy.W_GAP_DOWN:.1f}"
+            f"/{CapitulationReversalStrategy.W_GAP_DOWN:.0f}"
+        ) in proposal_gap.extras["score_breakdown"]
+        assert "Gapped down" in " ".join(proposal_gap.evidence)
+        # A gap up (wrong direction) earns no credit, same as no gap at all.
+        features_gap_up = self._good_features()
+        features_gap_up["gap_pct"] = 3.0
+        proposal_gap_up = strategy.evaluate(
+            make_context(
+                config=cfg,
+                bars=bars,
+                features=features_gap_up,
+                sentiment=sentiment,
+                sentiment_history=history,
+            )
+        )
+        assert proposal_gap_up is not None
+        assert "gap_down_capitulation=+0.0/8" in proposal_gap_up.extras["score_breakdown"]
+
+    def test_gap_pct_absent_degrades_gracefully(self, cfg: AppConfig):
+        bars = self._reversal_bars()
+        sentiment = self._good_sentiment()
+        history = make_sentiment_history(final=sentiment)
+        features = self._good_features()
+        features.pop("gap_pct", None)
+        strategy = CapitulationReversalStrategy(cfg)
+
+        proposal = strategy.evaluate(
+            make_context(
+                config=cfg, bars=bars, features=features, sentiment=sentiment, sentiment_history=history
+            )
+        )
+
+        assert proposal is not None
+        proposal.validate()
 
 
 # --------------------------------------------------------------------------
@@ -677,6 +891,158 @@ class TestHypeFailureShort:
         assert rejections[0].reason == "score_below_threshold"
         assert "advance_speed_pctl=" in rejections[0].detail
         assert "sentiment_spike_pctl=" in rejections[0].detail
+
+    # ---- market-signal adoption package items 1(d)/2/4 ----------------------
+
+    def test_gap_down_failure_bonus_scales_with_gap_size(self, cfg: AppConfig):
+        bars = self._failure_bars()
+        sentiment = self._good_sentiment()
+        history = make_sentiment_history(final=sentiment)
+        security = self._good_security()
+        strategy = HypeFailureShortStrategy(cfg)
+
+        features_no_gap = self._good_features()
+        proposal_no_gap = strategy.evaluate(
+            make_context(
+                config=cfg,
+                bars=bars,
+                features=features_no_gap,
+                sentiment=sentiment,
+                sentiment_history=history,
+                security=security,
+            )
+        )
+        assert proposal_no_gap is not None
+        assert "gap_down_failure=+0.0/8" in proposal_no_gap.extras["score_breakdown"]
+
+        features_gap = self._good_features()
+        features_gap["gap_pct"] = -5.0  # well beyond GAP_DOWN_FULL_CREDIT_PCT (-3.0)
+        proposal_gap = strategy.evaluate(
+            make_context(
+                config=cfg,
+                bars=bars,
+                features=features_gap,
+                sentiment=sentiment,
+                sentiment_history=history,
+                security=security,
+            )
+        )
+        assert proposal_gap is not None
+        assert (
+            f"gap_down_failure=+{HypeFailureShortStrategy.W_GAP_DOWN_FAILURE:.1f}"
+            f"/{HypeFailureShortStrategy.W_GAP_DOWN_FAILURE:.0f}"
+        ) in proposal_gap.extras["score_breakdown"]
+        assert "Gapped down" in " ".join(proposal_gap.evidence)
+
+    def test_gap_continuation_down_is_boolean_full_credit(self, cfg: AppConfig):
+        bars = self._failure_bars()
+        sentiment = self._good_sentiment()
+        history = make_sentiment_history(final=sentiment)
+        security = self._good_security()
+        strategy = HypeFailureShortStrategy(cfg)
+
+        features_off = self._good_features()
+        proposal_off = strategy.evaluate(
+            make_context(
+                config=cfg,
+                bars=bars,
+                features=features_off,
+                sentiment=sentiment,
+                sentiment_history=history,
+                security=security,
+            )
+        )
+        assert proposal_off is not None
+        assert "gap_continuation=+0.0/6" in proposal_off.extras["score_breakdown"]
+
+        features_on = self._good_features()
+        features_on["gap_continuation_down"] = 1.0
+        proposal_on = strategy.evaluate(
+            make_context(
+                config=cfg,
+                bars=bars,
+                features=features_on,
+                sentiment=sentiment,
+                sentiment_history=history,
+                security=security,
+            )
+        )
+        assert proposal_on is not None
+        assert (
+            f"gap_continuation=+{HypeFailureShortStrategy.W_GAP_CONTINUATION_DOWN:.1f}"
+            f"/{HypeFailureShortStrategy.W_GAP_CONTINUATION_DOWN:.0f}"
+        ) in proposal_on.extras["score_breakdown"]
+        assert "extending the breakdown" in " ".join(proposal_on.evidence)
+
+    def test_volume_divergence_undercuts_the_failure_thesis(self, cfg: AppConfig):
+        """A moderate (non-saturating) scenario so the penalty is visible on
+        the clamped setup_score, not just in the raw breakdown."""
+        bars = self._failure_bars()
+        sentiment = self._good_sentiment()
+        history = make_sentiment_history(final=sentiment)
+        security = self._good_security()
+        strategy = HypeFailureShortStrategy(cfg)
+        moderate = self._good_features()
+        moderate.update({"roc_20_pctl_120": 0.75})
+
+        proposal_clean = strategy.evaluate(
+            make_context(
+                config=cfg,
+                bars=bars,
+                features=dict(moderate),
+                sentiment=sentiment,
+                sentiment_history=history,
+                security=security,
+            )
+        )
+        assert proposal_clean is not None
+
+        features_divergent = dict(moderate)
+        features_divergent["volume_divergence"] = 1.0
+        proposal_divergent = strategy.evaluate(
+            make_context(
+                config=cfg,
+                bars=bars,
+                features=features_divergent,
+                sentiment=sentiment,
+                sentiment_history=history,
+                security=security,
+            )
+        )
+        assert proposal_divergent is not None
+        assert (
+            f"volume_divergence={HypeFailureShortStrategy.PENALTY_VOLUME_DIVERGENCE:.1f}"
+            in proposal_divergent.extras["score_breakdown"]
+        )
+        assert proposal_divergent.setup_score < proposal_clean.setup_score
+        assert proposal_clean.setup_score - proposal_divergent.setup_score <= abs(
+            HypeFailureShortStrategy.PENALTY_VOLUME_DIVERGENCE
+        )
+        assert any("absorption" in r for r in proposal_divergent.risks)
+
+    def test_new_gap_features_absent_degrades_gracefully(self, cfg: AppConfig):
+        bars = self._failure_bars()
+        sentiment = self._good_sentiment()
+        history = make_sentiment_history(final=sentiment)
+        security = self._good_security()
+        features = self._good_features()
+        for key in ("gap_pct", "gap_continuation_down", "volume_divergence"):
+            features.pop(key, None)
+        strategy = HypeFailureShortStrategy(cfg)
+
+        proposal = strategy.evaluate(
+            make_context(
+                config=cfg,
+                bars=bars,
+                features=features,
+                sentiment=sentiment,
+                sentiment_history=history,
+                security=security,
+            )
+        )
+
+        assert proposal is not None
+        proposal.validate()
 
 
 # --------------------------------------------------------------------------

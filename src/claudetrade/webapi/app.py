@@ -22,6 +22,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from claudetrade.config import AppConfig
 from claudetrade.pipeline import Pipeline
 from claudetrade.version import CODE_VERSION, DISCLAIMER
+from claudetrade.webapi.refresh_state import RefreshState
 from claudetrade.webapi.routers import dashboard, paper, signals, system, tickers
 
 #: Built frontend assets (``npm run build`` output), committed to the repo so
@@ -59,6 +60,9 @@ def create_app(config: AppConfig, pipeline: Pipeline | None = None) -> FastAPI:
     app.state.config = config
     app.state.pipeline = pipeline or Pipeline.bootstrap(config)
     app.state.last_scan_result = None
+    #: Background-refresh progress -- see webapi.routers.system's
+    #: POST /api/system/refresh and GET /api/system/refresh/status.
+    app.state.refresh_state = RefreshState()
 
     app.include_router(signals.router)
     app.include_router(tickers.router)

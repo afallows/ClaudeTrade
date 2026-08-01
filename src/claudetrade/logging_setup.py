@@ -102,11 +102,85 @@ class ConsoleFormatter(logging.Formatter):
         super().__init__("%(asctime)s %(levelname)-7s %(name)-28s %(message)s", "%H:%M:%S")
 
 
+class ResilientRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """A ``RotatingFileHandler`` that tolerates a rollover it cannot complete.
+
+    On Windows, ``doRollover()``'s ``os.rename`` raises ``PermissionError``
+    (``WinError 32``) when a second process has the same log file open --
+    exactly the situation of running ``claudetrade refresh`` from a terminal
+    while the desktop UI's own server is also running and logging to the
+    same file. Left to the default handler, that exception is not silently
+    swallowed: Python's logging module prints a full "--- Logging error
+    ---" traceback to stderr for *every subsequent record* once a handler is
+    left in this broken state -- a real owner log showed thousands of lines
+    of exactly this, burying every other message.
+
+    This subclass catches the rollover failure, logs one WARNING the first
+    time (never per record), and keeps appending to the current file without
+    rotating -- an oversized log file until the next successful rotation
+    (typically the next process start, once the other process has released
+    the file) is a far better failure mode than an unreadable console.
+    Combined with per-entry-point log filenames (see ``setup_logging``),
+    which remove the routine two-processes-one-file case entirely, this is
+    belt-and-braces for whatever scenario still shares a file (e.g. two
+    instances of the same entry point run concurrently by the operator).
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._rollover_warned = False
+
+    def doRollover(self) -> None:  # noqa: N802 - overrides logging.handlers.RotatingFileHandler's own camelCase method name
+        try:
+            super().doRollover()
+        except OSError as exc:
+            if not self._rollover_warned:
+                self._rollover_warned = True
+                logging.getLogger(__name__).warning(
+                    "log rotation failed for %s (%s: %s) -- another process most likely has "
+                    "this file open; continuing to append to the current file without "
+                    "rotating until a future run can rotate it",
+                    self.baseFilename,
+                    type(exc).__name__,
+                    exc,
+                )
+            # doRollover() may have already closed self.stream before the
+            # rename failed; make sure the handler can still write.
+            if self.stream is None or self.stream.closed:
+                self.stream = self._open()
+
+
 _CONFIGURED = False
 
 
-def setup_logging(config: AppConfig, *, force: bool = False) -> logging.Logger:
-    """Install handlers on the root logger. Idempotent unless ``force``."""
+def _entry_point_filename(base_filename: str, component: str | None) -> str:
+    """Derive a per-entry-point log filename from the configured base name.
+
+    ``claudetrade.log`` + ``component="cli"`` -> ``claudetrade-cli.log``;
+    ``component=None`` leaves the configured name untouched (existing/other
+    callers, and every pre-existing test, are unaffected). This is what
+    stops the CLI and the desktop UI server -- two separate OS processes --
+    from ever holding a handle to the same log file at the same time, which
+    is the routine (not exceptional) cause of the Windows rollover
+    contention ``ResilientRotatingFileHandler`` also guards against.
+    """
+    if not component:
+        return base_filename
+    path = Path(base_filename)
+    return f"{path.stem}-{component}{path.suffix or '.log'}"
+
+
+def setup_logging(
+    config: AppConfig, *, force: bool = False, component: str | None = None
+) -> logging.Logger:
+    """Install handlers on the root logger. Idempotent unless ``force``.
+
+    Args:
+        component: Short tag identifying this entry point (``"cli"``,
+            ``"web"``, ...), used to derive a per-entry-point log filename --
+            see ``_entry_point_filename``. Omit to use the configured
+            filename verbatim.
+    """
     global _CONFIGURED
     root = logging.getLogger()
     if _CONFIGURED and not force:
@@ -118,8 +192,8 @@ def setup_logging(config: AppConfig, *, force: bool = False) -> logging.Logger:
     root.setLevel(getattr(logging, config.logging.level))
     redaction = RedactionFilter()
 
-    file_handler = logging.handlers.RotatingFileHandler(
-        logs_dir / config.logging.filename,
+    file_handler = ResilientRotatingFileHandler(
+        logs_dir / _entry_point_filename(config.logging.filename, component),
         maxBytes=config.logging.rotate_max_bytes,
         backupCount=config.logging.rotate_backup_count,
         encoding="utf-8",
@@ -136,8 +210,8 @@ def setup_logging(config: AppConfig, *, force: bool = False) -> logging.Logger:
 
     audit = logging.getLogger("claudetrade.audit")
     audit.propagate = False
-    audit_handler = logging.handlers.RotatingFileHandler(
-        logs_dir / config.logging.audit_filename,
+    audit_handler = ResilientRotatingFileHandler(
+        logs_dir / _entry_point_filename(config.logging.audit_filename, component),
         maxBytes=config.logging.rotate_max_bytes,
         backupCount=config.logging.rotate_backup_count,
         encoding="utf-8",

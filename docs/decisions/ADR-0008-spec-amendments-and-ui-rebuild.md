@@ -48,6 +48,75 @@ account suspension (owner-accepted, bounded by fail-closed + rates).
 SocialProvider seam with an `enabled` flag; deleting the module restores the
 prior posture. The spec's original wording is preserved in git history.
 
+### Amendment 1 (2026-07-31, owner directive) — browser-TLS impersonation for the Stocktwits keyless endpoint
+
+*The Decision 1 text above stands unchanged and remains the general rule.
+This amendment records one narrow, explicitly owner-authorised exception for
+this personal-use deployment. Owner's words: "This is a personal use project.
+We can take any approach to stocktwits needed to make it work effectively."*
+
+**Scope — one source, one mechanism.** `api.stocktwits.com/api/2/streams/
+symbol/{SYMBOL}.json` may be fetched with a client that presents a real
+browser's TLS ClientHello fingerprint (JA3), via `curl_cffi`'s browser
+impersonation. Nothing else changes, and the exception extends to no other
+source.
+
+**Why this is not the line Decision 1 draws.** Decision 1's "never rotate
+fingerprints ... or otherwise evade anti-bot systems" was written about
+*credentialed, ToS-gated* surfaces, where the block is the vendor enforcing
+an access boundary. This case is materially different on every axis:
+
+* The endpoint is **keyless and open by the vendor's own documentation**.
+  There is no credential to present, none is bypassed, no paywall or
+  authentication boundary exists to cross, and no account (ours or anyone
+  else's) is involved.
+* The block is **not an access decision about the request** — it is a
+  client-shape heuristic about the *handshake*. Confirmed cause: Cloudflare
+  bot management gating on the TLS fingerprint. A logged-out browser tab on
+  the same machine and IP is served HTTP 200 for the identical URL; a
+  stdlib-`ssl` Python client gets 403 before the request line is read.
+* We are therefore **making our client look like the client the endpoint
+  already serves**, not defeating a gate that says no to us on the merits.
+* It is one **honest, configured, disclosed** profile (`stocktwits.impersonate`,
+  default `"chrome"`), not a rotating pool. "Fingerprint rotation" — the
+  thing Decision 1 forbids, and the thing that produces the unmaintainable
+  arms race — is still forbidden here.
+
+**What still applies, unchanged.** Fail-closed on any 401/403, non-JSON body,
+or unexpected shape (`SourceBlockedError` ends that source's cycle: no retry
+loop, no proxy rotation, no CAPTCHA solving, no profile-shuffling on a
+block). Conservative, human-scale rates with jitter, well under the vendor's
+published 200 requests/hour unauthenticated budget. A hard
+`max_symbols_per_cycle` cap. **No Cloudflare cookie is captured, stored or
+replayed** — no `cf_clearance`/`__cf_bm` harvesting, no session persistence;
+each request stands alone. Impersonation is expected to make a block
+unlikely, not impossible, and "Stocktwits unavailable" remains a supported,
+non-degraded state for the application.
+
+**This does NOT extend to credentialed sources.** X and Reddit keep the
+original Decision 1 posture verbatim. There the block *is* an access/ToS
+boundary tied to an account, so the reasoning above does not transfer — and
+neither does the authorisation.
+
+**Consequences.** `curl_cffi` becomes an **optional** runtime dependency
+(lazy-imported, same pattern as the `anthropic`/`openai` SDKs): without it
+the application runs unchanged and the source reports itself unavailable with
+an install hint. `stocktwits.enabled` flips to `true` by default (owner
+directive) — the vendor's rate budget is respected by the rate limiter and
+symbol cap rather than by leaving the source switched off.
+
+**Risks.** Cloudflare heuristics change; a profile that works today may be
+challenged later (mitigated: fail-closed, plus `impersonate` is a one-line
+config change and `curl_cffi` ships new profiles as browsers ship). The
+impersonation profile drifts from the browser fleet as Chrome advances
+(mitigated: the default is the alias `"chrome"`, which resolves to
+`curl_cffi`'s newest Chrome build rather than a pinned version).
+
+**Reversal.** Set `stocktwits.enabled = false`, or uninstall `curl_cffi` —
+either leaves the source cleanly unavailable. Reverting the transport to
+`httpx` restores the pre-amendment behaviour (and, on the evidence, HTTP
+403).
+
 ## Decision 2 — UI rebuilt as a local web app in a desktop shell
 
 **Decision.** Replace Streamlit with a React + TypeScript SPA (Vite build;

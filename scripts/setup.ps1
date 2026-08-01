@@ -3,7 +3,8 @@
 .SYNOPSIS
     One-script setup for ClaudeTrade on a fresh Windows machine: checks/installs
     Python, creates the virtual environment, installs ClaudeTrade, creates the
-    database, loads the first 90 days of data, and launches the desktop UI.
+    database, launches the desktop UI immediately, and triggers the first data
+    load in the background so the UI is never blocked behind it.
 
 .DESCRIPTION
     Implements ADR-0008 Decision 4 ("One-script setup"). Automates the manual
@@ -22,37 +23,60 @@
       b) Create .venv if it doesn't already exist; upgrade pip; install
          requirements.txt; install ClaudeTrade itself in editable mode.
       c) `claudetrade init` -- create/migrate the local database.
-      d) `claudetrade refresh` -- first data load (defaults to the last 90
-         calendar days). A provider problem here is reported as a warning,
-         not a fatal error -- the script continues to the UI regardless,
-         since the app is designed to run in reduced-capability mode.
-      e) `claudetrade ui` -- launch the desktop app (the new React/FastAPI
-         interface by default; pass -Classic for the legacy Streamlit UI).
+      d) UI-FIRST STARTUP (the fix for a real owner-reported problem: a first
+         live refresh against ~2,400 symbols took 80+ minutes, and this
+         script used to run it INLINE, blocking the UI from ever appearing
+         until it finished):
+           - **Default (React/FastAPI desktop app)**: launch
+             `claudetrade ui` as a DETACHED background process (its own
+             window), poll `http://127.0.0.1:<port>` until the server
+             answers, then (unless -SkipData) POST
+             `/api/system/refresh` against that now-listening server --
+             which starts the refresh on a background thread inside the
+             server process and returns immediately (see
+             `claudetrade.webapi.routers.system`). This setup script then
+             exits 0; the UI keeps running in its own window and shows
+             live progress (`GET /api/system/refresh/status`) as the
+             refresh runs behind it. A failure to reach the API (server
+             slow to start, a custom non-default port, ...) is a WARNING,
+             not fatal -- the UI is already up regardless; trigger the
+             refresh later from the UI or with `claudetrade refresh`.
+           - **-Classic (legacy Streamlit UI)**: Streamlit has no
+             background-refresh API, so this path keeps the OLD inline
+             behaviour instead -- `claudetrade refresh` runs to completion
+             (unless -SkipData; a provider problem here is a WARNING, not
+             fatal -- run `claudetrade probe` to diagnose), THEN
+             `claudetrade ui --classic` launches and blocks this console
+             until it is closed, exactly as before this change.
 
     Every step is idempotent: re-running this script on a machine that
     already has some or all of the above in place skips or repeats each step
-    safely (venv creation is skipped if .venv already exists; pip installs,
-    `init`, and `refresh` are all safe to repeat).
+    safely (venv creation is skipped if .venv already exists; pip installs
+    and `init` are both safe to repeat).
 
     All console output is also written to a timestamped transcript log file
     next to this script (scripts\setup-log-<timestamp>.txt).
 
 .PARAMETER SkipData
-    Skip step (d), the first `claudetrade refresh`. Useful if you already
-    have data loaded and just want to relaunch the UI quickly.
+    Skip triggering the first data load. Useful if you already have data
+    loaded and just want to relaunch the UI quickly.
 
 .PARAMETER Classic
-    Pass `--classic` through to `claudetrade ui`, launching the legacy
-    Streamlit interface instead of the new desktop (React/FastAPI) app.
+    Launch the legacy Streamlit interface instead of the new desktop
+    (React/FastAPI) app -- see step (d) above for how this changes the
+    data-load ordering (inline/blocking, not background).
 
 .PARAMETER NoLaunch
-    Do everything except step (e): set up the environment, initialize the
-    database, and (unless -SkipData) load data, but do not launch the UI.
-    Useful for unattended/scripted provisioning.
+    Do everything except step (d): set up the environment and initialize the
+    database, but do not launch the UI and do not trigger a data load (there
+    is no server to trigger it against without a UI). Useful for
+    unattended/scripted provisioning; run `claudetrade refresh` and
+    `claudetrade ui` manually afterwards.
 
 .EXAMPLE
     scripts\setup.ps1
-    Full first-run flow: install prerequisites, load data, launch the UI.
+    Full first-run flow: install prerequisites, launch the UI immediately,
+    load data in the background behind it.
 
 .EXAMPLE
     scripts\setup.ps1 -SkipData -Classic
@@ -85,7 +109,8 @@
 
       1. Fresh Windows 11 VM, nothing installed, winget present (default on
          current Windows 11) -> installs Python via winget, creates .venv,
-         installs deps, inits db, refreshes data, opens the desktop UI.
+         installs deps, inits db, opens the desktop UI immediately, then
+         POSTs the background refresh to it once it answers.
       2. Same, but winget absent (older Windows 10 image) -> prints manual
          install instructions, opens the python.org downloads page, exits 1
          without touching the filesystem further.
@@ -104,18 +129,24 @@
          in-place) rather than silently reusing a broken environment.
       8. `pip install -r requirements.txt` fails (e.g. no network for a
          first-time install with no cached wheels) -> exits non-zero (3)
-         with a pointed message; does not proceed to init/refresh/ui.
-      9. `claudetrade refresh` fails or reports degraded sources (e.g. a
-         corporate proxy blocking an optional live host) -> prints a
-         warning and the `claudetrade probe` hint, then still proceeds to
-         launch the UI (non-fatal, per the app's own graceful-degradation
-         design already exercised by `refresh`/`scan`).
-      10. `-SkipData` -> step (d) is skipped entirely, no network calls,
-          straight to UI launch.
-      11. `-NoLaunch` -> steps (a)-(d) run, step (e) is skipped, script
+         with a pointed message; does not proceed to init/UI launch.
+      9. The UI process never becomes reachable on 127.0.0.1 within the
+         polling window (slow machine, crashed on launch, a customised
+         non-default port) -> prints a WARNING (not fatal -- the UI window
+         is already open regardless) and skips the background-refresh POST;
+         the operator can trigger it from the UI or with
+         `claudetrade refresh` (whose own failure path still prints the
+         `claudetrade probe` hint) once it is up.
+      10. `-SkipData` -> the background-refresh POST (or, under -Classic,
+          the inline `claudetrade refresh`) is skipped entirely, no network
+          calls, straight to UI launch.
+      11. `-NoLaunch` -> steps (a)-(c) run, step (d) (UI launch and the
+          refresh trigger that depends on it) is skipped entirely, script
           exits 0 with instructions for launching the UI manually later.
-      12. `-Classic` -> `claudetrade ui --classic` is invoked instead of the
-          new desktop app's default invocation.
+      12. `-Classic` -> the OLD inline-refresh-then-blocking-UI flow runs
+          instead: `claudetrade refresh` to completion, then
+          `claudetrade ui --classic`, blocking this console until closed --
+          Streamlit has no background-refresh API to trigger against.
       13. Run from a directory other than the repo root (e.g. double-click
           from Explorer, or invoked via a shortcut) -> resolves paths from
           $PSScriptRoot, not the current directory, so this should not
@@ -189,6 +220,16 @@ function Exit-Setup {
     Write-Host ""
     if ($Code -eq 0) {
         Write-Host "Setup finished (exit code 0). Transcript: $LogPath" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "-----------------------------------------------------------------" -ForegroundColor Cyan
+        Write-Host "Optional: enable AI-assisted sentiment." -ForegroundColor Cyan
+        Write-Host "  Open the Configuration screen -> AI Analysis and follow the" -ForegroundColor Cyan
+        Write-Host "  instructions there to connect Claude or ChatGPT. This is purely" -ForegroundColor Cyan
+        Write-Host "  optional and setup does not block on it -- rules-based sentiment" -ForegroundColor Cyan
+        Write-Host "  always runs on its own; AI, if configured, is an ensemble adjunct" -ForegroundColor Cyan
+        Write-Host "  on top of it, never the sole basis of a signal." -ForegroundColor Cyan
+        Write-Host "  Details: docs\ai-setup.md" -ForegroundColor Cyan
+        Write-Host "-----------------------------------------------------------------" -ForegroundColor Cyan
     } else {
         Write-Host "Setup stopped early (exit code $Code). Transcript: $LogPath" -ForegroundColor Red
     }
@@ -369,50 +410,121 @@ if ($LASTEXITCODE -ne 0) {
 Write-Ok "Database ready."
 
 # ---------------------------------------------------------------------------
-# Step d: claudetrade refresh (first data load)
+# Step d: launch the UI, then trigger the first data load
+#
+# UI-FIRST STARTUP: the previous version of this script ran `claudetrade
+# refresh` INLINE, here, before the UI ever launched -- blocking behind it
+# for as long as the refresh took. A real owner refresh against ~2,400
+# symbols took 80+ minutes; a first-run install should never look hung for
+# that long with nothing on screen. The default (React/FastAPI) path below
+# launches the UI first, waits for its server to answer, then POSTs the
+# refresh to it so it runs on a background thread INSIDE the already-running
+# server -- see claudetrade.webapi.routers.system's POST /api/system/refresh
+# and GET /api/system/refresh/status. -Classic has no such API (Streamlit),
+# so it keeps the old inline-then-blocking ordering, unchanged.
 # ---------------------------------------------------------------------------
 
-if ($SkipData) {
-    Write-Step "Skipping first data load (-SkipData passed)"
-} else {
-    Write-Step "Loading data (claudetrade refresh -- defaults to the last 90 days)"
-    & $venvClaudetrade refresh
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warn "'claudetrade refresh' reported a problem (exit code $LASTEXITCODE)."
-        Write-Warn "This is not fatal -- ClaudeTrade's default synthetic data needs no network, so this usually means a live provider (Stooq, Reddit, etc.) is unreachable or missing credentials."
-        Write-Warn "Run '.venv\Scripts\claudetrade.exe probe' to see exactly which host or credential is the problem. The UI will still start below, using whatever data is already in the database."
-    } else {
-        Write-Ok "Data refresh completed."
+function Wait-ForHttp {
+    <#
+        Polls a plain TCP connection to $HostName:$Port until it accepts, or
+        $TimeoutSeconds elapses. Returns $true/$false. Used to detect when a
+        detached UI process's own server is ready for the background-refresh
+        trigger below -- a TCP-level check is enough here (no need to parse
+        a response body) and avoids pulling in Invoke-WebRequest's overhead
+        just to poll.
+    #>
+    param(
+        [string]$HostName = '127.0.0.1',
+        [int]$Port,
+        [int]$TimeoutSeconds = 30
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient
+            $client.Connect($HostName, $Port)
+            $client.Close()
+            return $true
+        } catch {
+            Start-Sleep -Milliseconds 300
+        }
     }
+    return $false
 }
-
-# ---------------------------------------------------------------------------
-# Step e: launch the UI
-# ---------------------------------------------------------------------------
-
-$finalExitCode = 0
 
 if ($NoLaunch) {
     Write-Step "Skipping UI launch (-NoLaunch passed)"
     Write-Info "Setup is complete. Launch the UI later with:"
     Write-Info "  .venv\Scripts\claudetrade.exe ui"
     Write-Info "or by re-running scripts\setup.bat without -NoLaunch."
-} else {
-    $uiArgs = @('ui')
-    if ($Classic) {
-        $uiArgs += '--classic'
-        Write-Step "Starting the ClaudeTrade UI (--classic: legacy Streamlit interface)"
+    Exit-Setup 0
+}
+
+if ($Classic) {
+    # Streamlit has no background-refresh API to trigger against -- keep the
+    # ORIGINAL inline-refresh-then-blocking-UI ordering for this path only.
+    if ($SkipData) {
+        Write-Step "Skipping first data load (-SkipData passed)"
     } else {
-        Write-Step "Starting the ClaudeTrade UI (desktop app)"
+        Write-Step "Loading data (claudetrade refresh -- defaults to the last 90 days)"
+        & $venvClaudetrade refresh
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "'claudetrade refresh' reported a problem (exit code $LASTEXITCODE)."
+            Write-Warn "This is not fatal -- ClaudeTrade's default synthetic data needs no network, so this usually means a live provider (Stooq, Reddit, etc.) is unreachable or missing credentials."
+            Write-Warn "Run '.venv\Scripts\claudetrade.exe probe' to see exactly which host or credential is the problem. The UI will still start below, using whatever data is already in the database."
+        } else {
+            Write-Ok "Data refresh completed."
+        }
     }
+
+    Write-Step "Starting the ClaudeTrade UI (--classic: legacy Streamlit interface)"
     Write-Info "This window will stay busy while the UI is running. Close the app window (or press Ctrl+C here) to stop it."
-    & $venvClaudetrade @uiArgs
+    & $venvClaudetrade ui --classic
     $finalExitCode = $LASTEXITCODE
     if ($finalExitCode -ne 0) {
         Write-Warn "The UI process exited with code $finalExitCode. Check the transcript above for details."
     } else {
         Write-Ok "UI closed normally."
     }
+    Exit-Setup $finalExitCode
 }
 
-Exit-Setup $finalExitCode
+# Default: the React/FastAPI desktop app, launched as a DETACHED background
+# process so this script can keep running long enough to trigger the first
+# data load against it, then exit -- the UI itself keeps running in its own
+# window independently of this script from this point on.
+Write-Step "Starting the ClaudeTrade UI (desktop app) -- data loads in the background behind it"
+
+# ClaudeTrade.UIConfig.port's own default; NOT detected from a customised
+# config.toml here (this is a fresh-install script -- see the header
+# comment's step (d)/test-matrix row 9 for the documented fallback when a
+# non-default port means this polling step cannot find the server).
+$UiPort = 8501
+$BaseUrl = "http://127.0.0.1:$UiPort"
+
+Write-Info "Launching '$venvClaudetrade ui' as a background process ..."
+$uiProcess = Start-Process -FilePath $venvClaudetrade -ArgumentList 'ui' -PassThru -WindowStyle Minimized
+Write-Ok "UI process started (PID $($uiProcess.Id))."
+
+Write-Info "Waiting for the UI's server to answer on $BaseUrl (up to 30s) ..."
+if (-not (Wait-ForHttp -Port $UiPort -TimeoutSeconds 30)) {
+    Write-Warn "The UI did not become reachable on $BaseUrl within 30s -- it may still be starting (a slow first launch), or it may be configured on a non-default port."
+    Write-Warn "The UI window is already open regardless of this warning. Once it is up, trigger the first data load from its own Diagnostics screen, or run '.venv\Scripts\claudetrade.exe refresh' from a terminal."
+    Exit-Setup 0
+}
+Write-Ok "UI is up."
+
+if ($SkipData) {
+    Write-Info "Skipping the first data load (-SkipData passed)."
+} else {
+    Write-Info "Triggering the first data load in the background (POST $BaseUrl/api/system/refresh) ..."
+    try {
+        $null = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/system/refresh" -TimeoutSec 15
+        Write-Ok "Data refresh started in the background. Watch its progress at $BaseUrl (Diagnostics) or GET $BaseUrl/api/system/refresh/status."
+    } catch {
+        Write-Warn "Could not start the background data refresh via the API: $($_.Exception.Message)"
+        Write-Warn "This is not fatal -- the UI is already open and usable with whatever data already exists. Trigger a refresh later from the UI, or run '.venv\Scripts\claudetrade.exe refresh' (see 'claudetrade probe' if that also fails, to diagnose a blocked host or missing credential)."
+    }
+}
+
+Exit-Setup 0

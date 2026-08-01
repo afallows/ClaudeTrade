@@ -9,6 +9,7 @@ schedulable.
     claudetrade refresh              # pull data from configured providers
     claudetrade scan                 # generate ranked signals for a session
     claudetrade backtest             # replay strategies over history
+    claudetrade backtest report      # honest, per-strategy walk-forward evidence report
     claudetrade paper ...            # inspect and drive the paper account
     claudetrade secrets ...          # store credentials in the OS keychain
     claudetrade db ...               # backup, restore, migrate
@@ -49,10 +50,17 @@ secrets_app = typer.Typer(help="Manage API credentials in the OS credential stor
 paper_app = typer.Typer(help="Inspect and drive the paper-trading account.")
 db_app = typer.Typer(help="Database maintenance: migrate, backup, restore.")
 verify_app = typer.Typer(help="Integrity and reproducibility checks.")
+#: A Typer group rather than a plain command so ``claudetrade backtest report``
+#: (the multi-strategy owner report, see ``backtest.report``) can live
+#: alongside the original single-run ``claudetrade backtest`` -- which keeps
+#: working unchanged as this group's callback, invoked when no subcommand is
+#: given (see ``backtest()`` below).
+backtest_app = typer.Typer(help="Replay strategies over history and report performance.")
 app.add_typer(secrets_app, name="secrets")
 app.add_typer(paper_app, name="paper")
 app.add_typer(db_app, name="db")
 app.add_typer(verify_app, name="verify")
+app.add_typer(backtest_app, name="backtest")
 
 ConfigOption = Annotated[
     Path | None, typer.Option("--config", "-c", help="Path to config.toml.")
@@ -61,7 +69,7 @@ ConfigOption = Annotated[
 
 def _load(config_path: Path | None) -> AppConfig:
     config = get_config(config_path, reload=True)
-    setup_logging(config)
+    setup_logging(config, component="cli")
     return config
 
 
@@ -81,6 +89,20 @@ def _today() -> dt.date:
 def _parse_date(value: str | None, default: dt.date) -> dt.date:
     if not value:
         return default
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        raise typer.BadParameter(f"expected an ISO date (YYYY-MM-DD), got {value!r}") from None
+
+
+def _parse_optional_date(value: str | None) -> dt.date | None:
+    """Like ``_parse_date`` but with no default -- ``None`` means 'let the caller decide'.
+
+    Used by ``backtest report``, where an unset ``--start``/``--end`` means
+    "everything available" rather than a fixed lookback window.
+    """
+    if not value:
+        return None
     try:
         return dt.date.fromisoformat(value)
     except ValueError:
@@ -421,12 +443,18 @@ def scan(
     result = pipeline.scan(session_date, lookback_days=lookback, record=record)
     scan_result = result.scan
     if scan_result is None:
+        for warning in result.warnings:
+            typer.secho(warning, fg=typer.colors.YELLOW)
         typer.secho("scan produced no result", fg=typer.colors.RED)
         raise typer.Exit(1)
 
+    for warning in result.warnings:
+        typer.secho(warning, fg=typer.colors.YELLOW)
     typer.echo(f"\n{DISCLAIMER}\n")
     typer.echo(
-        f"session {session_date} | regime {scan_result.regime.regime.value} | "
+        # scan_result.session, not session_date: the pipeline may have fallen
+        # back to the latest stored session (the warnings above explain).
+        f"session {scan_result.session} | regime {scan_result.regime.regime.value} | "
         f"{scan_result.evaluated_symbols} symbols evaluated"
     )
     if not scan_result.signals:
@@ -446,8 +474,9 @@ def scan(
         typer.secho(f"! {warning}", fg=typer.colors.YELLOW)
 
 
-@app.command()
+@backtest_app.callback(invoke_without_command=True)
 def backtest(
+    ctx: typer.Context,
     config: ConfigOption = None,
     start: Annotated[str | None, typer.Option(help="ISO start date.")] = None,
     end: Annotated[str | None, typer.Option(help="ISO end date.")] = None,
@@ -456,7 +485,19 @@ def backtest(
     export: Annotated[Path | None, typer.Option(help="Export trades/metrics CSV here.")] = None,
     walk_forward: Annotated[bool, typer.Option(help="Run walk-forward validation.")] = False,
 ) -> None:
-    """Replay strategies over history and report performance."""
+    """Replay strategies over history and report performance.
+
+    Bare ``claudetrade backtest`` runs one combined-strategy backtest exactly
+    as before. For the honest, per-strategy, significance-gated evidence
+    report an owner would hand to themselves before trusting a
+    recommendation, see ``claudetrade backtest report``.
+    """
+    if ctx.invoked_subcommand is not None:
+        # A subcommand (e.g. `report`) was given -- this group callback still
+        # runs first (that's how Typer/Click groups work), but the single-run
+        # backtest below must not also execute.
+        return
+
     cfg = _load(config)
     if strategies:
         cfg.signals.enabled_strategies = [s.strip() for s in strategies.split(",")]
@@ -508,6 +549,72 @@ def backtest(
         export.mkdir(parents=True, exist_ok=True)
         export_csv(result, export)
         typer.echo(f"CSV exported to {export}")
+
+
+@backtest_app.command("report")
+def backtest_report_cmd(
+    config: ConfigOption = None,
+    start: Annotated[
+        str | None, typer.Option(help="ISO start date (default: earliest stored session).")
+    ] = None,
+    end: Annotated[
+        str | None, typer.Option(help="ISO end date (default: latest stored session).")
+    ] = None,
+    strategies: Annotated[
+        str | None,
+        typer.Option(help="Comma-separated strategy names (default: every registered strategy)."),
+    ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(help="Directory for the .md/.json report (default: the exports directory)."),
+    ] = None,
+) -> None:
+    """Generate the honest, multi-strategy backtest REPORT (Markdown + JSON).
+
+    Runs walk-forward validation for every registered strategy, in isolation,
+    over the bars/sentiment/earnings already stored in this installation's
+    database (the full available history by default), then writes ONE
+    Markdown report and its JSON twin to ``--output-dir`` (default: the
+    configured exports directory, ``backtest-report-<date>.{md,json}``).
+
+    Every headline is significance-gated: a strategy without enough
+    out-of-sample evidence is reported as 'INSUFFICIENT EVIDENCE', not its
+    best-looking point estimate, and a strategy with zero trades in the
+    window says so plainly instead of rendering a table of zeros. See
+    docs/backtest-report.md.
+    """
+    cfg = _load(config)
+    from claudetrade.backtest.report import (
+        generate_backtest_report,
+        render_report_markdown,
+        save_report,
+    )
+    from claudetrade.pipeline import Pipeline
+
+    start_date = _parse_optional_date(start)
+    end_date = _parse_optional_date(end)
+    strategy_list = [s.strip() for s in strategies.split(",")] if strategies else None
+
+    pipeline = Pipeline.bootstrap(cfg)
+    typer.echo(
+        "running walk-forward backtests for every strategy, in isolation -- this replays "
+        "the full signal engine per strategy and can take a while on a large universe/window..."
+    )
+    try:
+        report_obj = generate_backtest_report(
+            pipeline, cfg, start=start_date, end=end_date, strategy_names=strategy_list
+        )
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(1) from None
+
+    out_dir = output_dir or cfg.paths.resolve("exports_dir")
+    md_path, json_path = save_report(report_obj, out_dir)
+
+    typer.echo(f"\n{DISCLAIMER}\n")
+    typer.echo(render_report_markdown(report_obj))
+    typer.echo(f"\nmarkdown report: {md_path}")
+    typer.echo(f"json report:     {json_path}")
 
 
 # --------------------------------------------------------------------------
@@ -804,6 +911,250 @@ def db_backup(config: ConfigOption = None, label: str = "") -> None:
     typer.echo(f"backup written to {path}")
 
 
+@db_app.command("purge-synthetic")
+def db_purge_synthetic(config: ConfigOption = None) -> None:
+    """Delete social posts/mentions/sentiment aggregates that came from the
+    offline synthetic generator.
+
+    ``reddit.provider`` (and, less commonly, ``x.provider``/``news.provider``)
+    used to default to ``"synthetic"``; an install left on that default while
+    the operator believed it was live would silently fill the database with
+    fabricated posts -- a real refresh log showed tens of thousands of them.
+    Changing the default going forward does not clean up a database that
+    already has them, so this exists as a scoped fix short of a full reset.
+
+    Synthetic posts are identified by their ``external_id`` prefix
+    (``"synthetic-"``), stamped unconditionally by every synthetic social
+    adapter (``providers.social.synthetic.SyntheticSocialProvider``,
+    regardless of which ``SocialSource`` -- reddit/x/news -- it is filed
+    under) -- no live adapter ever produces an id in that form.
+
+    Daily sentiment aggregates (``symbol_sentiment_daily``) cannot be
+    attributed to a single originating post without a recompute, so ALL of
+    them are cleared too, not just the ones touching a purged post -- run
+    `claudetrade refresh` afterwards to rebuild them from whichever sources
+    are configured now.
+    """
+    cfg = _load(config)
+    from sqlalchemy import select
+
+    from claudetrade.db.models import (
+        SentimentRecordRow,
+        SocialPostRow,
+        SymbolSentimentDaily,
+        TickerMentionRow,
+    )
+    from claudetrade.db.session import get_database
+
+    db = get_database(cfg)
+    with db.session() as session:
+        synthetic_posts = (
+            session.execute(
+                select(SocialPostRow).where(SocialPostRow.external_id.like("synthetic-%"))
+            )
+            .scalars()
+            .all()
+        )
+        post_ids = [p.id for p in synthetic_posts]
+
+        mentions_deleted = 0
+        if post_ids:
+            mentions = (
+                session.execute(
+                    select(TickerMentionRow).where(TickerMentionRow.post_id.in_(post_ids))
+                )
+                .scalars()
+                .all()
+            )
+            mentions_deleted = len(mentions)
+            for mention in mentions:
+                session.delete(mention)
+
+            # A second foreign key into social_posts -- the per-post,
+            # per-symbol classifier output -- must also go before the post
+            # itself can be deleted.
+            sentiment_records = (
+                session.execute(
+                    select(SentimentRecordRow).where(SentimentRecordRow.post_id.in_(post_ids))
+                )
+                .scalars()
+                .all()
+            )
+            for record in sentiment_records:
+                session.delete(record)
+
+        posts_deleted = len(synthetic_posts)
+        for post in synthetic_posts:
+            session.delete(post)
+
+        aggregates = session.execute(select(SymbolSentimentDaily)).scalars().all()
+        aggregates_deleted = len(aggregates)
+        for aggregate in aggregates:
+            session.delete(aggregate)
+
+    _echo_json(
+        {
+            "posts_deleted": posts_deleted,
+            "mentions_deleted": mentions_deleted,
+            "sentiment_aggregates_deleted": aggregates_deleted,
+        }
+    )
+    if posts_deleted == 0:
+        typer.secho("No synthetic-origin posts found -- nothing to purge.", fg=typer.colors.GREEN)
+    else:
+        typer.secho(
+            f"Purged {posts_deleted} synthetic post(s), {mentions_deleted} mention(s), and "
+            f"{aggregates_deleted} sentiment aggregate row(s). Run 'claudetrade refresh' to "
+            "rebuild aggregates from your currently configured (live) sources.",
+            fg=typer.colors.YELLOW,
+        )
+
+
+@db_app.command("rebuild-sentiment")
+def db_rebuild_sentiment(
+    config: ConfigOption = None,
+    days: int = typer.Option(
+        90, help="Rebuild sentiment for sessions this many days back from today."
+    ),
+) -> None:
+    """Recompute daily sentiment aggregates from the posts already stored in
+    the database, using the CURRENT entity-resolution and classifier code.
+
+    Exists because stored aggregates outlive the bugs that produced them:
+    the trending list kept surfacing common-word "tickers" (AS, YOU, DAY --
+    all genuine symbols, resolved from ordinary English by a since-fixed
+    extractor) long after the extractor was fixed, because ``get_trending``
+    reads ``symbol_sentiment_daily`` rows that nothing ever revisited. This
+    clears every stored mention and aggregate row and rebuilds the aggregates
+    from the sanitised posts on disk, so one command brings the stored view
+    in line with the current code. Ticker-mention provenance rows repopulate
+    for newly fetched posts on subsequent refreshes.
+    """
+    cfg = _load(config)
+    import datetime as _dt
+
+    from sqlalchemy import delete, select
+
+    from claudetrade.db.models import (
+        Security,
+        SocialPostRow,
+        SymbolSentimentDaily,
+        TickerMentionRow,
+    )
+    from claudetrade.db.session import get_database
+    from claudetrade.domain import SecurityInfo, SocialPost, SocialSource
+    from claudetrade.pipeline import Pipeline
+    from claudetrade.utils.timeutils import ensure_utc, utc_now
+
+    db = get_database(cfg)
+    end = utc_now().date()
+    start = end - _dt.timedelta(days=days)
+    # Posts strictly older than the window cannot contribute to any rebuilt
+    # session (aggregation decay makes them weightless well before this), but
+    # the fetch is padded by the aggregation lookback so the earliest rebuilt
+    # sessions still see their own trailing context.
+    post_cutoff = _dt.datetime.combine(
+        start - _dt.timedelta(days=cfg.sentiment.lookback_days), _dt.time.min, tzinfo=_dt.UTC
+    )
+
+    def _read_utc(value: _dt.datetime) -> _dt.datetime:
+        # SQLite hands DateTime(timezone=True) columns back naive; every
+        # write went through ensure_utc, so re-attaching UTC reproduces the
+        # stored instant (same convention as signals.ledger's read path).
+        if value.tzinfo is None:
+            return value.replace(tzinfo=_dt.UTC)
+        return ensure_utc(value)
+
+    with db.session() as session:
+        securities = session.execute(select(Security)).scalars().all()
+        directory = {
+            r.symbol: SecurityInfo(
+                symbol=r.symbol,
+                name=r.name,
+                exchange=r.exchange,
+                sector=r.sector,
+                industry=r.industry,
+                market_cap_usd=r.market_cap_usd,
+                shares_outstanding=r.shares_outstanding,
+                is_etf=r.is_etf,
+                is_leveraged_or_inverse=r.is_leveraged_or_inverse,
+                listed_date=r.listed_date,
+                delisted_date=r.delisted_date,
+            )
+            for r in securities
+        }
+        if not directory:
+            # Checked BEFORE any delete: aborting must not leave the stored
+            # aggregates wiped with nothing rebuilt in their place.
+            typer.secho(
+                "No securities stored -- run 'claudetrade refresh' first.",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(code=1)
+        # Datetime filtering happens in Python, after tz normalisation --
+        # comparing an aware bound against SQLite's naive storage in SQL is
+        # backend-dependent behaviour this maintenance command has no need
+        # to depend on.
+        post_rows = [
+            r
+            for r in session.execute(select(SocialPostRow)).scalars().all()
+            if _read_utc(r.created_at) >= post_cutoff
+        ]
+        posts = [
+            SocialPost(
+                source=SocialSource(r.source),
+                external_id=r.external_id,
+                created_at=_read_utc(r.created_at),
+                text=r.text,
+                community=r.community,
+                score=r.score,
+                num_comments=r.num_comments,
+                num_reposts=r.num_reposts,
+                num_replies=r.num_replies,
+                author_hash=r.author_hash,
+                author_age_days=r.author_age_days,
+                author_karma=r.author_karma,
+                author_followers=r.author_followers,
+                is_comment=r.is_comment,
+                parent_id=r.parent_id,
+                is_removed=r.is_removed,
+                is_crosspost=r.is_crosspost,
+                crosspost_parent=r.crosspost_parent,
+                text_hash=r.text_hash,
+                duplicate_group=r.duplicate_group,
+                injection_risk=r.injection_risk,
+                flair=r.flair,
+            )
+            for r in post_rows
+        ]
+        # Mentions are re-derivable diagnostics and are cleared wholesale;
+        # aggregates are only cleared inside the rebuild window, so history
+        # older than --days (whose posts may already be pruned) survives.
+        # Widen --days to reach further back.
+        mentions_deleted = session.execute(delete(TickerMentionRow)).rowcount
+        aggregates_deleted = session.execute(
+            delete(SymbolSentimentDaily).where(SymbolSentimentDaily.session >= start)
+        ).rowcount
+
+    pipeline = Pipeline(cfg, db)
+    rows_written = pipeline.build_sentiment(
+        posts=posts, directory=directory, start=start, end=end
+    )
+    _echo_json(
+        {
+            "posts_considered": len(posts),
+            "mentions_deleted": mentions_deleted,
+            "sentiment_aggregates_deleted": aggregates_deleted,
+            "sentiment_rows_rebuilt": rows_written,
+        }
+    )
+    typer.secho(
+        f"Rebuilt {rows_written} sentiment row(s) from {len(posts)} stored post(s) "
+        f"(cleared {aggregates_deleted} stale aggregate(s), {mentions_deleted} stale mention(s)).",
+        fg=typer.colors.GREEN,
+    )
+
+
 @db_app.command("restore")
 def db_restore(
     backup: Annotated[Path, typer.Argument(help="Backup file to restore.")],
@@ -933,6 +1284,45 @@ def _run_streamlit_in_process(app_path: str, port: int) -> None:
     from streamlit.web import bootstrap
 
     bootstrap.run(app_path, False, [], {"server.port": port})
+
+
+@app.command("mcp")
+def mcp_server(config: ConfigOption = None) -> None:
+    r"""Run a local MCP (Model Context Protocol) server over stdio.
+
+    Lets an MCP client on this machine -- typically the Claude Desktop app,
+    configured via its ``claude_desktop_config.json`` -- query this
+    installation's signals, sentiment and market status directly, without
+    the web UI running. See docs/claude-desktop-mcp.md for setup.
+
+    Bootstraps its own ``Pipeline`` (``Pipeline.bootstrap``, same as every
+    other entry point), so it works whether or not ``claudetrade ui`` is
+    already running -- SQLite's WAL mode makes concurrent read access safe.
+    This command blocks, serving requests on stdin/stdout, until the client
+    disconnects; all diagnostic output here goes to stderr so it never
+    collides with the MCP protocol framing on stdout.
+
+    Requires the optional ``mcp`` package (``pip install claudetrade\[mcp]``);
+    everything else in the application works without it.
+    """
+    cfg = get_config(config, reload=True)
+    setup_logging(cfg, component="mcp")
+
+    try:
+        from claudetrade.mcp_server import run_stdio
+    except ImportError as exc:
+        typer.secho(
+            "The 'mcp' package is not installed. Install it with:\n"
+            "  pip install claudetrade[mcp]\n"
+            "(or: pip install mcp)\n\n"
+            f"Details: {exc}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"claudetrade MCP server starting (stdio transport). {DISCLAIMER}", err=True)
+    run_stdio(cfg)
 
 
 def main() -> None:

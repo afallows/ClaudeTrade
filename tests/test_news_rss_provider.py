@@ -314,6 +314,7 @@ class TestConfigAndRegistry:
         config.news.enabled = True
         config.news.provider = "news_rss"
         config.news.feed_urls = []
+        config.stocktwits.enabled = False  # keyless, on by default; isolate news here
 
         assert get_social_providers(config) == []
 
@@ -325,6 +326,7 @@ class TestConfigAndRegistry:
         config = AppConfig()
         config.reddit.enabled = False
         config.x.enabled = False
+        config.stocktwits.enabled = False  # keyless, on by default; isolate news here
         assert config.news.enabled is True
         assert config.news.provider == "news_rss"
 
@@ -339,6 +341,7 @@ class TestConfigAndRegistry:
         config = AppConfig()
         config.reddit.enabled = False
         config.x.enabled = False
+        config.stocktwits.enabled = False  # keyless, on by default; isolate news here
         config.news.provider = "synthetic"
 
         providers = get_social_providers(config)

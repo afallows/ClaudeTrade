@@ -43,6 +43,23 @@ def _scale(value: float, lo: float, hi: float) -> float:
     return _clamp(100.0 * (value - lo) / (hi - lo))
 
 
+@dataclass(frozen=True, slots=True)
+class GateFailure:
+    """One hard-gate rejection: a stable ``code`` plus the human-readable message.
+
+    ``code`` exists for the rejection funnel (``signals.engine.ScanFunnel``):
+    the message alone (e.g. ``"average dollar volume $1,234 below the
+    $10,000,000 minimum"``) embeds the candidate's own numbers, so it is
+    unique per candidate and useless as an aggregation key. ``code`` is the
+    same value regardless of the specific numbers involved, so "how many
+    candidates failed on liquidity today" is a single dict lookup rather
+    than a text-parsing exercise.
+    """
+
+    code: str
+    message: str
+
+
 @dataclass(slots=True)
 class ScoreBreakdown:
     """Scoring result plus the reasons a candidate was gated out, if it was."""
@@ -50,7 +67,7 @@ class ScoreBreakdown:
     components: ComponentScores
     overall: float
     confidence: float
-    gate_failures: list[str] = field(default_factory=list)
+    gate_failures: list[GateFailure] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -249,62 +266,119 @@ def apply_hard_gates(
     security: SecurityInfo,
     sentiment: SymbolSentiment | None,
     requires_sentiment: bool = True,
-) -> list[str]:
+) -> list[GateFailure]:
     """Filters that no score can override.
 
     These exist because a weighted average is exactly the wrong tool for a
     disqualifying condition: a spectacular sentiment reading should not be able
     to average away an illiquid stock two days from earnings.
+
+    Codes are chosen to match the equivalent strategy-level hard-veto codes
+    (``Strategy.decline``'s first argument, e.g. ``"illiquid"``,
+    ``"earnings_window"``, ``"manipulation_risk"``) wherever the same
+    underlying condition exists at both layers, so the scan funnel
+    (``signals.engine.ScanFunnel``) rolls the two up under one bucket instead
+    of splitting an identical rejection reason across two labels.
     """
-    failures: list[str] = []
+    failures: list[GateFailure] = []
     filters = config.filters
     price = ctx.price
 
     if price < filters.min_price:
-        failures.append(f"price {price:.2f} below the {filters.min_price:.2f} minimum")
+        failures.append(
+            GateFailure(
+                "price_below_minimum",
+                f"price {price:.2f} below the {filters.min_price:.2f} minimum",
+            )
+        )
     if price > filters.max_price:
-        failures.append(f"price {price:.2f} above the {filters.max_price:.2f} maximum")
+        failures.append(
+            GateFailure(
+                "price_above_maximum",
+                f"price {price:.2f} above the {filters.max_price:.2f} maximum",
+            )
+        )
     if filters.exclude_penny_stocks and price < 5.0:
-        failures.append("penny stocks are excluded")
+        failures.append(GateFailure("penny_stock", "penny stocks are excluded"))
 
     if security.exchange and security.exchange not in config.universe.permitted_exchanges:
-        failures.append(f"exchange {security.exchange} is not permitted")
+        failures.append(
+            GateFailure(
+                "exchange_not_permitted", f"exchange {security.exchange} is not permitted"
+            )
+        )
 
     market_cap = security.market_cap_usd or 0.0
     if market_cap and market_cap < filters.min_market_cap_usd:
-        failures.append(f"market cap ${market_cap:,.0f} below the minimum")
+        failures.append(
+            GateFailure(
+                "market_cap_too_small", f"market cap ${market_cap:,.0f} below the minimum"
+            )
+        )
 
     adv = ctx.feature("avg_dollar_volume_20", 0.0)
     if adv < filters.min_avg_dollar_volume_usd:
         failures.append(
-            f"average dollar volume ${adv:,.0f} below the "
-            f"${filters.min_avg_dollar_volume_usd:,.0f} minimum"
+            GateFailure(
+                "illiquid",
+                f"average dollar volume ${adv:,.0f} below the "
+                f"${filters.min_avg_dollar_volume_usd:,.0f} minimum",
+            )
         )
 
     if filters.exclude_leveraged_inverse_etfs and security.is_leveraged_or_inverse:
-        failures.append("leveraged and inverse ETFs are excluded")
+        failures.append(
+            GateFailure("leveraged_etf", "leveraged and inverse ETFs are excluded")
+        )
     if filters.exclude_binary_event_sectors and security.industry in filters.binary_event_sectors:
-        failures.append(f"{security.industry} is excluded as a binary-event sector")
+        failures.append(
+            GateFailure(
+                "binary_event_sector",
+                f"{security.industry} is excluded as a binary-event sector",
+            )
+        )
 
     atr_pct = ctx.feature("atr_pct", 0.0)
     if atr_pct > filters.max_atr_pct:
-        failures.append(f"ATR {atr_pct:.1f}% of price exceeds the {filters.max_atr_pct:.1f}% cap")
+        failures.append(
+            GateFailure(
+                "volatility_too_high",
+                f"ATR {atr_pct:.1f}% of price exceeds the {filters.max_atr_pct:.1f}% cap",
+            )
+        )
     if 0 < atr_pct < filters.min_atr_pct:
-        failures.append(f"ATR {atr_pct:.1f}% too low for a swing move to clear costs")
+        failures.append(
+            GateFailure(
+                "volatility_too_low",
+                f"ATR {atr_pct:.1f}% too low for a swing move to clear costs",
+            )
+        )
     hv = ctx.feature("hv_20", 0.0)
     if hv > filters.max_annualised_volatility:
-        failures.append(f"annualised volatility {hv:.2f} above the cap")
+        failures.append(
+            GateFailure(
+                "realised_volatility_too_high", f"annualised volatility {hv:.2f} above the cap"
+            )
+        )
 
     # Earnings guard.
     days = ctx.days_to_earnings()
     if days is not None and 0 <= days < filters.min_days_to_earnings:
-        failures.append(f"earnings in {days} days, inside the exclusion window")
+        failures.append(
+            GateFailure(
+                "earnings_window", f"earnings in {days} days, inside the exclusion window"
+            )
+        )
     if (
         filters.max_days_to_earnings is not None
         and days is not None
         and days > filters.max_days_to_earnings
     ):
-        failures.append(f"earnings {days} days away, beyond the configured window")
+        failures.append(
+            GateFailure(
+                "earnings_window_max", f"earnings {days} days away, beyond the configured window"
+            )
+        )
 
     # Sentiment quality gates.
     #
@@ -317,13 +391,19 @@ def apply_hard_gates(
     if sentiment is not None and requires_sentiment:
         if sentiment.unique_authors < filters.min_unique_authors:
             failures.append(
-                f"only {sentiment.unique_authors} unique authors, below the "
-                f"{filters.min_unique_authors} minimum"
+                GateFailure(
+                    "sentiment_thin",
+                    f"only {sentiment.unique_authors} unique authors, below the "
+                    f"{filters.min_unique_authors} minimum",
+                )
             )
         if sentiment.confidence < filters.min_sentiment_confidence:
             failures.append(
-                f"sentiment confidence {sentiment.confidence:.2f} below the "
-                f"{filters.min_sentiment_confidence:.2f} minimum"
+                GateFailure(
+                    "sentiment_confidence_low",
+                    f"sentiment confidence {sentiment.confidence:.2f} below the "
+                    f"{filters.min_sentiment_confidence:.2f} minimum",
+                )
             )
 
     # Manipulation risk applies whether or not the strategy leans on sentiment:
@@ -336,16 +416,22 @@ def apply_hard_gates(
         and sentiment.manipulation_risk > filters.max_manipulation_risk
     ):
         failures.append(
-            f"manipulation risk {sentiment.manipulation_risk:.2f} above the "
-            f"{filters.max_manipulation_risk:.2f} cap"
+            GateFailure(
+                "manipulation_risk",
+                f"manipulation risk {sentiment.manipulation_risk:.2f} above the "
+                f"{filters.max_manipulation_risk:.2f} cap",
+            )
         )
 
     # Reward:risk floor. This is the structural guard against a strategy that
     # wins often by taking tiny profits against large losses.
     if proposal.reward_risk_ratio < config.risk.min_reward_risk_ratio:
         failures.append(
-            f"reward:risk {proposal.reward_risk_ratio:.2f} below the "
-            f"{config.risk.min_reward_risk_ratio:.2f} minimum"
+            GateFailure(
+                "reward_risk_floor",
+                f"reward:risk {proposal.reward_risk_ratio:.2f} below the "
+                f"{config.risk.min_reward_risk_ratio:.2f} minimum",
+            )
         )
 
     return failures
@@ -412,9 +498,15 @@ def score_candidate(
     # Confidence blends data quality with sample adequacy and agreement.
     confidence = components.data_confidence / 100.0
     if sentiment is not None:
-        confidence *= 0.5 + 0.5 * sentiment.confidence
+        sentiment_factor = 0.5 + 0.5 * sentiment.confidence
         # Wide disagreement means the signal is contested, not confirmed.
-        confidence *= 1.0 - 0.25 * min(1.0, sentiment.dispersion)
+        sentiment_factor *= 1.0 - 0.25 * min(1.0, sentiment.dispersion)
+        # Floored at the no-sentiment multiplier below: a thin or noisy
+        # social sample is missing evidence, not contrary evidence, and must
+        # never leave a candidate WORSE off than having no sentiment row at
+        # all -- otherwise storing a weak aggregate actively suppresses the
+        # price-driven strategies for that symbol.
+        confidence *= max(0.75, sentiment_factor)
     else:
         confidence *= 0.75
     if ctx.data_warnings:

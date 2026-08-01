@@ -7,7 +7,10 @@
 
 import type {
   DashboardData,
+  AIConfig,
+  AIConfigUpdateResult,
   CredentialsResponse,
+  CredentialTestResult,
   DiagnosticsResponse,
   Meta,
   PaperAccountResponse,
@@ -15,6 +18,7 @@ import type {
   Performance,
   RefreshRequest,
   RefreshResponse,
+  RefreshStatus,
   RejectedResponse,
   ScanRequest,
   ScanResponse,
@@ -79,6 +83,21 @@ export const api = {
   deleteCredential: (name: string) =>
     request<void>(`/api/system/credentials/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   diagnostics: () => request<DiagnosticsResponse>('/api/system/diagnostics'),
+  testCredential: (source: string) =>
+    request<CredentialTestResult>(`/api/system/credentials/${encodeURIComponent(source)}/test`, {
+      method: 'POST',
+    }),
+
+  aiConfig: () => request<AIConfig>('/api/system/ai-config'),
+  updateAIConfig: (provider: string, model: string) =>
+    request<AIConfigUpdateResult>('/api/system/ai-config', {
+      method: 'PUT',
+      body: JSON.stringify({ provider, model }),
+    }),
+
+  refreshStatus: () => request<RefreshStatus>('/api/system/refresh/status'),
+  startBackgroundRefresh: () =>
+    request<{ started: boolean }>('/api/system/refresh', { method: 'POST' }),
 
   listSignals: (filters: SignalFilters = {}) =>
     request<SignalList>(

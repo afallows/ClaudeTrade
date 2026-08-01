@@ -319,6 +319,18 @@ class SocialPost:
     #: ``text`` unconditionally. Sources with no such concept (Reddit, X,
     #: news) always leave this ``None``.
     sentiment_prior: str | None = None
+    #: Reddit's own native post-type flair (``link_flair_text`` in the
+    #: listing payload -- e.g. ``"DD"``, ``"YOLO"``, ``"News"``, ``"Meme"``),
+    #: captured verbatim as Reddit sent it. Like ``sentiment_prior`` above,
+    #: this is a PRIOR HINT the author/community attached, not a
+    #: classification we vouch for -- ``sentiment.classifiers``/
+    #: ``sentiment.aggregation`` treat it as a small, non-dominant nudge
+    #: only, never a substitute for scoring ``text``. ``None`` when the post
+    #: carries no flair or the source has no such concept (only Reddit does
+    #: today). Idea: native-field capture inspired by
+    #: reddit-stock-ai-agent-recommendation (MIT) -- no code copied, only
+    #: the observation that Reddit already hands this field to us for free.
+    flair: str | None = None
 
     @property
     def engagement(self) -> float:
@@ -373,6 +385,16 @@ class SentimentScores:
     short_squeeze: float = 0.0
     pump_and_dump: float = 0.0
     position_disclosure: float = 0.0
+    #: Options-chatter split -- independent 0-1 magnitudes (mirroring the
+    #: bullish/bearish pair, not a single signed score) for how much the
+    #: text reads as call-side vs. put-side options talk ("bought calls",
+    #: "100c" strike shorthand vs. "puts", "100p"). Like bullish/bearish,
+    #: a post can hit both (a spread, or hedged commentary) or neither.
+    #: Idea (the calls/puts split itself): Stocksera
+    #: (``scheduled_tasks/reddit/stocks/scrape_discussion_thread.py``, MIT)
+    #: -- reimplemented against our own lexicon conventions, not copied.
+    options_call: float = 0.0
+    options_put: float = 0.0
     coordinated: float = 0.0
     confidence: float = 0.0
     classifier: str = "rules"

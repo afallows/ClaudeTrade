@@ -87,6 +87,17 @@ class HypeFailureShortStrategy(Strategy):
     W_DUPLICATE_RATIO = 6.0
     PENALTY_SQUEEZE = -16.0
     PENALTY_REAL_CATALYST = -10.0
+    #: Market-signal adoption package items 1(d)/2/4. W_GAP_DOWN_FAILURE sits
+    #: at the same tier as W_BELOW_FAST_MA/W_DUPLICATE_RATIO -- a gap-down
+    #: failure is stronger evidence than a slow rollover, but it is still one
+    #: confirming component among several, not the primary failure evidence
+    #: (that remains W_FAILURE_EVIDENCE's failed_breakout/rollover_ratio read).
+    W_GAP_DOWN_FAILURE = 8.0
+    W_GAP_CONTINUATION_DOWN = 6.0
+    PENALTY_VOLUME_DIVERGENCE = -6.0
+    #: A gap of this size or larger earns full W_GAP_DOWN_FAILURE credit;
+    #: smaller gaps ramp linearly from zero.
+    GAP_DOWN_FULL_CREDIT_PCT = -3.0
 
     def evaluate(self, ctx: StrategyContext) -> StrategyProposal | None:
         # --- hard vetoes ---------------------------------------------------
@@ -157,6 +168,28 @@ class HypeFailureShortStrategy(Strategy):
         ) + 0.5 * ramp_down(last.close - prior.low, 0.01 * price, -0.005 * price)
         score.add("bearish_confirmation", bearish_fraction, self.W_BEARISH_CONFIRMATION)
 
+        # Market-signal adoption package items 1(d)/2/4: a gap-down failure
+        # is stronger evidence than a slow rollover; a later session gapping
+        # further beyond the failed high extends that thesis; heavy volume
+        # with no decisive move undercuts it. Absent features default to 0
+        # (no gap, no continuation, not flagged), degrading to zero
+        # contribution rather than crashing.
+        gap_pct = ctx.feature("gap_pct", 0.0)
+        score.add(
+            "gap_down_failure",
+            ramp_down(gap_pct, 0.0, self.GAP_DOWN_FULL_CREDIT_PCT),
+            self.W_GAP_DOWN_FAILURE,
+        )
+
+        gap_continuation_down = ctx.feature("gap_continuation_down", 0.0) > 0
+        score.add(
+            "gap_continuation", 1.0 if gap_continuation_down else 0.0, self.W_GAP_CONTINUATION_DOWN
+        )
+
+        volume_divergence = ctx.feature("volume_divergence", 0.0) > 0
+        if volume_divergence:
+            score.penalty("volume_divergence", self.PENALTY_VOLUME_DIVERGENCE)
+
         ema_9 = ctx.feature("ema_9", 0.0)
         if ema_9 > 0:
             score.add("below_fast_ma", ramp_down(price - ema_9, 0.01 * price, 0.0), self.W_BELOW_FAST_MA)
@@ -197,6 +230,10 @@ class HypeFailureShortStrategy(Strategy):
             f"Sentiment acceleration {accel_pctl:.0%} percentile of its own trailing readings",
             f"Catalyst quality {sentiment.catalyst_quality:.2f}",
         ]
+        if gap_pct < 0:
+            evidence.append(f"Gapped down {gap_pct:+.1f}% on the failure -- not a slow rollover")
+        if gap_continuation_down:
+            evidence.append("A later session gapped further below the level, extending the breakdown")
         risks = [
             "Short losses are unbounded; a squeeze can gap through the stop",
             "Historical borrow availability and cost are NOT modelled -- this trade may not "
@@ -205,6 +242,11 @@ class HypeFailureShortStrategy(Strategy):
         ]
         if squeeze > 0.35:
             risks.append(f"Short-squeeze chatter elevated ({squeeze:.2f})")
+        if volume_divergence:
+            risks.append(
+                "Elevated volume with little same-day price follow-through "
+                "(possible absorption, undercutting the failure thesis)"
+            )
 
         threshold = cal.proposal_score_threshold
         if score.score < threshold:

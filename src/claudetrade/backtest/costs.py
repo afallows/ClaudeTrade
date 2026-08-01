@@ -68,7 +68,7 @@ class CostModel:
 
     # --- individual cost components ---------------------------------------
 
-    def commission(self, shares: int, price: float) -> float:
+    def commission(self, shares: int, price: float) -> float:  # noqa: ARG002 -- cost-component signature; value-based commission models need price
         """Per-share commission plus a flat per-trade fee, floored at a minimum.
 
         Many discount brokers charge $0 today; the knobs exist for brokers,

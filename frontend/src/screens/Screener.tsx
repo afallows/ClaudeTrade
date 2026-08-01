@@ -6,13 +6,14 @@ import { ChevronDown, RefreshCw, ScanSearch, Search } from 'lucide-react';
 import '../grid/register';
 import { claudeTradeGridTheme } from '../grid/theme';
 import { api, ApiError } from '../api/client';
-import type { RejectedCandidate, SignalRow } from '../api/types';
+import type { RejectedCandidate, ScanFunnel, SignalRow } from '../api/types';
 import { Card } from '../components/Card';
 import { EmptyState } from '../components/EmptyState';
 import { SkeletonRows } from '../components/Skeleton';
 import { DirectionBadge } from '../components/DirectionBadge';
 import { StatusChip } from '../components/StatusChip';
 import { ScoreBar, ConfidenceBar } from '../components/ScoreBar';
+import { RejectionFunnelPanel } from '../components/RejectionFunnelPanel';
 import { formatPrice, formatRatio, daysToEarningsLabel } from '../lib/format';
 
 const columnDefs: ColDef<SignalRow>[] = [
@@ -134,6 +135,7 @@ export function Screener() {
     available: boolean;
     reason: string | null;
     rejected: RejectedCandidate[];
+    funnel: ScanFunnel | null;
   } | null>(null);
   const [rejectedOpen, setRejectedOpen] = useState(false);
 
@@ -369,10 +371,15 @@ export function Screener() {
       {!loadError && allSignals === null && <SkeletonRows rows={8} className="h-10 w-full" />}
 
       {!loadError && allSignals !== null && allSignals.length === 0 && (
-        <EmptyState
-          message="No signals generated yet -- the ledger is empty for this database."
-          command="claudetrade scan"
-        />
+        <>
+          <EmptyState
+            message="No signals generated yet -- the ledger is empty for this database."
+            command="claudetrade scan"
+          />
+          {rejected?.available && rejected.funnel && (
+            <RejectionFunnelPanel funnel={rejected.funnel} />
+          )}
+        </>
       )}
 
       {!loadError && allSignals !== null && allSignals.length > 0 && filtered.length === 0 && (
