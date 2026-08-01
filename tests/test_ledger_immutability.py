@@ -361,3 +361,169 @@ class TestRecordOrReport:
         assert not outcome.ok
         assert outcome.error is not None
         assert "SIG001" in outcome.error
+
+
+def _count_selects(db: Database, fn):
+    """Run ``fn`` and return its result plus the SELECTs it issued.
+
+    Counted at the DBAPI cursor level so an N+1 that reappears inside a
+    helper cannot slip past the assertion.
+    """
+    from sqlalchemy import event
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, params, context, executemany):
+        statements.append(statement)
+
+    event.listen(db.engine, "before_cursor_execute", _record)
+    try:
+        result = fn()
+    finally:
+        event.remove(db.engine, "before_cursor_execute", _record)
+    return result, [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+
+
+class TestRecentWithStatus:
+    """``recent_with_status`` -- signals AND their current status in ONE query.
+
+    QA handoff v3, F26: the per-row ``current_status`` loop this replaces
+    issued up to 501 sequential queries per ``get_signals`` call, each opening
+    its own session; under a concurrent refresh that aggregate is what turned
+    a read into a multi-minute stall. These tests pin the join as row-for-row
+    equivalent to the loop it replaces -- a faster query returning *different*
+    statuses would be a far worse bug than the slow one.
+    """
+
+    def _many(self, count: int) -> list[Signal]:
+        base = dt.datetime(2024, 1, 3, 15, 0, tzinfo=dt.UTC)
+        return [
+            Signal(
+                signal_id=f"SIG{i:03d}",
+                created_at=base + dt.timedelta(minutes=i),
+                session=dt.date(2024, 1, 3),
+                symbol=f"SYM{i}",
+                company_name="x",
+                strategy="test",
+                direction=Direction.LONG,
+                status=SignalStatus.ACTIONABLE,
+                reference_price=100.0,
+                price_as_of=base,
+                overall_score=50.0 + i,
+                confidence=0.5,
+                components=ComponentScores(),
+                plan=TradePlan(
+                    entry_low=99.0, entry_high=101.0, stop_loss=95.0, targets=[110.0], shares=1
+                ),
+            )
+            for i in range(count)
+        ]
+
+    def test_matches_the_per_row_loop_it_replaces(self, tmp_db: Database):
+        ledger = SignalLedger(tmp_db)
+        for sig in self._many(5):
+            ledger.record(sig)
+        # Real revision history, so "latest revision wins" is genuinely
+        # exercised rather than every row sitting at revision 0.
+        ledger.append_revision("SIG001", status=SignalStatus.TRIGGERED, reason="entered")
+        ledger.append_revision("SIG001", status=SignalStatus.EXPIRED, reason="window closed")
+        ledger.append_revision("SIG003", status=SignalStatus.EXTENDED, reason="extended")
+
+        joined = ledger.recent_with_status(limit=10)
+        expected = [(s, ledger.current_status(s.signal_id)) for s in ledger.recent(limit=10)]
+
+        assert [s.signal_id for s, _ in joined] == [s.signal_id for s, _ in expected]
+        assert [st for _, st in joined] == [st for _, st in expected]
+
+    def test_reports_the_latest_revision_status(self, tmp_db: Database, sample_signal: Signal):
+        ledger = SignalLedger(tmp_db)
+        ledger.record(sample_signal)
+        ledger.append_revision("SIG001", status=SignalStatus.TRIGGERED, reason="entered")
+
+        rows = ledger.recent_with_status(limit=10)
+        assert len(rows) == 1
+        signal, status = rows[0]
+        assert signal.signal_id == "SIG001"
+        assert status == SignalStatus.TRIGGERED
+
+    def test_ordering_and_limit_match_recent(self, tmp_db: Database):
+        ledger = SignalLedger(tmp_db)
+        for sig in self._many(5):
+            ledger.record(sig)
+
+        rows = ledger.recent_with_status(limit=3)
+        assert [s.signal_id for s, _ in rows] == [s.signal_id for s in ledger.recent(limit=3)]
+        assert len(rows) == 3
+
+    def test_a_revisionless_signal_is_still_returned(self, tmp_db: Database, sample_signal: Signal):
+        """Outer joins on purpose: the ledger's completeness guarantee means a
+        signal is never dropped from a read, only reported with status None.
+
+        Such a row cannot be produced through this API (``record`` always
+        writes revision 0, and the append-only triggers forbid deleting it),
+        so it is written directly here -- the point is that a corrupt or
+        externally-tampered database degrades to "status unknown" rather than
+        to a signal silently vanishing from the screener.
+        """
+        ledger = SignalLedger(tmp_db)
+        ledger.record(sample_signal)
+        with tmp_db.session() as session:
+            session.add(
+                SignalRow(
+                    signal_id="ORPHAN",
+                    created_at=dt.datetime(2025, 1, 3, 15, 0, tzinfo=dt.UTC),
+                    session=dt.date(2025, 1, 3),
+                    symbol="ORPH",
+                    strategy="test",
+                    direction=Direction.LONG.value,
+                    initial_status=SignalStatus.ACTIONABLE.value,
+                    reference_price=100.0,
+                    price_as_of=dt.datetime(2025, 1, 3, 15, 0, tzinfo=dt.UTC),
+                    overall_score=60.0,
+                    confidence=0.5,
+                )
+            )
+
+        rows = ledger.recent_with_status(limit=10)
+        by_id = {s.signal_id: status for s, status in rows}
+        assert "ORPHAN" in by_id  # not dropped by the join
+        assert by_id["ORPHAN"] is None
+        assert by_id["SIG001"] == SignalStatus.ACTIONABLE
+
+    def test_empty_ledger(self, tmp_db: Database):
+        assert SignalLedger(tmp_db).recent_with_status(limit=10) == []
+
+    def test_issues_one_query_not_one_per_row(self, tmp_db: Database):
+        ledger = SignalLedger(tmp_db)
+        for sig in self._many(20):
+            ledger.record(sig)
+
+        rows, selects = _count_selects(tmp_db, lambda: ledger.recent_with_status(limit=20))
+
+        assert len(rows) == 20
+        assert len(selects) == 1, f"expected one SELECT, got {len(selects)}"
+
+
+class TestCountsByStatus:
+    """``counts_by_status`` is grouped in the database, not looped in Python."""
+
+    def test_counts_reflect_the_latest_revision(self, tmp_db: Database, sample_signal: Signal):
+        ledger = SignalLedger(tmp_db)
+        ledger.record(sample_signal)
+        ledger.record(replace(sample_signal, signal_id="SIG002", symbol="OTHER"))
+        ledger.append_revision("SIG002", status=SignalStatus.TRIGGERED, reason="entered")
+
+        assert ledger.counts_by_status() == {"actionable": 1, "triggered": 1}
+
+    def test_empty_ledger_counts_nothing(self, tmp_db: Database):
+        assert SignalLedger(tmp_db).counts_by_status() == {}
+
+    def test_issues_one_query_not_one_per_signal(self, tmp_db: Database, sample_signal: Signal):
+        ledger = SignalLedger(tmp_db)
+        for i in range(10):
+            ledger.record(replace(sample_signal, signal_id=f"SIG{i:03d}", symbol=f"S{i}"))
+
+        counts, selects = _count_selects(tmp_db, ledger.counts_by_status)
+
+        assert counts == {"actionable": 10}
+        assert len(selects) == 1, f"expected one SELECT, got {len(selects)}"

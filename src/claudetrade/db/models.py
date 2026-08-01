@@ -813,6 +813,41 @@ class NotificationRow(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class RefreshRunRow(Base):
+    """Cross-process record of a data refresh (QA handoff v3, F27).
+
+    Refresh progress used to live only in a per-process dataclass
+    (``webapi.refresh_state.RefreshState``), so the CLI, the web API server
+    and the MCP server -- each with its own ``Pipeline`` -- were mutually
+    blind: whichever process did not start the refresh reported "idle" while
+    another was actively writing, and nothing stopped it from starting a
+    second concurrent refresh against the same SQLite file. This table is the
+    cross-process truth: one row per refresh attempt, written through
+    ``db.refresh_state_store`` in its own short transactions.
+
+    ``heartbeat_at`` is the liveness signal -- a "running" row whose heartbeat
+    has gone stale (the owning process crashed or was killed) is taken over
+    and marked failed by the next acquirer rather than blocking refreshes
+    forever. Migration 005 additionally installs a partial unique index
+    allowing at most ONE row with ``status='running'``, which is what makes
+    acquisition atomic across processes (a losing INSERT gets a constraint
+    violation instead of a second concurrent refresh).
+    """
+
+    __tablename__ = "refresh_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    entry_point: Mapped[str] = mapped_column(String(20))  # "cli" | "webapi" | "mcp"
+    status: Mapped[str] = mapped_column(String(20), index=True)  # running | done | failed
+    phase: Mapped[str] = mapped_column(String(40), default="starting")
+    symbols_done: Mapped[int] = mapped_column(Integer, default=0)
+    symbols_total: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    heartbeat_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class ModelVersionRow(Base):
     """Registry of trained ML models and prompt versions used in production."""
 

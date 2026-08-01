@@ -192,7 +192,11 @@ class Pipeline:
         if posts:
             directory = {s.symbol: s for s in securities}
             rows = self.build_sentiment(
-                posts=posts, directory=directory, start=start, end=end
+                posts=posts,
+                directory=directory,
+                start=start,
+                end=end,
+                progress_callback=progress_callback,
             )
             result.sentiment_rows = rows
         else:
@@ -214,6 +218,7 @@ class Pipeline:
         directory: dict[str, SecurityInfo],
         start: dt.date,
         end: dt.date,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> int:
         """Resolve mentions, classify posts and store daily aggregates.
 
@@ -239,6 +244,26 @@ class Pipeline:
         Each written row still aggregates the full decayed post set as of its
         session close (a rolling read, not a one-day slice) -- only *which*
         sessions get written is bounded by post coverage.
+
+        Transaction scope (QA handoff v3, F26): one short write transaction
+        PER SYMBOL, with all aggregation compute done before it opens. This
+        loop used to hold a single write transaction across the entire
+        symbol x session pass -- minutes on a real universe -- which (a) held
+        SQLite's write lock so every other process's writes queued behind it
+        for the whole duration, and (b) deferred WAL checkpointing (which
+        only runs at commit) so the WAL ballooned and slowed every
+        cross-process *read* too. Upserts are idempotent, so a run killed
+        mid-loop just re-covers the same ground next time.
+
+        Args:
+            progress_callback: Optional ``(phase, done, total)`` hook, the
+                same shape as ``data.ingest.ProgressCallback``. Reports
+                ``("sentiment_aggregate", symbols_done, symbols_total)`` per
+                symbol -- this is what keeps the cross-process refresh
+                heartbeat (``db.refresh_state_store``) alive through a long
+                aggregation pass that the ingest phases' own callbacks no
+                longer cover. Exceptions from it are swallowed, matching
+                ``DataIngestor._report_progress``.
 
         Returns:
             Number of ``symbol_sentiment_daily`` rows written.
@@ -277,23 +302,36 @@ class Pipeline:
             )
 
         written = 0
-        with self.db.session() as session:
-            for symbol, symbol_posts in by_symbol.items():
-                post_times = [ensure_utc(p.created_at) for p in symbol_posts]
-                for trading_session, lower, upper in session_windows:
-                    if not any(lower < t <= upper for t in post_times):
-                        continue  # no fresh post for this session -- see docstring
-                    snapshot = aggregator.aggregate(
-                        symbol,
-                        trading_session,
-                        symbol_posts,
-                        mentions_by_symbol.get(symbol, []),
-                        scores_by_symbol.get(symbol, {}),
-                        security=directory.get(symbol),
-                    )
-                    if snapshot.post_count == 0:
-                        continue
-                    written += _upsert_sentiment(session, snapshot)
+        total_symbols = len(by_symbol)
+        for done, (symbol, symbol_posts) in enumerate(by_symbol.items(), start=1):
+            post_times = [ensure_utc(p.created_at) for p in symbol_posts]
+            # All compute happens BEFORE the write transaction opens -- the
+            # transaction below holds the write lock only for this symbol's
+            # upserts, never for aggregation work.
+            snapshots = []
+            for trading_session, lower, upper in session_windows:
+                if not any(lower < t <= upper for t in post_times):
+                    continue  # no fresh post for this session -- see docstring
+                snapshot = aggregator.aggregate(
+                    symbol,
+                    trading_session,
+                    symbol_posts,
+                    mentions_by_symbol.get(symbol, []),
+                    scores_by_symbol.get(symbol, {}),
+                    security=directory.get(symbol),
+                )
+                if snapshot.post_count == 0:
+                    continue
+                snapshots.append(snapshot)
+            if snapshots:
+                with self.db.session() as session:
+                    for snapshot in snapshots:
+                        written += _upsert_sentiment(session, snapshot)
+            if progress_callback is not None:
+                try:
+                    progress_callback("sentiment_aggregate", done, total_symbols)
+                except Exception:
+                    log.debug("progress callback raised; ignored", exc_info=True)
         drop_summary = aggregator.drain_drop_summary()
         if drop_summary:
             log.warning(drop_summary)

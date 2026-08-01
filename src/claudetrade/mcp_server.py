@@ -29,17 +29,30 @@ Design notes:
 * stdio transport means the MCP protocol itself is framed on stdout. Nothing
   in this module (or in ``claudetrade.logging_setup``, whose console handler
   is explicitly attached to stderr) writes anything else to stdout.
+* **Every registered tool is bounded (QA handoff v3, F26).** FastMCP calls a
+  *sync* tool function directly on the server's event loop thread
+  (``mcp.server.fastmcp.utilities.func_metadata`` -- no thread offload), so
+  one blocking tool call used to freeze the whole server, including the
+  transport's message reader: QA observed ``get_signals`` stall under a
+  concurrent CLI refresh and every subsequent call go dead. The closures
+  ``build_server`` registers are therefore *async*, running the sync tool
+  body on a worker thread with a hard deadline
+  (``McpConfig.tool_timeout_seconds`` / ``scan_timeout_seconds``); on expiry
+  the client gets a structured ``{"timed_out": true, ...}`` payload instead
+  of silence, and the event loop keeps serving other calls throughout.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select
 
 from claudetrade.config import AppConfig
+from claudetrade.db import refresh_state_store
 from claudetrade.db.models import Security, SymbolSentimentDaily
 from claudetrade.domain import Signal, SignalStatus
 from claudetrade.logging_setup import get_logger
@@ -151,13 +164,18 @@ def get_signals(
             :func:`build_server` always passes one.
     """
     limit = max(1, min(int(limit), 200))
-    recent = pipeline.ledger.recent(limit=SIGNAL_SCAN_LIMIT)
+    # One query for signals AND statuses. The previous per-row
+    # ``current_status`` loop issued up to SIGNAL_SCAN_LIMIT+1 sequential
+    # queries -- and whenever fewer than ``limit`` rows cleared ``min_score``
+    # it never broke early, so a concurrent refresh's per-query slowdown
+    # multiplied by the full scan width. That aggregate, executed on the MCP
+    # event loop, is what QA observed as a hung-then-dead server (F26).
+    recent = pipeline.ledger.recent_with_status(limit=SIGNAL_SCAN_LIMIT)
 
     rows: list[dict[str, Any]] = []
-    for sig in recent:
+    for sig, status in recent:
         if sig.overall_score < min_score:
             continue
-        status = pipeline.ledger.current_status(sig.signal_id)
         rows.append(_signal_summary(sig, status))
         if len(rows) >= limit:
             break
@@ -407,15 +425,17 @@ def run_scan(pipeline: Pipeline) -> dict[str, Any]:
 def trigger_refresh(pipeline: Pipeline, config: AppConfig, state: RefreshState) -> dict[str, Any]:
     """WRITE (background). Starts a data refresh; poll with ``get_refresh_status``.
 
-    Reuses ``webapi.refresh_state.RefreshState`` -- the same
-    progress-tracking mechanism ``POST /api/system/refresh`` uses -- rather
-    than inventing a second one; this MCP server holds its own instance,
-    matching the app's one-``Pipeline``-per-process model (each of the CLI,
-    the web UI and this server has its own ``Pipeline`` and its own refresh
-    state; SQLite's WAL mode is what makes concurrent *reads* across them
-    safe, not a shared in-memory refresh state). 409-equivalent: if a refresh
-    is already running here, this reports that instead of starting a second
-    one that would race the first one's writes.
+    Two layers of single-flight, in order:
+
+    * The in-process ``RefreshState`` (the same mechanism
+      ``POST /api/system/refresh`` uses) refuses a second refresh started
+      from THIS server -- fine-grained live progress stays here.
+    * The cross-process lock in ``db.refresh_state_store`` (QA handoff v3,
+      F27) refuses when ANY entry point -- the CLI, the web API, another MCP
+      server -- holds a running refresh with a fresh heartbeat, naming the
+      holder, its start time and its progress; a stale holder (dead process)
+      is taken over rather than blocking forever. The database row, not any
+      process's memory, is the cross-process truth.
     """
     with state.lock:
         already_running = state.running
@@ -435,8 +455,27 @@ def trigger_refresh(pipeline: Pipeline, config: AppConfig, state: RefreshState) 
         return {
             "started": False,
             "reason": "a refresh is already running",
-            "status": state.snapshot(),
+            "status": get_refresh_status(pipeline, state),
         }
+
+    outcome = refresh_state_store.try_acquire(pipeline.db, "mcp")
+    if not outcome.acquired:
+        # Roll the eager local claim back so a later trigger (once the other
+        # entry point finishes) starts cleanly rather than 409ing on
+        # this process's own leftover state.
+        with state.lock:
+            state.running = False
+            state.phase = "idle"
+        holder = outcome.holder
+        return {
+            "started": False,
+            "reason": holder.describe()
+            if holder
+            else "another process holds the refresh lock",
+            "status": get_refresh_status(pipeline, state),
+        }
+    handle = outcome.handle
+    progress = _compose_progress(state.update_progress, handle.update_progress)
 
     def _run() -> None:
         end = utc_now().date()
@@ -451,12 +490,15 @@ def trigger_refresh(pipeline: Pipeline, config: AppConfig, state: RefreshState) 
                 start=start,
                 end=end,
                 social_lookback_hours=config.sentiment.lookback_days * 24,
-                progress_callback=state.update_progress,
+                progress_callback=progress,
             )
         except Exception as exc:  # matches webapi.routers.system's own catch-all
             with state.lock:
                 state.last_error = str(exc)
+            handle.finish("failed", error=str(exc))
             log.exception("MCP-triggered background refresh failed")
+        else:
+            handle.finish("done")
         finally:
             with state.lock:
                 state.running = False
@@ -467,9 +509,35 @@ def trigger_refresh(pipeline: Pipeline, config: AppConfig, state: RefreshState) 
     return {"started": True, "status": state.snapshot()}
 
 
-def get_refresh_status(state: RefreshState) -> dict[str, Any]:
-    """Read-only. Progress of the background refresh started by ``trigger_refresh``."""
-    return state.snapshot()
+def _compose_progress(
+    *callbacks: Callable[[str, int, int], None],
+) -> Callable[[str, int, int], None]:
+    """Fan one ``(phase, done, total)`` progress stream out to several sinks.
+
+    Each sink is isolated: the in-process ``RefreshState`` update must land
+    even if the database heartbeat write hiccups, and vice versa.
+    """
+
+    def _fanout(phase: str, done: int, total: int) -> None:
+        for callback in callbacks:
+            try:
+                callback(phase, done, total)
+            except Exception:
+                log.debug("refresh progress sink raised; ignored", exc_info=True)
+
+    return _fanout
+
+
+def get_refresh_status(pipeline: Pipeline, state: RefreshState) -> dict[str, Any]:
+    """Read-only. Refresh progress, merged across every entry point.
+
+    The QA acceptance check for F27: a refresh started by the CLI (a
+    different process -- this server's in-process ``RefreshState`` knows
+    nothing about it) must be visible here. The DB row is the cross-process
+    truth; the in-process snapshot supplies the finer-grained detail when
+    the running refresh is this server's own.
+    """
+    return refresh_state_store.merged_status(pipeline.db, state.snapshot(), "mcp")
 
 
 def get_backtest_report(config: AppConfig) -> dict[str, Any]:
@@ -509,6 +577,60 @@ INSTRUCTIONS = (
     "(swing-trading sentiment/technical signals). " + DISCLAIMER
 )
 
+#: Distinguishes "the tool timed out" from "the tool legitimately returned
+#: None/falsy" inside :func:`_call_bounded` -- a sentinel, never surfaced.
+_TIMED_OUT = object()
+
+
+def _timeout_payload(tool_name: str, timeout_s: float) -> dict[str, Any]:
+    """The structured error a client sees instead of a hang (F26)."""
+    return {
+        "error": f"{tool_name} did not complete within {timeout_s:.0f}s",
+        "timed_out": True,
+        "hint": "a data refresh may be holding the database; retry shortly",
+    }
+
+
+async def _call_bounded(tool_name: str, timeout_s: float, fn: Callable[[], Any]) -> Any:
+    """Run one sync tool body on a worker thread with a hard deadline.
+
+    This is the per-tool watchdog fixing F26's two failure modes at once:
+
+    * The body runs via ``anyio.to_thread.run_sync``, so the event loop --
+      and with it the transport's message reader -- keeps serving other
+      calls while a tool is busy. (FastMCP itself would have called a sync
+      tool directly ON the loop thread; see the module docstring.)
+    * ``move_on_after`` bounds the wait. On expiry the client receives a
+      structured ``timed_out`` payload rather than silence.
+
+    Trade-off, deliberate: ``abandon_on_cancel=True`` means a timed-out
+    body's worker thread is ABANDONED, not killed -- Python has no safe way
+    to kill a thread mid-SQLite-call. The abandoned thread finishes on its
+    own (each individual query is bounded by the connection's busy_timeout,
+    so it drains rather than leaking forever) and its result is discarded.
+    Until it drains it holds one worker-thread slot and possibly one pooled
+    database connection; a pathological burst of timed-out calls therefore
+    degrades throughput before it degrades correctness -- responses stay
+    bounded either way, which is the property QA's acceptance check names.
+
+    ``anyio`` is imported here, not at module top: it arrives with the
+    optional ``mcp`` extra, and importing *this module* must stay dependency-
+    free (see ``_require_fastmcp``).
+    """
+    import anyio
+
+    result: Any = _TIMED_OUT
+    with anyio.move_on_after(timeout_s):
+        result = await anyio.to_thread.run_sync(fn, abandon_on_cancel=True)
+    if result is _TIMED_OUT:
+        log.warning(
+            "MCP tool %s exceeded its %.0fs deadline; returning a timed_out payload "
+            "(its worker thread is left to drain in the background)",
+            tool_name, timeout_s,
+        )
+        return _timeout_payload(tool_name, timeout_s)
+    return result
+
 
 def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
     """Construct the FastMCP server and register every tool against ``pipeline``.
@@ -516,6 +638,12 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
     Separated from :func:`run_stdio` so tests can build a server (and
     introspect its registered tools) without ever starting the stdio
     transport loop.
+
+    Every closure below is ``async`` and delegates its sync body to
+    :func:`_call_bounded` -- the per-tool watchdog (F26). Deadlines are read
+    from ``config.mcp`` at CALL time, not captured here, so a runtime config
+    tweak applies without a server restart (matching how ``/api/system``'s
+    ai-config mutation behaves).
     """
     FastMCP = _require_fastmcp()
     server = FastMCP(name="claudetrade", instructions=INSTRUCTIONS)
@@ -533,8 +661,12 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "installation, so 'why no picks today?' has a real answer."
         ),
     )
-    def _get_signals(min_score: float = 0.0, limit: int = 20) -> dict[str, Any]:
-        return get_signals(pipeline, config, min_score=min_score, limit=limit)
+    async def _get_signals(min_score: float = 0.0, limit: int = 20) -> dict[str, Any]:
+        return await _call_bounded(
+            "get_signals",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_signals(pipeline, config, min_score=min_score, limit=limit),
+        )
 
     @server.tool(
         name="get_sentiment",
@@ -544,8 +676,12 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "one row per trading day over the last N days."
         ),
     )
-    def _get_sentiment(symbol: str, days: int = 7) -> dict[str, Any]:
-        return get_sentiment(pipeline, symbol, days=days)
+    async def _get_sentiment(symbol: str, days: int = 7) -> dict[str, Any]:
+        return await _call_bounded(
+            "get_sentiment",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_sentiment(pipeline, symbol, days=days),
+        )
 
     @server.tool(
         name="get_trending",
@@ -555,8 +691,12 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "aggregates), most-mentioned first."
         ),
     )
-    def _get_trending(limit: int = 20) -> dict[str, Any]:
-        return get_trending(pipeline, limit=limit)
+    async def _get_trending(limit: int = 20) -> dict[str, Any]:
+        return await _call_bounded(
+            "get_trending",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_trending(pipeline, limit=limit),
+        )
 
     @server.tool(
         name="get_market_status",
@@ -567,19 +707,32 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "The tool to check before asking about 'this morning's' sentiment."
         ),
     )
-    def _get_market_status() -> dict[str, Any]:
-        return get_market_status(pipeline)
+    async def _get_market_status() -> dict[str, Any]:
+        return await _call_bounded(
+            "get_market_status",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_market_status(pipeline),
+        )
 
     @server.tool(
         name="run_scan",
         description=(
             "WRITE -- records new signals to the immutable ledger. Runs a full scan "
             "for today's session (identical to `claudetrade scan`) and returns "
-            "summary counts only; call get_signals afterwards for the candidates."
+            "summary counts only; call get_signals afterwards for the candidates. "
+            "If it reports timed_out, the scan keeps running in the background -- "
+            "check get_signals again shortly rather than re-running it."
         ),
     )
-    def _run_scan() -> dict[str, Any]:
-        return run_scan(pipeline)
+    async def _run_scan() -> dict[str, Any]:
+        # The one legitimately-slow tool gets its own, larger deadline; an
+        # abandoned (timed-out) scan still runs to completion on its worker
+        # thread and its signals land in the ledger as usual.
+        return await _call_bounded(
+            "run_scan",
+            config.mcp.scan_timeout_seconds,
+            lambda: run_scan(pipeline),
+        )
 
     @server.tool(
         name="trigger_refresh",
@@ -588,18 +741,30 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "social sentiment from every configured provider and stores it; can take "
             "several minutes on a large universe. Returns immediately; poll "
             "get_refresh_status for progress. Refuses to start a second refresh while "
-            "one is already running here."
+            "one is already running from ANY entry point (CLI, web UI, or MCP), "
+            "naming the current holder."
         ),
     )
-    def _trigger_refresh() -> dict[str, Any]:
-        return trigger_refresh(pipeline, config, refresh_state)
+    async def _trigger_refresh() -> dict[str, Any]:
+        return await _call_bounded(
+            "trigger_refresh",
+            config.mcp.tool_timeout_seconds,
+            lambda: trigger_refresh(pipeline, config, refresh_state),
+        )
 
     @server.tool(
         name="get_refresh_status",
-        description="Read-only. Progress of the background refresh started by trigger_refresh.",
+        description=(
+            "Read-only. Progress of the current data refresh, whichever entry point "
+            "started it (CLI, web UI, or this server) -- entry_point names the owner."
+        ),
     )
-    def _get_refresh_status() -> dict[str, Any]:
-        return get_refresh_status(refresh_state)
+    async def _get_refresh_status() -> dict[str, Any]:
+        return await _call_bounded(
+            "get_refresh_status",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_refresh_status(pipeline, refresh_state),
+        )
 
     @server.tool(
         name="get_backtest_report",
@@ -615,8 +780,12 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "never runs a backtest itself."
         ),
     )
-    def _get_backtest_report() -> dict[str, Any]:
-        return get_backtest_report(config)
+    async def _get_backtest_report() -> dict[str, Any]:
+        return await _call_bounded(
+            "get_backtest_report",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_backtest_report(config),
+        )
 
     return server
 

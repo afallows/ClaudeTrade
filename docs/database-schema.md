@@ -508,6 +508,48 @@ Simulated trades from paper trading mode.
 
 ---
 
+## Operations
+
+### `refresh_runs`
+
+Cross-process record of every data refresh, and the single-flight lock that
+keeps two of them from overlapping. The CLI, the web API server and the MCP
+server each run their own process against the same database file, so refresh
+state cannot live in any one process's memory: whichever entry point did not
+start the run would report "idle" while another was actively writing, and
+would happily start a second concurrent refresh racing the first one's writes.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `id` | Integer (PK) | Run identifier |
+| `entry_point` | String | Which process started it: `cli`, `webapi` or `mcp` |
+| `status` | String | `running`, `done` or `failed` |
+| `phase` | String | Current ingestion phase (`securities`, `prices`, `sentiment`, ...) |
+| `symbols_done` / `symbols_total` | Integer | Coarse progress within the phase |
+| `started_at` | DateTime | UTC start instant |
+| `heartbeat_at` | DateTime | Liveness signal, written at most ~once per 2 s |
+| `finished_at` | DateTime | UTC completion instant (NULL while running) |
+| `last_error` | Text | Failure message, or `stale lock taken over` |
+
+**Append-only**: No (a run's own row is updated as it progresses)
+
+**Design notes**:
+- A partial unique index (`uq_refresh_running`, migration 005) permits at most
+  **one** row with `status = 'running'`. That constraint — not a
+  check-then-insert — is what makes acquisition atomic across processes: of
+  two racing acquirers, exactly one INSERT succeeds and the loser is refused
+  with the winner's details.
+- `heartbeat_at` is what makes the lock self-healing. A `running` row whose
+  heartbeat is older than ~120 s belongs to a process that died mid-refresh;
+  the next acquirer takes the lock over and marks the abandoned row `failed`
+  with `stale lock taken over`, so a crash never wedges refreshes permanently
+  and the abandoned run stays visible rather than vanishing.
+- All writes go through `claudetrade.db.refresh_state_store` in their own
+  short transactions, so the bookkeeping can never itself hold a lock that a
+  multi-minute refresh would queue behind.
+
+---
+
 ## Summary
 
 | Table | Append-Only | Purpose |
@@ -529,5 +571,6 @@ Simulated trades from paper trading mode.
 | `signals` | **Yes** | Immutable research signals |
 | `signal_revisions` | **Yes** | Status change history |
 | `paper_trades` | No | Simulated/backtest trades |
+| `refresh_runs` | No | Cross-process refresh state + single-flight lock |
 
 The append-only tables (`schema_version`, `audit_log`, `signals`, `signal_revisions`) guarantee that historical records cannot be tampered with. This is enforced at the database layer, not just in code.

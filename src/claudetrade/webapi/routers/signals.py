@@ -48,13 +48,19 @@ def list_signals(
     Filters mirror the Streamlit Scanner's ``apply_candidate_filters``
     exactly: minimum score, minimum confidence, direction set, strategy set,
     and a maximum days-to-earnings ceiling.
+
+    Statuses arrive with the signals in one ledger query
+    (``recent_with_status``) -- the per-row ``current_status`` loop this
+    replaces issued up to ``limit`` extra queries per request, which under a
+    concurrent data refresh compounded into multi-minute responses (QA
+    handoff v3, F26; the MCP server's ``get_signals`` shared the pattern).
     """
-    recent = pipeline.ledger.recent(limit=limit)
+    recent = pipeline.ledger.recent_with_status(limit=limit)
     directions = {d.lower() for d in direction} if direction else None
     strategies = set(strategy) if strategy else None
 
     rows = []
-    for sig in recent:
+    for sig, status in recent:
         if sig.overall_score < min_score:
             continue
         if sig.confidence < min_confidence:
@@ -67,7 +73,6 @@ def list_signals(
             sig.days_to_earnings is None or sig.days_to_earnings > max_days_to_earnings
         ):
             continue
-        status = pipeline.ledger.current_status(sig.signal_id)
         rows.append(signal_to_row(sig, status))
 
     return SignalListOut(signals=rows, total=len(rows))

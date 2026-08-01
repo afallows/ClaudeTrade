@@ -203,6 +203,55 @@ CLAUDETRADE_SECRET_ANTHROPIC_API_KEY, or store it with: claudetrade secrets set 
    ```
 4. If issue persists, restart the application
 
+### "Refusing to start: a refresh started by the &lt;cli|webapi|mcp&gt; entry point is already running"
+
+**Cause**: Not an error. Only one data refresh may run at a time across the
+whole installation — the CLI, the web UI and the MCP server all write the same
+SQLite file, so a second concurrent refresh would race the first one's writes.
+The lock lives in the database (`refresh_runs` table), so it holds across
+processes, and the message names which entry point started the run, when, and
+how far along it is.
+
+**Solution**:
+1. Wait for the running refresh to finish. Watch it from anywhere:
+   - MCP: the `get_refresh_status` tool
+   - Web UI/API: `GET /api/system/refresh/status`
+
+   Both report the run whichever entry point started it; `entry_point` names
+   the owner.
+2. If the process that held the lock died (machine slept, terminal closed,
+   task killed), its run stops heartbeating and is automatically taken over
+   after about two minutes — retry then. The abandoned run is recorded as
+   `failed` with `stale lock taken over`, so it stays visible rather than
+   silently disappearing.
+3. There is no manual unlock command by design; nothing needs one, because a
+   dead lock always expires on its own.
+
+### MCP tool returns `"timed_out": true`
+
+**Error**: An MCP tool call returns
+`{"error": "get_signals did not complete within 30s", "timed_out": true, "hint": "a data refresh may be holding the database; retry shortly"}`.
+
+**Cause**: The call exceeded its deadline — almost always because a data
+refresh is writing heavily to the same database. The MCP server answers with
+this payload instead of hanging: a bounded error is recoverable, an unbounded
+wait wedges the client. Other tool calls keep working while one is stuck.
+
+**Solution**:
+1. Check whether a refresh is running (`get_refresh_status`) and retry once it
+   finishes — this is the expected path.
+2. `run_scan` has its own, much larger deadline (a full-universe scan is
+   legitimately slow). If it reports `timed_out`, the scan is still running in
+   the background and its signals will land in the ledger; check `get_signals`
+   again shortly rather than re-running it.
+3. Raise the deadlines only if your installation is genuinely slow (a very
+   large universe on slow storage):
+   ```toml
+   [mcp]
+   tool_timeout_seconds = 60      # default 30, for ordinary reads
+   scan_timeout_seconds = 600     # default 300, for run_scan only
+   ```
+
 ### "table signals already exists" (migration)
 
 **Error**: Migration fails because the table exists.

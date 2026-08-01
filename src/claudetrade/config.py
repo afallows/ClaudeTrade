@@ -1222,6 +1222,37 @@ class UIConfig(BaseModel):
     port: int = 8501
 
 
+class McpConfig(BaseModel):
+    """MCP stdio server behaviour (``claudetrade mcp``).
+
+    Exists because of a QA-observed production lockup (handoff v3, F26): the
+    ``mcp`` package runs *sync* tool functions directly on the server's event
+    loop thread, so one tool call that stalls -- e.g. reads slowed by a
+    concurrent CLI data refresh writing to the same SQLite file -- froze the
+    entire server, including the transport's message reader, and every
+    subsequent call appeared dead. Tool bodies therefore run on a worker
+    thread with a hard deadline (see ``mcp_server.build_server``); on expiry
+    the client gets a structured ``timed_out`` payload instead of silence.
+    """
+
+    #: Deadline for ordinary (read-mostly) tools. Generous next to the
+    #: sub-second normal case, but small enough that a wedged database never
+    #: makes the server *appear* dead -- the QA acceptance is "MCP reads
+    #: never hang", not "reads are always fast".
+    tool_timeout_seconds: float = 30.0
+    #: Separate, larger deadline for ``run_scan`` only: a full-universe scan
+    #: is a legitimate multi-minute compute-and-write job, and killing it at
+    #: the read deadline would make the tool useless on a real installation.
+    scan_timeout_seconds: float = 300.0
+
+    @field_validator("tool_timeout_seconds", "scan_timeout_seconds")
+    @classmethod
+    def _positive_timeout(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("timeout must be positive")
+        return v
+
+
 # --------------------------------------------------------------------------
 # Root configuration
 # --------------------------------------------------------------------------
@@ -1262,6 +1293,7 @@ class AppConfig(BaseSettings):
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     trading: TradingModeConfig = Field(default_factory=TradingModeConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
 
     # --- construction -----------------------------------------------------
 

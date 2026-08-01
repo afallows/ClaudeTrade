@@ -281,8 +281,10 @@ class TestFlairColumnMigration:
         assert current_version(unmigrated_db) == 3
 
         applied = migrate(unmigrated_db)
-        assert applied == [4]
-        assert current_version(unmigrated_db) == 4
+        # 004 adds the flair column under test here; 005 (refresh_runs) rides
+        # along because migrate always brings the schema fully current.
+        assert applied == [4, 5]
+        assert current_version(unmigrated_db) == 5
 
         insp = inspect(unmigrated_db.engine)
         columns = {c["name"] for c in insp.get_columns("social_posts")}
