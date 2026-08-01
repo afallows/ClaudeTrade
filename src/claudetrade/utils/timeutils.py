@@ -152,6 +152,25 @@ def previous_trading_day(day: dt.date, *, skip: int = 1) -> dt.date:
     return cur
 
 
+def current_trading_session(now: dt.datetime | None = None) -> dt.date:
+    """The trading session ``now`` belongs to, in exchange (ET) terms.
+
+    ``utc_now().date()`` is the wrong session key for a US-equity scanner:
+    from Friday 20:00 ET onward the UTC date is already Saturday, so a
+    Friday-evening scan would request a session that can never exist (and
+    after a weekend, one that never will). This is the ET calendar date,
+    rolled back to the most recent trading day when it falls on a weekend
+    or exchange holiday -- Friday 22:40 ET is Friday's session, Saturday
+    and Sunday resolve to Friday, and a holiday Monday resolves to the
+    preceding Friday.
+    """
+    moment = to_display(now if now is not None else utc_now(), "America/New_York")
+    day = moment.date()
+    if not is_trading_day(day):
+        day = previous_trading_day(day)
+    return day
+
+
 def trading_days_between(start: dt.date, end: dt.date) -> int:
     """Count trading days in the half-open interval ``(start, end]``."""
     if end <= start:

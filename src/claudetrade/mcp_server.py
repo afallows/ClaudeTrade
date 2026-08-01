@@ -49,6 +49,7 @@ from claudetrade.ui.data_access import data_freshness, sentiment_timeline
 from claudetrade.utils.timeutils import (
     MARKET_CLOSE,
     MARKET_OPEN,
+    current_trading_session,
     is_trading_day,
     to_display,
     utc_now,
@@ -379,7 +380,10 @@ def run_scan(pipeline: Pipeline) -> dict[str, Any]:
     so this does not block on AI-provider latency. Returns summary counts
     only -- call ``get_signals`` afterwards for the actual candidates.
     """
-    session_date = utc_now().date()
+    # The ET trading calendar, not the UTC date: a Friday-evening call is
+    # Friday's session, never the (nonexistent) Saturday one -- see
+    # ``timeutils.current_trading_session``.
+    session_date = current_trading_session()
     result = pipeline.scan(session_date, generate_thesis=False)
     scan_result = result.scan
     return {

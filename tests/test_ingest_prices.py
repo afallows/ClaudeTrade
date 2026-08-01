@@ -24,6 +24,7 @@ from claudetrade.data.ingest import DataIngestor, IngestReport
 from claudetrade.db.models import PriceBar, Security
 from claudetrade.domain import Bar
 from claudetrade.providers.base import ProviderError
+from claudetrade.utils.timeutils import current_trading_session, previous_trading_day
 
 
 class _FakeBarsProvider:
@@ -456,8 +457,10 @@ def test_merge_appends_current_session_bar_when_daily_history_lacks_today(memory
     today yet, so the TipRanks GetQuotes current-session bar is appended."""
     config = AppConfig()
     config.market_data.benchmark_symbol = "SPY"
-    today = dt.datetime.now(tz=dt.UTC).date()
-    yesterday = today - dt.timedelta(days=1)
+    # The merge keys "today" on the ET trading session (F24) -- on a weekend
+    # this is the preceding Friday, not the UTC calendar date.
+    today = current_trading_session()
+    yesterday = previous_trading_day(today)
 
     yahoo_like = _YahooLikeBars({
         "AAPL": [
@@ -497,7 +500,7 @@ def test_merge_never_overwrites_an_existing_today_bar(memory_db):
     at all yet."""
     config = AppConfig()
     config.market_data.benchmark_symbol = "SPY"
-    today = dt.datetime.now(tz=dt.UTC).date()
+    today = current_trading_session()
 
     yahoo_like = _YahooLikeBars({
         "AAPL": [

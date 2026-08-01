@@ -14,7 +14,7 @@ import datetime as dt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from claudetrade.pipeline import Pipeline
-from claudetrade.utils.timeutils import utc_now
+from claudetrade.utils.timeutils import current_trading_session, utc_now
 from claudetrade.webapi.deps import get_config, get_last_scan, get_pipeline, set_last_scan
 from claudetrade.webapi.schemas import (
     NearMissOut,
@@ -152,7 +152,9 @@ def run_scan(
     interactive scan from the UI doesn't block on AI-provider latency by
     default; the caller can opt in.
     """
-    session_date = body.session or utc_now().date()
+    # ET trading calendar, not the UTC date: a Friday-evening scan is
+    # Friday's session, never a weekend date (timeutils.current_trading_session).
+    session_date = body.session or current_trading_session()
     result = pipeline.scan(
         session_date,
         lookback_days=body.lookback_days,

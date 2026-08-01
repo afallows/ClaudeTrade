@@ -45,7 +45,7 @@ from claudetrade.domain import (
 from claudetrade.logging_setup import get_logger
 from claudetrade.providers.base import ProviderError
 from claudetrade.sentiment.entity_resolution import TickerResolver
-from claudetrade.utils.timeutils import ensure_utc, utc_now
+from claudetrade.utils.timeutils import current_trading_session, ensure_utc, utc_now
 
 log = get_logger(__name__)
 
@@ -589,7 +589,11 @@ class DataIngestor:
         if not callable(get_current):
             return
 
-        today = utc_now().date()
+        # The ET trading session, not the UTC date: after Friday's close the
+        # UTC date is Saturday, and "which symbols lack a bar for *today*"
+        # keyed on Saturday would select the entire universe for a GetQuotes
+        # sweep that can only ever return Friday-stamped bars.
+        today = current_trading_session()
         missing_today = [
             symbol
             for symbol in symbols

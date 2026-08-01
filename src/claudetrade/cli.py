@@ -30,7 +30,7 @@ import typer
 
 from claudetrade.config import AppConfig, get_config
 from claudetrade.logging_setup import setup_logging
-from claudetrade.utils.timeutils import utc_now
+from claudetrade.utils.timeutils import current_trading_session, utc_now
 from claudetrade.version import CODE_VERSION, DISCLAIMER, __version__
 
 if TYPE_CHECKING:
@@ -438,7 +438,9 @@ def scan(
     cfg = _load(config)
     from claudetrade.pipeline import Pipeline
 
-    session_date = _parse_date(session, _today())
+    # Scan defaults to the ET trading session, not the UTC calendar date --
+    # a Friday-evening scan must request Friday, not Saturday.
+    session_date = _parse_date(session, current_trading_session())
     pipeline = Pipeline.bootstrap(cfg)
     result = pipeline.scan(session_date, lookback_days=lookback, record=record)
     scan_result = result.scan

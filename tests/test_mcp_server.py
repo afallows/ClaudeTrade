@@ -28,7 +28,7 @@ from claudetrade.db.session import Database
 from claudetrade.domain import Direction, MarketRegime, Signal
 from claudetrade.pipeline import Pipeline, PipelineResult
 from claudetrade.signals.ledger import SignalLedger
-from claudetrade.utils.timeutils import utc_now
+from claudetrade.utils.timeutils import current_trading_session, utc_now
 from claudetrade.version import DISCLAIMER
 from claudetrade.webapi.refresh_state import RefreshState
 
@@ -230,8 +230,14 @@ def test_get_sentiment_days_window_is_clamped(pipeline: Pipeline) -> None:
 
 
 def test_get_trending_ranks_by_recent_mention_volume(pipeline: Pipeline, tmp_db: Database) -> None:
+    from claudetrade.db.models import Security
+
     today = utc_now().date()
     with tmp_db.session() as session:
+        # get_trending joins against ``securities`` as a junk-symbol guard --
+        # only known symbols may rank, so each test symbol needs a row.
+        for sym in ("HOT", "WARM", "OLD"):
+            session.add(Security(symbol=sym, name=sym))
         session.add(SymbolSentimentDaily(symbol="HOT", session=today, source="all", post_count=50))
         session.add(SymbolSentimentDaily(symbol="WARM", session=today, source="all", post_count=10))
         # Outside the trending window -- must not appear at all.
@@ -251,9 +257,12 @@ def test_get_trending_ranks_by_recent_mention_volume(pipeline: Pipeline, tmp_db:
 
 
 def test_get_trending_respects_limit(pipeline: Pipeline, tmp_db: Database) -> None:
+    from claudetrade.db.models import Security
+
     today = utc_now().date()
     with tmp_db.session() as session:
         for i in range(5):
+            session.add(Security(symbol=f"SYM{i}", name=f"SYM{i}"))
             session.add(
                 SymbolSentimentDaily(symbol=f"SYM{i}", session=today, source="all", post_count=i + 1)
             )
@@ -338,7 +347,26 @@ def test_run_scan_on_a_fresh_database_does_not_crash(pipeline: Pipeline) -> None
     assert result["signal_count"] == 0
     assert result["rejected_count"] == 0
     assert isinstance(result["warnings"], list)
-    assert result["session"] == utc_now().date().isoformat()
+    assert result["session"] == current_trading_session().isoformat()
+
+
+def test_run_scan_requests_the_et_trading_session_never_a_weekend_date(
+    pipeline: Pipeline, monkeypatch
+) -> None:
+    """QA handoff v3, F24: at 22:40 ET on a Friday the UTC date is already
+    Saturday, and ``run_scan`` used to request that nonexistent session.
+    The requested session must be Friday's date -- and never a weekend --
+    regardless of the UTC calendar.
+    """
+    from claudetrade.utils import timeutils
+
+    friday_evening_utc = dt.datetime(2026, 8, 1, 2, 40, tzinfo=dt.UTC)  # Fri 22:40 ET
+    monkeypatch.setattr(timeutils, "utc_now", lambda: friday_evening_utc)
+
+    result = mcp_server.run_scan(pipeline)
+    requested = dt.date.fromisoformat(result["requested_session"])
+    assert requested == dt.date(2026, 7, 31)  # Friday, in ET
+    assert requested.weekday() < 5
 
 
 # --------------------------------------------------------------------------
@@ -353,7 +381,7 @@ def test_trigger_refresh_starts_in_background_and_reports_progress(
     started = threading.Event()
     release = threading.Event()
 
-    def fake_refresh(*, start, end, symbols=None, progress_callback=None):
+    def fake_refresh(*, start, end, symbols=None, social_lookback_hours=None, progress_callback=None):
         started.set()
         if progress_callback:
             progress_callback("prices", 3, 10)
@@ -382,7 +410,7 @@ def test_trigger_refresh_refuses_a_concurrent_run(
     started = threading.Event()
     release = threading.Event()
 
-    def fake_refresh(*, start, end, symbols=None, progress_callback=None):
+    def fake_refresh(*, start, end, symbols=None, social_lookback_hours=None, progress_callback=None):
         started.set()
         release.wait(timeout=5)
         return PipelineResult()
@@ -405,7 +433,7 @@ def test_trigger_refresh_failure_is_reported_and_unblocks_the_next_run(
 ) -> None:
     state = RefreshState()
 
-    def failing_refresh(*, start, end, symbols=None, progress_callback=None):
+    def failing_refresh(*, start, end, symbols=None, social_lookback_hours=None, progress_callback=None):
         raise RuntimeError("boom")
 
     pipeline.refresh = failing_refresh

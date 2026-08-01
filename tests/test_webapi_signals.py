@@ -218,6 +218,10 @@ def test_refresh_degrades_without_configured_providers(client: TestClient):
 
 
 def test_scan_request_defaults_session_to_today(client: TestClient):
+    """Defaults to the ET trading session (F24) -- on a weekend or after
+    Friday's ET close this is Friday's date, never the UTC calendar date."""
+    from claudetrade.utils.timeutils import current_trading_session
+
     resp = client.post("/api/scan", json={})
     assert resp.status_code == 200
-    assert resp.json()["session"] == dt.datetime.now(dt.UTC).date().isoformat()
+    assert resp.json()["session"] == current_trading_session().isoformat()
