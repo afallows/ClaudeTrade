@@ -111,11 +111,18 @@ class Pipeline:
 
     @classmethod
     def bootstrap(cls, config: AppConfig) -> Pipeline:
-        """Open the database, apply migrations and construct the pipeline."""
+        """Open the database, apply migrations and construct the pipeline.
+
+        ``config`` is passed through to ``init_database`` so its data-fix
+        hooks (currently the stored-sentiment extraction-version self-heal,
+        see ``sentiment.rebuild.ensure_extraction_version``) can actually
+        run -- this is the seam every entry point (CLI, web API, MCP server,
+        UI) shares.
+        """
         from claudetrade.db.session import get_database
 
         db = get_database(config)
-        init_database(db)
+        init_database(db, config)
         return cls(config, db)
 
     # --- provider health ---------------------------------------------------

@@ -96,6 +96,50 @@ def test_rebuild_replaces_junk_aggregates_with_recomputed_rows(cli_env):
     assert any(r.confidence > 0.2 for r in amzn)
 
 
+def test_cli_is_a_thin_wrapper_over_the_importable_core(cli_env):
+    """The command body now lives in ``sentiment.rebuild.rebuild_sentiment``
+    (the same core the bootstrap self-heal calls); the CLI must surface that
+    core's summary verbatim -- including the original JSON keys, which are
+    operator-visible output shape."""
+    import json
+    import re
+
+    _seed()
+    result = runner.invoke(app, ["db", "rebuild-sentiment", "--days", "60"])
+    assert result.exit_code == 0, result.output
+
+    # The runner captures log lines alongside stdout; fish the JSON block out.
+    match = re.search(r'\{\s*"posts_considered".*?\}', result.output, re.S)
+    assert match is not None, result.output
+    payload = json.loads(match.group(0))
+    assert set(payload) == {
+        "posts_considered",
+        "mentions_deleted",
+        "sentiment_aggregates_deleted",
+        "sentiment_rows_rebuilt",
+        "symbols_affected",
+    }
+    assert payload["posts_considered"] == 10
+    assert payload["sentiment_rows_rebuilt"] >= 1
+    assert "Rebuilt" in result.output
+
+
+def test_cli_rebuild_records_the_extraction_version(cli_env):
+    """An explicit manual rebuild brings the version stamp current too, so
+    the bootstrap self-heal will not immediately redo the same work."""
+    from claudetrade.config import get_config
+    from claudetrade.sentiment import EXTRACTION_VERSION
+    from claudetrade.sentiment.rebuild import record_extraction_version, stored_extraction_version
+
+    _seed()
+    db = get_database(get_config(reload=True))
+    record_extraction_version(db, EXTRACTION_VERSION - 1)  # simulate stale stamp
+
+    result = runner.invoke(app, ["db", "rebuild-sentiment"])
+    assert result.exit_code == 0, result.output
+    assert stored_extraction_version(db) == EXTRACTION_VERSION
+
+
 def test_rebuild_without_securities_aborts_before_deleting(cli_env):
     from claudetrade.config import get_config
 
