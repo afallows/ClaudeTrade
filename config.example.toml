@@ -42,6 +42,15 @@ audit_filename = "audit.log"              # Append-only security and integrity a
 
 [market_data]
 # Historical daily OHLCV bars and security reference data.
+#
+# RECOMMENDED (needs a free polygon.io key -- see the [polygon] section below):
+#   provider = "polygon"                    # bars: ONE grouped call per trading date
+#   fallbacks = ["tipranks", "yahoo", "csv"]  # refdata/caps/earnings + per-symbol bar gaps
+# This is what makes a whole-universe refresh one HTTP call instead of
+# thousands, and what makes `claudetrade db backfill --years 2` practical --
+# without real price history the strategies veto every symbol for
+# insufficient_history. Safe to set before you have a key: an unconfigured
+# polygon degrades straight to the fallbacks.
 provider = "stooq"                        # Live US/TSX daily history; use synthetic only for an explicit offline demo
 fallbacks = ["yahoo", "csv"]              # Yahoo supplies current market caps before Stooq history requests
 credential = ""                           # Named credential for providers that need auth (not used by default providers)
@@ -64,6 +73,30 @@ benchmark_symbol = "SPY"                  # Market-wide trend reference
 "Utilities" = "XLU"
 "Real Estate" = "XLRE"
 "Communication Services" = "XLC"
+
+[polygon]
+# Polygon.io grouped-daily EOD bars: the ENTIRE US equity market's OHLCV in
+# ONE request per trading date. RECOMMENDED primary for bars -- it is what
+# makes a daily refresh one HTTP call instead of thousands, and what makes a
+# 2-year history backfill practical (~500 calls) so the strategies' 60-bar
+# minimum is actually met. To enable:
+#
+#   [market_data]
+#   provider = "polygon"
+#   fallbacks = ["tipranks", "yahoo", "csv"]
+#
+# then create a free key at polygon.io and store it (NEVER in this file --
+# see the security note at the top):
+#   claudetrade secrets set polygon_api_key
+#   or: export POLYGON_API_KEY="..."
+# then load history once:  claudetrade db backfill --years 2
+#
+# Enabled-by-key: with no key resolvable the provider reports itself
+# unconfigured and bars degrade cleanly to the fallbacks, so switching the
+# primary above before creating a key is safe.
+rate_limit_per_minute = 5                 # Free tier is ~5/min and EOD-delayed; raise to match a paid plan
+request_timeout_s = 30.0                  # A grouped response is ~10k rows (~2-3 MB)
+# api_key = ""                            # Supported but DISCOURAGED -- prefer the credential store above
 
 [earnings]
 # Earnings calendar and reported results.

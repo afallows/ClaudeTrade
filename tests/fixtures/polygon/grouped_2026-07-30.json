@@ -1,0 +1,14 @@
+{
+  "_fixture_note": "Second trading date (2026-07-30) of the same transcribed-from-published-schema shape as grouped_2026-07-29.json -- two consecutive dates let tests assert one HTTP call per trading date and per-symbol chronological sorting across dates.",
+  "queryCount": 10688,
+  "resultsCount": 4,
+  "adjusted": true,
+  "results": [
+    {"T": "AAPL", "v": 66102513, "vw": 232.4181, "o": 231.3, "c": 233.02, "h": 233.87, "l": 230.91, "t": 1785528000000, "n": 601227},
+    {"T": "INTC", "v": 39441210, "vw": 33.9112, "o": 33.7, "c": 34.05, "h": 34.3, "l": 33.5, "t": 1785528000000, "n": 199834},
+    {"T": "SPY", "v": 58720411, "vw": 639.671, "o": 638.3, "c": 640.92, "h": 641.75, "l": 637.6, "t": 1785528000000, "n": 498112},
+    {"T": "BRK.B", "v": 2988112, "vw": 478.514, "o": 477.9, "c": 479.31, "h": 480.05, "l": 476.88, "t": 1785528000000, "n": 80211}
+  ],
+  "status": "OK",
+  "request_id": "9b1f2e77a0c94d31b6f4d2a9c8e51b02"
+}

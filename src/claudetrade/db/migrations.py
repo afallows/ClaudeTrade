@@ -204,6 +204,19 @@ def _m005_refresh_runs(session: Session) -> None:
             "partial unique index for refresh_runs skipped (%s): %s", bind.dialect.name, exc
         )
 
+def _m006_symbol_fetch_health(session: Session) -> None:
+    """Create the ``symbol_fetch_health`` table (per-symbol fetch quarantine).
+
+    Same fresh-vs-migrated shape as ``_m004_add_flair_column``: a brand-new
+    database already gets this table from ``_m001_create_schema``'s
+    ``create_all`` (the ORM model exists now), so this migration only does
+    real work on a database that reached version 4 before the model did.
+    ``checkfirst=True`` keeps it idempotent either way.
+    """
+    from claudetrade.db.models import SymbolFetchHealth
+
+    SymbolFetchHealth.__table__.create(session.get_bind(), checkfirst=True)
+
 
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_schema", _m001_create_schema, "Initial tables, indexes and constraints"),
@@ -211,6 +224,12 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(3, "performance_indexes", _m003_performance_indexes, "Query indexes for scale"),
     Migration(4, "add_flair_column", _m004_add_flair_column, "Nullable social_posts.flair column"),
     Migration(5, "refresh_runs", _m005_refresh_runs, "Cross-process refresh state + lock (F27)"),
+    Migration(
+        6,
+        "symbol_fetch_health",
+        _m006_symbol_fetch_health,
+        "Per-symbol fetch-failure quarantine table",
+    ),
 )
 
 LATEST_VERSION = max(m.version for m in MIGRATIONS)
