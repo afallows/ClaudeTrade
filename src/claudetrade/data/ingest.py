@@ -54,6 +54,24 @@ log = get_logger(__name__)
 #: callback is caught and logged, never allowed to break ingestion itself.
 ProgressCallback = Callable[[str, int, int], None]
 
+#: Rows/items per write transaction for the bulk persistence helpers
+#: (securities, earnings, posts, mentions). A single transaction across a
+#: whole-universe loop held SQLite's write lock for minutes and -- because
+#: WAL checkpoints only run at commit -- let the WAL balloon, degrading every
+#: concurrent process's reads (QA handoff v3, F26). Chunked commits bound
+#: both: the write lock is held for one chunk at a time and the WAL gets
+#: checkpointed as the run progresses. All of these helpers are idempotent
+#: upserts, so a run killed between chunks simply re-covers the same ground
+#: on the next refresh; partial persistence was already this module's
+#: documented posture (one dead provider degrades, never aborts).
+PERSIST_CHUNK_ROWS = 200
+
+
+def _chunks(items: list, size: int):
+    """Yield ``items`` in order, ``size`` at a time."""
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
 
 @dataclass(slots=True)
 class IngestReport:
@@ -311,62 +329,67 @@ class DataIngestor:
             for provider in hooked:
                 provider.on_symbol_progress = None
         self._report_progress("securities", len(securities), len(securities))
-        with self.db.session() as session:
-            for info in securities:
-                row = session.get(Security, info.symbol)
-                if row is None:
-                    row = Security(symbol=info.symbol)
-                    session.add(row)
-                row.name = info.name
-                row.exchange = info.exchange
-                row.sector = info.sector
-                row.industry = info.industry
-                row.market_cap_usd = info.market_cap_usd
-                row.shares_outstanding = info.shares_outstanding
-                row.is_etf = info.is_etf
-                row.is_leveraged_or_inverse = info.is_leveraged_or_inverse
-                row.listed_date = info.listed_date
-                if info.delisted_date is not None:
-                    row.delisted_date = info.delisted_date
-                # else: leave whatever is already stored untouched. Most
-                # providers' reference data never tracks a delisting date at
-                # all (info.delisted_date is simply None), and treating that
-                # absence as "confirmed still listed" would silently clear a
-                # deactivation this application made itself (see
-                # ``_deactivate_confirmed_unknown``) on the very next
-                # refresh -- undoing it before ``ingest_prices`` even runs
-                # again. Reactivation is instead the more precise trigger of
-                # "a refresh actually found real bars again" -- see
-                # ``_persist_bars``.
-                row.source = getattr(self.market, "name", "unknown")
-                row.updated_at = utc_now()
-                report.securities_upserted += 1
+        # One short write transaction per chunk, not one across the whole
+        # ~2,400-name reference pass (see ``PERSIST_CHUNK_ROWS``). All
+        # network I/O (cap enrichment above) is already done by this point;
+        # nothing inside these transactions can wait on a provider.
+        for chunk in _chunks(securities, PERSIST_CHUNK_ROWS):
+            with self.db.session() as session:
+                for info in chunk:
+                    row = session.get(Security, info.symbol)
+                    if row is None:
+                        row = Security(symbol=info.symbol)
+                        session.add(row)
+                    row.name = info.name
+                    row.exchange = info.exchange
+                    row.sector = info.sector
+                    row.industry = info.industry
+                    row.market_cap_usd = info.market_cap_usd
+                    row.shares_outstanding = info.shares_outstanding
+                    row.is_etf = info.is_etf
+                    row.is_leveraged_or_inverse = info.is_leveraged_or_inverse
+                    row.listed_date = info.listed_date
+                    if info.delisted_date is not None:
+                        row.delisted_date = info.delisted_date
+                    # else: leave whatever is already stored untouched. Most
+                    # providers' reference data never tracks a delisting date at
+                    # all (info.delisted_date is simply None), and treating that
+                    # absence as "confirmed still listed" would silently clear a
+                    # deactivation this application made itself (see
+                    # ``_deactivate_confirmed_unknown``) on the very next
+                    # refresh -- undoing it before ``ingest_prices`` even runs
+                    # again. Reactivation is instead the more precise trigger of
+                    # "a refresh actually found real bars again" -- see
+                    # ``_persist_bars``.
+                    row.source = getattr(self.market, "name", "unknown")
+                    row.updated_at = utc_now()
+                    report.securities_upserted += 1
 
-                # Aliases feed entity resolution: a post naming the company, or
-                # its former ticker, must still resolve to the current symbol.
-                aliases = {(info.name, "name")} if info.name else set()
-                aliases |= {(a, "nickname") for a in info.aliases}
-                aliases |= {(s, "former_symbol") for s in info.former_symbols}
-                for alias, kind in aliases:
-                    if not alias:
-                        continue
-                    normalised = _normalise_alias(alias)
-                    exists = session.execute(
-                        select(SymbolAlias).where(
-                            SymbolAlias.symbol == info.symbol,
-                            SymbolAlias.alias == alias,
-                            SymbolAlias.kind == kind,
-                        )
-                    ).scalar_one_or_none()
-                    if exists is None:
-                        session.add(
-                            SymbolAlias(
-                                symbol=info.symbol,
-                                alias=alias,
-                                alias_normalised=normalised,
-                                kind=kind,
+                    # Aliases feed entity resolution: a post naming the company, or
+                    # its former ticker, must still resolve to the current symbol.
+                    aliases = {(info.name, "name")} if info.name else set()
+                    aliases |= {(a, "nickname") for a in info.aliases}
+                    aliases |= {(s, "former_symbol") for s in info.former_symbols}
+                    for alias, kind in aliases:
+                        if not alias:
+                            continue
+                        normalised = _normalise_alias(alias)
+                        exists = session.execute(
+                            select(SymbolAlias).where(
+                                SymbolAlias.symbol == info.symbol,
+                                SymbolAlias.alias == alias,
+                                SymbolAlias.kind == kind,
                             )
-                        )
+                        ).scalar_one_or_none()
+                        if exists is None:
+                            session.add(
+                                SymbolAlias(
+                                    symbol=info.symbol,
+                                    alias=alias,
+                                    alias_normalised=normalised,
+                                    kind=kind,
+                                )
+                            )
 
         return securities
 
@@ -861,40 +884,44 @@ class DataIngestor:
         for symbol, events in upcoming.items():
             merged.setdefault(symbol, []).extend(events)
 
-        with self.db.session() as session:
-            for symbol, events in merged.items():
-                for event in events:
-                    source = event.source or getattr(self.earnings, "name", "")
-                    exists = session.execute(
-                        select(EarningsEventRow).where(
-                            EarningsEventRow.symbol == symbol,
-                            EarningsEventRow.report_date == event.report_date,
-                            EarningsEventRow.source == source,
+        # Both provider calls above are complete before any transaction
+        # opens; commits land per symbol-chunk rather than once for the whole
+        # universe (see ``PERSIST_CHUNK_ROWS``).
+        for symbol_chunk in _chunks(list(merged.items()), PERSIST_CHUNK_ROWS):
+            with self.db.session() as session:
+                for symbol, events in symbol_chunk:
+                    for event in events:
+                        source = event.source or getattr(self.earnings, "name", "")
+                        exists = session.execute(
+                            select(EarningsEventRow).where(
+                                EarningsEventRow.symbol == symbol,
+                                EarningsEventRow.report_date == event.report_date,
+                                EarningsEventRow.source == source,
+                            )
+                        ).scalar_one_or_none()
+                        if exists is not None:
+                            # A date can be revised from estimated to confirmed;
+                            # that is a legitimate update and is applied.
+                            exists.confirmed = event.confirmed
+                            exists.eps_actual = event.eps_actual
+                            exists.surprise_pct = event.surprise_pct
+                            continue
+                        session.add(
+                            EarningsEventRow(
+                                symbol=symbol,
+                                report_date=event.report_date,
+                                session=event.session.value,
+                                confirmed=event.confirmed,
+                                eps_estimate=event.eps_estimate,
+                                eps_actual=event.eps_actual,
+                                revenue_estimate=event.revenue_estimate,
+                                revenue_actual=event.revenue_actual,
+                                surprise_pct=event.surprise_pct,
+                                source=source,
+                                as_of=ensure_utc(event.as_of) if event.as_of else utc_now(),
+                            )
                         )
-                    ).scalar_one_or_none()
-                    if exists is not None:
-                        # A date can be revised from estimated to confirmed;
-                        # that is a legitimate update and is applied.
-                        exists.confirmed = event.confirmed
-                        exists.eps_actual = event.eps_actual
-                        exists.surprise_pct = event.surprise_pct
-                        continue
-                    session.add(
-                        EarningsEventRow(
-                            symbol=symbol,
-                            report_date=event.report_date,
-                            session=event.session.value,
-                            confirmed=event.confirmed,
-                            eps_estimate=event.eps_estimate,
-                            eps_actual=event.eps_actual,
-                            revenue_estimate=event.revenue_estimate,
-                            revenue_actual=event.revenue_actual,
-                            surprise_pct=event.surprise_pct,
-                            source=source,
-                            as_of=ensure_utc(event.as_of) if event.as_of else utc_now(),
-                        )
-                    )
-                    report.earnings_upserted += 1
+                        report.earnings_upserted += 1
 
         for symbol, events in merged.items():
             self.checker.check_earnings(symbol, events, report=report.quality)
@@ -1056,79 +1083,97 @@ class DataIngestor:
         return posts
 
     def _persist_posts(self, posts: list[SocialPost], report: IngestReport) -> None:
-        with self.db.session() as session:
-            for post in posts:
-                exists = session.execute(
-                    select(SocialPostRow).where(
-                        SocialPostRow.source == post.source.value,
-                        SocialPostRow.external_id == post.external_id,
-                    )
-                ).scalar_one_or_none()
-                if exists is not None:
-                    continue
-                session.add(
-                    SocialPostRow(
-                        source=post.source.value,
-                        external_id=post.external_id,
-                        created_at=ensure_utc(post.created_at),
-                        fetched_at=ensure_utc(post.fetched_at) if post.fetched_at else utc_now(),
-                        text=post.text,
-                        text_hash=post.text_hash,
-                        community=post.community,
-                        score=post.score,
-                        num_comments=post.num_comments,
-                        num_reposts=post.num_reposts,
-                        num_replies=post.num_replies,
-                        author_hash=post.author_hash,
-                        author_age_days=post.author_age_days,
-                        author_karma=post.author_karma,
-                        author_followers=post.author_followers,
-                        is_comment=post.is_comment,
-                        parent_id=post.parent_id,
-                        is_removed=post.is_removed,
-                        is_crosspost=post.is_crosspost,
-                        crosspost_parent=post.crosspost_parent,
-                        duplicate_group=post.duplicate_group,
-                        injection_risk=post.injection_risk,
-                        raw_ref=post.raw_ref,
-                        flair=post.flair,
-                    )
-                )
-                report.posts_inserted += 1
-
-    def persist_mentions(self, mentions_by_post: dict[str, list], report: IngestReport) -> None:
-        """Store resolved ticker mentions keyed by post external id."""
-        with self.db.session() as session:
-            id_map = {
-                (row.source, row.external_id): row.id
-                for row in session.execute(select(SocialPostRow)).scalars()
-            }
-            for external_id, mentions in mentions_by_post.items():
-                post_id = next(
-                    (pid for (_src, ext), pid in id_map.items() if ext == external_id), None
-                )
-                if post_id is None:
-                    continue
-                for mention in mentions:
+        # Fetch already happened (possibly on the background thread); commits
+        # land per chunk so a many-thousand-post persist never holds the
+        # write lock end to end (see ``PERSIST_CHUNK_ROWS``).
+        for chunk in _chunks(posts, PERSIST_CHUNK_ROWS):
+            with self.db.session() as session:
+                for post in chunk:
                     exists = session.execute(
-                        select(TickerMentionRow).where(
-                            TickerMentionRow.post_id == post_id,
-                            TickerMentionRow.symbol == mention.symbol,
+                        select(SocialPostRow).where(
+                            SocialPostRow.source == post.source.value,
+                            SocialPostRow.external_id == post.external_id,
                         )
                     ).scalar_one_or_none()
                     if exists is not None:
                         continue
                     session.add(
-                        TickerMentionRow(
-                            post_id=post_id,
-                            symbol=mention.symbol,
-                            confidence=mention.confidence,
-                            method=mention.method,
-                            matched_text=getattr(mention, "matched_text", "")[:120],
-                            context=getattr(mention, "context", "")[:500],
+                        SocialPostRow(
+                            source=post.source.value,
+                            external_id=post.external_id,
+                            created_at=ensure_utc(post.created_at),
+                            fetched_at=ensure_utc(post.fetched_at)
+                            if post.fetched_at
+                            else utc_now(),
+                            text=post.text,
+                            text_hash=post.text_hash,
+                            community=post.community,
+                            score=post.score,
+                            num_comments=post.num_comments,
+                            num_reposts=post.num_reposts,
+                            num_replies=post.num_replies,
+                            author_hash=post.author_hash,
+                            author_age_days=post.author_age_days,
+                            author_karma=post.author_karma,
+                            author_followers=post.author_followers,
+                            is_comment=post.is_comment,
+                            parent_id=post.parent_id,
+                            is_removed=post.is_removed,
+                            is_crosspost=post.is_crosspost,
+                            crosspost_parent=post.crosspost_parent,
+                            duplicate_group=post.duplicate_group,
+                            injection_risk=post.injection_risk,
+                            raw_ref=post.raw_ref,
+                            flair=post.flair,
                         )
                     )
-                    report.mentions_inserted += 1
+                    report.posts_inserted += 1
+
+    def persist_mentions(self, mentions_by_post: dict[str, list], report: IngestReport) -> None:
+        """Store resolved ticker mentions keyed by post external id.
+
+        The external-id -> post-id map is read once, in its own read
+        transaction, as (external_id, id) pairs only -- this used to load
+        every column of every stored post and then linear-scan that map per
+        mention inside one whole-batch WRITE transaction, i.e. O(posts x
+        mentions) of pure Python compute performed while holding the write
+        lock. First match per external id is kept, preserving the previous
+        scan's first-hit-in-insertion-order behaviour for the (unindexed)
+        edge case of one external id appearing under two sources.
+        """
+        with self.db.read_session() as session:
+            id_map: dict[str, int] = {}
+            for external_id, post_id in session.execute(
+                select(SocialPostRow.external_id, SocialPostRow.id)
+            ):
+                id_map.setdefault(external_id, post_id)
+
+        for chunk in _chunks(list(mentions_by_post.items()), PERSIST_CHUNK_ROWS):
+            with self.db.session() as session:
+                for external_id, mentions in chunk:
+                    post_id = id_map.get(external_id)
+                    if post_id is None:
+                        continue
+                    for mention in mentions:
+                        exists = session.execute(
+                            select(TickerMentionRow).where(
+                                TickerMentionRow.post_id == post_id,
+                                TickerMentionRow.symbol == mention.symbol,
+                            )
+                        ).scalar_one_or_none()
+                        if exists is not None:
+                            continue
+                        session.add(
+                            TickerMentionRow(
+                                post_id=post_id,
+                                symbol=mention.symbol,
+                                confidence=mention.confidence,
+                                method=mention.method,
+                                matched_text=getattr(mention, "matched_text", "")[:120],
+                                context=getattr(mention, "context", "")[:500],
+                            )
+                        )
+                        report.mentions_inserted += 1
 
     def resolve_and_persist_mentions(
         self,

@@ -405,6 +405,7 @@ def refresh(
     hundreds of symbols before showing anything.
     """
     cfg = _load(config)
+    from claudetrade.db import refresh_state_store
     from claudetrade.pipeline import Pipeline
 
     end_date = _parse_date(end, _today())
@@ -412,7 +413,35 @@ def refresh(
     symbol_list = [s.strip().upper() for s in symbols.split(",")] if symbols else None
 
     pipeline = Pipeline.bootstrap(cfg)
-    result = pipeline.refresh(start=start_date, end=end_date, symbols=symbol_list)
+    # Cross-process single-flight (QA handoff v3, F27): the web API and MCP
+    # server write the same database file, and two concurrent refreshes race
+    # each other's writes. The lock lives in the database, heartbeats through
+    # the ordinary progress callback, and a holder that died mid-run is taken
+    # over automatically -- so a crash here never wedges future refreshes.
+    outcome = refresh_state_store.try_acquire(pipeline.db, "cli")
+    if not outcome.acquired:
+        holder = outcome.holder
+        typer.secho(
+            "Refusing to start: "
+            + (holder.describe() if holder else "another process holds the refresh lock")
+            + ". Wait for it to finish (or, if its process died, retry once its "
+            "lock goes stale -- about two minutes).",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=1)
+    handle = outcome.handle
+    try:
+        result = pipeline.refresh(
+            start=start_date,
+            end=end_date,
+            symbols=symbol_list,
+            progress_callback=handle.update_progress,
+        )
+    except Exception as exc:
+        handle.finish("failed", error=str(exc))
+        raise
+    else:
+        handle.finish("done")
     _echo_json(
         {
             "summary": result.summary(),

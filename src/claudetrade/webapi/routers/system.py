@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, SecretStr
 
 from claudetrade.config import AppConfig
+from claudetrade.db import refresh_state_store
 from claudetrade.pipeline import Pipeline
 from claudetrade.providers.base import (
     NotConfiguredError,
@@ -499,14 +500,18 @@ def start_background_refresh(
     progress (``GET /api/system/refresh/status``) rather than staring at a
     blank terminal for 40+ minutes on a large universe.
 
-    409 if a refresh is already running -- this process holds exactly one
-    ``Pipeline``/database connection pool (see ``webapi.deps``'s module
-    docstring), so a second concurrent refresh would race the first one's
-    writes rather than run alongside it usefully.
+    409 if a refresh is already running -- in THIS process (the in-memory
+    ``RefreshState`` check, unchanged) or in ANY other entry point holding
+    the cross-process lock (``db.refresh_state_store``, QA handoff v3, F27):
+    the CLI, the MCP server and this API all write the same SQLite file, so
+    a second concurrent refresh from anywhere would race the first one's
+    writes rather than run alongside it usefully. The 409 detail names the
+    holder, when it started and how far along it is; a stale holder (its
+    process died mid-run) is taken over automatically rather than blocking
+    refreshes forever.
 
-    The CLI's ``claudetrade refresh`` is unchanged: it calls
-    ``Pipeline.refresh`` directly, synchronously, with no progress callback,
-    for scripted/scheduled use where blocking is exactly what is wanted.
+    The CLI's ``claudetrade refresh`` still calls ``Pipeline.refresh``
+    synchronously, but now acquires/heartbeats the same cross-process lock.
     """
     state = _get_refresh_state(request)
     with state.lock:
@@ -519,6 +524,31 @@ def start_background_refresh(
         state.started_at = utc_now()
         state.finished_at = None
         state.last_error = None
+
+    outcome = refresh_state_store.try_acquire(pipeline.db, "webapi")
+    if not outcome.acquired:
+        # Roll the eager local claim back before 409ing, or the NEXT request
+        # would trip this process's own in-memory check forever.
+        with state.lock:
+            state.running = False
+            state.phase = "idle"
+        holder = outcome.holder
+        raise HTTPException(
+            status_code=409,
+            detail=holder.describe()
+            if holder
+            else "another process holds the refresh lock",
+        )
+    handle = outcome.handle
+
+    def _progress(phase: str, done: int, total: int) -> None:
+        # Both sinks isolated: the browser's progress banner must keep
+        # updating even if a DB heartbeat write hiccups, and vice versa.
+        try:
+            state.update_progress(phase, done, total)
+        except Exception:
+            log.debug("in-process refresh progress update raised; ignored", exc_info=True)
+        handle.update_progress(phase, done, total)
 
     def _run() -> None:
         end = utc_now().date()
@@ -533,12 +563,15 @@ def start_background_refresh(
                 start=start,
                 end=end,
                 social_lookback_hours=config.sentiment.lookback_days * 24,
-                progress_callback=state.update_progress,
+                progress_callback=_progress,
             )
         except Exception as exc:
             with state.lock:
                 state.last_error = str(exc)
+            handle.finish("failed", error=str(exc))
             log.exception("background refresh failed")
+        else:
+            handle.finish("done")
         finally:
             with state.lock:
                 state.running = False
@@ -550,6 +583,16 @@ def start_background_refresh(
 
 
 @router.get("/refresh/status")
-def refresh_status(request: Request) -> dict[str, object]:
-    """Poll target for the setup script and the UI's progress banner."""
-    return _get_refresh_state(request).snapshot()
+def refresh_status(
+    request: Request, pipeline: Pipeline = Depends(get_pipeline)
+) -> dict[str, object]:
+    """Poll target for the setup script and the UI's progress banner.
+
+    Merged across entry points (F27): a refresh run by the CLI or the MCP
+    server shows up here too, with ``entry_point`` naming the owner -- the
+    in-process snapshot alone reported "idle" while another process was
+    actively writing.
+    """
+    return refresh_state_store.merged_status(
+        pipeline.db, _get_refresh_state(request).snapshot(), "webapi"
+    )

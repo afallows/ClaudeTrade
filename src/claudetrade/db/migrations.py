@@ -170,11 +170,47 @@ def _m004_add_flair_column(session: Session) -> None:
     session.execute(text("ALTER TABLE social_posts ADD COLUMN flair VARCHAR(80)"))
 
 
+def _m005_refresh_runs(session: Session) -> None:
+    """Create the cross-process refresh-run table plus its single-flight guard.
+
+    A brand-new database already has ``refresh_runs`` from
+    ``_m001_create_schema`` (``create_all`` reflects the current ORM model),
+    so the targeted ``create_all`` here only does real work on a database
+    that reached version 4 before the table existed -- same idempotence
+    posture as ``_m004_add_flair_column``.
+
+    The partial unique index is the actual concurrency mechanism (see
+    ``db.refresh_state_store.try_acquire``): at most one ``status='running'``
+    row may exist, so of two processes racing to start a refresh exactly one
+    INSERT succeeds and the loser gets a constraint violation it can report
+    -- an atomicity guarantee a check-then-insert alone cannot give under
+    SQLite's deferred write locking. The identical statement is valid on
+    PostgreSQL; any dialect that rejects it degrades to check-then-insert
+    (a small race window, logged) rather than failing the migration.
+    """
+    from claudetrade.db.models import RefreshRunRow
+
+    bind = session.get_bind()
+    RefreshRunRow.metadata.create_all(bind, tables=[RefreshRunRow.__table__])
+    try:
+        session.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_refresh_running "
+                "ON refresh_runs (status) WHERE status = 'running'"
+            )
+        )
+    except Exception as exc:  # pragma: no cover - dialect variance
+        log.warning(
+            "partial unique index for refresh_runs skipped (%s): %s", bind.dialect.name, exc
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_schema", _m001_create_schema, "Initial tables, indexes and constraints"),
     Migration(2, "immutability_triggers", _m002_immutability_triggers, "Append-only ledger guards"),
     Migration(3, "performance_indexes", _m003_performance_indexes, "Query indexes for scale"),
     Migration(4, "add_flair_column", _m004_add_flair_column, "Nullable social_posts.flair column"),
+    Migration(5, "refresh_runs", _m005_refresh_runs, "Cross-process refresh state + lock (F27)"),
 )
 
 LATEST_VERSION = max(m.version for m in MIGRATIONS)

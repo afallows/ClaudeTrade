@@ -386,6 +386,58 @@ class SignalLedger:
             ).scalars().all()
             return [_row_to_signal(r) for r in rows]
 
+    @staticmethod
+    def _latest_revision_join():
+        """(subquery, join-condition) pairing each signal with its newest revision.
+
+        The "current status" of a signal is its highest-numbered revision's
+        status (see :meth:`current_status`). Expressed as a grouped
+        max-revision subquery joined back to ``signal_revisions`` so callers
+        can fetch N signals *with* their statuses in one round trip instead
+        of N+1 -- the per-row ``current_status`` loop was the dominant cost
+        of ``get_signals`` under a concurrent refresh (QA handoff v3, F26):
+        each loop iteration opened its own session/connection against a
+        database mid-write-churn, multiplying every per-query slowdown by
+        the scan limit.
+        """
+        latest = (
+            select(
+                SignalRevisionRow.signal_id.label("signal_id"),
+                func.max(SignalRevisionRow.revision).label("max_revision"),
+            )
+            .group_by(SignalRevisionRow.signal_id)
+            .subquery()
+        )
+        return latest
+
+    def recent_with_status(self, *, limit: int = 200) -> list[tuple[Signal, SignalStatus | None]]:
+        """Most recent signals paired with their current status, in ONE query.
+
+        Row-for-row equivalent to ``[(s, self.current_status(s.signal_id))
+        for s in self.recent(limit=limit)]`` without the N+1 round trips.
+        Outer joins keep a (theoretically) revision-less signal visible with
+        status ``None`` rather than silently dropping it -- the ledger's
+        completeness guarantee applies to reads too.
+        """
+        latest = self._latest_revision_join()
+        with self.db.read_session() as session:
+            rows = session.execute(
+                select(SignalRow, SignalRevisionRow.status)
+                .join(latest, latest.c.signal_id == SignalRow.signal_id, isouter=True)
+                .join(
+                    SignalRevisionRow,
+                    (SignalRevisionRow.signal_id == SignalRow.signal_id)
+                    & (SignalRevisionRow.revision == latest.c.max_revision),
+                    isouter=True,
+                )
+                .order_by(SignalRow.created_at.desc())
+                .limit(limit)
+            ).all()
+            return [
+                (_row_to_signal(row), SignalStatus(status) if status else None)
+                for row, status in rows
+            ]
+
     def history(self, signal_id: str) -> list[dict[str, object]]:
         """Full revision history, oldest first."""
         with self.db.read_session() as session:
@@ -408,14 +460,30 @@ class SignalLedger:
             ]
 
     def counts_by_status(self) -> dict[str, int]:
-        """Latest-revision status counts, for the dashboard."""
+        """Latest-revision status counts, for the dashboard.
+
+        One grouped query over the latest-revision join, not a
+        ``current_status`` call per stored signal -- this ran one query per
+        ledger row and only gets called from dashboards, i.e. exactly the
+        read path that must stay cheap while a refresh is writing.
+        """
+        latest = self._latest_revision_join()
         out: dict[str, int] = {}
         with self.db.read_session() as session:
-            ids = session.execute(select(SignalRow.signal_id)).scalars().all()
-        for signal_id in ids:
-            status = self.current_status(signal_id)
-            key = status.value if status else "unknown"
-            out[key] = out.get(key, 0) + 1
+            rows = session.execute(
+                select(SignalRevisionRow.status, func.count(SignalRow.signal_id))
+                .select_from(SignalRow)
+                .join(latest, latest.c.signal_id == SignalRow.signal_id, isouter=True)
+                .join(
+                    SignalRevisionRow,
+                    (SignalRevisionRow.signal_id == SignalRow.signal_id)
+                    & (SignalRevisionRow.revision == latest.c.max_revision),
+                    isouter=True,
+                )
+                .group_by(SignalRevisionRow.status)
+            ).all()
+        for status, count in rows:
+            out[status if status else "unknown"] = int(count)
         return out
 
 

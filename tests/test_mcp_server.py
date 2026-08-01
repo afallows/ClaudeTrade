@@ -394,11 +394,15 @@ def test_trigger_refresh_starts_in_background_and_reports_progress(
     assert result["started"] is True
     assert started.wait(timeout=2)
 
-    status = mcp_server.get_refresh_status(state)
+    status = mcp_server.get_refresh_status(pipeline, state)
     assert status["running"] is True
     assert status["phase"] == "prices"
     assert status["symbols_done"] == 3
     assert status["symbols_total"] == 10
+    # The local run's fine-grained in-process detail wins (source=local),
+    # and the merged view names this process as the owner.
+    assert status["source"] == "local"
+    assert status["entry_point"] == "mcp"
 
     release.set()
 
@@ -440,10 +444,10 @@ def test_trigger_refresh_failure_is_reported_and_unblocks_the_next_run(
 
     mcp_server.trigger_refresh(pipeline, tmp_app_config, state)
     deadline = time.monotonic() + 5
-    status = mcp_server.get_refresh_status(state)
+    status = mcp_server.get_refresh_status(pipeline, state)
     while status["running"] and time.monotonic() < deadline:
         time.sleep(0.05)
-        status = mcp_server.get_refresh_status(state)
+        status = mcp_server.get_refresh_status(pipeline, state)
 
     assert status["running"] is False
     assert status["last_error"] is not None and "boom" in status["last_error"]
@@ -451,6 +455,130 @@ def test_trigger_refresh_failure_is_reported_and_unblocks_the_next_run(
     # Not left stuck: the next trigger starts cleanly.
     second = mcp_server.trigger_refresh(pipeline, tmp_app_config, state)
     assert second["started"] is True
+
+
+# --------------------------------------------------------------------------
+# F27: cross-process refresh visibility + single-flight
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def second_db(tmp_app_config: AppConfig, tmp_db) -> object:
+    """A second handle on the same SQLite file -- what another OS process
+    (e.g. the owner's CLI) looks like to this server's database."""
+    from claudetrade.db.session import Database
+
+    db_path = tmp_app_config.paths.app_dir / "test.db"
+    db = Database(f"sqlite:///{db_path}", config=tmp_app_config)
+    yield db
+    db.dispose()
+
+
+def test_get_refresh_status_sees_a_cli_run_from_another_process(
+    pipeline: Pipeline, second_db
+) -> None:
+    """THE F27 acceptance check from QA: the CLI was refreshing while MCP
+    ``get_refresh_status`` said idle/started_at:null. The DB row must make
+    the CLI's run visible here, with its entry point and progress."""
+    from claudetrade.db import refresh_state_store
+
+    outcome = refresh_state_store.try_acquire(second_db, "cli")
+    assert outcome.acquired
+    outcome.handle._last_write = 0.0
+    outcome.handle.update_progress("prices", 42, 2400)
+
+    status = mcp_server.get_refresh_status(pipeline, RefreshState())
+    assert status["running"] is True
+    assert status["entry_point"] == "cli"
+    assert status["phase"] == "prices"
+    assert status["symbols_done"] == 42
+    assert status["symbols_total"] == 2400
+    assert status["started_at"] is not None
+    assert status["source"] == "db"
+
+
+def test_trigger_refresh_refuses_while_the_cli_holds_the_lock(
+    pipeline: Pipeline, tmp_app_config: AppConfig, second_db
+) -> None:
+    from claudetrade.db import refresh_state_store
+
+    outcome = refresh_state_store.try_acquire(second_db, "cli")
+    assert outcome.acquired
+
+    result = mcp_server.trigger_refresh(pipeline, tmp_app_config, RefreshState())
+    assert result["started"] is False
+    assert "cli" in result["reason"]
+    assert "already running" in result["reason"]
+
+    # Once the CLI's run finishes, this server may start its own.
+    outcome.handle.finish("done")
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_refresh(*, start, end, symbols=None, social_lookback_hours=None, progress_callback=None):
+        started.set()
+        release.wait(timeout=5)
+        return PipelineResult()
+
+    pipeline.refresh = fake_refresh
+    state = RefreshState()
+    second = mcp_server.trigger_refresh(pipeline, tmp_app_config, state)
+    assert second["started"] is True
+    assert started.wait(timeout=2)
+    release.set()
+
+
+def test_trigger_refresh_local_refusal_does_not_wedge_local_state(
+    pipeline: Pipeline, tmp_app_config: AppConfig, second_db
+) -> None:
+    """A cross-process refusal must roll back the eagerly-set in-process
+    running flag, or this server would 409 itself forever afterwards."""
+    from claudetrade.db import refresh_state_store
+
+    holder = refresh_state_store.try_acquire(second_db, "cli")
+    state = RefreshState()
+    refused = mcp_server.trigger_refresh(pipeline, tmp_app_config, state)
+    assert refused["started"] is False
+    assert state.snapshot()["running"] is False
+    assert state.snapshot()["phase"] == "idle"
+    holder.handle.finish("done")
+
+
+def test_trigger_refresh_marks_the_db_run_done_and_failed(
+    pipeline: Pipeline, tmp_app_config: AppConfig, tmp_db
+) -> None:
+    """The lock must be released on both outcomes -- the ``refresh_runs`` row
+    ends done on success and failed (with the error) on an exception."""
+    from sqlalchemy import select
+
+    from claudetrade.db.models import RefreshRunRow
+
+    def ok_refresh(*, start, end, symbols=None, social_lookback_hours=None, progress_callback=None):
+        return PipelineResult()
+
+    pipeline.refresh = ok_refresh
+    state = RefreshState()
+    mcp_server.trigger_refresh(pipeline, tmp_app_config, state)
+    deadline = time.monotonic() + 5
+    while state.snapshot()["running"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    def failing_refresh(*, start, end, symbols=None, social_lookback_hours=None, progress_callback=None):
+        raise RuntimeError("kaput")
+
+    pipeline.refresh = failing_refresh
+    mcp_server.trigger_refresh(pipeline, tmp_app_config, state)
+    deadline = time.monotonic() + 5
+    while state.snapshot()["running"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    with tmp_db.read_session() as session:
+        rows = session.execute(
+            select(RefreshRunRow).order_by(RefreshRunRow.id)
+        ).scalars().all()
+    assert [r.status for r in rows] == ["done", "failed"]
+    assert rows[1].last_error == "kaput"
+    assert all(r.finished_at is not None for r in rows)
 
 
 # --------------------------------------------------------------------------
@@ -582,3 +710,192 @@ def test_require_fastmcp_missing_package_gives_an_actionable_error(monkeypatch) 
         mcp_server._require_fastmcp()
     assert "claudetrade[mcp]" in str(exc_info.value)
     assert "pip install" in str(exc_info.value)
+
+
+# --------------------------------------------------------------------------
+# F26: the per-tool watchdog -- "MCP reads never hang"
+#
+# The production failure QA hit: FastMCP runs a *sync* tool function directly
+# on the server's event-loop thread, so one stalled call froze the transport's
+# message reader and every later call went dead. These tests pin both halves
+# of the fix -- the bounded call helper itself, and the end-to-end property
+# that a slow tool no longer wedges the server -- through the real in-memory
+# MCP transport, not a mock of it.
+# --------------------------------------------------------------------------
+
+
+def test_call_bounded_returns_the_tool_result_when_it_finishes_in_time() -> None:
+    import anyio
+
+    result = anyio.run(
+        lambda: mcp_server._call_bounded("fast", 5.0, lambda: {"ok": True})
+    )
+    assert result == {"ok": True}
+
+
+def test_call_bounded_returns_a_structured_timeout_payload() -> None:
+    """On expiry the client gets an actionable payload, never silence."""
+    import anyio
+
+    result = anyio.run(
+        lambda: mcp_server._call_bounded("stuck", 0.1, lambda: time.sleep(3.0))
+    )
+    assert result["timed_out"] is True
+    assert "stuck" in result["error"]
+    assert "refresh" in result["hint"] and "retry" in result["hint"]
+
+
+def test_call_bounded_preserves_a_falsy_result() -> None:
+    """A tool that legitimately returns something falsy must not be mistaken
+    for a timeout (the reason the helper uses a sentinel, not ``if result``)."""
+    import anyio
+
+    for value in ({}, [], 0, False, None):
+        assert (
+            anyio.run(lambda v=value: mcp_server._call_bounded("t", 5.0, lambda: v)) == value
+        )
+
+
+def test_call_bounded_propagates_tool_exceptions_unchanged(pipeline: Pipeline) -> None:
+    """The watchdog bounds time only. A tool that raises must still raise, so
+    FastMCP reports a real error instead of it being masked as a timeout."""
+    import anyio
+
+    def boom():
+        raise ValueError("kaput")
+
+    with pytest.raises(ValueError, match="kaput"):
+        anyio.run(lambda: mcp_server._call_bounded("t", 5.0, boom))
+
+
+def test_a_slow_tool_does_not_wedge_the_server(
+    pipeline: Pipeline, tmp_app_config: AppConfig
+) -> None:
+    """The exact QA scenario, end to end: while one tool call is stuck (a
+    concurrent refresh holding the database, simulated here by a blocking
+    read), OTHER tool calls must still be served -- and the stuck one must
+    come back with a timed_out payload rather than hanging forever.
+
+    Before the fix this test deadlocks: the sync tool body ran on the event
+    loop, so the second call could not even be read off the transport.
+    """
+    import anyio
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    tmp_app_config.mcp.tool_timeout_seconds = 1.0
+    stuck = threading.Event()
+
+    def blocking_trending(_pipeline, *, limit=20):
+        stuck.set()
+        time.sleep(30.0)  # far past the deadline; never completes in-test
+        return {}
+
+    server = mcp_server.build_server(pipeline, tmp_app_config)
+
+    async def scenario() -> dict[str, float]:
+        elapsed: dict[str, float] = {}
+        async with create_connected_server_and_client_session(server) as client:
+            t0 = time.monotonic()
+
+            async def call(name: str) -> None:
+                result = await client.call_tool(name, {})
+                elapsed[name] = time.monotonic() - t0
+                elapsed[f"{name}_text"] = result.content[0].text
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(call, "get_trending")
+                # Give the slow call time to be dispatched and block.
+                await anyio.sleep(0.3)
+                tg.start_soon(call, "get_market_status")
+        return elapsed
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(mcp_server, "get_trending", blocking_trending)
+        elapsed = anyio.run(scenario)
+
+    assert stuck.is_set()
+    # The healthy call was served WHILE the other one was stuck -- it did not
+    # queue behind it (the deadline is 1.0s; a wedged server would have made
+    # this at least that long, and before the fix, 30s).
+    assert elapsed["get_market_status"] < 1.0
+    assert "regime" in elapsed["get_market_status_text"]
+    # And the stuck call returned a structured timeout rather than hanging.
+    assert '"timed_out": true' in elapsed["get_trending_text"]
+    assert "get_trending" in elapsed["get_trending_text"]
+
+
+def test_every_registered_tool_is_wrapped_in_the_watchdog(
+    pipeline: Pipeline, tmp_app_config: AppConfig
+) -> None:
+    """A tool registered as a plain sync function would bypass the watchdog
+    entirely and reintroduce F26 for that one tool -- so the wiring itself is
+    asserted, not just the two tools exercised above."""
+    server = mcp_server.build_server(pipeline, tmp_app_config)
+    tools = {t.name: t for t in server._tool_manager.list_tools()}
+
+    assert set(tools) == EXPECTED_TOOL_NAMES
+    for name, tool in tools.items():
+        assert tool.is_async, f"{name} is registered sync -- it would run on the event loop"
+
+
+def test_scan_gets_its_own_longer_deadline(
+    pipeline: Pipeline, tmp_app_config: AppConfig, monkeypatch
+) -> None:
+    """A full-universe scan is legitimately slow; bounding it at the read
+    deadline would make the tool useless. It must use scan_timeout_seconds."""
+    import anyio
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    tmp_app_config.mcp.tool_timeout_seconds = 5.0
+    tmp_app_config.mcp.scan_timeout_seconds = 123.0
+    seen: dict[str, float] = {}
+
+    real_call_bounded = mcp_server._call_bounded
+
+    async def spy(tool_name, timeout_s, fn):
+        seen[tool_name] = timeout_s
+        return await real_call_bounded(tool_name, timeout_s, fn)
+
+    monkeypatch.setattr(mcp_server, "_call_bounded", spy)
+    server = mcp_server.build_server(pipeline, tmp_app_config)
+
+    async def scenario() -> None:
+        async with create_connected_server_and_client_session(server) as client:
+            await client.call_tool("run_scan", {})
+            await client.call_tool("get_market_status", {})
+
+    anyio.run(scenario)
+
+    assert seen["run_scan"] == 123.0
+    assert seen["get_market_status"] == 5.0
+
+
+def test_tool_timeouts_are_read_per_call_not_frozen_at_build_time(
+    pipeline: Pipeline, tmp_app_config: AppConfig, monkeypatch
+) -> None:
+    """The deadline is read off the live config at call time, so an operator
+    changing it does not need a server restart."""
+    import anyio
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    tmp_app_config.mcp.tool_timeout_seconds = 5.0
+    seen: list[float] = []
+
+    real_call_bounded = mcp_server._call_bounded
+
+    async def spy(tool_name, timeout_s, fn):
+        seen.append(timeout_s)
+        return await real_call_bounded(tool_name, timeout_s, fn)
+
+    monkeypatch.setattr(mcp_server, "_call_bounded", spy)
+    server = mcp_server.build_server(pipeline, tmp_app_config)  # built at 5.0
+
+    async def scenario() -> None:
+        async with create_connected_server_and_client_session(server) as client:
+            await client.call_tool("get_market_status", {})
+            tmp_app_config.mcp.tool_timeout_seconds = 9.0  # changed after build
+            await client.call_tool("get_market_status", {})
+
+    anyio.run(scenario)
+
+    assert seen == [5.0, 9.0]

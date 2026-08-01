@@ -377,3 +377,12 @@ theme = "dark"                            # Options: dark, light
 chart_lookback_days = 180                 # Historical depth for charts
 table_page_size = 50                      # Rows per page in tables
 port = 8501                               # Streamlit port
+
+[mcp]
+# MCP stdio server (`claudetrade mcp`) -- see docs/claude-desktop-mcp.md.
+# Every tool call is time-bounded: on expiry the client gets a structured
+# {"timed_out": true, ...} error instead of a call that never returns. Raise
+# these only if your installation is genuinely slow (very large universe on
+# slow storage); the defaults leave plenty of headroom over the normal case.
+tool_timeout_seconds = 30                 # Deadline for ordinary read tools
+scan_timeout_seconds = 300                # Deadline for run_scan only (a full-universe scan is legitimately slow)

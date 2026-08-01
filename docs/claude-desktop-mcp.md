@@ -119,8 +119,8 @@ these tools. All of them return plain JSON — no charts, no pandas objects.
 | `get_trending(limit)` | read-only | Symbols ranked by recent mention volume. |
 | `get_market_status()` | read-only | Regime, current Eastern time, whether the market is pre-market/open/after-hours/closed, last refresh time, symbol coverage, provider health. |
 | `run_scan()` | **write** | Runs a full scan for today's session and records new signals to the immutable ledger (same as `claudetrade scan`). |
-| `trigger_refresh()` | **write, background** | Starts a data refresh (market data, earnings, sentiment) on a background thread; can take several minutes on a large universe. |
-| `get_refresh_status()` | read-only | Progress of a refresh started by `trigger_refresh`. |
+| `trigger_refresh()` | **write, background** | Starts a data refresh (market data, earnings, sentiment) on a background thread; can take several minutes on a large universe. Refuses (naming the holder) while a refresh started from *any* entry point is running. |
+| `get_refresh_status()` | read-only | Progress of the current refresh, whichever entry point started it — CLI, web UI or this server; `entry_point` names the owner. |
 | `get_backtest_report()` | read-only | The latest `claudetrade backtest report` (see `docs/backtest-report.md`): per-strategy walk-forward win rate/expectancy/profit factor/drawdown, each gated behind a prominent significance verdict. Never runs a backtest itself — returns `available: false` with instructions if none has been generated yet. |
 
 Every read-only tool queries the exact same ledger/database objects the web
@@ -137,7 +137,7 @@ Eastern time and whether the market is `pre_market`, `open`, `after_hours` or
 A good morning routine is: ask for market status, then trending symbols, then
 sentiment on whatever stands out, then (optionally) a scan.
 
-## Concurrent use with the web UI
+## Concurrent use with the web UI and CLI
 
 SQLite is run in WAL (write-ahead log) mode, so `claudetrade mcp` can read
 from the same database while `claudetrade ui` is also running — you do not
@@ -145,6 +145,29 @@ need to stop one to use the other. `run_scan` and `trigger_refresh` write
 through the normal application logic (the immutable signal ledger, the same
 refresh path `claudetrade refresh` uses), so their effects show up in the web
 UI too, and vice versa.
+
+**One refresh at a time, across all three.** A data refresh is the one
+operation that must not overlap itself: the CLI, the web UI and this server
+write the same database file, so a second concurrent refresh would race the
+first one's writes. The lock lives in the database, so it holds across
+processes:
+
+- `get_refresh_status()` reports a refresh **whichever entry point started
+  it** — a `claudetrade refresh` running in your terminal shows up here, with
+  its phase and symbol progress, not as "idle".
+- `trigger_refresh()` refuses while another entry point holds the lock and
+  says who holds it, when they started and how far along they are.
+- If the process holding the lock dies, the lock goes stale and is taken over
+  automatically after about two minutes; nothing needs manual unlocking.
+
+**Every tool call is time-bounded.** Reads are answered or they return a
+structured `{"timed_out": true, ...}` error — they never hang the client, even
+while a refresh is hammering the database, and one slow call never blocks the
+others. `run_scan` gets its own much larger deadline because a full-universe
+scan is legitimately slow; if it does report `timed_out`, it is still running
+in the background and its signals will land in the ledger. Both deadlines are
+configurable under `[mcp]` in `config.toml` (`tool_timeout_seconds`, default
+30; `scan_timeout_seconds`, default 300).
 
 ## Security
 
