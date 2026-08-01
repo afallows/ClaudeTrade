@@ -110,7 +110,7 @@ class Pipeline:
         self.universe = UniverseSelector(config, db)
 
     @classmethod
-    def bootstrap(cls, config: AppConfig) -> Pipeline:
+    def bootstrap(cls, config: AppConfig, *, allow_data_fixes: bool = True) -> Pipeline:
         """Open the database, apply migrations and construct the pipeline.
 
         ``config`` is passed through to ``init_database`` so its data-fix
@@ -118,11 +118,26 @@ class Pipeline:
         see ``sentiment.rebuild.ensure_extraction_version``) can actually
         run -- this is the seam every entry point (CLI, web API, MCP server,
         UI) shares.
+
+        Args:
+            allow_data_fixes: When ``False``, migrations still run but the
+                stored-data self-heal is deferred to another entry point.
+                Exists for callers whose start-up latency is part of a
+                protocol handshake: the self-heal rebuilds sentiment
+                aggregates from every stored post, which is a minute-scale
+                job on a real database. That is fine ahead of a command the
+                operator just typed, and *not* fine ahead of
+                ``mcp_server.run_stdio``'s ``server.run()`` -- an MCP client
+                that launches the server as a subprocess (Claude Desktop)
+                would sit through the whole rebuild before the first tool
+                call and can give up on the handshake first. The heal is
+                deferred, never skipped: the stamp is only written once a
+                rebuild succeeds, so the next CLI/UI bootstrap still does it.
         """
         from claudetrade.db.session import get_database
 
         db = get_database(config)
-        init_database(db, config)
+        init_database(db, config, allow_data_fixes=allow_data_fixes)
         return cls(config, db)
 
     # --- provider health ---------------------------------------------------

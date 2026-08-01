@@ -7,6 +7,11 @@ mypy>=1.10,<2.0
 types-PyYAML
 types-python-dateutil
 
+# Required to TEST the MCP server, not just to run it: tests/test_mcp_server.py
+# skips itself without this, so its whole surface reported green while nine
+# real failures sat in it. Pinned <2.0 -- mcp 2.0 dropped mcp.server.fastmcp.
+mcp>=1.6,<2.0
+
 # Optional machine-learning extras (the app degrades gracefully without them)
 scikit-learn>=1.4,<2.0
 

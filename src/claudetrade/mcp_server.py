@@ -385,6 +385,43 @@ def get_market_status(pipeline: Pipeline) -> dict[str, Any]:
         "symbols_with_data": freshness.symbol_count,
         "providers": providers,
         "degraded_providers": degraded_providers,
+        "sentiment_rebuild_pending": _sentiment_rebuild_pending(pipeline),
+    }
+
+
+def _sentiment_rebuild_pending(pipeline: Pipeline) -> dict[str, Any] | None:
+    """Whether stored sentiment predates the current extractor, or ``None``.
+
+    ``run_stdio`` deliberately declines to run the stored-sentiment self-heal
+    at start-up (a minute-scale rebuild inside the MCP initialize handshake
+    would risk the client giving up before the server ever answers -- see
+    that function). Declining silently would be worse than the delay: the
+    trending list would keep serving the very junk the rebuild exists to
+    clear, with nothing anywhere saying why. So the deferral is reported on
+    the status tool QA already reaches for first.
+
+    Read-only and cheap: one indexed point read on ``settings_kv``.
+    """
+    try:
+        from claudetrade.sentiment.entity_resolution import EXTRACTION_VERSION
+        from claudetrade.sentiment.rebuild import stored_extraction_version
+
+        stored = stored_extraction_version(pipeline.db)
+    except Exception:  # pragma: no cover - diagnostics must never break status
+        log.debug("sentiment extraction-version probe failed", exc_info=True)
+        return None
+    if stored >= EXTRACTION_VERSION:
+        return None
+    return {
+        "stored_extraction_version": stored,
+        "current_extraction_version": EXTRACTION_VERSION,
+        "note": (
+            "Stored sentiment aggregates were built by an older extractor, so trending "
+            "and sentiment reads may still show common-word tickers and neutral "
+            "bull/bear ratios. This server does not rebuild them at start-up (it would "
+            "delay the MCP handshake); run `claudetrade db rebuild-sentiment`, or any "
+            "CLI/UI command, to heal them."
+        ),
     }
 
 
@@ -797,8 +834,21 @@ def run_stdio(config: AppConfig) -> None:
     the configured providers -- the same call ``claudetrade refresh``/``scan``
     make -- so this works on a fresh install with no other entry point ever
     having run first.
+
+    ``allow_data_fixes=False`` is the one deliberate difference from those
+    other entry points. Migrations still run (they are fast and the schema
+    must match the code), but the stored-sentiment self-heal
+    (``sentiment.rebuild.ensure_extraction_version``) is left to a CLI or UI
+    bootstrap: it rebuilds aggregates from every stored post, and a
+    minute-scale job here runs *before* ``server.run()`` accepts the first
+    message -- i.e. inside the client's initialize handshake, which is
+    exactly the window an MCP client (Claude Desktop launching this as a
+    subprocess) will time out. Bounding tool calls (see this module's
+    docstring) would not have helped: this happens before any tool exists.
+    ``get_market_status`` reports the pending heal so the deferral is
+    visible rather than silent.
     """
-    pipeline = Pipeline.bootstrap(config)
+    pipeline = Pipeline.bootstrap(config, allow_data_fixes=False)
     server = build_server(pipeline, config)
     server.run(transport="stdio")
 

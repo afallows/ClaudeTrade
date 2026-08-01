@@ -60,6 +60,14 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML",
     "types-python-dateutil",
+    # Not optional for *testing*, whatever it is for running: without it
+    # tests/test_mcp_server.py hits its ``pytest.importorskip("mcp")`` and
+    # the entire MCP surface silently reports as passing. It did exactly
+    # that for every run until 2026-08-01, hiding nine genuine failures
+    # (stale test doubles, and trending tests predating the securities-join
+    # guard). A skipped suite that reads as green is worse than no suite.
+    # Same <2.0 bound as the ``mcp`` extra: 2.0 removed mcp.server.fastmcp.
+    "mcp>=1.6,<2.0",
 ]
 build = ["pyinstaller>=6.6"]
 all = ["claudetrade[ui,ml,dev,build,mcp,anthropic,openai]"]

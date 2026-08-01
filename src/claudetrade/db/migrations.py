@@ -296,7 +296,9 @@ def verify_schema(db: Database) -> list[str]:
     return sorted(expected - present)
 
 
-def init_database(db: Database, config: AppConfig | None = None) -> list[int]:
+def init_database(
+    db: Database, config: AppConfig | None = None, *, allow_data_fixes: bool = True
+) -> list[int]:
     """Migrate to latest, assert the schema is complete, then self-heal data.
 
     Beyond schema migrations, this is also the seam for **stored-data fixes**
@@ -312,11 +314,19 @@ def init_database(db: Database, config: AppConfig | None = None) -> list[int]:
             shape) keep working; config-dependent data fixes simply defer
             until a config-carrying bootstrap (``Pipeline.bootstrap`` passes
             it) when it is absent.
+        allow_data_fixes: When ``False``, run migrations but defer the
+            stored-data self-heal below. Schema work is always fast and must
+            never be skipped; the data fixes are minute-scale and belong to
+            whichever entry point can afford to wait (see
+            ``Pipeline.bootstrap``, which the MCP server calls with ``False``
+            so a rebuild cannot delay its protocol handshake).
     """
     applied = migrate(db)
     missing = verify_schema(db)
     if missing:
         raise RuntimeError(f"schema incomplete after migration; missing tables: {missing}")
+    if not allow_data_fixes:
+        return applied
     # Stored sentiment aggregates must have been built by the current
     # extraction code (QA F25: junk common-word symbols and all-neutral
     # ratios kept echoing out of symbol_sentiment_daily long after the

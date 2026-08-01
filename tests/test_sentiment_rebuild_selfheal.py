@@ -255,6 +255,57 @@ class TestBootstrapSelfHeal:
         assert stored_extraction_version(db) == EXTRACTION_VERSION
         reset_database_cache()
 
+    def test_bootstrap_can_defer_the_heal_without_skipping_it(
+        self, tmp_app_config: AppConfig
+    ):
+        """``allow_data_fixes=False`` -- what ``mcp_server.run_stdio`` passes.
+
+        Integration hazard this pins: the self-heal landed on the seam every
+        entry point shares, but on a real database it is a minute-scale
+        rebuild, and the MCP server runs its bootstrap *inside* the client's
+        initialize handshake (before ``server.run()`` answers anything). A
+        client that launches the server as a subprocess would sit through the
+        whole rebuild and can time out first -- and the per-tool watchdog
+        cannot help, because no tool exists yet.
+
+        Deferred must not mean skipped: the schema is still migrated, the
+        stamp is deliberately NOT advanced, and the next ordinary bootstrap
+        still heals -- otherwise declining once would strand the junk
+        aggregates forever.
+        """
+        from claudetrade.db.session import get_database, reset_database_cache
+        from claudetrade.pipeline import Pipeline
+
+        reset_database_cache()
+        db = get_database(tmp_app_config)
+        init_database(db)
+        _seed_stale_state(db)
+        record_extraction_version(db, EXTRACTION_VERSION - 1)
+
+        Pipeline.bootstrap(tmp_app_config, allow_data_fixes=False)
+
+        # Untouched, and still flagged as stale so a later bootstrap retries.
+        assert "YOU" in _aggregate_symbols(db)
+        assert stored_extraction_version(db) == EXTRACTION_VERSION - 1
+
+        Pipeline.bootstrap(tmp_app_config)  # a CLI/UI start-up heals it
+
+        assert "YOU" not in _aggregate_symbols(db)
+        assert stored_extraction_version(db) == EXTRACTION_VERSION
+        reset_database_cache()
+
+    def test_migrations_still_run_when_data_fixes_are_deferred(self) -> None:
+        """Deferring data fixes must never defer *schema* work -- the code
+        assumes the current schema the moment it runs a query."""
+        from claudetrade.db.migrations import LATEST_VERSION, current_version, verify_schema
+
+        db = Database("sqlite:///:memory:")
+        init_database(db, None, allow_data_fixes=False)
+
+        assert current_version(db) == LATEST_VERSION
+        assert verify_schema(db) == []
+        db.dispose()
+
 
 class TestRebuildCore:
     """The importable core the CLI command now wraps."""

@@ -303,6 +303,28 @@ def test_get_market_status_shape(pipeline: Pipeline) -> None:
         )
 
 
+def test_get_market_status_reports_a_pending_sentiment_rebuild(
+    pipeline: Pipeline, tmp_db: Database
+) -> None:
+    """``run_stdio`` skips the stored-sentiment self-heal so a minute-scale
+    rebuild cannot run inside the MCP initialize handshake. Skipping it
+    silently would leave trending serving exactly the junk the rebuild
+    clears, with nothing saying why -- so the status tool reports it."""
+    from claudetrade.sentiment import EXTRACTION_VERSION
+    from claudetrade.sentiment.rebuild import record_extraction_version
+
+    record_extraction_version(tmp_db, EXTRACTION_VERSION - 1)
+    pending = mcp_server.get_market_status(pipeline)["sentiment_rebuild_pending"]
+    assert pending is not None
+    assert pending["stored_extraction_version"] == EXTRACTION_VERSION - 1
+    assert pending["current_extraction_version"] == EXTRACTION_VERSION
+    assert "rebuild-sentiment" in pending["note"]
+
+    # Healed databases say nothing at all rather than carrying a dead field.
+    record_extraction_version(tmp_db, EXTRACTION_VERSION)
+    assert mcp_server.get_market_status(pipeline)["sentiment_rebuild_pending"] is None
+
+
 def test_get_market_status_reports_the_most_recent_signals_regime(
     pipeline: Pipeline, tmp_db: Database, make_signal
 ) -> None:
