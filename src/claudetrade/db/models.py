@@ -193,6 +193,37 @@ class IntradayBar(Base):
     source: Mapped[str] = mapped_column(String(40), default="unknown")
 
 
+class SymbolFetchHealth(Base):
+    """Per-symbol provider-fetch health, driving the refresh quarantine.
+
+    A row exists only while a symbol is failing: ``data.ingest.DataIngestor``
+    records a failure when a refresh's FULL provider chain (primary plus
+    every fallback) produced zero bars for a requested symbol, and deletes
+    the row again on the first success -- so this table is naturally small
+    and ``claudetrade db fetch-health`` lists exactly the problem names.
+    After three consecutive full-chain failures the symbol is quarantined
+    (``quarantined_until``) and skipped by the expensive per-symbol fetch
+    paths for a week, which is what stops a dead ticker from burning a
+    dataForTicker probe + a yahoo chart call on every single refresh (the
+    owner's "many symbol failures" retry burn). Stored history, universe
+    membership and ``Security.delisted_date`` are all untouched -- this
+    gates *fetching only*, and expiry retries the symbol automatically.
+    """
+
+    __tablename__ = "symbol_fetch_health"
+
+    symbol: Mapped[str] = mapped_column(String(20), primary_key=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    last_failure_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str] = mapped_column(String(300), default="")
+    quarantined_until: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class CorporateActionRow(Base):
     __tablename__ = "corporate_actions"
     __table_args__ = (

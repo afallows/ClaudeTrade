@@ -281,12 +281,16 @@ class TestFlairColumnMigration:
         assert current_version(unmigrated_db) == 3
 
         applied = migrate(unmigrated_db)
-        assert applied == [4]
-        assert current_version(unmigrated_db) == 4
+        # 004 (flair) plus every later additive migration -- currently 005
+        # (symbol_fetch_health); the point under test is that 004 ran.
+        assert applied[0] == 4
+        assert current_version(unmigrated_db) == max(applied)
 
         insp = inspect(unmigrated_db.engine)
         columns = {c["name"] for c in insp.get_columns("social_posts")}
         assert "flair" in columns
+        # The 005 additive table arrived in the same upgrade pass.
+        assert "symbol_fetch_health" in insp.get_table_names()
 
         with unmigrated_db.read_session() as session:
             row = session.execute(

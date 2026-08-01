@@ -21,7 +21,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from claudetrade.config import AppConfig
 from claudetrade.data.quality import DataQualityChecker, QualityReport
@@ -32,6 +32,7 @@ from claudetrade.db.models import (
     Security,
     SocialPostRow,
     SymbolAlias,
+    SymbolFetchHealth,
     TickerMentionRow,
 )
 from claudetrade.db.session import Database
@@ -53,6 +54,20 @@ log = get_logger(__name__)
 #: ``DataIngestor.progress_callback``. Never required to succeed: a raising
 #: callback is caught and logged, never allowed to break ingestion itself.
 ProgressCallback = Callable[[str, int, int], None]
+
+#: Per-symbol fetch quarantine (F23 item 4 -- the "many symbol failures"
+#: retry burn): a symbol whose FULL provider chain (primary + every
+#: fallback) produced zero bars this many refreshes IN A ROW stops being
+#: fetched for ``_QUARANTINE_DAYS``. Deliberately conservative on both
+#: sides: one refresh's outage never quarantines anything (a wholesale
+#: chunk/provider failure is excluded from the per-symbol count -- see
+#: ``_record_fetch_outcomes``), and expiry retries the symbol automatically,
+#: with any success deleting its health row outright. Constants rather than
+#: config: there is no sensible per-install tuning here, and
+#: ``claudetrade db fetch-health --clear`` already covers the manual escape
+#: hatch.
+_QUARANTINE_AFTER_FAILURES = 3
+_QUARANTINE_DAYS = 7
 
 
 @dataclass(slots=True)
@@ -177,7 +192,24 @@ class DataIngestor:
         ``UniverseConfig.unknown_cap_policy`` -- this method only establishes
         and flags, it never filters.
         """
-        symbols = [s.symbol for s in securities]
+        # Quarantined symbols (see ``_quarantined_symbols``) are excluded
+        # from the provider requests: the per-symbol dataForTicker fallback
+        # inside ``get_market_caps`` is exactly the kind of doomed-retry
+        # spend the quarantine exists to stop. They keep any stored cap and
+        # are counted separately below -- NOT flagged ``unknown_market_cap``,
+        # because "we deliberately did not ask" must not masquerade as "no
+        # provider could answer"; their story is told by
+        # ``claudetrade db fetch-health``.
+        quarantined = self._quarantined_symbols()
+        benchmark = self.config.market_data.benchmark_symbol
+        skip = {s.symbol for s in securities} & quarantined - {benchmark}
+        if skip:
+            log.info(
+                "market-cap enrichment: skipped %d quarantined symbol(s) "
+                "(claudetrade db fetch-health)",
+                len(skip),
+            )
+        symbols = [s.symbol for s in securities if s.symbol not in skip]
         resolved: dict[str, float] = {}
         for provider in self._market_cap_sources():
             missing = [s for s in symbols if s not in resolved]
@@ -213,6 +245,9 @@ class DataIngestor:
         #: Genuinely unresolved -- no cap at all, seed or fresh -- and always
         #: flagged below regardless of these counts.
         unresolved_count = 0
+        #: Deliberately not asked about this run (fetch quarantine) -- a
+        #: fourth bucket so the honest-accounting log line stays honest.
+        quarantine_skipped = 0
         for security in securities:
             cap = resolved.get(security.symbol)
             if cap is not None:
@@ -220,6 +255,9 @@ class DataIngestor:
                 resolved_this_run += 1
                 continue
             enriched.append(security)
+            if security.symbol in skip:
+                quarantine_skipped += 1
+                continue
             if security.market_cap_usd is not None:
                 already_had_cap += 1
                 continue
@@ -241,8 +279,9 @@ class DataIngestor:
         # missing either" case that a provider outage produces.
         log.info(
             "market-cap enrichment: resolved %d/%d symbols this run "
-            "(%d already had a cap, %d unresolved and flagged)",
+            "(%d already had a cap, %d unresolved and flagged, %d quarantined and skipped)",
             resolved_this_run, len(securities), already_had_cap, unresolved_count,
+            quarantine_skipped,
         )
         return enriched
 
@@ -410,6 +449,14 @@ class DataIngestor:
     ) -> dict[str, list[Bar]]:
         """Fetch and persist daily bars for a set of symbols.
 
+        Two F23 behaviours live here (both no-ops in their default-off
+        conditions): symbols under fetch quarantine are skipped (see
+        ``_quarantined_symbols``/``_record_fetch_outcomes``), and when the
+        primary provider is bulk-by-date (``PolygonProvider.bulk_daily``)
+        the fetch window is narrowed to the sessions the database is
+        actually missing, so a normal daily refresh is one or two grouped
+        calls instead of a whole re-download.
+
         Args:
             securities: Reference data used to clip each symbol's expected date
                 range to its listing window, so newly-listed and delisted names
@@ -433,17 +480,75 @@ class DataIngestor:
         benchmark = self.config.market_data.benchmark_symbol
         symbols = list(dict.fromkeys([*symbols, benchmark]))
 
+        # Fetch quarantine (F23 item 4): symbols whose full provider chain
+        # has failed _QUARANTINE_AFTER_FAILURES refreshes running are not
+        # fetched at all this run. The benchmark is exempt unconditionally
+        # -- regime classification depends on it, so it always gets its
+        # attempt (and its dedicated retry below) no matter what its health
+        # row says. Stored history/universe membership are untouched: this
+        # gates fetching only.
+        quarantined = self._quarantined_symbols()
+        fetch_symbols = [s for s in symbols if s == benchmark or s not in quarantined]
+        skipped_count = len(symbols) - len(fetch_symbols)
+        if skipped_count:
+            log.info(
+                "skipped %d quarantined symbol(s) with repeated full-chain fetch "
+                "failures (claudetrade db fetch-health)",
+                skipped_count,
+            )
+
+        # Window narrowing (F23 item 3): when the configured PRIMARY provider
+        # fetches by DATE rather than by symbol (``bulk_daily = True`` --
+        # currently PolygonProvider), re-requesting sessions the database
+        # already stores just re-downloads the whole market for each of them.
+        # Narrow to the sessions actually missing -- with one deliberate
+        # deviation from "latest stored + 1": the LATEST stored session
+        # itself is always re-fetched. Its stored bars may be provisional (an
+        # intraday GetQuotes current-session merge, persisted by an earlier
+        # run today -- see ``_merge_current_session_bars``), and skipping
+        # past it would freeze that partial bar as the permanent record; the
+        # provider's per-date response cache makes the repair pass free
+        # whenever that date was already grouped-fetched once. Full window
+        # stays when no bulk provider is primary (per-symbol providers pay
+        # per symbol, not per date -- narrowing would only shrink coverage
+        # repair, not save calls) or when the DB has no bars at all.
+        effective_start = start
+        bulk = self._bulk_primary_provider()
+        if bulk is not None:
+            latest = self._latest_stored_bar_session()
+            # Only a "bring me current" window is narrowed (start < latest
+            # <= end). A window ending BEFORE the latest stored session is an
+            # explicit historical request -- the operator wants those exact
+            # dates, and "the DB has newer bars" says nothing about whether
+            # it has THOSE; the per-date cache keeps honouring it cheap.
+            if latest is not None and start < latest <= end:
+                effective_start = latest
+                log.info(
+                    "bulk-daily provider %s is primary: narrowed the price fetch window "
+                    "%s..%s -> %s..%s (DB already has bars through %s; the latest stored "
+                    "session is re-fetched so a provisional current-session bar gets "
+                    "repaired)",
+                    getattr(bulk, "name", "?"), start, end, effective_start, end, latest,
+                )
+
         batch_size = max(1, self.config.market_data.max_symbols_per_request)
         collected: dict[str, list[Bar]] = {}
-        total = len(symbols)
+        #: Symbols whose whole chunk failed with a ProviderError -- an outage
+        #: signal, never counted as a per-symbol failure (see
+        #: ``_record_fetch_outcomes``).
+        chain_failed: set[str] = set()
+        attempted: list[str] = []
+        total = len(fetch_symbols)
         self._report_progress("prices", 0, total)
         for i in range(0, total, batch_size):
-            chunk = symbols[i : i + batch_size]
+            chunk = fetch_symbols[i : i + batch_size]
+            attempted.extend(chunk)
             try:
-                fetched = self.market.get_daily_bars(chunk, start, end)
+                fetched = self.market.get_daily_bars(chunk, effective_start, end)
             except ProviderError as exc:
                 log.error("market provider failed for %d symbols: %s", len(chunk), exc)
                 report.provider_failures[getattr(self.market, "name", "market")] = str(exc)
+                chain_failed.update(chunk)
                 self._report_progress("prices", min(i + batch_size, total), total)
                 continue
             collected.update(fetched)
@@ -454,14 +559,17 @@ class DataIngestor:
         # real refresh log showed 641/1,673 symbols (SPY included) degrade to
         # close-only fallback bars because one batch's failure cascaded the
         # whole chunk to the fallback provider. This dedicated, independent,
-        # single-symbol call is the actual guarantee.
-        self._ensure_benchmark_bars(benchmark, start, end, collected, report)
+        # single-symbol call is the actual guarantee. It uses the same
+        # effective (possibly narrowed) window as the batches: with a bulk
+        # primary, a full-window benchmark fetch would pay one grouped call
+        # per already-stored date for nothing.
+        self._ensure_benchmark_bars(benchmark, effective_start, end, collected, report)
 
-        self._merge_current_session_bars(symbols, collected)
+        self._merge_current_session_bars(fetch_symbols, collected)
 
         self.checker.check_provider_gap(
             getattr(self.market, "name", "market"),
-            expected=len(symbols),
+            expected=len(attempted),
             received=sum(1 for v in collected.values() if v),
             report=report.quality,
         )
@@ -474,7 +582,11 @@ class DataIngestor:
             self.checker.check_bars(
                 symbol,
                 bars,
-                expected_start=start,
+                # The narrowed window, not the requested one: sessions before
+                # effective_start were deliberately not fetched this run, and
+                # flagging them missing would report the narrowing itself as
+                # a data defect.
+                expected_start=effective_start,
                 expected_end=end,
                 listed_date=info.listed_date if info else None,
                 delisted_date=info.delisted_date if info else None,
@@ -483,10 +595,166 @@ class DataIngestor:
             self.checker.check_staleness(symbol, bars, end, report=report.quality)
             self._persist_bars(symbol, bars, report)
 
-        self._deactivate_confirmed_unknown(symbols, report)
+        self._record_fetch_outcomes(
+            attempted=attempted, chain_failed=chain_failed, collected=collected, report=report
+        )
+        self._deactivate_confirmed_unknown(fetch_symbols, report)
 
         self.checker.persist(report.quality)
         return collected
+
+    # --- fetch health / quarantine (F23 item 4) -----------------------------
+
+    def _quarantined_symbols(self) -> set[str]:
+        """Symbols currently under fetch quarantine (``quarantined_until`` in
+        the future). Defensive throughout: no database, a missing table (an
+        un-migrated store), or any read error just means an empty set -- the
+        quarantine is an optimisation and must never be able to fail a
+        refresh."""
+        if self.db is None:
+            return set()
+        now = utc_now()
+        try:
+            with self.db.read_session() as session:
+                rows = session.execute(
+                    select(SymbolFetchHealth.symbol, SymbolFetchHealth.quarantined_until)
+                ).all()
+        except Exception:
+            log.debug("could not read symbol_fetch_health; no quarantine applied", exc_info=True)
+            return set()
+        out: set[str] = set()
+        for symbol, until in rows:
+            if until is None:
+                continue
+            if until.tzinfo is None:
+                # SQLite hands DateTime(timezone=True) back naive; every
+                # write goes through utc_now(), so re-attaching UTC
+                # reproduces the stored instant (same convention as the
+                # signals ledger's read path).
+                until = until.replace(tzinfo=dt.UTC)
+            if until > now:
+                out.add(symbol)
+        return out
+
+    def _record_fetch_outcomes(
+        self,
+        *,
+        attempted: list[str],
+        chain_failed: set[str],
+        collected: dict[str, list[Bar]],
+        report: IngestReport,
+    ) -> None:
+        """Update ``symbol_fetch_health`` from this refresh's bar outcomes.
+
+        Success (any bars, from any provider in the chain or the GetQuotes
+        current-session merge) DELETES the symbol's health row -- the table
+        only ever holds currently-failing names, which keeps both this
+        method's full-table read and ``claudetrade db fetch-health``'s
+        listing trivially small. Failure means the symbol was attempted
+        through the whole chain and yielded nothing; a wholesale chunk
+        failure (``chain_failed`` -- one ProviderError covering many
+        symbols) is an outage signal and deliberately counts for nobody,
+        otherwise three bad refreshes would quarantine the entire universe.
+        One short transaction over a handful of rows -- never held across
+        any network fetch.
+        """
+        if self.db is None:
+            return
+        succeeded = {s for s, bars in collected.items() if bars}
+        failed = [s for s in attempted if s not in succeeded and s not in chain_failed]
+        if not succeeded and not failed:
+            return
+        now = utc_now()
+        newly_quarantined: list[str] = []
+        try:
+            with self.db.session() as session:
+                rows = {
+                    r.symbol: r
+                    for r in session.execute(select(SymbolFetchHealth)).scalars()
+                }
+                for symbol in succeeded:
+                    row = rows.get(symbol)
+                    if row is not None:
+                        session.delete(row)
+                for symbol in failed:
+                    row = rows.get(symbol)
+                    if row is None:
+                        row = SymbolFetchHealth(symbol=symbol, consecutive_failures=0)
+                        session.add(row)
+                        rows[symbol] = row
+                    row.consecutive_failures += 1
+                    row.last_failure_at = now
+                    row.last_error = (
+                        "no bars from any configured market-data provider this refresh"
+                    )
+                    row.updated_at = now
+                    if row.consecutive_failures >= _QUARANTINE_AFTER_FAILURES:
+                        previously = row.quarantined_until
+                        if previously is not None and previously.tzinfo is None:
+                            previously = previously.replace(tzinfo=dt.UTC)
+                        row.quarantined_until = now + dt.timedelta(days=_QUARANTINE_DAYS)
+                        if previously is None or previously <= now:
+                            newly_quarantined.append(symbol)
+        except Exception:
+            log.debug("could not update symbol_fetch_health; skipping", exc_info=True)
+            return
+
+        if failed:
+            log.info(
+                "fetch health: %d symbol(s) failed the full provider chain this refresh, "
+                "%d newly quarantined for %d days (claudetrade db fetch-health)",
+                len(failed), len(newly_quarantined), _QUARANTINE_DAYS,
+            )
+        if newly_quarantined:
+            shown = ", ".join(sorted(newly_quarantined)[:20])
+            more = len(newly_quarantined) - min(len(newly_quarantined), 20)
+            report.quality.add(
+                DataQualitySeverity.WARNING,
+                "symbol_quarantined",
+                f"{len(newly_quarantined)} symbol(s) quarantined for {_QUARANTINE_DAYS} days "
+                f"after {_QUARANTINE_AFTER_FAILURES} consecutive refreshes with no bars from "
+                f"any configured provider: {shown}"
+                + (f" (+{more} more)" if more else "")
+                + ". Inspect or clear with 'claudetrade db fetch-health'.",
+            )
+
+    def _bulk_primary_provider(self) -> object | None:
+        """The configured PRIMARY provider iff it declares bulk-by-date
+        semantics (``bulk_daily = True``) and is actually configured.
+
+        Reaches through a ``FallbackMarketProvider``-shaped wrapper's
+        ``.primary`` the same duck-typed way ``_market_cap_sources`` does.
+        Fallback positions deliberately do not count: narrowing only pays
+        off when the provider doing the heavy lifting is per-date, and an
+        unconfigured bulk primary means the per-symbol fallbacks are doing
+        the work -- narrowing their window would shrink coverage repair
+        without saving a single call.
+        """
+        if self.market is None:
+            return None
+        primary = getattr(self.market, "primary", None) or self.market
+        if not getattr(primary, "bulk_daily", False):
+            return None
+        try:
+            status = primary.status()
+        except Exception:
+            log.debug("bulk provider status() raised; treating as unconfigured", exc_info=True)
+            return None
+        return primary if getattr(status, "configured", False) else None
+
+    def _latest_stored_bar_session(self) -> dt.date | None:
+        """Most recent session with ANY stored price bar, across all symbols
+        and sources -- the right key for per-DATE narrowing (a grouped call
+        covers every symbol at once, so per-symbol gaps older than this are
+        ``claudetrade db backfill``'s job, not the daily refresh's)."""
+        if self.db is None:
+            return None
+        try:
+            with self.db.read_session() as session:
+                return session.execute(select(func.max(PriceBar.session))).scalar()
+        except Exception:
+            log.debug("could not read latest stored bar session", exc_info=True)
+            return None
 
     def _ensure_benchmark_bars(
         self,

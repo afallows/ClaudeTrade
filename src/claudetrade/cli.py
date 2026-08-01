@@ -1157,6 +1157,344 @@ def db_rebuild_sentiment(
     )
 
 
+@db_app.command("backfill")
+def db_backfill(
+    config: ConfigOption = None,
+    years: Annotated[
+        int, typer.Option(help="Years of history to backfill (ignored when --start is given).")
+    ] = 2,
+    start: Annotated[str | None, typer.Option(help="ISO start date (overrides --years).")] = None,
+    end: Annotated[
+        str | None, typer.Option(help="ISO end date; defaults to the current trading session.")
+    ] = None,
+    force: Annotated[
+        bool, typer.Option(help="Re-fetch and replace dates that already have stored bars.")
+    ] = False,
+) -> None:
+    """One-time historical price backfill via Polygon.io grouped-daily bars.
+
+    QA handoff v3 F23: the scanner gates on 60 sessions of price history, but
+    a fresh install's refresh only ever adds ~1 real session per day -- so
+    without a backfill the scanner rejects the whole universe with
+    ``insufficient_history`` for weeks. This walks trading dates NEWEST ->
+    OLDEST (the scanner becomes useful as soon as the most recent ~60
+    sessions land, long before the full range finishes), fetching each
+    date's ENTIRE US market in one grouped call and persisting the
+    universe's symbols with source tag ``polygon_grouped``.
+
+    Safe to Ctrl-C and re-run: every date commits in its own short
+    transaction (no long transaction is ever held -- deliberate, see the
+    contention work elsewhere in this codebase), already-covered dates (any
+    stored bars for that session) are skipped on resume, and the provider's
+    per-date response cache makes a re-fetched date free. ``--force``
+    re-fetches covered dates and replaces those symbols' rows in place --
+    scoped to symbols Polygon actually returned, so e.g. TSX bars sourced
+    from the tipranks/yahoo cascade are never destroyed by a force pass.
+
+    Free-tier pacing (~5 calls/min) means ~2 years is roughly 500 calls,
+    about 1.7 hours; the progress line's ETA accounts for it.
+    """
+    cfg = _load(config)
+    import time as _time
+
+    from sqlalchemy import select
+
+    from claudetrade.data.universe import load_packaged_universe
+    from claudetrade.db.migrations import init_database
+    from claudetrade.db.models import PriceBar, Security
+    from claudetrade.db.session import get_database
+    from claudetrade.providers.base import ProviderError, RateLimitError
+    from claudetrade.providers.market.polygon import PolygonProvider
+    from claudetrade.utils.timeutils import trading_day_range
+
+    provider = PolygonProvider(config=cfg.polygon, cache_dir=cfg.paths.resolve("cache_dir"))
+    status = provider.status()
+    if not status.configured:
+        typer.secho(f"polygon is {status.message}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    end_date = _parse_date(end, current_trading_session())
+    start_date = _parse_date(start, end_date - dt.timedelta(days=round(years * 365.25)))
+    if start_date > end_date:
+        raise typer.BadParameter(f"--start {start_date} is after --end {end_date}")
+
+    db = get_database(cfg)
+    init_database(db)
+
+    # Persist only the names the scanner can ever use -- the grouped response
+    # is the ENTIRE US market (~10k rows/day) and storing all of it would
+    # triple the database for symbols nothing reads. Stored securities
+    # (delisted included -- survivorship-unbiased backtests need them), or the
+    # packaged seed universes before the first refresh, plus the benchmark and
+    # sector ETFs the regime/relative-strength features read.
+    with db.read_session() as session:
+        target_symbols = set(session.execute(select(Security.symbol)).scalars())
+    if not target_symbols:
+        target_symbols = {s.symbol for s in load_packaged_universe()}
+    target_symbols.add(cfg.market_data.benchmark_symbol)
+    target_symbols.update(cfg.market_data.sector_etfs.values())
+    targets = sorted(target_symbols)
+
+    dates = list(reversed(trading_day_range(start_date, end_date)))  # newest -> oldest
+    if force:
+        covered: set[dt.date] = set()
+    else:
+        with db.read_session() as session:
+            covered = set(
+                session.execute(
+                    select(PriceBar.session)
+                    .where(PriceBar.session >= start_date, PriceBar.session <= end_date)
+                    .distinct()
+                ).scalars()
+            )
+
+    rate = max(1, cfg.polygon.rate_limit_per_minute)
+    source_tag = "polygon_grouped"
+    calls_before = status.calls_made
+    fetched_dates = 0
+    cache_hits = 0
+    skipped = 0
+    error_dates = 0
+    consecutive_errors = 0
+    bars_written = 0
+    symbols_covered: set[str] = set()
+
+    typer.echo(
+        f"backfilling {len(dates)} trading date(s) {start_date}..{end_date} "
+        f"(newest first) for {len(targets)} symbol(s); "
+        f"{len(covered)} date(s) already covered will be skipped"
+    )
+
+    def _persist_date(date: dt.date, bars_by_symbol: dict) -> int:
+        """One date -> one short transaction. Returns rows written/updated."""
+        written = 0
+        with db.session() as session:
+            existing_rows: dict[str, list[PriceBar]] = {}
+            if force:
+                # Replace in place, scoped to symbols Polygon returned --
+                # never touches rows for symbols it has no data for.
+                for row in session.execute(
+                    select(PriceBar).where(PriceBar.session == date)
+                ).scalars():
+                    if row.symbol in bars_by_symbol:
+                        existing_rows.setdefault(row.symbol, []).append(row)
+            for symbol, bar in bars_by_symbol.items():
+                rows = existing_rows.get(symbol, [])
+                if rows:
+                    keep = rows[0]
+                    keep.open, keep.high, keep.low, keep.close = (
+                        bar.open, bar.high, bar.low, bar.close,
+                    )
+                    keep.adj_close = bar.adj_close
+                    keep.volume = bar.volume
+                    keep.source = source_tag
+                    keep.ingested_at = utc_now()
+                    # A second row for the same (symbol, session) from another
+                    # source would double-count in the context builder's bar
+                    # series -- collapse to one.
+                    for extra in rows[1:]:
+                        session.delete(extra)
+                else:
+                    session.add(
+                        PriceBar(
+                            symbol=symbol,
+                            session=date,
+                            open=bar.open,
+                            high=bar.high,
+                            low=bar.low,
+                            close=bar.close,
+                            adj_close=bar.adj_close,
+                            volume=bar.volume,
+                            source=source_tag,
+                        )
+                    )
+                written += 1
+            return written
+
+    try:
+        for index, date in enumerate(dates, start=1):
+            if date in covered:
+                skipped += 1
+            else:
+                calls_seen = provider.status().calls_made
+                try:
+                    bars_by_symbol = provider.grouped_daily_bars(
+                        targets, date, bypass_cache=force
+                    )
+                except RateLimitError as exc:
+                    # Honour the server's backoff once, then retry this date;
+                    # a second 429 aborts cleanly (resume later).
+                    wait = min(exc.retry_after_s, 120.0)
+                    typer.secho(
+                        f"{date}: rate limited; waiting {wait:.0f}s before retrying",
+                        fg=typer.colors.YELLOW,
+                    )
+                    _time.sleep(wait)
+                    bars_by_symbol = provider.grouped_daily_bars(
+                        targets, date, bypass_cache=force
+                    )
+                except ProviderError as exc:
+                    error_dates += 1
+                    consecutive_errors += 1
+                    typer.secho(f"{date}: {exc}", fg=typer.colors.YELLOW)
+                    if consecutive_errors >= 5:
+                        typer.secho(
+                            "5 consecutive date failures -- stopping; progress so far is "
+                            "committed, re-run to resume from where this left off.",
+                            fg=typer.colors.RED,
+                        )
+                        raise typer.Exit(1) from exc
+                    continue
+                consecutive_errors = 0
+                if provider.status().calls_made > calls_seen:
+                    fetched_dates += 1
+                else:
+                    cache_hits += 1
+                if bars_by_symbol:
+                    bars_written += _persist_date(date, bars_by_symbol)
+                    symbols_covered.update(bars_by_symbol)
+                else:
+                    typer.secho(
+                        f"{date}: polygon returned no data (EOD not yet published, or an "
+                        "unmodelled closure); will retry on a future run",
+                        fg=typer.colors.YELLOW,
+                    )
+
+            if index % 5 == 0 or index == len(dates):
+                remaining_fetch = sum(
+                    1 for d in dates[index:] if force or d not in covered
+                )
+                eta_min = remaining_fetch * (60.0 / rate) / 60.0
+                typer.echo(
+                    f"  {index}/{len(dates)} dates | {fetched_dates} fetched, "
+                    f"{cache_hits} cache hits, {skipped} already covered | "
+                    f"{bars_written} bars written | ETA <= {eta_min:.0f} min"
+                )
+    except KeyboardInterrupt:
+        typer.secho(
+            "\ninterrupted -- every completed date is already committed; re-run "
+            "'claudetrade db backfill' to resume (covered dates are skipped).",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(130) from None
+
+    _echo_json(
+        {
+            "dates_processed": len(dates),
+            "dates_fetched": fetched_dates,
+            "dates_from_cache": cache_hits,
+            "dates_skipped_covered": skipped,
+            "dates_errored": error_dates,
+            "http_calls": provider.status().calls_made - calls_before,
+            "bars_written": bars_written,
+            "symbols_covered": len(symbols_covered),
+        }
+    )
+    typer.secho(
+        f"Backfill complete: {bars_written} bars across {len(symbols_covered)} symbols "
+        f"({fetched_dates} dates fetched, {cache_hits} from cache, {skipped} already "
+        "covered). Run 'claudetrade scan' -- the strategies need ~60 sessions of "
+        "history, which this has now provided.",
+        fg=typer.colors.GREEN,
+    )
+
+
+@db_app.command("fetch-health")
+def db_fetch_health(
+    config: ConfigOption = None,
+    clear: Annotated[
+        str | None, typer.Option("--clear", help="Clear one symbol's failure/quarantine record.")
+    ] = None,
+    clear_all: Annotated[
+        bool, typer.Option("--clear-all", help="Clear every failure/quarantine record.")
+    ] = False,
+) -> None:
+    """List (or clear) symbols the refresh has quarantined for repeated
+    full-provider-chain fetch failures.
+
+    A row exists only while a symbol is failing (success deletes it -- see
+    ``db.models.SymbolFetchHealth``); after 3 consecutive refreshes with no
+    bars from any configured provider the symbol is skipped for 7 days
+    rather than burning doomed per-symbol calls every refresh. Clearing a
+    record makes the next refresh try the symbol again immediately.
+    """
+    cfg = _load(config)
+    from sqlalchemy import delete, select
+
+    from claudetrade.db.migrations import init_database
+    from claudetrade.db.models import SymbolFetchHealth
+    from claudetrade.db.session import get_database
+
+    db = get_database(cfg)
+    init_database(db)
+
+    if clear is not None and clear_all:
+        raise typer.BadParameter("use either --clear SYMBOL or --clear-all, not both")
+
+    if clear is not None:
+        symbol = clear.strip().upper()
+        with db.session() as session:
+            removed = session.execute(
+                delete(SymbolFetchHealth).where(SymbolFetchHealth.symbol == symbol)
+            ).rowcount
+        if removed:
+            typer.secho(
+                f"cleared {symbol}; the next refresh will fetch it again.",
+                fg=typer.colors.GREEN,
+            )
+        else:
+            typer.secho(f"no fetch-health record for {symbol}.", fg=typer.colors.YELLOW)
+        return
+
+    if clear_all:
+        with db.session() as session:
+            removed = session.execute(delete(SymbolFetchHealth)).rowcount
+        typer.secho(f"cleared {removed} fetch-health record(s).", fg=typer.colors.GREEN)
+        return
+
+    with db.read_session() as session:
+        rows = (
+            session.execute(
+                select(SymbolFetchHealth).order_by(
+                    SymbolFetchHealth.consecutive_failures.desc(), SymbolFetchHealth.symbol
+                )
+            )
+            .scalars()
+            .all()
+        )
+    if not rows:
+        typer.secho(
+            "No failing symbols -- every recently-refreshed symbol got bars from at "
+            "least one provider.",
+            fg=typer.colors.GREEN,
+        )
+        return
+
+    now = utc_now()
+
+    def _aware(value: dt.datetime | None) -> dt.datetime | None:
+        # SQLite returns naive datetimes; writes always went through UTC.
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=dt.UTC)
+        return value
+
+    quarantined = 0
+    typer.echo(f"{'SYMBOL':<10} {'FAILS':>5}  {'QUARANTINED UNTIL':<20} LAST ERROR")
+    for row in rows:
+        until = _aware(row.quarantined_until)
+        active = until is not None and until > now
+        quarantined += 1 if active else 0
+        until_text = until.date().isoformat() if active else "-"
+        typer.echo(
+            f"{row.symbol:<10} {row.consecutive_failures:>5}  {until_text:<20} "
+            f"{row.last_error[:70]}"
+        )
+    typer.echo(
+        f"\n{len(rows)} failing symbol(s), {quarantined} currently quarantined. "
+        "Clear one with --clear SYMBOL, or all with --clear-all."
+    )
+
+
 @db_app.command("restore")
 def db_restore(
     backup: Annotated[Path, typer.Argument(help="Backup file to restore.")],

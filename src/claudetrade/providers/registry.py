@@ -27,6 +27,7 @@ from claudetrade.providers.base import (
 from claudetrade.providers.earnings.csv_provider import CSVEarningsProvider
 from claudetrade.providers.earnings.synthetic import SyntheticEarningsProvider
 from claudetrade.providers.market.csv_provider import CSVMarketProvider
+from claudetrade.providers.market.polygon import PolygonProvider
 from claudetrade.providers.market.stooq import StooqMarketProvider
 from claudetrade.providers.market.synthetic import SyntheticMarketProvider
 from claudetrade.providers.market.tipranks import TipRanksProvider
@@ -54,6 +55,15 @@ _MARKET_PROVIDERS: dict[str, type[MarketDataProvider]] = {
     # FallbackMarketProvider.get_daily_bars for the cascade mechanism this
     # relies on.
     "tipranks": TipRanksProvider,
+    # Whole-US-market grouped-daily EOD bars, ONE call per trading date (QA
+    # handoff v3 F23). BARS ONLY (``bulk_daily = True`` -- see
+    # ``data.ingest.DataIngestor.ingest_prices``'s window narrowing);
+    # reference data/caps stay with tipranks via the cascade. Enabled-by-key:
+    # unconfigured it raises ``NotConfiguredError`` from every bars call,
+    # which ``FallbackMarketProvider`` degrades past cleanly. Recommended
+    # keyed config: provider = "polygon",
+    # fallbacks = ["tipranks", "yahoo", "csv"] -- see docs/api-providers.md.
+    "polygon": PolygonProvider,
 }
 
 #: Earnings adapters. Add new providers here.
@@ -313,6 +323,11 @@ def _instantiate_market_provider(
             config=config.tipranks,
             cache_dir=config.paths.resolve("cache_dir"),
             max_workers=config.market_data.max_workers,
+        )
+    if name == "polygon":
+        return provider_class(  # type: ignore[call-arg]
+            config=config.polygon,
+            cache_dir=config.paths.resolve("cache_dir"),
         )
     # stooq, yahoo, synthetic all take the shared MarketDataConfig.
     return provider_class(config=config.market_data)  # type: ignore[call-arg]

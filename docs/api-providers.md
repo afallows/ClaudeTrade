@@ -56,6 +56,139 @@ anthropic_api_key = "sk-ant-..."
 
 ## Market Data Providers
 
+### Polygon.io (RECOMMENDED primary for bars, Online, free tier)
+
+**Module**: `src/claudetrade/providers/market/polygon.py`
+
+**The entire US equity market's OHLCV in ONE request per trading date.**
+
+```
+GET https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{YYYY-MM-DD}?adjusted=true&apiKey=KEY
+```
+
+This inverts the cost model of every other bars source here. TipRanks and
+Yahoo pay one HTTP call *per symbol*, so a ~2,400-symbol universe refresh is
+thousands of calls -- which is why the owner's refresh took 5-10 minutes to
+reach ~33% with many symbol failures, and why the database only ever gained
+one session of history per day. Polygon pays one call *per date* regardless
+of universe size: a daily refresh is one grouped call, and a two-year
+historical backfill is about 500.
+
+That history is the point. The strategies hard-veto a symbol with fewer than
+60 price bars (`strategies/base.py`, `min_history_bars`) and the context
+builder needs 30+, so with only a few sessions stored a scan rejects the
+whole universe with `insufficient_history` -- 2,355 symbols evaluated,
+11,775 rejections, 100% of them for that one reason. At one session per day
+the scanner stays dead for weeks. `claudetrade db backfill` fixes that in
+one pass.
+
+**Recommended configuration** (once you have a key):
+
+```toml
+[market_data]
+provider = "polygon"                          # bars: one grouped call per date
+fallbacks = ["tipranks", "yahoo", "csv"]      # refdata/caps/earnings + per-symbol bar gaps
+
+[polygon]
+rate_limit_per_minute = 5                     # free tier; raise to match a paid plan
+```
+
+The default shipped config keeps `provider = "tipranks"` so a zero-key
+install works out of the box. Switching the primary to `polygon` is safe
+*before* you have a key: with no key resolvable the adapter reports itself
+unconfigured and every bars call degrades straight to the fallbacks.
+
+**Credentials** -- create a free key at polygon.io, then any one of:
+
+```bash
+# 1. The plain environment variable every Polygon client library documents
+export POLYGON_API_KEY="..."
+
+# 2. The OS credential store (recommended for a desktop install)
+claudetrade secrets set polygon_api_key
+# or: export CLAUDETRADE_SECRET_POLYGON_API_KEY="..."
+
+# 3. config.toml -- supported, but discouraged (that file is meant to be shareable)
+#    [polygon]
+#    api_key = "..."
+```
+
+They are checked in that order. A value in `config.toml` is redacted from
+`AppConfig.public_dict()`, so it never reaches the config hash, the logs, or
+persisted run metadata.
+
+**One-time historical backfill** (the F23 fix):
+
+```bash
+claudetrade db backfill --years 2
+claudetrade scan
+```
+
+Walks trading dates **newest first**, so the scanner becomes useful as soon
+as the most recent ~60 sessions land, long before the full range finishes.
+Roughly 252 calls per year (~500 for two years); at the free tier's ~5
+calls/minute that is about 1.7 hours for two years, and the progress line
+prints an ETA that accounts for the pacing. Safe to Ctrl-C: every date
+commits in its own short transaction, and a re-run skips dates that already
+have stored bars, so it resumes where it left off. `--force` re-fetches
+covered dates and replaces those rows in place (scoped to symbols Polygon
+actually returned, so TSX bars sourced from the cascade are never
+destroyed). Bars are stored with source tag `polygon_grouped`.
+
+**Free tier**: ~5 requests/minute, end-of-day (delayed) data. Both are fine
+for a session-based swing scanner that refreshes after the close. The
+adapter paces itself with the shared `RateLimiter` and honours a 429's
+`Retry-After` rather than looping.
+
+**Per-date response cache** (`<cache_dir>/polygon/`, one JSON file per date):
+a cache hit costs zero HTTP calls. Historical grouped responses are
+immutable, so there is no TTL -- with two exceptions that keep recent dates
+honest: an empty response is never cached (for today it just means EOD data
+has not landed yet), and the current session is only cached once it has
+closed and settled (an intraday grouped row is a partial-day aggregate).
+This is what makes a chunked refresh cheap (the first chunk fetches each
+date, later chunks hit the cache) and a backfill re-run free.
+
+**Refresh window narrowing**: because this provider declares `bulk_daily`,
+`data/ingest.py` narrows a refresh's fetch window to the sessions the
+database is actually missing (re-fetching the latest stored session, so a
+provisional current-session bar gets repaired). The full window is kept when
+no bulk provider is primary, when the bulk primary is unconfigured, or when
+the database has no bars at all.
+
+**Bars source only.** Reference data, market caps and earnings still come
+from TipRanks through the cascade: `get_security_info` deliberately returns
+nameless stubs (which `FallbackMarketProvider` treats as unfilled),
+`get_market_caps` is not supported, and `get_corporate_actions` returns an
+honest empty result. `list_universe` serves the packaged seed universes,
+same as stooq/yahoo.
+
+**Symbol mapping**: US share classes use Polygon's dot notation
+(`BRK-B` -> `BRK.B`), via the same deliberately narrow single-trailing-letter
+rule TipRanks uses; nothing else is rewritten. Canadian (TSX/TSXV) listings
+are simply not in a `locale=us` grouped response -- they come back with no
+bars and the cascade fills them from TipRanks/Yahoo, per symbol.
+
+**Limitations**:
+
+- US equities only (`locale/us/market/stocks`). TSX names never appear.
+- `adjusted=true` returns a split-adjusted OHLC series; there is no separate
+  raw + dividend-adjusted pair on this endpoint, so `Bar.adj_close` is left
+  `None` and `effective_adj_close` falls back to the close.
+- Free tier is end-of-day delayed -- today's bar lands after the close.
+- No intraday bars, market caps, corporate actions, or live reference data
+  in this adapter.
+- This sandbox cannot reach `api.polygon.io` to verify any of the above live
+  (egress policy answers 403); every behaviour is exercised against
+  shape-faithful fixtures transcribed from Polygon's published response
+  schema over a mocked transport (`tests/test_polygon_provider.py`,
+  `tests/fixtures/polygon/`), never fabricated data.
+
+**Licence**: An official, published, contracted REST API -- unlike the
+unauthenticated TipRanks/Yahoo endpoints. Free tier is for personal and
+research use per polygon.io's own terms of service; check those terms before
+any commercial or redistributive use.
+
 ### Synthetic (Default, Offline)
 
 **Module**: `src/claudetrade/providers/market/synthetic.py`
@@ -1872,6 +2005,45 @@ provider = "anthropic"
 ```
 
 Cost estimate: Reddit API is free; X API is ~$200–500/month (depending on tier); Anthropic is ~$0.01–0.05 per signal (depends on post volume).
+
+### RECOMMENDED: fast refreshes and real price history (free)
+
+The single highest-value change for anyone running this on real data. It
+costs one free API key and one overnight backfill, and it is what turns a
+scanner that rejects every symbol for `insufficient_history` into a working
+one.
+
+```toml
+[market_data]
+provider = "polygon"                        # bars: ONE grouped call per trading date
+fallbacks = ["tipranks", "yahoo", "csv"]    # refdata, caps, earnings, per-symbol gaps
+
+[earnings]
+provider = "tipranks"
+
+[polygon]
+rate_limit_per_minute = 5                   # free tier; raise to match a paid plan
+```
+
+```bash
+# 1. Free key from polygon.io, stored in the OS credential store
+claudetrade secrets set polygon_api_key      # or: export POLYGON_API_KEY="..."
+
+# 2. One-time history load: ~500 calls, ~1.7 hours at the free tier's 5/min.
+#    Newest-first, so the scanner works long before it finishes; Ctrl-C safe.
+claudetrade db backfill --years 2
+
+# 3. From here on, a daily refresh is ONE grouped call
+claudetrade refresh
+claudetrade scan
+```
+
+Cost estimate: free. The Polygon free tier's EOD delay and 5 calls/minute
+are both fine for a session-based scanner that refreshes after the close.
+See [Polygon.io](#polygonio-recommended-primary-for-bars-online-free-tier)
+for the full details, and `claudetrade db fetch-health` for the per-symbol
+fetch quarantine that keeps dead tickers from burning calls on every
+refresh.
 
 ---
 

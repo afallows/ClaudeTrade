@@ -1,0 +1,16 @@
+{
+  "_fixture_note": "Grouped-daily response for GET /v2/aggs/grouped/locale/us/market/stocks/2026-07-29?adjusted=true, transcribed from Polygon.io's published response schema (this sandbox has no egress, so it is NOT a captured live body; field names/shape follow the documented format exactly: T ticker, o/h/l/c OHLC, v volume, vw vwap, t epoch-millis, n trade count). Deliberately includes: BRK.B (Polygon's dot share-class notation for this codebase's BRK-B), ZZZC (a ticker no test requests, proving response filtering), and one malformed row (null OHLC) that the parser must skip without failing the date. A real response carries ~10k rows; a truncated but shape-faithful subset keeps the test honest without megabytes of fixture.",
+  "queryCount": 10702,
+  "resultsCount": 6,
+  "adjusted": true,
+  "results": [
+    {"T": "AAPL", "v": 70790813, "vw": 231.6292, "o": 230.47, "c": 231.15, "h": 233.41, "l": 229.89, "t": 1785441600000, "n": 645365},
+    {"T": "INTC", "v": 41927034, "vw": 33.4821, "o": 33.1, "c": 33.62, "h": 33.9, "l": 32.95, "t": 1785441600000, "n": 214553},
+    {"T": "SPY", "v": 61254900, "vw": 637.114, "o": 636.2, "c": 638.05, "h": 639.4, "l": 634.87, "t": 1785441600000, "n": 512331},
+    {"T": "BRK.B", "v": 3182240, "vw": 476.902, "o": 475.1, "c": 477.83, "h": 479.2, "l": 474.66, "t": 1785441600000, "n": 88214},
+    {"T": "ZZZC", "v": 120400, "vw": 9.981, "o": 9.9, "c": 10.02, "h": 10.11, "l": 9.85, "t": 1785441600000, "n": 1811},
+    {"T": "BROKEN", "v": 5000, "vw": null, "o": null, "c": null, "h": null, "l": null, "t": 1785441600000, "n": 12}
+  ],
+  "status": "OK",
+  "request_id": "6a7e466449b19c4a4e11e0b7a26f0347"
+}

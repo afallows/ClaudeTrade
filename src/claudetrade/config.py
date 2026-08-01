@@ -319,6 +319,45 @@ class TipRanksConfig(BaseModel):
     getquotes_batch_size: int = 200
 
 
+class PolygonConfig(BaseModel):
+    """Polygon.io grouped-daily EOD bars (QA handoff v3 F23 fix).
+
+    One HTTP call returns the ENTIRE US equity market's OHLCV for a trading
+    date, which inverts the per-symbol cost model that made whole-universe
+    refreshes take minutes and left the scanner starved of history -- see
+    ``providers.market.polygon.PolygonProvider``. Recommended primary for an
+    operator willing to create a (free) API key:
+
+        [market_data]
+        provider = "polygon"
+        fallbacks = ["tipranks", "yahoo", "csv"]
+
+    **Enabled-by-key**: with no key resolvable the provider reports itself
+    unconfigured and every bars call degrades cleanly to the fallbacks, so
+    this configuration is safe even before a key exists. The default
+    ``market_data.provider`` stays ``"tipranks"`` for zero-key installs.
+    """
+
+    #: Direct config-file key slot. Supported because a free-tier key is
+    #: low-stakes, but DISCOURAGED: prefer the ``POLYGON_API_KEY`` env var or
+    #: ``claudetrade secrets set polygon_api_key`` -- config.toml is meant to
+    #: be shareable. A value here is redacted from ``AppConfig.public_dict``
+    #: (so it can never reach the config hash, logs, or persisted run
+    #: metadata) -- the one deliberate exception to "credential values are
+    #: never held on the config object", see ``public_dict``.
+    api_key: str = ""
+    #: Credential-store name (``claudetrade.secrets``) checked after the
+    #: plain ``POLYGON_API_KEY`` env var and before ``api_key`` above.
+    api_key_credential: str = "polygon_api_key"
+    #: The documented free tier is ~5 requests/minute; the provider paces
+    #: itself under this and honours a 429's Retry-After regardless. A paid
+    #: tier lifts this -- raise to match your plan.
+    rate_limit_per_minute: int = 5
+    #: A grouped response is ~10k rows (~2-3 MB); allow more transfer time
+    #: than the per-symbol providers' 20s default.
+    request_timeout_s: float = 30.0
+
+
 class RedditConfig(BaseModel):
     """Authorised Reddit access.
 
@@ -1244,6 +1283,7 @@ class AppConfig(BaseSettings):
     market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
     earnings: EarningsConfig = Field(default_factory=EarningsConfig)
     tipranks: TipRanksConfig = Field(default_factory=TipRanksConfig)
+    polygon: PolygonConfig = Field(default_factory=PolygonConfig)
     reddit: RedditConfig = Field(default_factory=RedditConfig)
     x: XConfig = Field(default_factory=XConfig)
     stocktwits: StocktwitsConfig = Field(default_factory=StocktwitsConfig)
@@ -1300,9 +1340,17 @@ class AppConfig(BaseSettings):
         """Configuration with no secret-bearing fields, safe to persist or log.
 
         Credential *names* are retained (they are lookup keys, not secrets);
-        credential *values* are never held on this object in the first place.
+        credential *values* are never held on this object in the first place
+        -- with one deliberate exception: ``PolygonConfig.api_key`` accepts a
+        direct value for low-friction free-tier setup (see that field's
+        docstring), so it is redacted here. Redaction also keeps
+        ``config_hash`` independent of the key's value, which is correct: a
+        credential is not a strategy-relevant parameter.
         """
-        return self.model_dump(mode="json", exclude={"paths"})
+        data = self.model_dump(mode="json", exclude={"paths"})
+        if data.get("polygon", {}).get("api_key"):
+            data["polygon"]["api_key"] = "***"
+        return data
 
     @property
     def config_hash(self) -> str:
