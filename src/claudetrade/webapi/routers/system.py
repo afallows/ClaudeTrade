@@ -522,9 +522,19 @@ def start_background_refresh(
 
     def _run() -> None:
         end = utc_now().date()
-        start = end - dt.timedelta(days=config.sentiment.lookback_days)
+        # Price history needs its own, much longer window: contexts require
+        # 30+ bars (data.context.MIN_CONTEXT_BARS), so a window sized to the
+        # 14-day social lookback guaranteed every scan on a fresh install
+        # evaluated zero symbols. 90 days matches the CLI refresh default;
+        # social sources are bounded separately to the sentiment window.
+        start = end - dt.timedelta(days=90)
         try:
-            pipeline.refresh(start=start, end=end, progress_callback=state.update_progress)
+            pipeline.refresh(
+                start=start,
+                end=end,
+                social_lookback_hours=config.sentiment.lookback_days * 24,
+                progress_callback=state.update_progress,
+            )
         except Exception as exc:
             with state.lock:
                 state.last_error = str(exc)

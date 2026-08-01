@@ -52,6 +52,12 @@ from claudetrade.sentiment.lexicon import (
 log = logging.getLogger(__name__)
 
 _WORD_RE = re.compile(r"[a-z0-9']+")
+#: Everything that is not a word character, "/" (kept so the literal "/s"
+#: sarcasm marker survives normalisation) or whitespace. Replaced with a
+#: space -- NOT deleted -- so "bullish," and "bullish." tokenise identically
+#: to "bullish", and clause boundaries never fuse two words together.
+_NON_WORD_RE = re.compile(r"[^a-z0-9/\s]+")
+_WHITESPACE_RE = re.compile(r"\s+")
 _EXCESS_PUNCT_RE = re.compile(r"[!?]{2,}")
 _ALLCAPS_TOKEN_RE = re.compile(r"\b[A-Z]{2,}\b")
 #: Strike-shorthand ("100c" / "100p"): digits immediately (no space) followed
@@ -74,20 +80,36 @@ _FLAIR_PUMP_BOOST = 0.2
 
 
 def _normalise(text: str) -> str:
-    """Lower-case and strip apostrophes so lexicon phrases match consistently.
+    """Lower-case, strip apostrophes, replace punctuation with spaces and
+    collapse whitespace so lexicon phrases match consistently.
 
     Contractions ("don't") and their lexicon keys ("dont") must line up, or
-    the negation check below silently never fires.
+    the negation check below silently never fires. Punctuation replacement is
+    the load-bearing step: ``_find_hits`` matches space-delimited phrases, so
+    without it a term at a clause boundary -- "crushed earnings," or
+    "bearish." -- never matches its lexicon entry at all. Real social text
+    ends most clauses with punctuation, which left the classifier returning
+    exactly 0.0 bullish/bearish for the vast majority of genuine posts.
+    Newlines collapse to single spaces for the same reason.
     """
-    return text.lower().replace("'", "").replace("\u2019", "")
+    text = text.lower().replace("'", "").replace("\u2019", "")
+    text = _NON_WORD_RE.sub(" ", text)
+    return _WHITESPACE_RE.sub(" ", text).strip()
 
 
 def _find_hits(text_norm: str, lexicon: dict[str, float]) -> list[tuple[int, str, float]]:
-    """Every ``(start_index, phrase, weight)`` occurrence of a lexicon phrase."""
+    """Every ``(start_index, phrase, weight)`` occurrence of a lexicon phrase.
+
+    All phrases -- including "/"-prefixed markers like ``"/s"``, whose slash
+    survives ``_normalise`` -- match as space-delimited tokens. A raw
+    substring branch for "/"-prefixed phrases used to fire ``"/s"`` inside
+    any URL path segment starting with "s"; token matching keeps the real
+    standalone marker while ignoring it mid-URL.
+    """
     hits: list[tuple[int, str, float]] = []
     for phrase, weight in lexicon.items():
-        needle = phrase if phrase.startswith("/") else f" {phrase} "
-        haystack = text_norm if phrase.startswith("/") else f" {text_norm} "
+        needle = f" {phrase} "
+        haystack = f" {text_norm} "
         start = 0
         while True:
             pos = haystack.find(needle, start)
@@ -231,10 +253,14 @@ class RuleSentimentClassifier:
         hype_raw += min(1.0, allcaps_density * 2.0) + min(0.6, exclaim_density)
 
         # Excessive punctuation ("???", "!!!") is a classic sarcasm/irony tell.
+        # The "/s" marker itself is a SARCASM_MARKERS lexicon entry matched as
+        # a standalone token by ``_find_hits`` -- no ad-hoc substring check
+        # here. A raw ``"/s" in text`` test double-counted the marker and,
+        # worse, fired on every URL with an "/s..." path segment
+        # (reddit.com/r/stocks), silently halving the polarity and confidence
+        # of ordinary link-bearing posts.
         excess_punct_hits = len(_EXCESS_PUNCT_RE.findall(text))
         sarcasm_raw += 0.3 * excess_punct_hits
-        if "/s" in text.lower():
-            sarcasm_raw += 0.9
 
         # Question forms read as uncertainty, independent of lexicon hits.
         question_marks = text.count("?")

@@ -64,6 +64,18 @@ BULLISH_TERMS: dict[str, float] = {
     "steal at these prices": 0.6,
     "best stock": 0.5,
     "loading up": 0.55,
+    # Common inflected/colloquial variants -- the lexicon is exact-phrase, so
+    # each surface form people actually type must be enumerated. Weights stay
+    # in line with their base forms above.
+    "ripping": 0.6,
+    "crushed it": 0.7,
+    "beat earnings": 0.7,
+    "blowout quarter": 0.75,
+    "surging": 0.6,
+    "soaring": 0.6,
+    "rallying": 0.55,
+    "printing": 0.5,
+    "calls printing": 0.65,
 }
 
 BEARISH_TERMS: dict[str, float] = {
@@ -92,6 +104,16 @@ BEARISH_TERMS: dict[str, float] = {
     "avoid this stock": 0.6,
     "getting crushed": 0.65,
     "cant catch a bid": 0.55,
+    # Common inflected/colloquial variants (see the note in BULLISH_TERMS).
+    "selling everything": 0.7,
+    "tanking": 0.6,
+    "tanked": 0.6,
+    "plunging": 0.6,
+    "cratering": 0.65,
+    "guidance cut": 0.75,
+    "weak guidance": 0.65,
+    "disaster": 0.55,
+    "dumpster fire": 0.65,
 }
 
 # --------------------------------------------------------------------------
@@ -174,12 +196,19 @@ UNCERTAINTY_HEDGE_TERMS: dict[str, float] = {
 #: markers (the writer signposting irony) rather than sarcasm inferred from
 #: tone, which this module cannot detect at all.
 SARCASM_MARKERS: dict[str, float] = {
-    "/s": 0.9,
+    # Reddit's explicit sarcasm tag. Weighted well above the implicit markers:
+    # the author literally declared the post sarcastic. Matched as a
+    # standalone token (see ``classifiers._find_hits``), so URLs containing
+    # "/s..." path segments no longer fire it.
+    "/s": 1.8,
     "sure buddy": 0.85,
     "totally not a bubble": 0.85,
     "yeah right": 0.7,
     "as if": 0.5,
-    "shocking, i know": 0.7,
+    # No punctuation in phrase keys: the classifier's normalisation replaces
+    # punctuation with spaces before matching, so a comma-bearing key could
+    # never match anything.
+    "shocking i know": 0.7,
     "what could go wrong": 0.65,
     "totally sustainable": 0.6,
     "definitely not a ponzi": 0.8,
@@ -355,7 +384,10 @@ DIMINISHERS: dict[str, float] = {
     "somewhat": 0.7,
     "kinda": 0.7,
     "sorta": 0.7,
-    "a bit": 0.7,
+    # Single token: ``_modifier_multiplier`` checks individual preceding
+    # words, so a multi-word key like "a bit" could never match. "bit" alone
+    # covers "a bit bullish" within the negation window.
+    "bit": 0.7,
     "marginally": 0.6,
     "barely": 0.5,
     "mildly": 0.7,

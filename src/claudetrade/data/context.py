@@ -189,7 +189,11 @@ class ContextBuilder:
         candidates = [s for s in data.sentiment if s.session == session]
         if not candidates:
             return None
-        snapshot = candidates[0]
+        # A session can carry several rows -- the combined "all" aggregate
+        # plus per-source (reddit/x/news) breakdowns. Strategies score against
+        # the combined view; taking whichever row the query returned first
+        # silently substituted an arbitrary single-source sample.
+        snapshot = next((s for s in candidates if s.source == "all"), candidates[0])
         cfg = self.config.sentiment
         if (
             snapshot.post_count < cfg.min_posts_for_signal

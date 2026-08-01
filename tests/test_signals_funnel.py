@@ -580,23 +580,19 @@ class TestFunnelStore:
         path.write_text("not json{{{")
         assert funnel_store.load_latest(tmp_app_config) is None
 
-    def test_pipeline_scan_persists_the_artifact(self, tmp_app_config: AppConfig, tmp_db):
-        """`Pipeline.scan` (the CLI's and the web API's shared entry point --
-        see `signals.funnel_store`'s module docstring) writes the artifact
-        itself, so an MCP server sharing this installation's `snapshots_dir`
-        can read it back even though it never ran the scan."""
+    def test_pipeline_scan_without_data_warns_and_preserves_artifact(
+        self, tmp_app_config: AppConfig, tmp_db
+    ):
+        """A scan against a database with no price bars must fail loudly --
+        an explicit warning naming the missing session -- and must NOT write
+        (or clobber) the funnel artifact: a degenerate zero-context scan
+        carries no diagnostic value, while the previous artifact may."""
         from claudetrade.pipeline import Pipeline
 
         pipeline = Pipeline(tmp_app_config, tmp_db)
         assert funnel_store.load_latest(tmp_app_config) is None
 
-        # Bootstrap seeds a non-empty universe but there is no stored price
-        # data, so this is the same honest "0 evaluated symbols" scan
-        # `test_webapi_signals`/`test_mcp_server` exercise -- the point here
-        # is only that a scan through the real pipeline wiring saves an
-        # artifact at all, not any particular funnel content.
-        pipeline.scan(SESSION)
+        result = pipeline.scan(SESSION)
 
-        loaded = funnel_store.load_latest(tmp_app_config)
-        assert loaded is not None
-        assert loaded["session"] == SESSION.isoformat()
+        assert any("No price bars" in w for w in result.warnings)
+        assert funnel_store.load_latest(tmp_app_config) is None

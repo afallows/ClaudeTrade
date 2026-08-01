@@ -337,7 +337,7 @@ class TestBackgroundRefresh:
         started = threading.Event()
         release = threading.Event()
 
-        def fake_refresh(*, start, end, symbols=None, progress_callback=None):
+        def fake_refresh(*, start, end, symbols=None, social_lookback_hours=None, progress_callback=None):
             started.set()
             if progress_callback:
                 progress_callback("prices", 3, 10)
@@ -364,7 +364,7 @@ class TestBackgroundRefresh:
         started = threading.Event()
         release = threading.Event()
 
-        def fake_refresh(*, start, end, symbols=None, progress_callback=None):
+        def fake_refresh(*, start, end, symbols=None, social_lookback_hours=None, progress_callback=None):
             started.set()
             release.wait(timeout=5)
             return PipelineResult()
@@ -383,7 +383,7 @@ class TestBackgroundRefresh:
     def test_completed_refresh_reports_not_running_and_finished_at(self, client_and_pipeline):
         client, pipeline = client_and_pipeline
 
-        def fake_refresh(*, start, end, symbols=None, progress_callback=None):
+        def fake_refresh(*, start, end, symbols=None, social_lookback_hours=None, progress_callback=None):
             return PipelineResult()
 
         pipeline.refresh = fake_refresh
@@ -401,7 +401,7 @@ class TestBackgroundRefresh:
     def test_failed_refresh_is_reported_and_unblocks_the_next_run(self, client_and_pipeline):
         client, pipeline = client_and_pipeline
 
-        def failing_refresh(*, start, end, symbols=None, progress_callback=None):
+        def failing_refresh(*, start, end, symbols=None, social_lookback_hours=None, progress_callback=None):
             raise RuntimeError("boom")
 
         pipeline.refresh = failing_refresh

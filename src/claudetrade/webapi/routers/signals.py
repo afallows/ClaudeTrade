@@ -160,7 +160,10 @@ def run_scan(
     )
     set_last_scan(request, result.scan)
     return ScanResponse(
-        session=session_date,
+        # The session actually evaluated -- the pipeline may fall back to the
+        # latest stored session when the requested one has no data (the
+        # warnings explain when it does).
+        session=result.scan.session if result.scan else session_date,
         evaluated_symbols=result.scan.evaluated_symbols if result.scan else 0,
         signal_count=len(result.scan.signals) if result.scan else 0,
         rejected_count=len(result.scan.rejected) if result.scan else 0,
@@ -176,8 +179,16 @@ def run_refresh(
 ) -> RefreshResponse:
     """Run ``Pipeline.refresh`` -- identical to ``claudetrade refresh``."""
     end = body.end or utc_now().date()
-    start = body.start or (end - dt.timedelta(days=config.sentiment.lookback_days))
-    result = pipeline.refresh(start=start, end=end)
+    # Default price window is 90 days -- context building needs 30+ bars, so
+    # defaulting to the 14-day social lookback guaranteed empty scans on a
+    # fresh install (same fix as the background-refresh endpoint and the MCP
+    # server). Social sources stay bounded to the sentiment window.
+    start = body.start or (end - dt.timedelta(days=90))
+    result = pipeline.refresh(
+        start=start,
+        end=end,
+        social_lookback_hours=config.sentiment.lookback_days * 24,
+    )
     return RefreshResponse(
         universe_size=result.universe_size,
         sentiment_rows=result.sentiment_rows,

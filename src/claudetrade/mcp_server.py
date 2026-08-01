@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import func, select
 
 from claudetrade.config import AppConfig
-from claudetrade.db.models import SymbolSentimentDaily
+from claudetrade.db.models import Security, SymbolSentimentDaily
 from claudetrade.domain import Signal, SignalStatus
 from claudetrade.logging_setup import get_logger
 from claudetrade.pipeline import Pipeline
@@ -275,6 +275,13 @@ def get_trending(pipeline: Pipeline, *, limit: int = 20) -> dict[str, Any]:
                 func.avg(SymbolSentimentDaily.confidence).label("avg_confidence"),
                 func.max(SymbolSentimentDaily.session).label("latest_session"),
             )
+            # The join against ``securities`` is a guard, not an
+            # optimisation: stored sentiment rows can carry junk "symbols"
+            # left behind by earlier extraction bugs (bare English words) or
+            # by the synthetic demo provider's fabricated tickers, and a
+            # trending list is exactly where such rows would surface. Only
+            # symbols that exist in the reference table rank.
+            .join(Security, Security.symbol == SymbolSentimentDaily.symbol)
             .where(
                 SymbolSentimentDaily.source == "all",
                 SymbolSentimentDaily.session >= start,
@@ -377,11 +384,19 @@ def run_scan(pipeline: Pipeline) -> dict[str, Any]:
     scan_result = result.scan
     return {
         "disclaimer": DISCLAIMER,
-        "session": session_date.isoformat(),
+        # The pipeline may have fallen back to the latest stored session when
+        # the requested one has no data yet (see ``Pipeline.scan``); report
+        # both so the caller can tell which session was actually evaluated.
+        "requested_session": session_date.isoformat(),
+        "session": scan_result.session.isoformat() if scan_result else session_date.isoformat(),
         "evaluated_symbols": scan_result.evaluated_symbols if scan_result else 0,
         "signal_count": len(scan_result.signals) if scan_result else 0,
         "rejected_count": len(scan_result.rejected) if scan_result else 0,
         "warnings": list(result.warnings),
+        # The full rejection funnel (reason -> count per strategy, plus the
+        # closest near-misses): a zero-signal scan must explain itself in the
+        # same response, not require a separate diagnostic call.
+        "funnel": scan_result.funnel.to_dict() if scan_result else None,
     }
 
 
@@ -421,9 +436,19 @@ def trigger_refresh(pipeline: Pipeline, config: AppConfig, state: RefreshState) 
 
     def _run() -> None:
         end = utc_now().date()
-        start = end - dt.timedelta(days=config.sentiment.lookback_days)
+        # Price history needs its own, much longer window: contexts require
+        # 30+ bars (data.context.MIN_CONTEXT_BARS), so a window sized to the
+        # 14-day social lookback guaranteed every scan on a fresh install
+        # evaluated zero symbols. 90 days matches the CLI refresh default;
+        # social sources are bounded separately to the sentiment window.
+        start = end - dt.timedelta(days=90)
         try:
-            pipeline.refresh(start=start, end=end, progress_callback=state.update_progress)
+            pipeline.refresh(
+                start=start,
+                end=end,
+                social_lookback_hours=config.sentiment.lookback_days * 24,
+                progress_callback=state.update_progress,
+            )
         except Exception as exc:  # matches webapi.routers.system's own catch-all
             with state.lock:
                 state.last_error = str(exc)
