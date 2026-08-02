@@ -396,6 +396,13 @@ def refresh(
     start: Annotated[str | None, typer.Option(help="ISO start date.")] = None,
     end: Annotated[str | None, typer.Option(help="ISO end date.")] = None,
     symbols: Annotated[str | None, typer.Option(help="Comma-separated symbols.")] = None,
+    full: Annotated[
+        bool,
+        typer.Option(
+            "--full",
+            help="Re-fetch every symbol even if its stored bars are already current.",
+        ),
+    ] = False,
 ) -> None:
     """Pull data from every configured provider and store it.
 
@@ -403,8 +410,17 @@ def refresh(
     today -- enough recent history for the scan/backtest indicators without a
     new install's first real-data refresh pulling years of history for
     hundreds of symbols before showing anything.
+
+    By default only symbols whose stored bars are BEHIND the window's last
+    trading session are fetched. On a per-symbol provider every fetch is
+    rate-limited individually (120/min), so re-requesting an already-current
+    2,400-symbol universe costs ~20 minutes and changes nothing. ``--full``
+    forces the complete sweep (use it to repair interior gaps, though
+    ``claudetrade db backfill`` is the purpose-built tool for that).
     """
     cfg = _load(config)
+    if full:
+        cfg.market_data.incremental_prices = False
     from claudetrade.db import refresh_state_store
     from claudetrade.pipeline import Pipeline
 

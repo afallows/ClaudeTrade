@@ -49,7 +49,13 @@ from claudetrade.domain import (
 from claudetrade.logging_setup import get_logger
 from claudetrade.providers.base import ProviderError
 from claudetrade.sentiment.entity_resolution import TickerResolver
-from claudetrade.utils.timeutils import current_trading_session, ensure_utc, utc_now
+from claudetrade.utils.timeutils import (
+    current_trading_session,
+    ensure_utc,
+    is_trading_day,
+    previous_trading_day,
+    utc_now,
+)
 
 log = get_logger(__name__)
 
@@ -563,6 +569,51 @@ class DataIngestor:
                     getattr(bulk, "name", "?"), start, end, effective_start, end, latest,
                 )
 
+        # Per-SYMBOL skipping. The window narrowing above only helps a
+        # by-date provider; this is what makes a routine refresh cheap on the
+        # per-symbol chain, and it is the difference between ~20 minutes and
+        # seconds. Every fetch passes through
+        # ``yahoo_rate_limit_per_minute`` (120/min, acquired per symbol), so
+        # cost is driven by HOW MANY SYMBOLS are requested, not by the date
+        # range or the worker count -- 12 workers all queue behind the same
+        # 2/second gate. A refresh that re-requests 2,417 symbols already
+        # stored through the target session pays ~20 minutes to learn nothing.
+        #
+        # "Current" is measured against the last TRADING session in the
+        # window, not ``end``: on a Saturday every symbol is legitimately
+        # current at Friday's close, and comparing against Saturday would
+        # refetch the universe for a session that cannot exist.
+        #
+        # Deliberately conservative: only the tail is skipped. A symbol with
+        # an interior gap still looks current here -- repairing those is
+        # ``claudetrade db backfill``'s job (it walks the full window), not
+        # the daily refresh's, and the quality checker still reports them.
+        # Set ``market_data.incremental_prices = false`` (or pass --full) for
+        # a full sweep.
+        skipped_current = 0
+        if self.config.market_data.incremental_prices and bulk is None:
+            target = end if is_trading_day(end) else previous_trading_day(end)
+            latest_by_symbol = self._latest_stored_bar_by_symbol()
+            if latest_by_symbol:
+                behind = [
+                    s
+                    for s in fetch_symbols
+                    # The benchmark is never skipped: regime classification
+                    # reports UNKNOWN for every session without it, which is
+                    # a far worse outcome than one redundant call.
+                    if s == benchmark or latest_by_symbol.get(s) is None
+                    or latest_by_symbol[s] < target
+                ]
+                skipped_current = len(fetch_symbols) - len(behind)
+                if skipped_current:
+                    log.info(
+                        "incremental price refresh: %d/%d symbol(s) already have bars "
+                        "through %s and are skipped; fetching %d behind symbol(s) "
+                        "(set market_data.incremental_prices=false for a full sweep)",
+                        skipped_current, len(fetch_symbols), target, len(behind),
+                    )
+                fetch_symbols = behind
+
         batch_size = max(1, self.config.market_data.max_symbols_per_request)
         collected: dict[str, list[Bar]] = {}
         #: Symbols whose whole chunk failed with a ProviderError -- an outage
@@ -773,6 +824,28 @@ class DataIngestor:
             log.debug("bulk provider status() raised; treating as unconfigured", exc_info=True)
             return None
         return primary if getattr(status, "configured", False) else None
+
+    def _latest_stored_bar_by_symbol(self) -> dict[str, dt.date]:
+        """Each symbol's most recent stored session -- one grouped query.
+
+        The key to refresh cost on a per-symbol provider. Narrowing the
+        *window* saves nothing there (Yahoo charges one call per symbol
+        whatever range it covers), but skipping a symbol that is already
+        current saves the whole call -- and the call is the expensive unit:
+        ``yahoo_rate_limit_per_minute`` gates every fetch to 120/min, so
+        2,417 symbols cost ~20 minutes no matter how many workers run.
+        """
+        if self.db is None:
+            return {}
+        try:
+            with self.db.read_session() as session:
+                rows = session.execute(
+                    select(PriceBar.symbol, func.max(PriceBar.session)).group_by(PriceBar.symbol)
+                ).all()
+            return {symbol: latest for symbol, latest in rows if latest is not None}
+        except Exception:
+            log.debug("could not read per-symbol latest bar sessions", exc_info=True)
+            return {}
 
     def _latest_stored_bar_session(self) -> dt.date | None:
         """Most recent session with ANY stored price bar, across all symbols

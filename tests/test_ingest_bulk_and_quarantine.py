@@ -157,6 +157,86 @@ def test_no_narrowing_without_a_bulk_provider(memory_db):
     assert all(start == START for _symbols, start, _end in provider.calls)
 
 
+def test_symbols_already_current_are_not_fetched_at_all(memory_db, caplog):
+    """The refresh-speed fix. Narrowing the WINDOW saves nothing on a
+    per-symbol provider, but skipping an already-current symbol saves the
+    whole call -- and the call is the unit that costs: every fetch takes a
+    slot from a 120/min limiter, so 2,417 already-current symbols cost ~20
+    minutes to re-learn what the database already holds (observed in a real
+    owner refresh: ~50s per 100-symbol chunk, exactly 100/120min)."""
+    provider = _RecordingProvider(bulk_daily=False)
+    ingestor = DataIngestor(_config(), memory_db, market_provider=_Cascade(provider))
+    _store_bar(memory_db, "AAPL", END)  # current through the window's last session
+    _store_bar(memory_db, "MSFT", dt.date(2026, 7, 28))  # behind
+
+    with caplog.at_level(logging.INFO, logger="claudetrade.data.ingest"):
+        ingestor.ingest_prices(["AAPL", "MSFT"], START, END, IngestReport())
+
+    requested = {s for symbols, _start, _end in provider.calls for s in symbols}
+    assert "AAPL" not in requested, "an already-current symbol was re-fetched"
+    assert "MSFT" in requested
+    assert any("already have bars through" in r.getMessage() for r in caplog.records)
+
+
+def test_the_benchmark_is_never_skipped(memory_db):
+    """Without benchmark bars every session's regime reports UNKNOWN, which
+    silently disables every regime-dependent adjustment -- far worse than
+    one redundant call."""
+    provider = _RecordingProvider(bulk_daily=False)
+    ingestor = DataIngestor(_config(), memory_db, market_provider=_Cascade(provider))
+    _store_bar(memory_db, "SPY", END)
+    _store_bar(memory_db, "AAPL", END)
+
+    ingestor.ingest_prices(["AAPL", "SPY"], START, END, IngestReport())
+
+    requested = {s for symbols, _start, _end in provider.calls for s in symbols}
+    assert "SPY" in requested
+    assert "AAPL" not in requested
+
+
+def test_a_weekend_end_date_measures_currency_against_the_last_trading_day(memory_db):
+    """Currency is judged against the last TRADING session in the window. A
+    Saturday ``end`` with bars through Friday is fully current -- comparing
+    against Saturday would re-fetch the entire universe every weekend for a
+    session that cannot exist."""
+    provider = _RecordingProvider(bulk_daily=False)
+    ingestor = DataIngestor(_config(), memory_db, market_provider=_Cascade(provider))
+    friday, saturday = dt.date(2026, 7, 31), dt.date(2026, 8, 1)
+    _store_bar(memory_db, "AAPL", friday)
+
+    ingestor.ingest_prices(["AAPL"], START, saturday, IngestReport())
+
+    requested = {s for symbols, _start, _end in provider.calls for s in symbols}
+    assert "AAPL" not in requested
+
+
+def test_incremental_skipping_can_be_turned_off(memory_db):
+    """``--full`` / ``incremental_prices = false`` restores the complete
+    sweep for operators repairing coverage."""
+    provider = _RecordingProvider(bulk_daily=False)
+    config = _config()
+    config.market_data.incremental_prices = False
+    ingestor = DataIngestor(config, memory_db, market_provider=_Cascade(provider))
+    _store_bar(memory_db, "AAPL", END)
+
+    ingestor.ingest_prices(["AAPL"], START, END, IngestReport())
+
+    requested = {s for symbols, _start, _end in provider.calls for s in symbols}
+    assert "AAPL" in requested
+
+
+def test_an_empty_database_still_fetches_everything(memory_db):
+    """No stored bars means nothing is current -- a first refresh must not
+    be skipped into doing nothing."""
+    provider = _RecordingProvider(bulk_daily=False)
+    ingestor = DataIngestor(_config(), memory_db, market_provider=_Cascade(provider))
+
+    ingestor.ingest_prices(["AAPL", "MSFT"], START, END, IngestReport())
+
+    requested = {s for symbols, _start, _end in provider.calls for s in symbols}
+    assert {"AAPL", "MSFT"} <= requested
+
+
 def test_no_narrowing_when_the_database_has_no_bars(memory_db):
     """A first-ever refresh must fetch the whole requested window -- this is
     exactly the empty-database case F23 exists to fill."""

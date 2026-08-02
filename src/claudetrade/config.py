@@ -171,6 +171,14 @@ class MarketDataConfig(BaseModel):
     #: Bars older than this are flagged stale by the data-quality checks.
     stale_after_hours: float = 30.0
     max_symbols_per_request: int = 100
+    #: Skip symbols whose stored bars already reach the window's last trading
+    #: session. On a per-symbol provider the fetch cost is one rate-limited
+    #: call PER SYMBOL (``yahoo_rate_limit_per_minute``, 120/min), so a
+    #: refresh that re-requests an already-current universe costs ~20 minutes
+    #: for 2,400 symbols and changes nothing. Only the tail is skipped;
+    #: interior gaps are ``claudetrade db backfill``'s job. Set to ``false``
+    #: (or run ``claudetrade refresh --full``) to force a complete sweep.
+    incremental_prices: bool = True
     request_timeout_s: float = 20.0
     rate_limit_per_minute: int = 60
     #: Yahoo's undocumented chart endpoint gets its own bucket, separate from
