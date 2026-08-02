@@ -222,6 +222,28 @@ def _m006_symbol_fetch_health(session: Session) -> None:
     SymbolFetchHealth.__table__.create(session.get_bind(), checkfirst=True)
 
 
+def _m007_social_coverage(session: Session) -> None:
+    """Create the ``social_coverage`` table (collected vs. never-collected).
+
+    Same fresh-vs-migrated shape as ``_m006_symbol_fetch_health``: a
+    brand-new database already has the table from ``_m001_create_schema``,
+    so this only does real work on a database that reached version 6 before
+    the model existed. ``checkfirst=True`` keeps it idempotent either way.
+
+    Deliberately no backfill. Coverage cannot be reconstructed after the
+    fact -- a session with no aggregate rows is exactly the case that is
+    unknowable in retrospect, which is why the table exists -- so inventing
+    "collected" rows for stored history would be fabricating the evidence.
+    ``sentiment.store.CoverageWindow`` handles the resulting pre-tracking
+    history explicitly instead: sessions before the first recorded row are
+    unknown, and unknown is read as collected (the assumption every reader
+    already made), so an upgraded database keeps the baselines it has.
+    """
+    from claudetrade.db.models import SocialCoverageRow
+
+    SocialCoverageRow.__table__.create(session.get_bind(), checkfirst=True)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_schema", _m001_create_schema, "Initial tables, indexes and constraints"),
     Migration(2, "immutability_triggers", _m002_immutability_triggers, "Append-only ledger guards"),
@@ -233,6 +255,12 @@ MIGRATIONS: tuple[Migration, ...] = (
         "symbol_fetch_health",
         _m006_symbol_fetch_health,
         "Per-symbol fetch-failure quarantine table",
+    ),
+    Migration(
+        7,
+        "social_coverage",
+        _m007_social_coverage,
+        "Per-session social-collection coverage (confirmed zero vs not collected)",
     ),
 )
 
