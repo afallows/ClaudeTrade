@@ -21,7 +21,15 @@ from pathlib import Path
 
 import pytest
 
-from claudetrade.cli import app, backtest_app, db_app, paper_app, secrets_app, verify_app
+from claudetrade.cli import (
+    app,
+    backtest_app,
+    db_app,
+    paper_app,
+    secrets_app,
+    sentiment_app,
+    verify_app,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -67,6 +75,7 @@ def _real_command_surface() -> set[tuple[str, str | None]]:
         "db": db_app,
         "verify": verify_app,
         "backtest": backtest_app,
+        "sentiment": sentiment_app,
     }
     # Every group actually mounted on `app` (via add_typer) must be one of the
     # ones this test knows about -- catches a new group being added to cli.py

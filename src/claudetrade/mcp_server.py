@@ -381,6 +381,84 @@ def get_trending(pipeline: Pipeline, *, limit: int = 20, source: str = "auto") -
     }
 
 
+def get_sentiment_history(
+    pipeline: Pipeline, symbol: str, *, days: int = 90
+) -> dict[str, Any]:
+    """Read-only. One symbol's daily mention/sentiment series.
+
+    Reads ``sentiment.history.symbol_series`` -- the same densified view the
+    CLI's ``claudetrade sentiment history`` prints, not a second query. Gap
+    -filled across trading sessions, so a caller can chart or difference the
+    series directly; ``observed`` distinguishes a real zero ("nobody
+    mentioned it") from an absent row.
+    """
+    from claudetrade.sentiment.history import symbol_series
+
+    days = max(1, min(int(days), 365))
+    window = symbol_series(
+        pipeline.db, symbol, as_of=current_trading_session(), days=days
+    )
+    payload = window.to_dict()
+    if window.total_mentions == 0:
+        payload["note"] = (
+            f"No stored mentions for {window.symbol} in the last {days} day(s). "
+            "Sentiment history accumulates one session per refresh; run "
+            "`claudetrade refresh` daily, and check get_market_status for a "
+            "pending sentiment rebuild."
+        )
+    return payload
+
+
+def get_rising_sentiment(
+    pipeline: Pipeline,
+    *,
+    limit: int = 25,
+    recent_sessions: int = 3,
+    baseline_sessions: int = 20,
+    min_recent_mentions: int = 5,
+) -> dict[str, Any]:
+    """Read-only. Symbols whose mentions are accelerating vs their own baseline.
+
+    The question this application is built to answer -- "what is starting to
+    get talked about?" -- as opposed to ``get_trending``, which ranks by
+    absolute volume and therefore returns the same mega-caps every day. A
+    quiet symbol waking up outranks a permanently-loud one here.
+
+    Sentiment change rides along per row but is never ranked on: attention
+    moves first, and a mention surge with deteriorating tone is a short
+    setup rather than a row worth suppressing. ``coverage`` reports how much
+    history actually backs the answer, so a warming-up database says so
+    instead of reporting a confident "nothing is rising".
+    """
+    from claudetrade.sentiment.history import coverage_summary, rising_symbols
+
+    as_of = current_trading_session()
+    coverage = coverage_summary(pipeline.db, as_of=as_of, days=90)
+    trends = rising_symbols(
+        pipeline.db,
+        as_of=as_of,
+        recent_sessions=max(1, int(recent_sessions)),
+        baseline_sessions=max(1, int(baseline_sessions)),
+        limit=max(1, min(int(limit), 200)),
+        min_recent_mentions=max(0, int(min_recent_mentions)),
+    )
+    result: dict[str, Any] = {
+        "as_of": as_of.isoformat(),
+        "recent_sessions": recent_sessions,
+        "baseline_sessions": baseline_sessions,
+        "coverage": coverage,
+        "count": len(trends),
+        "rising": [t.to_dict() for t in trends],
+    }
+    if coverage["sessions_with_data"] < baseline_sessions:
+        result["warming_up"] = (
+            f"Only {coverage['sessions_with_data']} session(s) of stored history back this "
+            f"ranking, fewer than the {baseline_sessions}-session baseline it compares "
+            "against. Treat these as provisional until history accumulates."
+        )
+    return result
+
+
 def _market_session_state(now_et: dt.datetime) -> str:
     """``pre_market`` / ``open`` / ``after_hours`` / ``closed``, in ET.
 
@@ -799,6 +877,56 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
         )
 
     @server.tool(
+        name="get_rising_sentiment",
+        description=(
+            "Read-only. THE screen for 'what should I look at?': symbols whose "
+            "mention rate is accelerating against their OWN recent baseline, so a "
+            "quiet name waking up ranks above a permanently-loud mega-cap (which "
+            "is all get_trending's absolute-volume ranking can ever show you). "
+            "Each row carries the mention change, the recent vs baseline rate, and "
+            "the sentiment change where polarity was actually measured -- tone is "
+            "reported but never ranked on, since a mention surge with collapsing "
+            "sentiment is a short setup, not noise. Includes a coverage block "
+            "stating how much stored history backs the ranking."
+        ),
+    )
+    async def _get_rising_sentiment(
+        limit: int = 25,
+        recent_sessions: int = 3,
+        baseline_sessions: int = 20,
+        min_recent_mentions: int = 5,
+    ) -> dict[str, Any]:
+        return await _call_bounded(
+            "get_rising_sentiment",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_rising_sentiment(
+                pipeline,
+                limit=limit,
+                recent_sessions=recent_sessions,
+                baseline_sessions=baseline_sessions,
+                min_recent_mentions=min_recent_mentions,
+            ),
+        )
+
+    @server.tool(
+        name="get_sentiment_history",
+        description=(
+            "Read-only. One symbol's daily mention and sentiment series over the "
+            "last N days, gap-filled across trading sessions so it can be charted "
+            "or differenced directly. Each point carries locally-resolved mentions, "
+            "ApeWisdom attention mentions, their total, sentiment, bull/bear ratio "
+            "and confidence; 'observed' marks whether a row was actually stored, "
+            "distinguishing a real zero from absent data."
+        ),
+    )
+    async def _get_sentiment_history(symbol: str, days: int = 90) -> dict[str, Any]:
+        return await _call_bounded(
+            "get_sentiment_history",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_sentiment_history(pipeline, symbol, days=days),
+        )
+
+    @server.tool(
         name="get_market_status",
         description=(
             "Read-only. Market regime, current Eastern Time, and whether the market "
@@ -921,7 +1049,9 @@ __all__ = [
     "get_backtest_report",
     "get_market_status",
     "get_refresh_status",
+    "get_rising_sentiment",
     "get_sentiment",
+    "get_sentiment_history",
     "get_signals",
     "get_trending",
     "run_scan",

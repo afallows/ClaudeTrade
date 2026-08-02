@@ -49,6 +49,7 @@ app = typer.Typer(
 secrets_app = typer.Typer(help="Manage API credentials in the OS credential store.")
 paper_app = typer.Typer(help="Inspect and drive the paper-trading account.")
 db_app = typer.Typer(help="Database maintenance: migrate, backup, restore.")
+sentiment_app = typer.Typer(help="Sentiment and mention history: per-symbol series, what is rising.")
 verify_app = typer.Typer(help="Integrity and reproducibility checks.")
 #: A Typer group rather than a plain command so ``claudetrade backtest report``
 #: (the multi-strategy owner report, see ``backtest.report``) can live
@@ -59,6 +60,7 @@ backtest_app = typer.Typer(help="Replay strategies over history and report perfo
 app.add_typer(secrets_app, name="secrets")
 app.add_typer(paper_app, name="paper")
 app.add_typer(db_app, name="db")
+app.add_typer(sentiment_app, name="sentiment")
 app.add_typer(verify_app, name="verify")
 app.add_typer(backtest_app, name="backtest")
 
@@ -1508,6 +1510,91 @@ def db_backfill(
         "history, which this has now provided.",
         fg=typer.colors.GREEN,
     )
+
+
+@sentiment_app.command("history")
+def sentiment_history(
+    symbol: Annotated[str, typer.Argument(help="Ticker to report, e.g. NVDA.")],
+    config: ConfigOption = None,
+    days: Annotated[int, typer.Option(help="Calendar days of history to cover.")] = 90,
+    as_of: Annotated[
+        str | None, typer.Option(help="ISO session to report as of; defaults to the current one.")
+    ] = None,
+) -> None:
+    """One symbol's daily mention and sentiment series.
+
+    Trading sessions only, gap-filled: a session with no stored row reports
+    zero mentions with ``observed: false``, so "nobody talked about it" is
+    distinguishable from "we have no data" while the series stays
+    continuous enough to do arithmetic on.
+    """
+    cfg = _load(config)
+    from claudetrade.db.session import get_database
+    from claudetrade.sentiment.history import symbol_series
+
+    session_date = _parse_date(as_of, current_trading_session())
+    window = symbol_series(
+        get_database(cfg), symbol, as_of=session_date, days=days
+    )
+    _echo_json(window.to_dict())
+
+
+@sentiment_app.command("rising")
+def sentiment_rising(
+    config: ConfigOption = None,
+    days: Annotated[int, typer.Option(help="Ignored placeholder for symmetry.")] = 90,
+    recent: Annotated[int, typer.Option(help="Sessions in the recent window.")] = 3,
+    baseline: Annotated[int, typer.Option(help="Sessions in the comparison baseline.")] = 20,
+    limit: Annotated[int, typer.Option(help="Rows to display.")] = 25,
+    min_mentions: Annotated[
+        int, typer.Option(help="Minimum recent mentions before a symbol can rank.")
+    ] = 5,
+    as_of: Annotated[
+        str | None, typer.Option(help="ISO session to rank as of; defaults to the current one.")
+    ] = None,
+) -> None:
+    """Symbols whose chatter is accelerating against their own baseline.
+
+    The screen this application exists to run: recent mention *rate* versus
+    the symbol's own prior rate, so a quiet name waking up outranks a
+    permanently-loud one. Sentiment change is reported beside each row but
+    never ranked on -- attention rises first, tone tells you which way to
+    read it, and a mention surge with collapsing tone is a short candidate
+    rather than a row to hide.
+    """
+    cfg = _load(config)
+    from claudetrade.db.session import get_database
+    from claudetrade.sentiment.history import coverage_summary, rising_symbols
+
+    db = get_database(cfg)
+    session_date = _parse_date(as_of, current_trading_session())
+    coverage = coverage_summary(db, as_of=session_date, days=days)
+    trends = rising_symbols(
+        db,
+        as_of=session_date,
+        recent_sessions=recent,
+        baseline_sessions=baseline,
+        limit=limit,
+        min_recent_mentions=min_mentions,
+    )
+    _echo_json(
+        {
+            "as_of": session_date.isoformat(),
+            "recent_sessions": recent,
+            "baseline_sessions": baseline,
+            "coverage": coverage,
+            "count": len(trends),
+            "rising": [t.to_dict() for t in trends],
+        }
+    )
+    if coverage["sessions_with_data"] < baseline:
+        typer.secho(
+            f"Only {coverage['sessions_with_data']} session(s) of stored history -- fewer "
+            f"than the {baseline}-session baseline. Trends are provisional until history "
+            "accumulates (one session per refresh; ApeWisdom attention rows carry their "
+            "own 24h comparison and are usable sooner).",
+            fg=typer.colors.YELLOW,
+        )
 
 
 @db_app.command("fetch-health")
