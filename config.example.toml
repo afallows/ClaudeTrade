@@ -425,14 +425,33 @@ events = [
 ]
 
 [scheduler]
-# Scheduled background tasks (optional; disabled by default).
+# APScheduler cron jobs: NOT IMPLEMENTED. These settings are inert -- no job
+# runner reads them (see docs/known-limitations.md). Left in place so the
+# shape is documented for whoever wires them up.
 enabled = false
-timezone = "America/New_York"
+timezone = "America/New_York"                   # Also used by the overnight window below
 market_data_refresh_cron = "30 16 * * mon-fri"  # 4:30 PM ET weekdays (after market close)
 social_refresh_cron = "0 */4 * * *"             # Every 4 hours
 scan_cron = "45 16 * * mon-fri"                 # 4:45 PM ET weekdays
 paper_mark_cron = "5 16 * * mon-fri"            # 4:05 PM ET weekdays
 misfire_grace_time_s = 3600                     # Grace period for missed scheduled tasks
+
+# Hourly social/attention collection: IMPLEMENTED, and ON by default. Runs
+# inside the web API server (`python -m claudetrade.webapi`) for as long as it
+# is open. Social posts and ApeWisdom attention only -- never the ~20-minute
+# market pass. It exists because Reddit /new, X recent-search and ApeWisdom's
+# rolling 24h snapshot have no history endpoints: social history can only be
+# accumulated forward, so an hour the app was open but not collecting is an
+# hour permanently missing from every baseline. Run `claudetrade sentiment
+# collect` to do one by hand.
+social_collection_enabled = true
+social_collection_interval_minutes = 60         # Cadence while the app is open
+social_collection_jitter_seconds = 300          # Random 0..N added to every wait
+social_collection_lookback_hours = 72           # Wider than the cadence: recovers missed ticks
+social_collection_overnight_interval_minutes = 0   # 0 = same cadence around the clock
+social_collection_overnight_start_hour = 22     # Half-open [start, end) in `timezone`
+social_collection_overnight_end_hour = 4
+social_collection_max_backoff_minutes = 240     # Ceiling on back-off after repeated failures
 
 [trading]
 # Trading mode and broker configuration.

@@ -21,7 +21,9 @@ ClaudeTrade is under active development. This roadmap outlines planned features 
 - No live trading (a `BrokerProvider` interface and a non-functional stub
   adapter exist in `src/claudetrade/brokers/`; no real venue is wired up)
 - No intraday execution
-- No scheduler integration (`SchedulerConfig` exists but is not wired to any job runner)
+- Partial scheduler integration: social/attention collection runs hourly inside the
+  web API server (`src/claudetrade/scheduler.py`), but `SchedulerConfig`'s cron fields
+  (market refresh, scan, paper mark) are still not wired to any job runner
 - The UI's backtest "Export as CSV/Excel" buttons are placeholders (the CLI's
   `claudetrade backtest --export` works)
 - No CLI/UI command opens a paper trade — `PaperBroker.submit_signal` is
@@ -67,8 +69,10 @@ OHLCV chain; the range-brush works fine on closes.
 
 ## Mid-term
 
-**Background scheduler**:
-- Scheduled data refreshes (market, social, earnings)
+**Background scheduler** (social collection is done; the rest is not):
+- ~~Hourly social/sentiment collection while the app is open~~ — implemented in
+  `src/claudetrade/scheduler.py`, started from the web API lifespan
+- Scheduled market-data and earnings refreshes
 - Daily signal generation
 - Paper trading position updates
 - Automated backtests on new data
@@ -122,7 +126,9 @@ Contributions are welcome. Priority areas:
 1. **Broker adapters** (enables live trading for motivated users; the CLI, scan/backtest
    pipeline and UI are already in place and do not need to change)
 2. **Additional strategies** (low barrier; high research value)
-3. **Background scheduler wiring** (moderate complexity; config already exists)
+3. **Background scheduler wiring** for market refresh / scan / paper mark (moderate
+   complexity; config already exists, and the hourly social collector in
+   `src/claudetrade/scheduler.py` is the pattern to follow)
 4. **Documentation** (always appreciated)
 
 See the project repository for contribution guidelines.
@@ -153,7 +159,8 @@ See the project repository for contribution guidelines.
 ## Release Schedule
 
 - **v0.1.0**: current — core engine, CLI, and Streamlit UI
-- **v0.2.0**: scheduler wiring + live-trading broker adapter
+- **v0.2.0**: remaining scheduler wiring (market/scan/paper cron jobs) + live-trading
+  broker adapter
 - **v1.0.0**: production-ready
 
 Dates are aspirational and may slip. The backlog is public; feature requests and bug reports drive priorities.

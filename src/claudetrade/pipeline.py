@@ -782,6 +782,139 @@ class Pipeline:
         provider._regimes.update(regimes)
         return provider
 
+    # --- social-only collection ---------------------------------------------
+
+    def collect_social(
+        self,
+        *,
+        lookback_hours: int,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+    ) -> PipelineResult:
+        """Social posts and aggregator attention ONLY -- never the market pass.
+
+        The narrow entry point ``claudetrade.scheduler`` runs every hour, and
+        the reason it must be narrow is cost asymmetry: a full ``refresh``
+        spends ~20 rate-limit-bound minutes on per-symbol price/earnings
+        fetches that change once a day, while the data that is genuinely
+        perishable -- Reddit ``/new``, X recent-search, ApeWisdom's rolling
+        24h snapshot -- is cheap and unrecoverable once its window rolls past.
+        Running the whole refresh hourly would burn the market provider's rate
+        budget for nothing; running nothing hourly loses baseline forever.
+
+        Structurally, not just conventionally, market-free: the
+        ``DataIngestor`` built here is given ``market_provider=None`` and
+        ``earnings_provider=None``, so no code path from this method can
+        reach a price fetch even if it were changed to call one.
+
+        The symbol directory (needed to resolve mentions and to gate attention
+        rows to tracked tickers) comes from ``UniverseSelector.load_all`` --
+        stored securities, falling back to the packaged seed lists -- never
+        from ``market.list_universe()``, which for the live providers is a
+        network call and would reintroduce exactly the cost this method
+        exists to avoid.
+
+        Aggregation reuses ``build_sentiment`` unchanged, over this
+        collection's own posts, exactly as ``refresh`` does; the session
+        window is bounded by ``lookback_hours`` so an hourly run rewrites only
+        the sessions its posts actually cover and leaves older history alone.
+
+        Returns:
+            A ``PipelineResult`` whose ``ingest`` report carries the post and
+            mention counts, plus ``sentiment_rows`` and any degraded sources.
+        """
+        # Local import: this is the only method that needs the ET session
+        # helper, and keeping it out of the module import block keeps this
+        # addition to a single self-contained block.
+        from claudetrade.utils.timeutils import current_trading_session
+
+        result = PipelineResult()
+        report = IngestReport()
+        result.ingest = report
+
+        if not self.social and not self.attention:
+            result.warnings.append(
+                "No social or attention provider is configured; there is nothing to collect. "
+                "Sentiment history cannot accumulate until at least one is enabled."
+            )
+            result.finished_at = utc_now()
+            return result
+
+        securities = self.universe.load_all()
+        directory = {s.symbol: s for s in securities}
+        result.universe_size = len(directory)
+        if not directory:
+            result.warnings.append(
+                "No securities are known, so ticker mentions cannot be resolved. "
+                "Run 'claudetrade refresh' once to populate the universe."
+            )
+
+        ingestor = DataIngestor(
+            self.config,
+            self.db,
+            market_provider=None,
+            earnings_provider=None,
+            social_providers=self.social,
+            attention_providers=self.attention,
+            progress_callback=progress_callback,
+        )
+
+        def _report(phase: str, done: int) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(phase, done, 3)
+            except Exception:
+                log.debug("progress callback raised; ignored", exc_info=True)
+
+        end = current_trading_session()
+        since = utc_now() - dt.timedelta(hours=max(1, lookback_hours))
+        start = since.date()
+
+        posts: list[SocialPost] = []
+        if self.social:
+            _report("social", 0)
+            posts = ingestor.ingest_social(since=since, until=None, report=report)
+            if directory:
+                ingestor.resolve_and_persist_mentions(posts, directory, report)
+
+        if posts and directory:
+            _report("sentiment", 1)
+            result.sentiment_rows = self.build_sentiment(
+                posts=posts,
+                directory=directory,
+                start=start,
+                end=end,
+                progress_callback=progress_callback,
+            )
+        elif self.social and not posts:
+            result.warnings.append(
+                "No social posts were returned in this window; sentiment aggregates are "
+                "unchanged for this collection."
+            )
+
+        if self.attention:
+            _report("attention", 2)
+            # Keyed to the ET trading session for the same reason
+            # ``run_full_refresh`` does: the API reports a rolling current-24h
+            # window with no history endpoint, so today's observation is only
+            # ever about today.
+            ingestor.ingest_attention(end, report)
+
+        _report("finishing", 3)
+        result.degraded_sources.update(report.provider_failures)
+        report.finished_at = utc_now()
+        result.finished_at = utc_now()
+        log.info(
+            "social collection complete: %d post(s) fetched, %d new, %d mention(s), "
+            "%d sentiment row(s)%s",
+            len(posts),
+            report.posts_inserted,
+            report.mentions_inserted,
+            result.sentiment_rows,
+            f", degraded: {sorted(result.degraded_sources)}" if result.degraded_sources else "",
+        )
+        return result
+
 
 def _source_outcome(provider: object, failures: dict[str, str]) -> SourceCollection:
     """One provider's coverage outcome for this run.

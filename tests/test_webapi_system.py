@@ -1,6 +1,7 @@
 """Configuration and diagnostics API security contract."""
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import threading
 import time
@@ -420,6 +421,170 @@ class TestBackgroundRefresh:
         # starts cleanly rather than 409ing forever.
         second = client.post("/api/system/refresh")
         assert second.status_code == 200
+
+
+class TestHourlyCollectionSurface:
+    """``GET /api/system/refresh/status`` must make the automatic hourly
+    social collection *visible*.
+
+    The collector runs on its own, inside this server process, and writes to
+    the same database an operator-triggered refresh does. If the status
+    surface could not tell the two apart -- or could not say whether the loop
+    was even alive -- the operator would have no way to know whether history
+    was accumulating, which is the one thing that cannot be recovered later.
+    """
+
+    @pytest.fixture
+    def client_and_pipeline(self, tmp_app_config, tmp_db):
+        pipeline = Pipeline(tmp_app_config, tmp_db)
+        client = TestClient(
+            create_app(tmp_app_config, pipeline=pipeline), base_url="http://127.0.0.1"
+        )
+        return client, pipeline
+
+    def test_status_carries_readiness_and_collection_state(self, client_and_pipeline):
+        client, _ = client_and_pipeline
+
+        body = client.get("/api/system/refresh/status").json()
+
+        assert body["readiness"]["tier"] == "warming_up"
+        assert body["readiness"]["blocking"] is False
+        assert body["readiness"]["sessions_collected"] == 0
+        assert body["collection"]["enabled"] is True
+        assert body["scheduled"] is False
+
+    def test_a_scheduled_collection_is_distinguishable_from_a_manual_refresh(
+        self, client_and_pipeline
+    ):
+        """The acceptance shape: a run the app started on its own reads as
+        ``scheduled``; one a person started does not."""
+        from claudetrade.db import refresh_state_store
+        from claudetrade.scheduler import SCHEDULER_ENTRY_POINT
+
+        client, pipeline = client_and_pipeline
+
+        scheduled = refresh_state_store.try_acquire(pipeline.db, SCHEDULER_ENTRY_POINT)
+        body = client.get("/api/system/refresh/status").json()
+        assert body["running"] is True
+        assert body["entry_point"] == SCHEDULER_ENTRY_POINT
+        assert body["scheduled"] is True
+        scheduled.handle.finish("done")
+
+        manual = refresh_state_store.try_acquire(pipeline.db, "cli")
+        body = client.get("/api/system/refresh/status").json()
+        assert body["entry_point"] == "cli"
+        assert body["scheduled"] is False
+        manual.handle.finish("done")
+
+    def test_a_running_collection_makes_a_manual_refresh_409_rather_than_race(
+        self, client_and_pipeline
+    ):
+        """Same single-flight lock, both directions: the operator is told who
+        holds it instead of quietly starting a second concurrent writer."""
+        from claudetrade.db import refresh_state_store
+        from claudetrade.scheduler import SCHEDULER_ENTRY_POINT
+
+        client, pipeline = client_and_pipeline
+        held = refresh_state_store.try_acquire(pipeline.db, SCHEDULER_ENTRY_POINT)
+
+        response = client.post("/api/system/refresh")
+
+        assert response.status_code == 409
+        assert SCHEDULER_ENTRY_POINT in response.json()["detail"]
+        held.handle.finish("done")
+
+    def test_readiness_reflects_stored_coverage(self, client_and_pipeline):
+        from claudetrade.db.models import Security, SymbolSentimentDaily
+        from claudetrade.utils.timeutils import current_trading_session
+
+        client, pipeline = client_and_pipeline
+        # Seeded from the current ET session, not today's UTC date: coverage is
+        # asked "as of" the session, so a weekend's rows would not be counted.
+        latest = current_trading_session()
+        with pipeline.db.session() as session:
+            session.merge(Security(symbol="NVDA", name="NVDA Inc"))
+        with pipeline.db.session() as session:
+            for offset in range(25):
+                session.add(
+                    SymbolSentimentDaily(
+                        symbol="NVDA",
+                        session=latest - dt.timedelta(days=offset),
+                        source="all",
+                        post_count=4,
+                    )
+                )
+
+        body = client.get("/api/system/refresh/status").json()
+
+        assert body["readiness"]["sessions_collected"] == 25
+        assert body["readiness"]["tier"] == "provisional"
+
+    def test_readiness_is_cached_between_polls(self, client_and_pipeline, monkeypatch):
+        """This endpoint is polled every couple of seconds during a refresh,
+        while readiness can only move once per collection. Recomputing it per
+        request would spend a credential-store lookup per provider and several
+        400-day aggregate scans, against a database a refresh is writing to."""
+        import claudetrade.webapi.routers.system as system
+
+        client, _ = client_and_pipeline
+        calls = {"n": 0}
+
+        def counting_readiness(*args, **kwargs):
+            calls["n"] += 1
+            return {"tier": "warming_up", "sessions_collected": 0, "blocking": False}
+
+        monkeypatch.setattr(system, "collection_readiness", counting_readiness)
+
+        for _ in range(5):
+            assert client.get("/api/system/refresh/status").status_code == 200
+
+        assert calls["n"] == 1
+
+    def test_the_lifespan_starts_and_stops_the_collector(self, tmp_app_config, tmp_db):
+        """"While the application is open" is this process: the loop must come
+        up with the server and be gone before it finishes shutting down, or a
+        tick could outlive the database handle it writes through."""
+        from claudetrade.scheduler import SocialCollectionScheduler
+
+        app = create_app(tmp_app_config, pipeline=Pipeline(tmp_app_config, tmp_db))
+        # A sleep that never returns: the loop parks immediately and cannot
+        # reach a real collection during the test.
+        started: dict[str, object] = {}
+        original = SocialCollectionScheduler.start
+
+        def _capture(self):
+            self._sleep = _never
+            started["scheduler"] = self
+            return original(self)
+
+        SocialCollectionScheduler.start = _capture
+        try:
+            with TestClient(app, base_url="http://127.0.0.1") as client:
+                assert client.get("/api/meta").status_code == 200
+                scheduler = started["scheduler"]
+                assert scheduler.state()["running"] is True
+                assert client.get("/api/system/refresh/status").json()["collection"][
+                    "running"
+                ] is True
+        finally:
+            SocialCollectionScheduler.start = original
+
+        assert scheduler.state()["running"] is False
+
+    def test_the_lifespan_respects_the_disabled_flag(self, tmp_app_config, tmp_db):
+        tmp_app_config.scheduler.social_collection_enabled = False
+        app = create_app(tmp_app_config, pipeline=Pipeline(tmp_app_config, tmp_db))
+
+        with TestClient(app, base_url="http://127.0.0.1") as client:
+            body = client.get("/api/system/refresh/status").json()
+
+        assert body["collection"]["enabled"] is False
+        assert body["collection"]["running"] is False
+
+
+async def _never(_delay: float) -> None:
+    """A sleep that only ends when the task is cancelled."""
+    await asyncio.Event().wait()
 
 
 class TestHostValidation:

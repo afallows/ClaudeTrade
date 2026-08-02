@@ -189,8 +189,11 @@ The following requirements are **not yet implemented** (see [docs/known-limitati
 - **Live trading**: No real broker adapter is present (only the `BrokerProvider` interface
   and a non-functional `NullLiveBroker` stub, in `src/claudetrade/brokers/`). Live mode is
   rejected if `live_trading_authorised=true` but no broker is configured.
-- **Scheduler**: APScheduler dependency and `SchedulerConfig` are included but no background
-  task runners are implemented; the config settings are inert.
+- **Scheduler**: partially implemented. Hourly social/attention collection runs inside
+  the web API server (`src/claudetrade/scheduler.py`), driven by the
+  `scheduler.social_collection_*` settings. The APScheduler dependency and the
+  `SchedulerConfig` cron fields (market refresh, scan, paper mark) remain inert: no
+  background task runner is registered for them.
 - **Machine learning**: Optional `scikit-learn` dependency listed; ML-based signal fusion not implemented.
 - **Options support**: Only equity long/short is modelled.
 - **Intraday execution**: Only daily close prices and next-open fills; no intraday routing.

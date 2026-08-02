@@ -422,6 +422,65 @@ def test_get_market_status_reports_a_pending_sentiment_rebuild(
     assert mcp_server.get_market_status(pipeline)["sentiment_rebuild_pending"] is None
 
 
+def test_get_market_status_reports_collected_history_readiness(
+    pipeline: Pipeline, tmp_db: Database
+) -> None:
+    """An assistant reading a rising-sentiment list needs to know how much
+    baseline is behind it. Social history cannot be backfilled, so "installed
+    a week ago" and "has a usable baseline" are different facts -- and the
+    tier is computed from stored sessions, never asserted."""
+    from claudetrade.db.models import Security
+
+    empty = mcp_server.get_market_status(pipeline)["sentiment_readiness"]
+    assert empty["tier"] == "warming_up"
+    assert empty["sessions_collected"] == 0
+    assert empty["blocking"] is False
+
+    latest = current_trading_session()
+    with tmp_db.session() as session:
+        session.merge(Security(symbol="NVDA", name="NVDA Inc"))
+    with tmp_db.session() as session:
+        for offset in range(60):
+            session.add(
+                SymbolSentimentDaily(
+                    symbol="NVDA",
+                    session=latest - dt.timedelta(days=offset),
+                    source="all",
+                    post_count=6,
+                )
+            )
+
+    readiness = mcp_server.get_market_status(pipeline)["sentiment_readiness"]
+    assert readiness["sessions_collected"] == 60
+    assert readiness["tier"] == "partial"
+    assert readiness["next_tier"] == "ready"
+    assert readiness["sessions_to_next_tier"] == 60
+    assert isinstance(readiness["degraded_sources"], list)
+
+
+def test_get_refresh_status_marks_an_automatic_collection_as_scheduled(
+    pipeline: Pipeline, tmp_db: Database
+) -> None:
+    """The web server collects social data hourly on its own. A caller seeing
+    "a refresh is running" must be able to tell that nobody asked for it."""
+    from claudetrade.db import refresh_state_store
+    from claudetrade.scheduler import SCHEDULER_ENTRY_POINT
+
+    state = RefreshState()
+    assert mcp_server.get_refresh_status(pipeline, state)["scheduled"] is False
+
+    scheduled = refresh_state_store.try_acquire(tmp_db, SCHEDULER_ENTRY_POINT)
+    status = mcp_server.get_refresh_status(pipeline, state)
+    assert status["running"] is True
+    assert status["entry_point"] == SCHEDULER_ENTRY_POINT
+    assert status["scheduled"] is True
+    scheduled.handle.finish("done")
+
+    manual = refresh_state_store.try_acquire(tmp_db, "cli")
+    assert mcp_server.get_refresh_status(pipeline, state)["scheduled"] is False
+    manual.handle.finish("done")
+
+
 def test_get_market_status_reports_the_most_recent_signals_regime(
     pipeline: Pipeline, tmp_db: Database, make_signal
 ) -> None:

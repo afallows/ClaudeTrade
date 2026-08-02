@@ -54,14 +54,30 @@ This document lists what is NOT implemented in the current codebase.
 
 ### Background Scheduler
 
-- **Status**: Not implemented
-- **Current state**: `APScheduler` is a declared dependency and `SchedulerConfig` exists
-  in `src/claudetrade/config.py`, but no code constructs an `apscheduler` scheduler or
-  registers a job; the config settings are inert. There is no `claudetrade` subcommand
-  that runs continuously.
-- **Workaround**: Use cron (Linux/macOS) or Task Scheduler (Windows) to call
-  `claudetrade refresh` / `claudetrade scan` on a timer.
-- **Effort to implement**: Low; hook up the config settings to APScheduler jobs.
+- **Status**: Partially implemented — hourly social/attention collection is wired
+  up; scheduled market refreshes and scans are not.
+- **What runs**: `src/claudetrade/scheduler.py`'s `SocialCollectionScheduler`, started
+  from the web API server's FastAPI lifespan (`src/claudetrade/webapi/app.py`). While
+  the app is open it collects social posts and ApeWisdom attention every
+  `scheduler.social_collection_interval_minutes` (default 60, plus jitter), takes the
+  same cross-process refresh lock a manual refresh does — skipping, not queueing, when
+  it is held — and is visible through `GET /api/system/refresh/status` and the MCP
+  `get_refresh_status` tool with `entry_point = "scheduler"`. It **never** runs the
+  market pass. `claudetrade sentiment collect` runs exactly one collection on demand.
+- **Why only social**: Reddit `/new`, X recent-search and ApeWisdom's rolling 24h
+  snapshot have no history endpoints, so social history can only be accumulated
+  forward — a missed hour is permanently lost. Price bars, corporate actions and
+  earnings can all be backfilled, so they do not need an hourly loop, and running one
+  would cost ~20 rate-limit-bound minutes per hour for data that changes once a day.
+- **Still not implemented**: `APScheduler` remains a declared dependency with no jobs
+  registered. `SchedulerConfig.enabled` and the `*_cron` fields are inert — no code
+  constructs an `apscheduler` scheduler, and there is no `claudetrade` subcommand that
+  runs continuously.
+- **Workaround for the rest**: Use cron (Linux/macOS) or Task Scheduler (Windows) to
+  call `claudetrade refresh` / `claudetrade scan` on a timer. Use
+  `claudetrade sentiment collect` on a timer if you want social history to keep
+  accumulating while the app is closed.
+- **Effort to implement**: Low; hook up the remaining config settings to APScheduler jobs.
 
 ### Machine Learning Signal Fusion
 
@@ -262,7 +278,8 @@ This document lists what is NOT implemented in the current codebase.
 
 ## Future Work (Roadmap)
 
-1. **Background scheduler** (wire `SchedulerConfig` up to APScheduler jobs)
+1. **Background scheduler** (wire the remaining `SchedulerConfig` cron fields up to
+   APScheduler jobs; the hourly social/attention collection already runs in-process)
 2. **Live trading** (a real `BrokerProvider` implementation; the ABC and a
    non-functional `NullLiveBroker` stub already exist in `src/claudetrade/brokers/`,
    starting with Alpaca or Interactive Brokers)

@@ -166,6 +166,7 @@ claudetrade backtest              # replay strategies over history
 claudetrade ui                    # launch the Streamlit dashboard
 claudetrade secrets set|list|delete   # manage credentials in the OS credential store
 claudetrade paper status|positions|kill-switch   # inspect/drive the paper account
+claudetrade sentiment collect|history|rising     # social collection and mention history
 claudetrade db migrate|backup|restore            # database maintenance
 claudetrade verify ledger|survivorship           # integrity and reproducibility checks
 ```
@@ -173,6 +174,23 @@ claudetrade verify ledger|survivorship           # integrity and reproducibility
 Run `claudetrade --help` or `claudetrade <command> --help` for full option lists.
 **Live trading is not implemented**; `trading.mode = "live"` is rejected unless a
 broker adapter is configured, and none ships with this project.
+
+### Social history accumulates forward
+
+Reddit `/new`, X recent-search and ApeWisdom's rolling 24h snapshot have **no history
+endpoints**: unlike price bars, social data cannot be backfilled. It is therefore
+collected on a timer rather than fetched on demand.
+
+- While the web API server is open it collects social posts and attention every hour
+  (`scheduler.social_collection_interval_minutes`, jittered). This is social-only — it
+  never runs the ~20-minute market pass — and it takes the same single-flight lock a
+  refresh does, skipping rather than racing when one is running.
+- `claudetrade sentiment collect` runs exactly one collection on demand, for when the
+  app has not been open.
+- `claudetrade status` reports a **readiness tier** computed from the sessions actually
+  stored: `warming_up` (< 20 sessions), `provisional` (20+), `partial` (60+), `ready`
+  (120+). The tier is advisory — nothing is blocked at any tier — and it also appears
+  on `GET /api/system/refresh/status` and in the MCP `get_market_status` tool.
 
 ## Configuration
 
@@ -374,9 +392,11 @@ pytest tests/test_engine.py
 - `pandas>=2.1`, `numpy>=1.26` — Data manipulation
 - `httpx>=0.27` — HTTP client for API providers
 - `typer>=0.12` — CLI framework used by `claudetrade` (see `src/claudetrade/cli.py`)
-- `APScheduler>=3.10` — listed dependency; no scheduled jobs are wired up yet (see
-  [docs/known-limitations.md](docs/known-limitations.md)). Use the OS scheduler
-  (cron, Windows Task Scheduler) to run `claudetrade refresh`/`scan` on a timer instead.
+- `APScheduler>=3.10` — listed dependency; still no APScheduler jobs are registered
+  (see [docs/known-limitations.md](docs/known-limitations.md)). Hourly social/attention
+  collection *is* implemented, but as a plain asyncio loop inside the web API server
+  (`src/claudetrade/scheduler.py`), not through APScheduler. Use the OS scheduler
+  (cron, Windows Task Scheduler) to run `claudetrade refresh`/`scan` on a timer.
 - `keyring>=25.0` — OS credential store integration
 
 ### Optional Dependencies
