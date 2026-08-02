@@ -249,13 +249,14 @@ ClaudeTrade/
 │   │   ├── social/               # Social sentiment (reddit, x, synthetic)
 │   │   └── ai/                   # LLM classification (openai, anthropic, null)
 │   │
-│   ├── strategies/               # Five trading strategies
+│   ├── strategies/               # Six trading strategies
 │   │   ├── base.py               # Strategy base class and context
 │   │   ├── a_sentiment_breakout.py
 │   │   ├── b_sentiment_pullback.py
 │   │   ├── c_capitulation_reversal.py
 │   │   ├── d_hype_failure_short.py
-│   │   └── e_post_earnings_drift.py
+│   │   ├── e_post_earnings_drift.py
+│   │   └── f_volume_breakout.py
 │   │
 │   ├── signals/                  # Signal generation and ledger
 │   │   ├── engine.py             # Signal ranking and lifecycle

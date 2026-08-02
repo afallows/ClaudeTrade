@@ -311,8 +311,8 @@ Time-decayed daily sentiment aggregate per symbol and source.
 | `id` | Integer (PK) | |
 | `symbol` | String | Ticker |
 | `session` | Date | Trading date |
-| `source` | String | "reddit", "x", "all" |
-| `post_count` | Integer | Number of posts |
+| `source` | String | "all" (combined), per-source polarity ("reddit", "x", "news", "stocktwits"), or `apewisdom:<community>` for aggregator ATTENTION rows |
+| `post_count` | Integer | Number of posts (for `apewisdom:*` rows: mention count) |
 | `comment_count` | Integer | Number of comments |
 | `unique_authors` | Integer | Distinct authors |
 | `raw_sentiment` | Float | Mean polarity -1 to +1 |
@@ -339,6 +339,10 @@ Time-decayed daily sentiment aggregate per symbol and source.
 **Unique constraint**: `(symbol, session, source)`
 
 **Design note**: Computed from posts whose `created_at <= session` close time (no look-ahead). Can be recomputed if the aggregation logic changes.
+
+**Design note (attention vs polarity)**: `apewisdom:<community>` rows are a different kind of row sharing this table because the table is keyed by `(symbol, session, source)`. They carry mention volume and nothing else — no post text, no authors, no direction — so every polarity column keeps its neutral default and `unique_authors` stays 0. Those defaults are "never measured", not "measured as zero", and consumers must tell the two apart (`strategies.base.is_attention_only`) rather than averaging them together. These rows feed the attention axis only; they never reach `raw_sentiment`, `bull_bear_ratio`, `manipulation_risk`, `bot_risk`, `duplicate_ratio` or the combined `"all"` row.
+
+**Design note (per-source rows are independent evidence)**: `signals.scoring` weights each per-source row on its own. A source with no row for a session earns no weight rather than a neutral placeholder, and no row is ever substituted for another's.
 
 ---
 

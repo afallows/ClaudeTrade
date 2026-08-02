@@ -43,6 +43,7 @@ def _load_builtin_strategies() -> None:
         c_capitulation_reversal,
         d_hype_failure_short,
         e_post_earnings_drift,
+        f_volume_breakout,
     )
 
 

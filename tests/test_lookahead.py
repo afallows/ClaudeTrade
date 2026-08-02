@@ -172,6 +172,74 @@ class TestContextNeverExposesNextSession:
         assert len(filtered) == 2
         assert all(s.session <= session for s in context.sentiment_history)
 
+    def test_attention_history_through_session(self, tmp_app_config: AppConfig):
+        """The per-source attention series is clipped like every other series.
+
+        Attention history exists so an aggregator's reading can be ranked
+        against its own past. A future-dated entry in that reference
+        distribution would leak tomorrow's crowd into today's percentile --
+        subtler than a future bar, and just as disqualifying.
+        """
+        session = dt.date(2023, 1, 3)
+        series = [
+            SymbolSentiment(symbol="TEST", session=dt.date(2023, 1, 1), source="apewisdom:4chan"),
+            SymbolSentiment(symbol="TEST", session=session, source="apewisdom:4chan"),
+            SymbolSentiment(symbol="TEST", session=dt.date(2023, 1, 4), source="apewisdom:4chan"),
+        ]
+
+        context = StrategyContext(
+            session=session,
+            symbol="TEST",
+            bars=[Bar("TEST", session, 100.0, 102.0, 99.0, 101.0, 1_000_000)],
+            features={},
+            security=SecurityInfo("TEST"),
+            regime=None,
+            attention_history={"apewisdom:4chan": series},
+            config=tmp_app_config,
+        )
+
+        kept = context.attention_history["apewisdom:4chan"]
+        assert [s.session for s in kept] == [dt.date(2023, 1, 1), session]
+
+    def test_future_dated_per_source_snapshot_raises(self, tmp_app_config: AppConfig):
+        """A single per-source snapshot is a reading FOR this session, so --
+        like ``sentiment`` and unlike the histories -- it cannot be safely
+        clipped and a future-dated one is a bug upstream."""
+        session = dt.date(2023, 1, 3)
+        with pytest.raises(LookaheadError):
+            StrategyContext(
+                session=session,
+                symbol="TEST",
+                bars=[Bar("TEST", session, 100.0, 102.0, 99.0, 101.0, 1_000_000)],
+                features={},
+                security=SecurityInfo("TEST"),
+                regime=None,
+                sentiment_by_source={
+                    "reddit": SymbolSentiment(
+                        symbol="TEST", session=dt.date(2023, 1, 4), source="reddit"
+                    )
+                },
+                config=tmp_app_config,
+            )
+
+    def test_future_dated_attention_snapshot_raises(self, tmp_app_config: AppConfig):
+        session = dt.date(2023, 1, 3)
+        with pytest.raises(LookaheadError):
+            StrategyContext(
+                session=session,
+                symbol="TEST",
+                bars=[Bar("TEST", session, 100.0, 102.0, 99.0, 101.0, 1_000_000)],
+                features={},
+                security=SecurityInfo("TEST"),
+                regime=None,
+                attention_by_source={
+                    "apewisdom:4chan": SymbolSentiment(
+                        symbol="TEST", session=dt.date(2023, 1, 4), source="apewisdom:4chan"
+                    )
+                },
+                config=tmp_app_config,
+            )
+
 
 class TestEarningsWithConfirmation:
     """Unconfirmed (estimated) earnings dates are handled properly."""

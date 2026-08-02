@@ -267,9 +267,19 @@ class TestIngest:
     def test_never_writes_the_combined_aggregate_strategies_score_against(
         self, db: Database
     ) -> None:
-        """The load-bearing guarantee. ``data.context._sentiment_for`` picks
-        the ``"all"`` row; as long as attention never writes one, this source
-        cannot move a signal's score no matter what it reports."""
+        """The load-bearing guarantee, restated for what it actually protects.
+
+        It used to be described as "this source cannot move a signal's score
+        no matter what it reports". That was true only because attention data
+        was excluded from every axis -- including the one it measures better
+        than anything else in the system (QA #5). It now feeds ATTENTION
+        scoring, ranked against its own history, so the guarantee this test
+        protects is narrower and more precise: never the combined ``"all"``
+        row, and therefore never any POLARITY component, ``manipulation_risk``
+        or ``data_confidence``, all of which read that row alone. See
+        ``tests/test_scoring_sentiment_axes.py`` for the scoring-side half of
+        the same separation.
+        """
         self._ingest(db, [SymbolAttention("NVDA", "all-stocks", mentions=800)])
 
         with db.read_session() as session:
