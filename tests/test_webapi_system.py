@@ -66,6 +66,10 @@ class TestRedditConnectivityTest:
         assert response.status_code == 404
 
     def test_not_configured_reports_ok_false(self, client, monkeypatch) -> None:
+        # Neutralise the OS credential store too: a developer machine with a
+        # real reddit_session cookie stored would otherwise flip this to a
+        # configured cookie-session mode (same isolation as test_ai_providers).
+        monkeypatch.setattr("claudetrade.secrets._keyring_backend", lambda: None)
         monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_ID", raising=False)
         monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_CLIENT_SECRET", raising=False)
         monkeypatch.delenv("CLAUDETRADE_SECRET_REDDIT_SESSION_COOKIE", raising=False)
@@ -177,6 +181,9 @@ class TestXConnectivityTest:
     """
 
     def test_not_configured_reports_ok_false(self, client, monkeypatch) -> None:
+        # Neutralise the OS credential store too: real X session cookies
+        # stored on a developer machine would otherwise select session mode.
+        monkeypatch.setattr("claudetrade.secrets._keyring_backend", lambda: None)
         monkeypatch.delenv("CLAUDETRADE_SECRET_X_BEARER_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDETRADE_SECRET_X_AUTH_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDETRADE_SECRET_X_CT0", raising=False)
@@ -281,6 +288,10 @@ class TestAIConnectivityTest:
     def test_anthropic_successful_probe(self, client, tmp_app_config, monkeypatch) -> None:
         import json as _json
         from types import SimpleNamespace
+
+        # The provider requires the real SDK before it reaches the mocked
+        # client; skip cleanly where the optional extra is not installed.
+        pytest.importorskip("anthropic", reason="anthropic SDK not installed")
 
         tmp_app_config.ai.provider = "anthropic"
         monkeypatch.setenv("CLAUDETRADE_SECRET_ANTHROPIC_API_KEY", "sk-ant-test")
@@ -629,3 +640,174 @@ class TestHostValidation:
     def test_localhost_host_is_accepted(self, client):
         response = client.get("/api/meta", headers={"host": "127.0.0.1:8765"})
         assert response.status_code == 200
+
+
+class TestPolygonConnectivityTest:
+    """``POST /api/system/credentials/polygon/test`` -- fully mocked; this
+    endpoint must NEVER be exercised against the real network from a test.
+    """
+
+    def _install_transport(self, monkeypatch, handler):
+        import httpx as _httpx
+
+        real_client = _httpx.Client
+
+        def _factory(*args, **kwargs):
+            kwargs["transport"] = _httpx.MockTransport(handler)
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr("claudetrade.providers.market.polygon.httpx.Client", _factory)
+
+    def _isolate_key(self, monkeypatch):
+        monkeypatch.setattr("claudetrade.secrets._keyring_backend", lambda: None)
+        monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDETRADE_SECRET_POLYGON_API_KEY", raising=False)
+
+    def test_not_configured_reports_ok_false(self, client, monkeypatch) -> None:
+        self._isolate_key(monkeypatch)
+        response = client.post("/api/system/credentials/polygon/test")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is False
+        assert body["mode"] is None
+        assert "not configured" in body["status_detail"]
+
+    def test_successful_probe_fetches_grouped_bars(self, client, monkeypatch) -> None:
+        import json as _json
+        from pathlib import Path as _Path
+
+        import httpx as _httpx
+
+        self._isolate_key(monkeypatch)
+        monkeypatch.setenv("CLAUDETRADE_SECRET_POLYGON_API_KEY", "pk_test")
+        grouped = _json.loads(
+            (_Path(__file__).parent / "fixtures" / "polygon" / "grouped_2026-07-30.json")
+            .read_text(encoding="utf-8")
+        )
+        self._install_transport(monkeypatch, lambda request: _httpx.Response(200, json=grouped))
+
+        response = client.post("/api/system/credentials/polygon/test")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is True
+        assert body["mode"] == "grouped_daily"
+        assert "1 AAPL bar(s)" in body["status_detail"]
+
+    def test_auth_rejection_reports_ok_false(self, client, monkeypatch) -> None:
+        import httpx as _httpx
+
+        self._isolate_key(monkeypatch)
+        monkeypatch.setenv("CLAUDETRADE_SECRET_POLYGON_API_KEY", "pk_bad")
+        self._install_transport(monkeypatch, lambda request: _httpx.Response(401, json={}))
+
+        response = client.post("/api/system/credentials/polygon/test")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is False
+        assert "auth rejected" in body["status_detail"]
+
+
+class TestApeWisdomConnectivityTest:
+    """``POST /api/system/credentials/apewisdom/test`` -- fully mocked."""
+
+    def _install_transport(self, monkeypatch, handler):
+        import httpx as _httpx
+
+        real_client = _httpx.Client
+
+        def _factory(*args, **kwargs):
+            kwargs["transport"] = _httpx.MockTransport(handler)
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "claudetrade.providers.social.apewisdom.httpx.Client", _factory
+        )
+
+    def test_successful_probe(self, client, monkeypatch) -> None:
+        import httpx as _httpx
+
+        payload = {
+            "count": 1, "pages": 1, "current_page": 1,
+            "results": [{
+                "rank": 1, "ticker": "SPY", "name": "SPDR S&P 500 ETF Trust",
+                "mentions": 85, "upvotes": 844,
+                "rank_24h_ago": 2, "mentions_24h_ago": 116,
+            }],
+        }
+        self._install_transport(monkeypatch, lambda request: _httpx.Response(200, json=payload))
+
+        response = client.post("/api/system/credentials/apewisdom/test")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is True
+        assert body["mode"] == "all-stocks"
+        assert "attention row" in body["status_detail"]
+
+    def test_server_error_reports_ok_false(self, client, monkeypatch) -> None:
+        import httpx as _httpx
+
+        self._install_transport(monkeypatch, lambda request: _httpx.Response(503, json={}))
+        response = client.post("/api/system/credentials/apewisdom/test")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is False
+
+
+class TestAdanosConnectivityTest:
+    """``POST /api/system/credentials/adanos/test`` -- fully mocked."""
+
+    def _install_transport(self, monkeypatch, handler):
+        import httpx as _httpx
+
+        real_client = _httpx.Client
+
+        def _factory(*args, **kwargs):
+            kwargs["transport"] = _httpx.MockTransport(handler)
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr("claudetrade.providers.social.adanos.httpx.Client", _factory)
+
+    def test_successful_site_mode_probe(self, client, monkeypatch) -> None:
+        import json as _json
+        from pathlib import Path as _Path
+
+        import httpx as _httpx
+
+        rows = _json.loads(
+            (_Path(__file__).parent / "fixtures" / "adanos" / "x_trending.json")
+            .read_text(encoding="utf-8")
+        )
+        self._install_transport(monkeypatch, lambda request: _httpx.Response(200, json=rows))
+
+        response = client.post("/api/system/credentials/adanos/test")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is True
+        assert body["mode"] == "site:x"
+        assert "snapshot row" in body["status_detail"]
+
+    def test_feed_failure_reports_ok_false(self, client, monkeypatch) -> None:
+        import httpx as _httpx
+
+        self._install_transport(monkeypatch, lambda request: _httpx.Response(429, json={}))
+        response = client.post("/api/system/credentials/adanos/test")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is False
+        assert "feed failed" in body["status_detail"]
+
+
+class TestDiagnosticsCoversEveryConnector:
+    """The Diagnostics page is the single home for connector health -- every
+    connector must have a row, so a new one that forgets to register here
+    fails this test rather than silently missing from the page.
+    """
+
+    def test_diagnostics_lists_every_connector(self, client) -> None:
+        response = client.get("/api/system/diagnostics")
+        assert response.status_code == 200
+        names = {row["name"] for row in response.json()["pipelines"]}
+        assert {
+            "Market prices", "Polygon bars", "Reddit", "X", "Stocktwits",
+            "News RSS", "ApeWisdom", "Adanos", "AI classifier",
+        } <= names

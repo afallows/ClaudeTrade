@@ -19,6 +19,7 @@ from claudetrade.config import AppConfig
 from claudetrade.db import refresh_state_store
 from claudetrade.pipeline import Pipeline
 from claudetrade.providers.base import (
+    AuthenticationError,
     NotConfiguredError,
     ProviderError,
     RateLimitError,
@@ -155,10 +156,15 @@ def test_credential(source: str, config: AppConfig = Depends(get_config)) -> dic
     between tooling and a browser -- see ``docs/api-providers.md``), ``x``
     (the owner's way to validate the internal GraphQL endpoint constants in
     ``providers.social.x_provider`` live -- see that module's "expected
-    maintenance" note), and ``ai`` (one minimal real classification call
-    against the configured Claude/ChatGPT provider). Never echoes a
-    credential value; the response carries only a pass/fail verdict, the
-    mode/provider selected, and a short human-readable detail string.
+    maintenance" note), ``ai`` (one minimal real classification call
+    against the configured Claude/ChatGPT provider), ``polygon`` (one
+    grouped-daily bars call for the last settled trading day), ``apewisdom``
+    (one page of one filter), and ``adanos`` (one feed's snapshot, honouring
+    the official-mode monthly budget). This endpoint is the single home for
+    per-connector connection tests -- a new connector should gain a branch
+    here alongside its ``diagnostics()`` row. Never echoes a credential
+    value; the response carries only a pass/fail verdict, the mode/provider
+    selected, and a short human-readable detail string.
     """
     if source == "reddit":
         return _test_reddit_connectivity(config)
@@ -166,6 +172,12 @@ def test_credential(source: str, config: AppConfig = Depends(get_config)) -> dic
         return _test_x_connectivity(config)
     if source == "ai":
         return _test_ai_connectivity(config)
+    if source == "polygon":
+        return _test_polygon_connectivity(config)
+    if source == "apewisdom":
+        return _test_apewisdom_connectivity(config)
+    if source == "adanos":
+        return _test_adanos_connectivity(config)
     raise HTTPException(
         status_code=404, detail=f"no connectivity test is implemented for {source!r}"
     )
@@ -357,6 +369,145 @@ def _test_ai_connectivity(config: AppConfig) -> dict[str, object]:
     }
 
 
+def _test_polygon_connectivity(config: AppConfig) -> dict[str, object]:
+    """Live probe for Polygon.io: ONE grouped-daily bars request for the most
+    recent settled trading day, ``bypass_cache=True`` so a cached response
+    can never masquerade as connectivity. Follows
+    ``_test_reddit_connectivity``'s pattern: cheap, never echoes a
+    credential, never 500s the page.
+    """
+    from claudetrade.providers.market.polygon import PolygonProvider
+    from claudetrade.utils.timeutils import is_trading_day
+
+    provider = PolygonProvider(config.polygon, cache_dir=config.paths.resolve("cache_dir"))
+    if not provider.status().configured:
+        return {
+            "ok": False,
+            "mode": None,
+            "status_detail": (
+                f"not configured: credential '{config.polygon.api_key_credential}' "
+                "does not resolve"
+            ),
+        }
+
+    # Most recent trading day strictly before today: settled, so the
+    # provider's not-yet-closed guard can never interfere with the probe.
+    day = utc_now().date() - dt.timedelta(days=1)
+    for _ in range(5):
+        if is_trading_day(day):
+            break
+        day -= dt.timedelta(days=1)
+
+    try:
+        bars = provider.grouped_daily_bars(["AAPL"], day, bypass_cache=True)
+    except AuthenticationError as exc:
+        return {"ok": False, "mode": "grouped_daily", "status_detail": f"auth rejected: {exc}"}
+    except RateLimitError as exc:
+        return {"ok": False, "mode": "grouped_daily", "status_detail": f"rate limited: {exc}"}
+    except ProviderError as exc:
+        return {"ok": False, "mode": "grouped_daily", "status_detail": f"provider error: {exc}"}
+    except Exception as exc:  # never let a probe endpoint 500 the whole page
+        return {"ok": False, "mode": "grouped_daily", "status_detail": f"unexpected error: {exc}"}
+
+    return {
+        "ok": True,
+        "mode": "grouped_daily",
+        "status_detail": (
+            f"fetched grouped daily bars for {day.isoformat()}; "
+            f"{len(bars)} AAPL bar(s) parsed"
+        ),
+    }
+
+
+def _test_apewisdom_connectivity(config: AppConfig) -> dict[str, object]:
+    """Live probe for ApeWisdom: ONE page of ONE filter.
+
+    Calls the provider's per-filter fetch directly (rather than
+    ``fetch_attention``, which deliberately swallows per-filter failures --
+    correct for a refresh, useless for a connectivity verdict).
+    """
+    from claudetrade.providers.social.apewisdom import ApeWisdomProvider
+
+    probe_config = config.apewisdom.model_copy(
+        update={
+            "filters": (config.apewisdom.filters or ["all-stocks"])[:1],
+            "max_pages_per_filter": 1,
+            "request_timeout_s": 15.0,
+        }
+    )
+    if not probe_config.enabled or not probe_config.filters:
+        return {"ok": False, "mode": None, "status_detail": "disabled or no filters configured"}
+
+    provider = ApeWisdomProvider(probe_config)
+    community = probe_config.filters[0]
+    try:
+        rows = provider._fetch_filter(community, utc_now())  # private on purpose -- see docstring
+    except RateLimitError as exc:
+        return {"ok": False, "mode": community, "status_detail": f"rate limited: {exc}"}
+    except ProviderError as exc:
+        return {"ok": False, "mode": community, "status_detail": f"provider error: {exc}"}
+    except Exception as exc:  # never let a probe endpoint 500 the whole page
+        return {"ok": False, "mode": community, "status_detail": f"unexpected error: {exc}"}
+
+    return {
+        "ok": True,
+        "mode": community,
+        "status_detail": f"fetched {len(rows)} attention row(s) from filter '{community}'",
+    }
+
+
+def _test_adanos_connectivity(config: AppConfig) -> dict[str, object]:
+    """Live probe for Adanos: ONE feed's trending snapshot in whichever mode
+    (keyless site proxy / official X-API-Key) the configuration selects.
+
+    Uses the real cache_dir so an official-mode probe is counted against the
+    persistent monthly budget -- a connectivity test that dodged the budget
+    would understate the month's usage.
+    """
+    from claudetrade.providers.social.adanos import AdanosProvider
+
+    adanos = config.adanos
+    feeds = [
+        name
+        for name, on in (
+            ("x", adanos.feed_x),
+            ("reddit", adanos.feed_reddit),
+            ("polymarket", adanos.feed_polymarket),
+        )
+        if on
+    ]
+    if not adanos.enabled or not feeds:
+        return {"ok": False, "mode": None, "status_detail": "disabled or no feeds configured"}
+
+    # Probe exactly one feed -- the first enabled one -- to keep this to a
+    # single outbound request.
+    first = feeds[0]
+    probe_config = adanos.model_copy(
+        update={
+            "feed_x": first == "x",
+            "feed_reddit": first == "reddit",
+            "feed_polymarket": first == "polymarket",
+            "request_timeout_s": 15.0,
+        }
+    )
+    provider = AdanosProvider(probe_config, cache_dir=config.paths.resolve("cache_dir"))
+    mode = f"{provider.mode}:{first}"
+    try:
+        rows = provider.fetch_snapshots()
+    except Exception as exc:  # fetch_snapshots is best-effort; belt and braces
+        return {"ok": False, "mode": mode, "status_detail": f"unexpected error: {exc}"}
+
+    failures = dict(getattr(provider, "last_feed_failures", {}) or {})
+    if failures:
+        detail = "; ".join(f"{feed}: {reason}" for feed, reason in failures.items())
+        return {"ok": False, "mode": mode, "status_detail": f"feed failed -- {detail}"}
+    return {
+        "ok": True,
+        "mode": mode,
+        "status_detail": f"fetched {len(rows)} snapshot row(s) from the {first} feed",
+    }
+
+
 def _pipeline(name: str, kind: Literal["sentiment", "stock_price"], provider: str,
               enabled: bool, needs_credential: bool, credential: str | None = None) -> dict[str, object]:
     configured = enabled and (not needs_credential or bool(credential and get_secret(credential)))
@@ -435,11 +586,54 @@ def _reddit_pipeline(config: AppConfig) -> dict[str, object]:
     }
 
 
+def _adanos_pipeline(config: AppConfig) -> dict[str, object]:
+    """Adanos diagnostics row, mode-aware (site proxy vs official API) the
+    same way ``_reddit_pipeline`` is mode-aware, without any vendor request.
+    """
+    adanos = config.adanos
+    feeds = [
+        name
+        for name, on in (
+            ("x", adanos.feed_x),
+            ("reddit", adanos.feed_reddit),
+            ("polymarket", adanos.feed_polymarket),
+        )
+        if on
+    ]
+    configured = adanos.enabled and bool(feeds)
+    official = adanos.prefer_official_api and bool(get_secret(adanos.api_key_credential))
+    if not adanos.enabled:
+        detail = "Disabled in configuration"
+    elif not feeds:
+        detail = "No feeds enabled"
+    else:
+        mode = (
+            "official API (X-API-Key, monthly-budget gated)"
+            if official
+            else "keyless site mode"
+        )
+        detail = (
+            f"{mode}; feeds: {', '.join(feeds)}; network reachability is "
+            "checked during refresh"
+        )
+    return {
+        "name": "Adanos", "kind": "sentiment", "provider": "adanos",
+        "status": "not_configured" if not configured else "configured",
+        "configured": configured, "reachable": None,
+        "detail": detail,
+    }
+
+
 @router.get("/diagnostics")
 def diagnostics(config: AppConfig = Depends(get_config)) -> dict[str, object]:
     pipelines = [
         _pipeline("Market prices", "stock_price", config.market_data.provider, True,
                   bool(config.market_data.credential), config.market_data.credential),
+        # Enabled-by-key: the provider is always willing, so "Credential
+        # required" (no key) vs "Configured" (key resolves) is the honest
+        # pair of states -- mirrors PolygonConfig's own contract.
+        _pipeline("Polygon bars", "stock_price", "polygon", True,
+                  True, config.polygon.api_key_credential),
         _reddit_pipeline(config),
         _pipeline("X", "sentiment", config.x.provider, config.x.enabled,
                   config.x.provider != "synthetic", config.x.bearer_credential),
@@ -448,6 +642,9 @@ def diagnostics(config: AppConfig = Depends(get_config)) -> dict[str, object]:
         _pipeline("News RSS", "sentiment", config.news.provider,
                   config.news.enabled, config.news.hosted_enabled,
                   config.news.hosted_credential),
+        _pipeline("ApeWisdom", "sentiment", config.apewisdom.provider,
+                  config.apewisdom.enabled, False),
+        _adanos_pipeline(config),
         _pipeline("AI classifier", "sentiment", config.ai.provider,
                   config.ai.provider != "none", config.ai.provider != "none",
                   config.ai.api_key_credential),
