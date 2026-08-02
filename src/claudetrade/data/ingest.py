@@ -1591,6 +1591,7 @@ class DataIngestor:
                             injection_risk=post.injection_risk,
                             raw_ref=post.raw_ref,
                             flair=post.flair,
+                            sentiment_prior=post.sentiment_prior,
                         )
                     )
                     report.posts_inserted += 1

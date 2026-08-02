@@ -244,6 +244,29 @@ def _m007_social_coverage(session: Session) -> None:
     SocialCoverageRow.__table__.create(session.get_bind(), checkfirst=True)
 
 
+def _m008_add_sentiment_prior_column(session: Session) -> None:
+    """Add the nullable ``social_posts.sentiment_prior`` column.
+
+    Same fresh-vs-migrated posture as ``_m004_add_flair_column``: a database
+    created by ``_m001_create_schema`` already reflects the current ORM model
+    and has the column, so the inspector guard makes this a no-op there.
+
+    Existing rows stay NULL and are *not* backfilled. They cannot be: the tag
+    lives on the Stocktwits message payload, which we do not retain, and
+    inferring a tag from the stored text would be exactly the substitution
+    this field exists to avoid. NULL correctly says "we never captured
+    whether this author tagged the post".
+    """
+    bind = session.get_bind()
+    insp = inspect(bind)
+    if "social_posts" not in insp.get_table_names():
+        return
+    existing_columns = {col["name"] for col in insp.get_columns("social_posts")}
+    if "sentiment_prior" in existing_columns:
+        return
+    session.execute(text("ALTER TABLE social_posts ADD COLUMN sentiment_prior VARCHAR(10)"))
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_schema", _m001_create_schema, "Initial tables, indexes and constraints"),
     Migration(2, "immutability_triggers", _m002_immutability_triggers, "Append-only ledger guards"),
@@ -261,6 +284,12 @@ MIGRATIONS: tuple[Migration, ...] = (
         "social_coverage",
         _m007_social_coverage,
         "Per-session social-collection coverage (confirmed zero vs not collected)",
+    ),
+    Migration(
+        8,
+        "add_sentiment_prior_column",
+        _m008_add_sentiment_prior_column,
+        "Nullable social_posts.sentiment_prior column (author's own bull/bear tag)",
     ),
 )
 

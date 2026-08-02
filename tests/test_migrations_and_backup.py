@@ -326,3 +326,115 @@ class TestFlairColumnMigration:
         insp = inspect(unmigrated_db.engine)
         columns = {c["name"] for c in insp.get_columns("social_posts")}
         assert "flair" in columns
+
+
+class TestSentimentPriorColumnMigration:
+    """Migration 008 adds the nullable ``social_posts.sentiment_prior`` column.
+
+    Same shape as ``TestFlairColumnMigration`` above, and for the same reason
+    -- a fresh database gets the column from ``_m001_create_schema``, so only
+    a database upgraded from an earlier release exercises the ALTER.
+    """
+
+    def test_fresh_schema_already_has_sentiment_prior_column(self, memory_db: Database):
+        insp = inspect(memory_db.engine)
+        columns = {c["name"] for c in insp.get_columns("social_posts")}
+        assert "sentiment_prior" in columns
+
+    def test_column_is_three_valued_not_two(self, memory_db: Database):
+        """NULL ("this author did not tag the post") must stay distinguishable
+        from a tag. Collapsing the two would invent opinions nobody held."""
+        with memory_db.session() as session:
+            session.add_all(
+                [
+                    SocialPostRow(
+                        source="stocktwits",
+                        external_id="st_tagged",
+                        created_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+                        text="long here",
+                        sentiment_prior="bullish",
+                    ),
+                    SocialPostRow(
+                        source="stocktwits",
+                        external_id="st_untagged",
+                        created_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+                        text="long here",
+                    ),
+                ]
+            )
+        with memory_db.read_session() as session:
+            tagged = session.query(SocialPostRow).filter_by(external_id="st_tagged").one()
+            untagged = session.query(SocialPostRow).filter_by(external_id="st_untagged").one()
+        assert tagged.sentiment_prior == "bullish"
+        assert untagged.sentiment_prior is None
+
+    def test_upgrade_from_an_older_database_adds_the_column_without_backfilling(
+        self, unmigrated_db: Database
+    ):
+        """Existing rows stay NULL on purpose: the tag lives on the Stocktwits
+        payload we do not retain, and inferring one from the stored text would
+        be exactly the substitution this field exists to prevent."""
+        Base.metadata.create_all(unmigrated_db.engine, tables=[SchemaVersion.__table__])
+        with unmigrated_db.session() as session:
+            session.execute(
+                text(
+                    """
+                    CREATE TABLE social_posts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source VARCHAR(20),
+                        external_id VARCHAR(80),
+                        created_at DATETIME,
+                        fetched_at DATETIME,
+                        text TEXT,
+                        text_hash VARCHAR(64),
+                        community VARCHAR(80),
+                        score INTEGER,
+                        num_comments INTEGER,
+                        num_reposts INTEGER,
+                        num_replies INTEGER,
+                        author_hash VARCHAR(64),
+                        author_age_days FLOAT,
+                        author_karma FLOAT,
+                        author_followers FLOAT,
+                        is_comment BOOLEAN,
+                        parent_id VARCHAR(80),
+                        is_removed BOOLEAN,
+                        is_crosspost BOOLEAN,
+                        crosspost_parent VARCHAR(80),
+                        duplicate_group VARCHAR(64),
+                        injection_risk FLOAT,
+                        raw_ref VARCHAR(200),
+                        flair VARCHAR(80)
+                    )
+                    """
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO social_posts (source, external_id, created_at, text) "
+                    "VALUES ('stocktwits', 'st_old', '2024-01-01 00:00:00', 'long here')"
+                )
+            )
+            session.add(
+                SchemaVersion(
+                    version=7, name="social_coverage", checksum="007:social_coverage"
+                )
+            )
+
+        assert current_version(unmigrated_db) == 7
+        applied = migrate(unmigrated_db)
+        assert 8 in applied
+
+        insp = inspect(unmigrated_db.engine)
+        assert "sentiment_prior" in {c["name"] for c in insp.get_columns("social_posts")}
+        with unmigrated_db.read_session() as session:
+            row = session.execute(
+                text("SELECT sentiment_prior FROM social_posts WHERE external_id = 'st_old'")
+            ).one()
+            assert row.sentiment_prior is None
+
+    def test_migration_is_idempotent_when_rerun(self, unmigrated_db: Database):
+        init_database(unmigrated_db)
+        assert migrate(unmigrated_db) == []
+        insp = inspect(unmigrated_db.engine)
+        assert "sentiment_prior" in {c["name"] for c in insp.get_columns("social_posts")}

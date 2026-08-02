@@ -69,14 +69,25 @@ log = logging.getLogger(__name__)
 # filter "graphql") while logged in as the account owner, then update this
 # block alone; nothing else in this file should need to change alongside it.
 #
-# The query ID below is illustrative/unverified: this sandbox has no network
-# egress to capture a live one (see docs/api-providers.md's honesty note).
-# Session mode will simply fail closed (typically a 404/400 on the GraphQL
-# path, caught by the status-code checks below) until an operator supplies a
-# current query ID from their own browser capture.
+# There is deliberately NO built-in query ID. It is account-independent but
+# rotates without notice, so it belongs to the operator's own browser capture
+# and lives in ``XConfig.session_query_id``. Shipping a placeholder here (as
+# this module previously did) produced a 404 with an empty body and no
+# content-type header, which the checks below then reported as a login wall
+# -- sending operators off to re-export cookies that were perfectly valid.
+# ``_session_search_url`` is the single place the URL is built.
 # ============================================================================
-_SEARCH_GRAPHQL_QUERY_ID = "UNVERIFIED_CAPTURE_YOUR_OWN_QUERY_ID"
-_SEARCH_GRAPHQL_URL = f"https://x.com/i/api/graphql/{_SEARCH_GRAPHQL_QUERY_ID}/SearchTimeline"
+_SEARCH_GRAPHQL_URL_TEMPLATE = "https://x.com/i/api/graphql/{query_id}/SearchTimeline"
+
+#: How an operator gets a query ID. Repeated verbatim in every place that can
+#: report the missing-ID failure, because the failure is only actionable with
+#: the click-path attached.
+_QUERY_ID_CAPTURE_HINT = (
+    "Set x.session_query_id in config.toml to the value from your own browser "
+    "capture: log in to x.com, open devtools -> Network, filter 'graphql', "
+    "search any cashtag, and copy the path segment immediately before "
+    "'/SearchTimeline'."
+)
 #: The static, public bearer token the logged-in web client itself sends
 #: alongside session cookies (not a secret -- it identifies the web app, the
 #: cookies are what authenticate the *user*). Left as a documented constant
@@ -176,14 +187,30 @@ class XProvider:
                 rate_limit_per_minute=self._rate_limiter.calls_per_minute,
                 licence_note="Official X API v2; requires paid tier for production volume",
             )
+        # Session mode needs three things, and reporting "configured" on the
+        # strength of the two credentials alone is what let a missing query ID
+        # masquerade as an authentication failure at fetch time. Each missing
+        # piece is named here so the Providers panel answers "why is X quiet?"
+        # without anyone having to trigger a live probe.
+        blockers = []
+        if not (self.config.session_query_id or "").strip():
+            blockers.append(f"no GraphQL query ID -- {_QUERY_ID_CAPTURE_HINT}")
+        if not self.config.session_symbols:
+            blockers.append(
+                "no watchlist symbols -- set x.session_symbols in config.toml; "
+                "session mode only searches cashtags from that list, so an empty "
+                "list means every cycle fetches nothing"
+            )
         return ProviderStatus(
             name=self.name,
             kind="social",
-            available=True,
-            configured=True,
+            available=not blockers,
+            configured=not blockers,
             message=(
                 f"X cookie-session mode, UNOFFICIAL "
                 f"({len(self.config.session_symbols)} watchlist symbols)"
+                if not blockers
+                else "X cookie-session mode cannot run: " + "; ".join(blockers)
             ),
             supports_point_in_time=False,
             rate_limit_per_minute=self._rate_limiter.calls_per_minute,
@@ -404,6 +431,19 @@ class XProvider:
         Decision 1 requires failing closed on; never guesses at a shape it
         cannot confidently parse.
         """
+        # Checked before the request, not after: without a query ID there is
+        # no URL worth calling, and issuing one anyway is how this failure
+        # used to come back disguised as an authentication problem.
+        query_id = (self.config.session_query_id or "").strip()
+        if not query_id:
+            raise SourceBlockedError(
+                f"X session mode has no GraphQL query ID configured, so no search "
+                f"request was attempted for '{cashtag}'. This is NOT a cookie or "
+                f"login problem -- your session credentials were never used. "
+                f"{_QUERY_ID_CAPTURE_HINT}",
+                provider="x",
+            )
+
         headers = {
             "authorization": f"Bearer {_WEB_CLIENT_BEARER}",
             "cookie": f"auth_token={self._auth_token}; ct0={self._ct0}",
@@ -424,7 +464,11 @@ class XProvider:
         }
 
         with httpx.Client(timeout=self.config.session_request_timeout_s) as client:
-            response = client.get(_SEARCH_GRAPHQL_URL, headers=headers, params=params)
+            response = client.get(
+                _SEARCH_GRAPHQL_URL_TEMPLATE.format(query_id=query_id),
+                headers=headers,
+                params=params,
+            )
 
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After", "60")
@@ -447,21 +491,32 @@ class XProvider:
                 provider="x",
             )
 
-        content_type = response.headers.get("content-type", "")
-        if "json" not in content_type.lower():
-            raise SourceBlockedError(
-                f"X session search returned unexpected content-type '{content_type}' "
-                f"for '{cashtag}' (possible login wall or challenge page) -- "
-                "fail-closed per ADR-0008 Decision 1.",
-                provider="x",
-            )
-
+        # ORDER MATTERS. The status code is checked FIRST because a stale
+        # query ID 404s with an empty body and no content-type header at all,
+        # and the content-type branch below would then report that as a login
+        # wall -- the one diagnosis guaranteed to send an operator off to
+        # re-export cookies that were never the problem. Authentication
+        # failures have already been separated out above as 401/403, so any
+        # remaining 4xx/5xx here is an endpoint problem, not a credential one.
         if response.status_code >= 400:
             raise SourceBlockedError(
                 f"X session search returned HTTP {response.status_code} for "
-                f"'{cashtag}' -- fail-closed per ADR-0008 Decision 1. This is the "
-                "expected failure mode if the GraphQL query ID constant above has "
-                "gone stale; see this module's constants-block doc note.",
+                f"'{cashtag}' -- fail-closed per ADR-0008 Decision 1. Your session "
+                "cookies authenticated fine (a bad cookie returns 401/403, handled "
+                f"above); the configured GraphQL query ID has most likely gone "
+                f"stale, which X does without notice. {_QUERY_ID_CAPTURE_HINT}",
+                provider="x",
+            )
+
+        content_type = response.headers.get("content-type", "")
+        if "json" not in content_type.lower():
+            raise SourceBlockedError(
+                f"X session search returned HTTP {response.status_code} with "
+                f"unexpected content-type '{content_type}' for '{cashtag}' -- a 2xx "
+                "that isn't JSON is the shape of a login wall or challenge page, so "
+                "re-exporting fresh auth_token/ct0 cookies from DevTools "
+                "(Application -> Cookies -> https://x.com) is the first thing to "
+                "try. Fail-closed per ADR-0008 Decision 1.",
                 provider="x",
             )
 

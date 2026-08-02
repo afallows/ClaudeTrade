@@ -57,7 +57,7 @@ from claudetrade.providers.registry import (
 )
 from claudetrade.regime.market_regime import RegimeClassifier
 from claudetrade.sentiment.aggregation import SentimentAggregator
-from claudetrade.sentiment.classifiers import RuleSentimentClassifier
+from claudetrade.sentiment.classifiers import EnsembleSentimentClassifier
 from claudetrade.sentiment.entity_resolution import TickerResolver
 from claudetrade.sentiment.store import (
     SourceCollection,
@@ -430,7 +430,15 @@ class Pipeline:
             Number of ``symbol_sentiment_daily`` rows written.
         """
         resolver = TickerResolver(directory=directory)
-        classifier = RuleSentimentClassifier()
+        # The ensemble with no AI classifier attached is the rule classifier
+        # plus one thing the rule classifier cannot do: fold in the author's
+        # own bull/bear tag (`SocialPost.sentiment_prior`), which is a fact
+        # about the post rather than a feature of its text. Constructed
+        # without an `ai_classifier` deliberately -- per-post LLM calls across
+        # a 90-day window are not something a refresh should incur silently --
+        # so for every post that carries no tag this is byte-for-byte the
+        # previous behaviour, and no stored aggregate changes meaning.
+        classifier = EnsembleSentimentClassifier()
         aggregator = SentimentAggregator(self.config.sentiment)
         threshold = self.config.sentiment.min_ticker_confidence
 

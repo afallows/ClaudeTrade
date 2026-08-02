@@ -1343,8 +1343,8 @@ export CLAUDETRADE_SECRET_X_CT0="..."
    fields (or `POST /api/system/credentials/x/test`) to confirm the
    cookies work -- see "Validating the internal endpoint constants" below.
 
-**Configuration** (only `session_symbols` needs setting -- the rest are the
-defaults):
+**Configuration** (`session_query_id` and `session_symbols` both need
+setting -- the rest are the defaults):
 
 ```toml
 [x]
@@ -1352,6 +1352,7 @@ enabled = true                         # default; explicit disable knob
 session_enabled = true                 # default; explicit disable knob
 auth_token_credential = "x_auth_token"
 ct0_credential = "x_ct0"
+session_query_id = ""                  # REQUIRED -- your own browser capture, see below
 session_symbols = ["AAPL", "MSFT"]     # cashtag-searched; leading $ added automatically
 session_max_results_per_query = 40
 session_rate_limit_per_minute = 6      # deliberately stricter than the official API default
@@ -1360,8 +1361,8 @@ session_request_timeout_s = 20.0
 
 **Validating the internal endpoint constants (`x_provider.py`'s "expected
 maintenance" note)**: session mode calls x.com's internal, unversioned
-GraphQL API, whose path and query ID (`_SEARCH_GRAPHQL_QUERY_ID` in
-`x_provider.py`) x.com changes without notice -- see the "Endpoint
+GraphQL API, whose path and query ID (`x.session_query_id`) x.com changes
+without notice -- see the "Endpoint
 stability" note below for the full explanation and why this sandbox could
 not verify a live query ID while building this adapter. The
 Configuration screen's **Test** button (`POST
@@ -1372,26 +1373,43 @@ detail string, without waiting for a full scheduled refresh to discover the
 same failure. A `SourceBlockedError` result there is the first, fastest
 signal that the constants block needs a fresh browser capture.
 
-**Endpoint stability (read before relying on this mode)**: the GraphQL
-endpoint path and query ID this adapter calls are internal to x.com's web
-client and change without notice or a deprecation window -- see the
-clearly-marked constants block at the top of `x_provider.py`
-(`_SEARCH_GRAPHQL_QUERY_ID` etc.). **This sandbox has no network egress and
-could not capture a live, current query ID while building this adapter**;
-the shipped constant is illustrative/unverified and will need to be replaced
-with a fresh capture from your own browser's devtools (Network tab, filter
-`graphql`, log in, run a search, copy the request the client itself makes)
-before this mode returns real data. Until then, or whenever x.com changes
-its internal API again, session-mode requests fail closed (typically a
-404/400 on the stale path, or an unparseable response shape) rather than
-guessing -- see the fail-closed behaviour below. Updating the constant is
-expected, ordinary maintenance, not a bug fix.
+**Endpoint stability -- and why `session_query_id` is required**: the
+GraphQL endpoint path and query ID this adapter calls are internal to
+x.com's web client and change without notice or a deprecation window. **No
+query ID ships with this application**, and none can: it rotates, and a
+current one only exists in your own browser's traffic.
+
+Capture it once:
+
+1. Log in to x.com in a normal browser.
+2. Open devtools -> **Network**, filter on `graphql`.
+3. Search for any cashtag (e.g. `$AAPL`).
+4. Find the `SearchTimeline` request and copy the opaque path segment
+   immediately *before* `/SearchTimeline` -- that is the query ID.
+5. Put it in `config.toml` as `x.session_query_id`. It is not a credential
+   (it is account-independent and carries no authority), so it belongs in
+   config rather than the secrets store.
+
+Until it is set, session mode fails closed **without issuing a request** and
+says so explicitly. When x.com rotates it, requests start returning 404 and
+the error names the query ID as the likely cause. Re-capturing is expected,
+ordinary maintenance, not a bug fix.
+
+An earlier release shipped a placeholder query-ID constant instead. It 404'd
+with an empty body and no `content-type` header, and because the
+content-type check ran ahead of the status-code check, the failure was
+reported as a login wall -- telling operators to re-export cookies that were
+perfectly valid. The checks are now ordered status-code-first, and the two
+messages are pinned by
+`tests/test_x_provider.py::TestSessionQueryIdDiagnosis`.
 
 **Fail-closed behaviour (ADR-0008 Decision 1)**: any HTTP 401/403 (expired,
-logged-out, or challenged cookies), any non-JSON response, any response that
-doesn't match the expected timeline shape (including a changed internal API,
-see above), or a 429 immediately disables the source **for the rest of that
-fetch cycle** -- no retry loop, no fingerprint/proxy rotation, no CAPTCHA
+logged-out, or challenged cookies), any other 4xx/5xx (a stale or unset
+`session_query_id`, which is reported as such rather than as an
+authentication failure), any non-JSON *2xx* response (the login-wall
+shape), any response that doesn't match the expected timeline shape
+(including a changed internal API, see above), or a 429 immediately disables
+the source **for the rest of that fetch cycle** -- no retry loop, no fingerprint/proxy rotation, no CAPTCHA
 handling. Re-export fresh cookies (401/403) or wait for the next scheduled
 cycle (429) to resume. This is exercised in `tests/test_x_provider.py`.
 

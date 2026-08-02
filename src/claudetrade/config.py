@@ -584,6 +584,18 @@ class XConfig(BaseModel):
     #: click-path. Stored via the normal credential store, never in config.
     auth_token_credential: str = "x_auth_token"
     ct0_credential: str = "x_ct0"
+    #: The opaque query ID in x.com's internal GraphQL search URL
+    #: (``/i/api/graphql/<THIS>/SearchTimeline``). X rotates it without notice
+    #: and it is account-independent, so it lives here rather than in the
+    #: secrets store -- it is a moving endpoint detail, not a credential.
+    #:
+    #: Empty by default and *deliberately not shipped with a value*: a real
+    #: one can only come from the operator's own browser capture (devtools ->
+    #: Network, filter "graphql", search any cashtag while logged in, then
+    #: copy the path segment before ``/SearchTimeline``). Session mode fails
+    #: closed with an explicit message until this is set -- it does not
+    #: silently issue doomed requests, and it does not blame the cookies.
+    session_query_id: str = ""
     #: Watchlist symbols searched as cashtags (``$AAPL``); the leading ``$``
     #: is added automatically if a bare symbol is given.
     session_symbols: list[str] = Field(default_factory=list)

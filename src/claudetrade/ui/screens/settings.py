@@ -17,7 +17,7 @@ import streamlit as st
 
 from claudetrade.config import ENV_PREFIX, default_app_dir
 from claudetrade.db.backup import create_backup, list_backups
-from claudetrade.secrets import describe_secrets, set_secret
+from claudetrade.secrets import credential_catalog, describe_secrets, set_secret
 from claudetrade.ui.components.layout import page_header
 from claudetrade.ui.components.tables import empty_state
 from claudetrade.ui.formatting import format_currency
@@ -50,7 +50,7 @@ def page_settings() -> None:
     with tabs[0]:
         _render_providers(pipeline)
     with tabs[1]:
-        _render_api_keys()
+        _render_api_keys(config)
     with tabs[2]:
         _render_risk_and_filters(config)
     with tabs[3]:
@@ -92,16 +92,20 @@ def _render_providers(pipeline) -> None:
     st.dataframe(rows, hide_index=True, width="stretch")
 
 
-def _render_api_keys() -> None:
+def _render_api_keys(config) -> None:
     st.subheader("API Credential Management")
     st.caption("Values are never displayed -- only whether a credential resolves, from where, and a masked tail.")
 
-    credentials_to_check = [
-        ("anthropic_api_key", "Anthropic API Key"),
-        ("openai_api_key", "OpenAI API Key"),
-        ("reddit_client_id", "Reddit Client ID"),
-        ("reddit_client_secret", "Reddit Client Secret"),
-        ("x_bearer_token", "X Bearer Token"),
+    # Read from the shared allowlist rather than a second hand-written list.
+    # The hand-written one that used to live here had drifted badly: it
+    # offered a field for the X *bearer* token but none for the two session
+    # cookies, and none for the Polygon key, so an operator holding those
+    # credentials had nowhere to put them and nothing on screen explaining
+    # why. See ``secrets.credential_catalog``.
+    credentials_to_check = [(name, label) for name, label, _ in credential_catalog(config)]
+    # Notification credentials are not part of the provider catalog (nothing
+    # fetches with them), but this screen has always been able to set them.
+    credentials_to_check += [
         ("notify_webhook_url", "Webhook URL"),
         ("smtp_user", "SMTP Username"),
         ("smtp_password", "SMTP Password"),

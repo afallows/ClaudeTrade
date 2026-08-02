@@ -186,10 +186,33 @@ class TestXConnectivityTest:
         assert body["ok"] is False
         assert body["mode"] is None
 
-    def test_successful_session_probe(self, client, monkeypatch) -> None:
+    def test_no_query_id_reports_failure_and_does_not_blame_the_cookies(
+        self, client, tmp_app_config, monkeypatch
+    ) -> None:
+        """Valid cookies plus no ``x.session_query_id`` must report the
+        missing endpoint ID, not an authentication problem -- the probe is
+        where an operator goes first, so a wrong diagnosis here sends them
+        re-exporting perfectly good cookies."""
         monkeypatch.delenv("CLAUDETRADE_SECRET_X_BEARER_TOKEN", raising=False)
         monkeypatch.setenv("CLAUDETRADE_SECRET_X_AUTH_TOKEN", "owner-auth-token")
         monkeypatch.setenv("CLAUDETRADE_SECRET_X_CT0", "owner-ct0")
+        tmp_app_config.x.session_query_id = ""
+        tmp_app_config.x.session_symbols = ["AAPL"]
+
+        response = client.post("/api/system/credentials/x/test")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is False
+        detail = body["status_detail"].lower()
+        assert "query id" in detail
+        assert "login wall" not in detail
+        assert "owner-auth-token" not in body["status_detail"]
+
+    def test_successful_session_probe(self, client, tmp_app_config, monkeypatch) -> None:
+        monkeypatch.delenv("CLAUDETRADE_SECRET_X_BEARER_TOKEN", raising=False)
+        monkeypatch.setenv("CLAUDETRADE_SECRET_X_AUTH_TOKEN", "owner-auth-token")
+        monkeypatch.setenv("CLAUDETRADE_SECRET_X_CT0", "owner-ct0")
+        tmp_app_config.x.session_query_id = "TESTQUERYID"
 
         payload = {
             "data": {
@@ -211,10 +234,13 @@ class TestXConnectivityTest:
         assert body["ok"] is True
         assert body["mode"] == "session"
 
-    def test_blocked_probe_reports_failure_without_leaking_cookies(self, client, monkeypatch) -> None:
+    def test_blocked_probe_reports_failure_without_leaking_cookies(
+        self, client, tmp_app_config, monkeypatch
+    ) -> None:
         monkeypatch.delenv("CLAUDETRADE_SECRET_X_BEARER_TOKEN", raising=False)
         monkeypatch.setenv("CLAUDETRADE_SECRET_X_AUTH_TOKEN", "owner-auth-token")
         monkeypatch.setenv("CLAUDETRADE_SECRET_X_CT0", "owner-ct0")
+        tmp_app_config.x.session_query_id = "TESTQUERYID"
 
         def handler(request):
             import httpx as _httpx

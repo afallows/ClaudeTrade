@@ -653,3 +653,84 @@ class TestMentionGrowth:
         assert result.mention_acceleration == 10.0
         # And attention has not leaked into polarity on the way through.
         assert result.raw_sentiment == pytest.approx(0.5)
+
+
+class TestBullBearRatioOnLexiconSilentPosts:
+    """The all-neutral ``bull_bear_ratio == 1.0`` signature, and what fixes it.
+
+    QA repeatedly reported stored aggregates pinned at exactly 1.0. The cause
+    is arithmetic, not a bug in the ratio: ``bull_sum / bear_sum`` falls back
+    to 1.0 when *both* sums are zero, and both are zero whenever no post in
+    the sample scored directionally. Short Stocktwits messages -- "$X long",
+    "$X 260c", "$X added more" -- are unambiguous to a human and invisible to
+    a lexicon, so a sample made of them produces exactly that.
+
+    These tests fix the mechanism in place: same corpus, same aggregator, the
+    only difference being whether the authors' own bull/bear tags survive to
+    the classifier.
+    """
+
+    SESSION = dt.date(2024, 6, 3)
+    #: Deliberately lexicon-silent: every one of these scores 0.0/0.0 on text.
+    SILENT_TEXTS = ("long here", "added more", "260c", "in at 250", "still holding")
+
+    def _corpus(self, priors: list[str | None]) -> tuple[list, list]:
+        posts, mentions = [], []
+        for i, prior in enumerate(priors):
+            post = SocialPost(
+                source=SocialSource.STOCKTWITS,
+                external_id=f"st_{i}",
+                created_at=dt.datetime(2024, 6, 3, 14, 0, tzinfo=dt.UTC),
+                text=self.SILENT_TEXTS[i % len(self.SILENT_TEXTS)],
+                author_hash=f"author_{i}",
+                sentiment_prior=prior,
+            )
+            posts.append(post)
+            mentions.append(
+                TickerMention(
+                    post_external_id=post.external_id,
+                    symbol="ACME",
+                    confidence=0.95,
+                    method="cashtag",
+                )
+            )
+        return posts, mentions
+
+    def _ratio(self, priors: list[str | None]) -> float:
+        from claudetrade.sentiment.classifiers import EnsembleSentimentClassifier
+
+        posts, mentions = self._corpus(priors)
+        classifier = EnsembleSentimentClassifier()
+        scores = {
+            p.external_id: classifier.classify(p, "ACME", [m])
+            for p, m in zip(posts, mentions, strict=True)
+        }
+        result = SentimentAggregator(SentimentConfig()).aggregate(
+            "ACME", self.SESSION, posts, mentions, scores
+        )
+        return result.bull_bear_ratio
+
+    def test_untagged_silent_corpus_pins_at_exactly_one(self):
+        """The reported symptom, reproduced. This is the *correct* output for
+        this input -- with no directional evidence anywhere, 1.0 is the honest
+        answer, and the defect was upstream in throwing the tags away."""
+        assert self._ratio([None] * 10) == pytest.approx(1.0)
+
+    def test_tagged_bullish_corpus_is_decisively_above_one(self):
+        """Same posts, same aggregator -- the authors' tags now survive."""
+        assert self._ratio(["bullish"] * 8 + ["bearish"] * 2) > 2.0
+
+    def test_tagged_bearish_corpus_is_decisively_below_one(self):
+        """The fix must not be a one-directional thumb on the scale."""
+        assert self._ratio(["bearish"] * 8 + ["bullish"] * 2) < 0.5
+
+    def test_a_balanced_tagged_corpus_still_reads_as_balanced(self):
+        """Tags supplying direction must not manufacture a lean where the
+        crowd genuinely has none -- a 50/50 split belongs at 1.0."""
+        assert self._ratio(["bullish", "bearish"] * 5) == pytest.approx(1.0, abs=0.05)
+
+    def test_partial_tagging_still_moves_the_ratio(self):
+        """Only some Stocktwits authors tag their posts. A minority of tags
+        among untagged neighbours must still register, because the untagged
+        ones contribute 0.0 to both sums and cannot dilute it."""
+        assert self._ratio(["bullish", "bullish", None, None, None, None]) > 2.0

@@ -103,6 +103,10 @@ def session_config() -> XConfig:
         enabled=True,
         bearer_credential="x_bearer_token",  # left unresolved -- forces session mode
         session_enabled=True,
+        # Session mode refuses to issue a request without one (it is the
+        # operator's own browser capture, never shipped); these tests supply a
+        # stand-in so they exercise the request path rather than the guard.
+        session_query_id="TESTQUERYID",
         session_symbols=["AAPL"],
         session_rate_limit_per_minute=6000,  # avoid real sleeps between test requests
     )
@@ -232,6 +236,7 @@ class TestSessionHappyPath:
         config = XConfig(
             enabled=True,
             session_enabled=True,
+            session_query_id="TESTQUERYID",
             session_symbols=["MSFT"],  # no leading '$'
             session_rate_limit_per_minute=6000,
         )
@@ -316,6 +321,7 @@ class TestSessionFailClosed:
         config = XConfig(
             enabled=True,
             session_enabled=True,
+            session_query_id="TESTQUERYID",
             session_symbols=["AAPL", "MSFT"],
             session_rate_limit_per_minute=6000,
         )
@@ -326,3 +332,139 @@ class TestSessionFailClosed:
         with pytest.raises(SourceBlockedError):
             XProvider(config).fetch_posts(since=NOW - dt.timedelta(days=1))
         assert len(stub.requests) == 1  # never attempted MSFT
+
+
+class TestSessionQueryIdDiagnosis:
+    """A missing or stale GraphQL query ID must never be reported as a cookie
+    problem.
+
+    The shipped placeholder query ID produced a 404 with an empty body and no
+    content-type header; because the content-type check ran *before* the
+    status-code check, that surfaced as "possible login wall or challenge page
+    -- re-export fresh cookies". The cookies were valid the whole time. These
+    tests pin the ordering and the wording, because the wording *is* the bug:
+    an error that names the wrong cause costs more than one that says nothing.
+    """
+
+    def _config(self, **overrides) -> XConfig:
+        base = {
+            "enabled": True,
+            "bearer_credential": "x_bearer_token",
+            "session_enabled": True,
+            "session_symbols": ["AAPL"],
+            "session_rate_limit_per_minute": 6000,
+        }
+        base.update(overrides)
+        return XConfig(**base)
+
+    def test_no_query_id_means_no_request_is_even_attempted(
+        self, session_credentials, monkeypatch
+    ):
+        """Not one doomed HTTP call: with no endpoint to call, issuing the
+        request is what let this failure wear an authentication costume."""
+        stub = _XSessionStub(_timeline_payload([_tweet_entry()]))
+        _install(monkeypatch, stub)
+
+        with pytest.raises(SourceBlockedError) as excinfo:
+            XProvider(self._config(session_query_id="")).fetch_posts(
+                since=NOW - dt.timedelta(days=1)
+            )
+
+        assert stub.requests == []
+        assert "query ID" in str(excinfo.value)
+        assert "NOT a cookie or login problem" in str(excinfo.value)
+
+    def test_missing_query_id_message_says_how_to_get_one(
+        self, session_credentials, monkeypatch
+    ):
+        """Naming the cause is half a diagnosis; the click-path is the rest."""
+        _install(monkeypatch, _XSessionStub())
+        with pytest.raises(SourceBlockedError) as excinfo:
+            XProvider(self._config(session_query_id="  ")).fetch_posts(
+                since=NOW - dt.timedelta(days=1)
+            )
+        message = str(excinfo.value)
+        assert "session_query_id" in message
+        assert "devtools" in message.lower()
+        assert "SearchTimeline" in message
+
+    def test_404_with_no_content_type_blames_the_endpoint_not_the_cookies(
+        self, session_credentials, monkeypatch
+    ):
+        """The exact regression. A stale query ID returns precisely this
+        shape, and the old ordering reported it as a login wall."""
+        stub = _XSessionStub()
+        stub.override_response = httpx.Response(404, content=b"")
+        _install(monkeypatch, stub)
+
+        with pytest.raises(SourceBlockedError) as excinfo:
+            XProvider(self._config(session_query_id="STALE")).fetch_posts(
+                since=NOW - dt.timedelta(days=1)
+            )
+
+        message = str(excinfo.value)
+        assert "query ID" in message
+        assert "gone stale" in message
+        assert "login wall" not in message.lower()
+        assert "challenge page" not in message.lower()
+
+    def test_a_2xx_non_json_body_still_points_at_the_cookies(
+        self, session_credentials, monkeypatch
+    ):
+        """The content-type check keeps its original job -- a *successful*
+        response carrying HTML really is the login-wall shape. Narrowing it to
+        2xx must not delete it."""
+        stub = _XSessionStub()
+        stub.override_response = httpx.Response(
+            200, headers={"content-type": "text/html"}, content=b"<html>login</html>"
+        )
+        _install(monkeypatch, stub)
+
+        with pytest.raises(SourceBlockedError) as excinfo:
+            XProvider(self._config(session_query_id="OK")).fetch_posts(
+                since=NOW - dt.timedelta(days=1)
+            )
+
+        message = str(excinfo.value)
+        assert "login wall" in message.lower()
+        assert "auth_token" in message
+
+    @pytest.mark.parametrize("code", [401, 403])
+    def test_real_auth_failures_still_blame_the_cookies(
+        self, session_credentials, monkeypatch, code
+    ):
+        """The reordering must not swing the pendulum the other way: 401/403
+        genuinely *are* credential failures and are handled before both
+        checks."""
+        stub = _XSessionStub()
+        stub.override_response = httpx.Response(code, json={})
+        _install(monkeypatch, stub)
+
+        with pytest.raises(SourceBlockedError) as excinfo:
+            XProvider(self._config(session_query_id="OK")).fetch_posts(
+                since=NOW - dt.timedelta(days=1)
+            )
+
+        message = str(excinfo.value)
+        assert "cookies" in message.lower()
+        assert "query ID" not in message
+
+    def test_status_reports_the_missing_query_id_without_a_live_probe(
+        self, session_credentials
+    ):
+        """The Providers panel should answer "why is X quiet?" on sight."""
+        status = XProvider(self._config(session_query_id="")).status()
+        assert status.configured is False
+        assert "query ID" in status.message
+
+    def test_status_reports_an_empty_watchlist_too(self, session_credentials):
+        """Cookies plus a query ID plus no symbols fetches nothing forever,
+        and used to report as a healthy, fully-configured provider."""
+        status = XProvider(self._config(session_query_id="OK", session_symbols=[])).status()
+        assert status.configured is False
+        assert "session_symbols" in status.message
+
+    def test_fully_configured_session_mode_reports_healthy(self, session_credentials):
+        status = XProvider(self._config(session_query_id="OK")).status()
+        assert status.configured is True
+        assert "UNOFFICIAL" in status.message

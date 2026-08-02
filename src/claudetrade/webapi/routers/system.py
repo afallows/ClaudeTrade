@@ -25,7 +25,7 @@ from claudetrade.providers.base import (
     SourceBlockedError,
 )
 from claudetrade.scheduler import collection_readiness, is_scheduled_run
-from claudetrade.secrets import delete_secret, get_secret, set_secret
+from claudetrade.secrets import credential_catalog, delete_secret, get_secret, set_secret
 from claudetrade.utils.timeutils import utc_now
 from claudetrade.webapi.deps import get_config, get_pipeline
 from claudetrade.webapi.refresh_state import RefreshState
@@ -39,39 +39,10 @@ class CredentialWrite(BaseModel):
     value: SecretStr = Field(min_length=1, max_length=16_384)
 
 
-def _credential_catalog(config: AppConfig) -> list[tuple[str, str, str]]:
-    """Allowlisted credentials exposed in the UI (name, label, pipeline)."""
-    items = [
-        (config.reddit.client_id_credential, "Reddit client ID", "sentiment"),
-        (config.reddit.client_secret_credential, "Reddit client secret", "sentiment"),
-        (config.reddit.username_credential, "Reddit username", "sentiment"),
-        (config.reddit.password_credential, "Reddit password", "sentiment"),
-        (config.reddit.session_cookie_credential, "Reddit session cookie", "sentiment"),
-        (config.reddit.token_v2_credential, "Reddit token_v2 cookie (optional)", "sentiment"),
-        (config.x.bearer_credential, "X bearer token", "sentiment"),
-        (config.x.auth_token_credential, "X session auth token", "sentiment"),
-        (config.x.ct0_credential, "X session CSRF token", "sentiment"),
-        # Both AI provider credentials are always listed (not just the
-        # currently-selected one) so the Configuration screen's AI Analysis
-        # section can offer either Claude or ChatGPT without the operator
-        # having to flip ``ai.provider`` first just to see the key field.
-        (config.ai.anthropic_api_key_credential, "Anthropic (Claude) API key", "sentiment"),
-        (config.ai.openai_api_key_credential, "OpenAI (ChatGPT) API key", "sentiment"),
-    ]
-    # Polygon is OPTIONAL -- bars degrade to the tipranks/yahoo cascade and
-    # `db backfill` has a keyless path -- but it was previously unreachable
-    # from this screen entirely, so an operator who had a key had nowhere to
-    # put it and no way to tell that was the reason nothing changed. Listed
-    # unconditionally, like the AI keys above and for the same reason.
-    items.append((config.polygon.api_key_credential, "Polygon.io API key (optional)", "stock_price"))
-    if config.market_data.credential:
-        items.append((config.market_data.credential, "Market data API key", "stock_price"))
-    if config.earnings.credential:
-        items.append((config.earnings.credential, "Earnings API key", "stock_price"))
-    if config.news.hosted_credential:
-        items.append((config.news.hosted_credential, "Hosted sentiment API key", "sentiment"))
-    # Config may intentionally reuse a key; show/store it only once.
-    return list({item[0]: item for item in items}.values())
+#: The catalog moved to ``claudetrade.secrets`` so this screen and the
+#: Streamlit Settings screen cannot drift apart again -- see
+#: ``secrets.credential_catalog`` for why that mattered.
+_credential_catalog = credential_catalog
 
 
 def _credential(config: AppConfig, name: str) -> tuple[str, str, str]:

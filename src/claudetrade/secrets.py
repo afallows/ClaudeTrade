@@ -170,3 +170,48 @@ def describe_secrets(names: list[str]) -> dict[str, dict[str, str]]:
             else {"configured": "yes", "source": secret.source, "masked": secret.masked()}
         )
     return out
+
+
+def credential_catalog(config: Any) -> list[tuple[str, str, str]]:
+    """Every credential the application will let a UI read or write.
+
+    Returns ``(credential_name, human_label, pipeline)`` triples. This is the
+    single source of truth for both credential surfaces -- the web
+    Configuration screen (``webapi.routers.system``) and the Streamlit
+    Settings screen (``ui.screens.settings``) -- and it is an allowlist: the
+    write endpoint refuses any name absent from it.
+
+    It lives here, rather than in either screen, because it was previously
+    duplicated in both and the copies drifted. Every credential missing from
+    one copy was, from that screen's operator's point of view, a credential
+    the application simply had no field for -- with no error to explain the
+    absence. A Polygon key had nowhere to go on the web screen; the X session
+    cookies had nowhere to go on the Streamlit one. Adding a credential must
+    only ever mean adding a line here.
+
+    Optional credentials are listed unconditionally, precisely so an operator
+    who *has* one is never left hunting for a field that only appears once
+    the thing is already configured.
+    """
+    items = [
+        (config.reddit.client_id_credential, "Reddit client ID", "sentiment"),
+        (config.reddit.client_secret_credential, "Reddit client secret", "sentiment"),
+        (config.reddit.username_credential, "Reddit username", "sentiment"),
+        (config.reddit.password_credential, "Reddit password", "sentiment"),
+        (config.reddit.session_cookie_credential, "Reddit session cookie", "sentiment"),
+        (config.reddit.token_v2_credential, "Reddit token_v2 cookie (optional)", "sentiment"),
+        (config.x.bearer_credential, "X bearer token", "sentiment"),
+        (config.x.auth_token_credential, "X session auth token (browser cookie)", "sentiment"),
+        (config.x.ct0_credential, "X session CSRF token (ct0 browser cookie)", "sentiment"),
+        (config.ai.anthropic_api_key_credential, "Anthropic (Claude) API key", "sentiment"),
+        (config.ai.openai_api_key_credential, "OpenAI (ChatGPT) API key", "sentiment"),
+        (config.polygon.api_key_credential, "Polygon.io API key (optional)", "stock_price"),
+    ]
+    if config.market_data.credential:
+        items.append((config.market_data.credential, "Market data API key", "stock_price"))
+    if config.earnings.credential:
+        items.append((config.earnings.credential, "Earnings API key", "stock_price"))
+    if config.news.hosted_credential:
+        items.append((config.news.hosted_credential, "Hosted sentiment API key", "sentiment"))
+    # Config may intentionally point two settings at one key; show it once.
+    return list({item[0]: item for item in items}.values())

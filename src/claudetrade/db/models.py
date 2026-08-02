@@ -319,6 +319,15 @@ class SocialPostRow(Base):
     #: source. See ``domain.SocialPost.flair`` for the field's provenance
     #: and how it is used as a scoring prior. Added by migration 004.
     flair: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    #: The author's own directional tag on the post, normalised to
+    #: ``"bullish"``/``"bearish"`` (Stocktwits' ``entities.sentiment.basic``;
+    #: every other source leaves this NULL because it has no such concept).
+    #: Nullable and *three*-valued on purpose -- NULL means "this author did
+    #: not tag the post", which is a different fact from "this author called
+    #: it neutral", and collapsing the two would invent opinions nobody
+    #: expressed. See ``domain.SocialPost.sentiment_prior`` for why it is a
+    #: prior hint rather than a label we vouch for. Added by migration 008.
+    sentiment_prior: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
 
 class TickerMentionRow(Base):

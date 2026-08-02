@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import replace
 
 from claudetrade.domain import SentimentScores, SocialPost, TickerMention
 from claudetrade.sentiment.ai_classifier import AISentimentClassifier
@@ -375,13 +376,118 @@ def _confidence(
     return max(0.05, min(0.97, confidence))
 
 
+#: Directional weight an author's own bull/bear tag carries when the post's
+#: *text* said nothing directional. Priced against this module's own output:
+#: one explicit directional word ("moon", "dumping") scores ~0.33-0.53, so a
+#: tag is worth slightly less than one such word. Deliberately not more --
+#: tagging is a single click that costs the author nothing, whereas typing a
+#: directional sentence costs at least a little thought.
+_PRIOR_WEIGHT = 0.30
+
+#: Additive bump when tag and text agree. Small on purpose: the two are *not*
+#: independent observations -- one author produced both in one action -- so
+#: agreement is barely more evidence than either alone, and scoring it as two
+#: confirmations would inflate every tagged post.
+_PRIOR_CORROBORATION = 0.08
+
+#: Confidence floor for a post whose direction came from the tag alone. Sits
+#: deliberately just *below* ``FiltersConfig.min_sentiment_confidence`` (0.35)
+#: so a corpus of contentless-but-tagged posts cannot clear the downstream bar
+#: on tags alone, while still lifting such posts far off the ~0.08 floor the
+#: text-only path assigns a four-word message.
+_PRIOR_CONFIDENCE_FLOOR = 0.30
+
+#: Multiplier applied when tag and text agree -- corroboration is worth a
+#: little more trust, capped by ``_confidence``'s own 0.97 ceiling.
+_PRIOR_AGREEMENT_GAIN = 1.15
+
+#: What a tag/text conflict costs. It buys the tag *no* direction: the text
+#: keeps its read and only trust drops, because every explanation for the
+#: conflict (sarcasm, a hedged position, a mis-click) means we know less.
+_PRIOR_CONFLICT_CONFIDENCE = 0.60
+_PRIOR_CONFLICT_UNCERTAINTY = 0.50
+
+#: Below this magnitude a text read counts as silent rather than merely quiet.
+_PRIOR_SILENCE_EPS = 0.05
+
+
+def _apply_sentiment_prior(scores: SentimentScores, prior: str | None) -> SentimentScores:
+    """Fold an author's self-declared bull/bear tag into a text-derived read.
+
+    Stocktwits lets an author tag a message "Bullish" or "Bearish"; no other
+    source we ingest has the concept, so ``prior`` is ``None`` for all of
+    them and this is a no-op. It is applied *after* the text classifiers, on
+    their combined result, because the tag is evidence about the post rather
+    than a feature of its wording -- which classifier read the text does not
+    change what the tag is worth.
+
+    Three cases, and the split between them is the whole point:
+
+    * **The text is silent.** ``$AAPL long``, ``$AAPL 260c``, ``$AAPL added
+      more`` -- unambiguous to a human, invisible to a lexicon, and roughly
+      half of real Stocktwits traffic. Today these score 0.0/0.0 and vanish
+      into ``neutral``; a symbol whose whole sample looks like this produces
+      ``bull_sum == bear_sum == 0`` and therefore ``bull_bear_ratio`` of
+      exactly 1.0 -- the all-neutral signature QA kept reporting. Here the
+      tag supplies the direction the text withheld.
+    * **The text agrees.** A small bump and a little more confidence. Not a
+      doubling: see ``_PRIOR_CORROBORATION``.
+    * **The text disagrees.** The text wins and keeps its polarity. A tag is
+      one human's assertion about their own post, not ground truth about it,
+      and "Bullish 🐂" on a post reading ``lmao this thing is cooked`` is
+      sarcasm the tag cannot overrule. Flipping the read on the tag's say-so
+      would make every sarcastic bagholder post a buy signal. The conflict is
+      recorded instead, as lower confidence and higher uncertainty.
+
+    The text classifier always runs first regardless -- the tag never short-
+    circuits classification, and an untagged post is scored exactly as before.
+    """
+    if prior not in ("bullish", "bearish"):
+        return scores
+
+    bullish, bearish = scores.bullish, scores.bearish
+    agreeing, opposing = (bullish, bearish) if prior == "bullish" else (bearish, bullish)
+    confidence, uncertainty = scores.confidence, scores.uncertainty
+
+    if opposing > agreeing + _PRIOR_SILENCE_EPS:
+        confidence *= _PRIOR_CONFLICT_CONFIDENCE
+        uncertainty = max(uncertainty, _PRIOR_CONFLICT_UNCERTAINTY)
+    elif agreeing <= _PRIOR_SILENCE_EPS and opposing <= _PRIOR_SILENCE_EPS:
+        agreeing = _PRIOR_WEIGHT
+        confidence = max(confidence, _PRIOR_CONFIDENCE_FLOOR)
+    else:
+        agreeing = min(1.0, agreeing + _PRIOR_CORROBORATION)
+        confidence = min(0.97, confidence * _PRIOR_AGREEMENT_GAIN)
+
+    if prior == "bullish":
+        bullish = agreeing
+    else:
+        bearish = agreeing
+
+    return replace(
+        scores,
+        bullish=bullish,
+        bearish=bearish,
+        # `neutral` is a residual, not an independent label (see
+        # `RuleSentimentClassifier.classify`), so it has to be recomputed
+        # rather than carried over -- otherwise a post the tag just made
+        # directional would still claim to be mostly neutral.
+        neutral=max(0.0, 1.0 - (bullish + bearish)),
+        uncertainty=uncertainty,
+        confidence=confidence,
+        classifier=f"{scores.classifier}+prior",
+    )
+
+
 class EnsembleSentimentClassifier:
     """Combines the rule classifier with an optional AI classifier.
 
     The rule classifier always runs -- it is the floor. When an AI classifier
     is configured *and* returns a usable result, the two are blended weighted
     by each source's own ``confidence``; otherwise this degrades silently
-    (and loudly in the logs) to rules-only.
+    (and loudly in the logs) to rules-only. Whichever path produced the text
+    read, the author's own directional tag is folded in last -- see
+    :func:`_apply_sentiment_prior`.
     """
 
     def __init__(
@@ -398,7 +504,7 @@ class EnsembleSentimentClassifier:
         rule_scores = self.rule_classifier.classify(post, symbol, mentions)
 
         if self.ai_classifier is None:
-            return rule_scores
+            return _apply_sentiment_prior(rule_scores, post.sentiment_prior)
 
         # `AISentimentClassifier.classify` returns None for every failure mode
         # (no credential, malformed JSON, schema violation, cost cap, blocked
@@ -407,9 +513,9 @@ class EnsembleSentimentClassifier:
         ai_scores = self.ai_classifier.classify(post, symbol)
         if ai_scores is None:
             log.debug("ai classifier unavailable for %s/%s; using rules only", symbol, post.external_id)
-            return rule_scores
+            return _apply_sentiment_prior(rule_scores, post.sentiment_prior)
 
-        return _blend(rule_scores, ai_scores)
+        return _apply_sentiment_prior(_blend(rule_scores, ai_scores), post.sentiment_prior)
 
 
 _BLENDABLE_FIELDS = (

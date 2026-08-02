@@ -13,7 +13,11 @@ import datetime as dt
 import pytest
 
 from claudetrade.domain import SentimentScores, SocialPost, SocialSource
-from claudetrade.sentiment.classifiers import RuleSentimentClassifier, _blend
+from claudetrade.sentiment.classifiers import (
+    EnsembleSentimentClassifier,
+    RuleSentimentClassifier,
+    _blend,
+)
 
 NOW = dt.datetime(2024, 6, 3, 15, 0, tzinfo=dt.UTC)
 
@@ -202,3 +206,126 @@ class TestFlairPrior:
         real_signal = classifier.classify(_post(real_catalyst_text), "ACME", [])
 
         assert real_signal.regulatory_catalyst > flaired_neutral.regulatory_catalyst
+
+
+def _tagged(text: str, prior: str | None) -> SocialPost:
+    """A Stocktwits post carrying (or not carrying) the author's own tag."""
+    return SocialPost(
+        source=SocialSource.STOCKTWITS,
+        external_id=f"st_{abs(hash((text, prior))) % 10**8}",
+        created_at=NOW,
+        text=text,
+        sentiment_prior=prior,
+    )
+
+
+class TestSelfDeclaredSentimentPrior:
+    """``_apply_sentiment_prior`` -- the author's own bull/bear tag.
+
+    The tag is the only directional evidence on roughly half of real
+    Stocktwits traffic, because the messages that carry it ("$X long",
+    "$X 260c", "$X added more") are exactly the ones a lexicon scores flat
+    at 0.0/0.0. It is also, being one click, the weakest kind of evidence a
+    human can leave, so these tests pin down both that it *counts* and that
+    it cannot overrule what someone actually wrote.
+    """
+
+    SILENT = "added more here"
+    BULL_TEXT = "absolutely mooning, breakout confirmed"
+    BEAR_TEXT = "dumping hard, this is a disaster"
+
+    def test_untagged_posts_are_scored_exactly_as_before(self, classifier):
+        """The no-tag path must be byte-identical: every Reddit, X and news
+        post has ``sentiment_prior is None``, and so does every Stocktwits
+        post already on disk (migration 008 backfills nothing)."""
+        ensemble = EnsembleSentimentClassifier()
+        for text in (self.SILENT, self.BULL_TEXT, self.BEAR_TEXT):
+            assert ensemble.classify(_tagged(text, None), "ACME", []) == classifier.classify(
+                _tagged(text, None), "ACME", []
+            )
+
+    def test_tag_supplies_direction_when_the_text_is_silent(self, classifier):
+        """The case that matters: a lexicon-invisible post the author tagged."""
+        baseline = classifier.classify(_tagged(self.SILENT, None), "ACME", [])
+        assert baseline.bullish == pytest.approx(0.0)
+        assert baseline.bearish == pytest.approx(0.0)
+
+        ensemble = EnsembleSentimentClassifier()
+        bull = ensemble.classify(_tagged(self.SILENT, "bullish"), "ACME", [])
+        bear = ensemble.classify(_tagged(self.SILENT, "bearish"), "ACME", [])
+
+        assert bull.bullish > 0.0 and bull.bearish == pytest.approx(0.0)
+        assert bear.bearish > 0.0 and bear.bullish == pytest.approx(0.0)
+        assert bull.polarity > 0.0 > bear.polarity
+
+    def test_neutral_is_recomputed_not_left_stale(self):
+        """``neutral`` is a residual of bullish+bearish. A post the tag just
+        made directional must not still claim to be fully neutral."""
+        ensemble = EnsembleSentimentClassifier()
+        scores = ensemble.classify(_tagged(self.SILENT, "bullish"), "ACME", [])
+        assert scores.neutral == pytest.approx(1.0 - scores.bullish - scores.bearish)
+        assert scores.neutral < 1.0
+
+    def test_tag_cannot_overrule_the_text(self):
+        """Sarcasm defence: "Bullish" tagged onto plainly bearish writing must
+        not flip the read, or every bagholder joke becomes a buy signal."""
+        ensemble = EnsembleSentimentClassifier()
+        scores = ensemble.classify(_tagged(self.BEAR_TEXT, "bullish"), "ACME", [])
+        assert scores.polarity < 0.0
+        assert scores.bearish > scores.bullish
+
+    def test_conflict_costs_confidence_and_raises_uncertainty(self, classifier):
+        """Tag and text disagreeing means we know *less*, not more."""
+        agreeing = classifier.classify(_tagged(self.BEAR_TEXT, None), "ACME", [])
+        ensemble = EnsembleSentimentClassifier()
+        conflicted = ensemble.classify(_tagged(self.BEAR_TEXT, "bullish"), "ACME", [])
+
+        assert conflicted.confidence < agreeing.confidence
+        assert conflicted.uncertainty > agreeing.uncertainty
+
+    def test_agreement_corroborates_without_doubling(self, classifier):
+        """Tag and text are one author's single act, not two witnesses."""
+        text_only = classifier.classify(_tagged(self.BULL_TEXT, None), "ACME", [])
+        ensemble = EnsembleSentimentClassifier()
+        corroborated = ensemble.classify(_tagged(self.BULL_TEXT, "bullish"), "ACME", [])
+
+        assert corroborated.bullish > text_only.bullish
+        assert corroborated.bullish < text_only.bullish * 2
+        assert corroborated.confidence > text_only.confidence
+
+    def test_a_tag_is_worth_less_than_someone_actually_writing_it(self, classifier):
+        """One click must never outweigh a typed directional sentence."""
+        tagged_silent = EnsembleSentimentClassifier().classify(
+            _tagged(self.SILENT, "bullish"), "ACME", []
+        )
+        written = classifier.classify(_tagged(self.BULL_TEXT, None), "ACME", [])
+        assert tagged_silent.bullish < written.bullish
+
+    def test_tag_only_confidence_stays_under_the_downstream_bar(self):
+        """A contentless post the author tagged is evidence, but it must not
+        clear ``FiltersConfig.min_sentiment_confidence`` (0.35) on its own."""
+        scores = EnsembleSentimentClassifier().classify(
+            _tagged(self.SILENT, "bullish"), "ACME", []
+        )
+        assert 0.1 < scores.confidence < 0.35
+
+    @pytest.mark.parametrize("prior", [None, "", "neutral", "Bullish", "unknown"])
+    def test_only_normalised_tags_are_honoured(self, classifier, prior):
+        """The provider normalises to "bullish"/"bearish"/None; anything else
+        reaching here is a bug upstream and must be ignored, not guessed at.
+        Note "Bullish" -- the raw Stocktwits casing -- is deliberately *not*
+        accepted, so a provider that forgets to normalise fails loudly (as a
+        missing effect) rather than half-working."""
+        expected = classifier.classify(_tagged(self.SILENT, None), "ACME", [])
+        actual = EnsembleSentimentClassifier().classify(_tagged(self.SILENT, prior), "ACME", [])
+        assert (actual.bullish, actual.bearish) == (expected.bullish, expected.bearish)
+
+    def test_provenance_records_that_a_tag_was_applied(self):
+        """``classifier`` is the provenance breadcrumb for "why is this row
+        directional when the text reads flat?"."""
+        applied = EnsembleSentimentClassifier().classify(
+            _tagged(self.SILENT, "bullish"), "ACME", []
+        )
+        untouched = EnsembleSentimentClassifier().classify(_tagged(self.SILENT, None), "ACME", [])
+        assert applied.classifier.endswith("+prior")
+        assert not untouched.classifier.endswith("+prior")

@@ -165,6 +165,7 @@ def load_stored_posts(
                 duplicate_group=row.duplicate_group,
                 injection_risk=row.injection_risk,
                 flair=row.flair,
+                sentiment_prior=row.sentiment_prior,
             )
         )
     return posts
