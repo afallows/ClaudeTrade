@@ -735,6 +735,70 @@ class ApeWisdomConfig(BaseModel):
     user_agent: str = "claudetrade/0.1 (research; contact configured by operator)"
 
 
+class AdanosConfig(BaseModel):
+    """Adanos (``adanos.org``) pre-aggregated buzz/sentiment across X, Reddit
+    and Polymarket.
+
+    Same family as :class:`ApeWisdomConfig` -- a hosted aggregator serving
+    finished per-ticker rows, not individual posts -- but richer: alongside
+    volume it reports real polarity (``sentiment_score``, ``bullish_pct``,
+    ``bearish_pct``) across THREE platforms, refreshed hourly. Rows are
+    stored through their own path (``domain.AdanosSnapshot`` ->
+    ``db.models.AdanosSnapshotRow``), never forced into
+    ``domain.SymbolAttention`` or ``SocialPost`` -- see
+    ``providers.social.adanos`` for why.
+
+    Two access modes:
+
+    * **Site mode (default, keyless).** Hits the vendor's own public-page
+      proxy endpoints under ``site_base_url`` -- the same JSON its website
+      calls, no key required, one request per enabled feed per collection
+      cycle (the same courtesy-budget class as ApeWisdom's few calls/cycle).
+    * **Official mode**, when both ``prefer_official_api`` is true AND
+      ``api_key_credential`` resolves to a real key: ``official_base_url``
+      with an ``X-API-Key`` header, gated by a persistent monthly budget
+      (``monthly_budget``/``monthly_reserve``) that fails closed rather than
+      falling back to hammering the site proxy harder than page-equivalent
+      cadence -- see ``providers.social.adanos`` for the budget mechanism.
+
+    Licensing (adanos.org/terms, checked 2026-08-02): commercial use is
+    permitted subject to the vendor's terms; raw API data may not be
+    redistributed as a competing service, and rate limits may not be
+    circumvented. Site-proxy mode is the vendor's own public page endpoint,
+    used at page-equivalent cadence -- an API key is the guaranteed-compliant
+    path and is preferred whenever one is configured.
+    """
+
+    enabled: bool = True
+    #: Fetch the X/Twitter feed (``proxy-x`` / ``x/stocks/v1/trending``).
+    feed_x: bool = True
+    #: Fetch the Reddit feed (``proxy`` / ``reddit/stocks/v1/trending``).
+    feed_reddit: bool = True
+    #: Fetch the Polymarket feed (``proxy-polymarket`` /
+    #: ``polymarket/stocks/v1/trending``). Official-API shape is inferred,
+    #: not yet confirmed live -- the adapter degrades that one feed cleanly
+    #: on a 404 rather than failing the whole provider.
+    feed_polymarket: bool = True
+    site_base_url: str = "https://adanos.org/api"
+    official_base_url: str = "https://api.adanos.org"
+    #: Use ``official_base_url`` with a key instead of the keyless site
+    #: proxy. Requires ``api_key_credential`` to actually resolve; when it
+    #: does not, the adapter degrades to site mode rather than failing.
+    prefer_official_api: bool = False
+    api_key_credential: str = "adanos_api_key"
+    calls_per_minute: int = 10
+    #: Free-tier monthly cap on official-mode requests.
+    monthly_budget: int = 250
+    #: Official mode stops making requests for the rest of the calendar
+    #: month once remaining budget falls to this floor -- never silently
+    #: falls back to over-cadence site-proxy calls to compensate.
+    monthly_reserve: int = 15
+    #: Rows requested per feed per cycle (vendor's ``limit`` query param).
+    limit: int = 100
+    request_timeout_s: float = 20.0
+    user_agent: str = "claudetrade/0.1 (research; contact configured by operator)"
+
+
 class NewsConfig(BaseModel):
     """Publisher-syndicated RSS/Atom news feeds: a lawful, credential-free
     social-sentiment source.
@@ -1558,6 +1622,7 @@ class AppConfig(BaseSettings):
     x: XConfig = Field(default_factory=XConfig)
     stocktwits: StocktwitsConfig = Field(default_factory=StocktwitsConfig)
     apewisdom: ApeWisdomConfig = Field(default_factory=ApeWisdomConfig)
+    adanos: AdanosConfig = Field(default_factory=AdanosConfig)
     news: NewsConfig = Field(default_factory=NewsConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)

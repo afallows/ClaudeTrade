@@ -23,7 +23,7 @@ from claudetrade.cli import app
 from claudetrade.config import AppConfig, reset_config_cache
 from claudetrade.db.models import Security, SocialPostRow, SymbolSentimentDaily
 from claudetrade.db.session import Database, reset_database_cache
-from claudetrade.domain import SocialPost, SocialSource, SymbolAttention
+from claudetrade.domain import AdanosSnapshot, SocialPost, SocialSource, SymbolAttention
 from claudetrade.pipeline import Pipeline
 from claudetrade.utils.timeutils import utc_now
 
@@ -55,6 +55,28 @@ class StubAttentionProvider:
         return [
             SymbolAttention(
                 symbol="NVDA", community="all-stocks", mentions=42, upvotes=100, rank=1
+            )
+        ]
+
+
+class StubAdanosProvider:
+    name = "adanos"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_feed_failures: dict[str, str] = {}
+
+    def fetch_snapshots(self):
+        self.calls += 1
+        return [
+            AdanosSnapshot(
+                "NVDA",
+                "x",
+                buzz_score=87.5,
+                mentions=950,
+                sentiment_score=0.42,
+                bullish_pct=68.0,
+                bearish_pct=32.0,
             )
         ]
 
@@ -98,6 +120,12 @@ def pipeline(config: AppConfig, tmp_db: Database) -> Pipeline:
     built.earnings = ExplodingMarketProvider()
     built.social = []
     built.attention = []
+    # Adanos, like ApeWisdom above, is keyless and enabled by default, so a
+    # real Pipeline() construction gives it a live provider instance too --
+    # cleared here for the same reason as .attention: this module's tests
+    # must be fully offline (see the module docstring), and individual tests
+    # opt a stub back in explicitly when they want to exercise it.
+    built.adanos = []
     return built
 
 
@@ -190,6 +218,42 @@ class TestCollectSocial:
 
         assert result.sentiment_rows == 0
         assert any("nothing to collect" in w for w in result.warnings)
+
+    def test_adanos_is_collected_even_with_no_post_sources(
+        self, pipeline, tmp_db
+    ) -> None:
+        """Same independence guarantee as ApeWisdom above: Adanos keeps
+        producing data on its own schedule regardless of the post-level
+        sources' health."""
+        from claudetrade.db.models import AdanosSnapshotRow
+
+        with tmp_db.session() as session:
+            session.merge(Security(symbol="NVDA", name="NVIDIA Corp"))
+        adanos = StubAdanosProvider()
+        pipeline.adanos = [adanos]
+
+        pipeline.collect_social(lookback_hours=6)
+
+        assert adanos.calls == 1
+        with tmp_db.read_session() as session:
+            rows = session.query(AdanosSnapshotRow).all()
+        assert [(r.symbol, r.platform, r.sentiment_score) for r in rows] == [
+            ("NVDA", "x", pytest.approx(0.42))
+        ]
+
+    def test_adanos_failure_is_degraded_not_fatal(self, pipeline) -> None:
+        class DeadAdanos:
+            name = "adanos"
+            last_feed_failures: dict[str, str] = {}
+
+            def fetch_snapshots(self):
+                raise RuntimeError("adanos outage")
+
+        pipeline.adanos = [DeadAdanos()]
+
+        result = pipeline.collect_social(lookback_hours=6)
+
+        assert "adanos" in result.degraded_sources
 
     def test_repeated_collections_are_idempotent_on_the_same_posts(
         self, pipeline, tmp_db

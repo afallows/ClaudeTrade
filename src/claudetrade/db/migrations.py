@@ -309,6 +309,27 @@ def _m009_signal_research_revisions(session: Session) -> None:
         session.execute(text(stmt))
 
 
+def _m010_adanos_snapshots(session: Session) -> None:
+    """Create the ``adanos_snapshots`` table (Adanos X/Reddit/Polymarket rows).
+
+    Same fresh-vs-migrated shape as ``_m006_symbol_fetch_health``/
+    ``_m009_signal_research_revisions``: a brand-new database already gets
+    the table from ``_m001_create_schema``'s ``create_all`` (the ORM model
+    exists now), so ``checkfirst=True`` makes this a no-op there and real
+    work only on a database that reached version 9 before the model did.
+
+    A new table rather than extending ``symbol_sentiment_daily`` -- see
+    ``db.models.AdanosSnapshotRow`` for why the two schemas cannot honestly
+    share one table. No append-only triggers: unlike
+    ``signal_research_revisions``, these rows are re-collected and upserted
+    every cycle (see ``data.ingest.DataIngestor.ingest_adanos``), not an
+    immutable ledger.
+    """
+    from claudetrade.db.models import AdanosSnapshotRow
+
+    AdanosSnapshotRow.__table__.create(session.get_bind(), checkfirst=True)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_schema", _m001_create_schema, "Initial tables, indexes and constraints"),
     Migration(2, "immutability_triggers", _m002_immutability_triggers, "Append-only ledger guards"),
@@ -338,6 +359,12 @@ MIGRATIONS: tuple[Migration, ...] = (
         "signal_research_revisions",
         _m009_signal_research_revisions,
         "Append-only MCP research revisions (thesis/invalidation/score adjustments) + guards",
+    ),
+    Migration(
+        10,
+        "adanos_snapshots",
+        _m010_adanos_snapshots,
+        "Per-(session, platform, symbol) Adanos buzz/sentiment rows (X/Reddit/Polymarket)",
     ),
 )
 

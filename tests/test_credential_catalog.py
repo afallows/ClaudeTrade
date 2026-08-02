@@ -27,6 +27,7 @@ class TestCredentialCatalogIsTheSingleSource:
             config.polygon.api_key_credential,
             config.ai.anthropic_api_key_credential,
             config.ai.openai_api_key_credential,
+            config.adanos.api_key_credential,
         ):
             assert expected in names, f"{expected} has no field on either credential screen"
 

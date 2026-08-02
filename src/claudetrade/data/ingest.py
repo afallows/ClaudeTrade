@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 from claudetrade.config import AppConfig
 from claudetrade.data.quality import DataQualityChecker, QualityReport
 from claudetrade.db.models import (
+    AdanosSnapshotRow,
     CorporateActionRow,
     EarningsEventRow,
     PaperTradeRow,
@@ -165,6 +166,7 @@ class DataIngestor:
         earnings_provider=None,
         social_providers=None,
         attention_providers=None,
+        adanos_providers=None,
         progress_callback: ProgressCallback | None = None,
     ):
         self.config = config
@@ -176,6 +178,11 @@ class DataIngestor:
         #: ``social`` because they return per-symbol tallies rather than
         #: posts -- see ``providers.social.apewisdom``.
         self.attention = list(attention_providers or [])
+        #: Adanos (X/Reddit/Polymarket buzz+sentiment). Kept separate from
+        #: ``attention`` too: Adanos rows carry real polarity and a platform
+        #: dimension ``SymbolAttention``/``ingest_attention`` have no room
+        #: for -- see ``providers.social.adanos`` and ``ingest_adanos``.
+        self.adanos = list(adanos_providers or [])
         self.checker = DataQualityChecker(config, db)
         #: Optional ``(phase, done, total)`` progress hook -- see
         #: ``webapi.routers.system``'s background refresh endpoint, the
@@ -1731,6 +1738,92 @@ class DataIngestor:
         )
         return written
 
+    def ingest_adanos(
+        self, session_date: dt.date, report: IngestReport | None = None
+    ) -> int:
+        """Fetch Adanos buzz/sentiment snapshots and store them.
+
+        Written into their own table (``db.models.AdanosSnapshotRow``), one
+        row per ``(session_date, platform, symbol)`` -- deliberately not
+        ``symbol_sentiment_daily``: that table's rows are either the
+        strategy-scored ``"all"`` aggregate or ApeWisdom's attention-only
+        (no polarity) rows, and Adanos is neither -- it carries real
+        ``sentiment_score``/``bullish_pct``/``bearish_pct`` alongside volume,
+        which would either corrupt the ``"all"`` aggregate if merged into it
+        or be silently discarded if squeezed into ApeWisdom's attention-only
+        shape. See ``domain.AdanosSnapshot`` and ``db.models.AdanosSnapshotRow``.
+
+        Rows are only stored for symbols present in ``securities``, the same
+        guard ``ingest_attention`` applies -- a vendor naming a ticker this
+        installation does not track is not evidence about anything it
+        screens.
+
+        Best-effort throughout: a feed failure is recorded on the report
+        (keyed ``"adanos_x"``/``"adanos_reddit"``/``"adanos_polymarket"`` --
+        see ``providers.social.adanos.AdanosProvider.last_feed_failures``)
+        and the refresh continues.
+        """
+        report = report or IngestReport()
+        if not self.adanos:
+            return 0
+
+        observations: list = []
+        for provider in self.adanos:
+            name = getattr(provider, "name", "adanos")
+            try:
+                observations.extend(provider.fetch_snapshots())
+            except Exception as exc:
+                log.warning("adanos provider %s failed: %s", name, exc)
+                report.provider_failures[name] = str(exc)
+            else:
+                # Per-feed failures the provider already caught internally
+                # (one platform's outage, budget exhaustion, ...) are merged
+                # in by name so they show up individually in
+                # ``degraded_sources``, not collapsed into one opaque entry.
+                report.provider_failures.update(getattr(provider, "last_feed_failures", {}) or {})
+        if not observations:
+            return 0
+
+        with self.db.read_session() as session:
+            known = {row[0] for row in session.execute(select(Security.symbol)).all()}
+
+        written = 0
+        for chunk in _chunks(observations, PERSIST_CHUNK_ROWS):
+            with self.db.session() as session:
+                for obs in chunk:
+                    if obs.symbol not in known:
+                        continue
+                    existing = (
+                        session.query(AdanosSnapshotRow)
+                        .filter_by(symbol=obs.symbol, session=session_date, platform=obs.platform)
+                        .one_or_none()
+                    )
+                    row = existing or AdanosSnapshotRow(
+                        symbol=obs.symbol, session=session_date, platform=obs.platform
+                    )
+                    row.company_name = obs.company_name
+                    row.buzz_score = obs.buzz_score
+                    row.mentions = obs.mentions
+                    row.trend = obs.trend
+                    row.sentiment_score = obs.sentiment_score
+                    row.bullish_pct = obs.bullish_pct
+                    row.bearish_pct = obs.bearish_pct
+                    row.engagement = obs.engagement
+                    row.trend_history = list(obs.trend_history)
+                    row.fetched_at = utc_now()
+                    if existing is None:
+                        session.add(row)
+                    written += 1
+
+        skipped = len(observations) - written
+        log.info(
+            "adanos: stored %d row(s) for %s%s",
+            written,
+            session_date,
+            f"; {skipped} skipped (symbol not in the tracked universe)" if skipped else "",
+        )
+        return written
+
     def resolve_and_persist_mentions(
         self,
         posts: list[SocialPost],
@@ -1843,6 +1936,14 @@ class DataIngestor:
             self._report_progress("attention", 0, 1)
             self.ingest_attention(current_trading_session(), report)
             self._report_progress("attention", 1, 1)
+
+        # Same independence rationale as the attention block above: Adanos
+        # keeps producing data on its own schedule regardless of whether the
+        # post-level sources are healthy, so it is not gated on ``self.social``.
+        if self.adanos:
+            self._report_progress("adanos", 0, 1)
+            self.ingest_adanos(current_trading_session(), report)
+            self._report_progress("adanos", 1, 1)
 
         self.checker.persist(report.quality)
         report.finished_at = utc_now()

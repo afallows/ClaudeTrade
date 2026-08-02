@@ -453,6 +453,60 @@ class SymbolSentimentDaily(Base):
     computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class AdanosSnapshotRow(Base):
+    """One Adanos platform's pre-aggregated buzz/sentiment reading for one
+    symbol on one session.
+
+    A dedicated table rather than an extension of ``symbol_sentiment_daily``
+    (migration 010): that table's ``source``-keyed rows are built around
+    ``data.ingest.DataIngestor.ingest_attention``'s "attention only, never
+    polarity" contract -- callers (``mcp_server.get_trending``,
+    ``sentiment.aggregation``) assume any row there either IS the strategy-
+    scored ``"all"`` aggregate or carries no direction at all. Adanos breaks
+    that assumption on purpose (it has real ``sentiment_score``/
+    ``bullish_pct``/``bearish_pct``), plus per-platform ``trend``/
+    ``trend_history`` that table has no columns for. A new table keeps that
+    distinction structural instead of relying on every future reader to
+    remember one ``source`` prefix is special.
+
+    See ``domain.AdanosSnapshot`` for what each field means and
+    ``providers.social.adanos`` for how rows are produced. Dedup/upsert is on
+    ``(session, platform, symbol)`` -- a re-collection within the same
+    session updates the existing row rather than duplicating it, matching
+    ``ingest_attention``'s posture for ApeWisdom.
+    """
+
+    __tablename__ = "adanos_snapshots"
+    __table_args__ = (
+        UniqueConstraint("session", "platform", "symbol", name="uq_adanos_snapshot"),
+        Index("ix_adanos_snapshot_lookup", "symbol", "session"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    session: Mapped[dt.date] = mapped_column(Date, index=True)
+    platform: Mapped[str] = mapped_column(String(20))
+    company_name: Mapped[str] = mapped_column(String(120), default="")
+    buzz_score: Mapped[float] = mapped_column(Float, default=0.0)
+    #: ``mentions`` for x/reddit, ``trade_count`` for polymarket -- one
+    #: column, source-specific meaning, matching how ``total_engagement``
+    #: already does double duty (upvotes vs liquidity) below.
+    mentions: Mapped[int] = mapped_column(Integer, default=0)
+    trend: Mapped[str] = mapped_column(String(10), default="")
+    #: ``None`` when the vendor reported no score for this row -- distinct
+    #: from ``0.0`` (measured neutral), the same absent-vs-neutral
+    #: distinction ``SymbolSentimentDaily``'s attention rows preserve.
+    sentiment_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bullish_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bearish_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: ``total_upvotes`` (x/reddit) or ``total_liquidity`` (polymarket).
+    engagement: Mapped[float] = mapped_column(Float, default=0.0)
+    #: The vendor's own 7-point trailing buzz series, oldest first, stored
+    #: as reported -- see ``domain.AdanosSnapshot``.
+    trend_history: Mapped[list[float]] = mapped_column(JSON, default=list)
+    fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 # --------------------------------------------------------------------------
 # Features, signals, ledger
 # --------------------------------------------------------------------------

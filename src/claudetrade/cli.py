@@ -323,6 +323,14 @@ LIVE_ENDPOINTS: tuple[tuple[str, str, str, bool], ...] = (
         "https://widgets.tipranks.com/api/etoro/dataForTicker?ticker=AAPL",
         False,
     ),
+    # Polygon.io grouped-daily bars (official, keyed REST API; free tier
+    # ~5/min). needs_key=True -- see the credential-name mapping below.
+    (
+        "polygon",
+        "api.polygon.io",
+        "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/2024-01-02",
+        True,
+    ),
     ("reddit", "www.reddit.com", "https://www.reddit.com/api/v1/access_token", True),
     ("reddit", "oauth.reddit.com", "https://oauth.reddit.com/api/v1/me", True),
     # Public JSON fallback (ADR-0008 Decision 1): genuinely credential-free,
@@ -354,6 +362,31 @@ LIVE_ENDPOINTS: tuple[tuple[str, str, str, bool], ...] = (
         "api.stocktwits.com",
         "https://api.stocktwits.com/api/2/streams/symbol/AAPL.json",
         False,
+    ),
+    # ApeWisdom aggregate mention counts (attention source): free, keyless,
+    # so needs_key=False is fully accurate.
+    (
+        "apewisdom",
+        "apewisdom.io",
+        "https://apewisdom.io/api/v1.0/filter/all-stocks/page/1",
+        False,
+    ),
+    # Adanos (attention source; see providers.social.adanos). Default
+    # keyless site-proxy mode -- needs_key=False is fully accurate for this
+    # row, which is what most operators actually use.
+    (
+        "adanos",
+        "adanos.org",
+        "https://adanos.org/api/proxy-x/trending?limit=1",
+        False,
+    ),
+    # Adanos official, keyed API -- opt-in via [adanos] prefer_official_api.
+    # Reachability check only.
+    (
+        "adanos",
+        "api.adanos.org",
+        "https://api.adanos.org/x/stocks/v1/trending?limit=1",
+        True,
     ),
     ("ai", "api.anthropic.com", "https://api.anthropic.com/v1/models", True),
     ("ai", "api.openai.com", "https://api.openai.com/v1/models", True),
@@ -414,6 +447,8 @@ def probe(
                 "reddit": cfg.reddit.client_id_credential,
                 "x": cfg.x.bearer_credential,
                 "ai": cfg.ai.api_key_credential,
+                "polygon": cfg.polygon.api_key_credential,
+                "adanos": cfg.adanos.api_key_credential,
             }.get(source, "")
             credential = "configured" if (name and has_secret(name)) else "MISSING"
 
@@ -737,19 +772,25 @@ def secrets_set(
 
 @secrets_app.command("list")
 def secrets_list(config: ConfigOption = None) -> None:
-    """Show which credentials resolve, without revealing any value."""
-    cfg = _load(config)
-    from claudetrade.secrets import describe_secrets
+    """Show which credentials resolve, without revealing any value.
 
-    names = [
-        cfg.ai.api_key_credential,
-        cfg.reddit.client_id_credential,
-        cfg.reddit.client_secret_credential,
-        cfg.x.bearer_credential,
-        cfg.notifications.webhook_url_credential,
-    ]
-    if cfg.market_data.credential:
-        names.append(cfg.market_data.credential)
+    Derives its rows from ``claudetrade.secrets.credential_catalog`` -- the
+    same allowlist that drives the web Configuration screen and the
+    Streamlit Settings screen -- rather than keeping a third, independent
+    list. The catalog's own docstring explains why: three copies of "every
+    credential this application has" drifted apart before, and a credential
+    with a field on neither of the other two screens is not something this
+    command should silently omit either. A small number of names the catalog
+    does not cover (e.g. the notification webhook, which is not one of the
+    provider credentials the catalog enumerates) are appended after the
+    catalog-derived rows so nothing this command used to report disappears.
+    """
+    cfg = _load(config)
+    from claudetrade.secrets import credential_catalog, describe_secrets
+
+    names = [name for name, _, _ in credential_catalog(cfg)]
+    if cfg.notifications.webhook_url_credential not in names:
+        names.append(cfg.notifications.webhook_url_credential)
     for name, info in describe_secrets(sorted(set(names))).items():
         typer.echo(f"  {name:28s} {info['configured']:4s} {info['source']:12s} {info['masked']}")
 

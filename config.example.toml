@@ -221,6 +221,45 @@ min_mentions = 5                          # Rows quieter than this are dropped b
 rate_limit_per_minute = 30
 request_timeout_s = 20.0
 
+[adanos]
+# Adanos (adanos.org) pre-aggregated buzz/sentiment across X, Reddit and
+# Polymarket -- same family as [apewisdom] above (a hosted aggregator
+# serving finished per-ticker rows, not individual posts), but richer: it
+# also reports real polarity (sentiment_score, bullish_pct, bearish_pct)
+# across THREE platforms, refreshed hourly. Stored in its own table
+# (adanos_snapshots), never as SocialPost rows -- see providers.social.adanos
+# for why pre-aggregated vendor data must never be turned into fabricated
+# per-post rows.
+#
+# Two access modes:
+#   * Default keyless "site" mode hits adanos.org's own public-page proxy
+#     endpoints -- one request per enabled feed per collection cycle, no key
+#     required. This is what most operators use.
+#   * "official" mode (prefer_official_api = true, with api_key_credential
+#     resolving to a real key) uses the keyed api.adanos.org API instead,
+#     gated by a persistent monthly budget that fails closed at the reserve
+#     floor rather than ever falling back to extra site-proxy calls.
+#
+# Licensing (adanos.org/terms): commercial use permitted subject to the
+# vendor's terms; raw API data may not be redistributed as a competing
+# service and rate limits may not be circumvented. Local personal-research
+# use; no redistribution. Site-proxy mode is the vendor's own public page
+# endpoint used at page-equivalent cadence -- prefer an API key for
+# guaranteed terms compliance.
+enabled = true
+feed_x = true                             # X/Twitter feed
+feed_reddit = true                        # Reddit feed
+feed_polymarket = true                    # Polymarket feed
+site_base_url = "https://adanos.org/api"
+official_base_url = "https://api.adanos.org"
+prefer_official_api = false               # true = use official_base_url + X-API-Key when the credential resolves
+api_key_credential = "adanos_api_key"     # Environment variable or keyring lookup name (optional)
+calls_per_minute = 10
+monthly_budget = 250                      # Free-tier monthly cap on official-mode requests
+monthly_reserve = 15                      # Official mode fails closed for the rest of the month at this floor
+limit = 100                               # Rows requested per feed per cycle
+request_timeout_s = 20.0
+
 [ai]
 # Optional LLM-assisted sentiment classification -- an ensemble ADJUNCT,
 # never the decision-maker. The system is fully functional with

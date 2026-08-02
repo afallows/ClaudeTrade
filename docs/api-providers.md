@@ -1627,6 +1627,98 @@ Other filters ApeWisdom publishes include `wallstreetbets`, `stocks`,
 `options`, `investing`, and `stockmarket`; crypto-only filters are
 deliberately not defaults, since this application screens US equities.
 
+### Adanos -- X/Reddit/Polymarket aggregator (Default, Live, No Credentials Required)
+
+**Module**: `src/claudetrade/providers/social/adanos.py`
+
+Reads [adanos.org](https://adanos.org)'s pre-aggregated per-ticker buzz and
+sentiment across **three** platforms -- X/Twitter, Reddit and Polymarket --
+refreshed hourly. Same family as ApeWisdom above (a hosted aggregator
+serving finished rows, not individual posts) but richer in the one way that
+matters: alongside volume, Adanos reports real polarity.
+
+| | ApeWisdom | Adanos |
+|---|---|---|
+| Platforms | Reddit, 4chan (combined tally) | X, Reddit, Polymarket (separate rows) |
+| Volume | mentions, upvotes | `buzz_score`, mentions/trade count, `trend`, 7-point `trend_history` |
+| Direction | **none — attention only** | `sentiment_score` (-1..1), `bullish_pct`/`bearish_pct` |
+| Storage | `symbol_sentiment_daily` (`apewisdom:<filter>` source) | its own table, `adanos_snapshots` |
+| Backfillable | no -- rolling 24h window, no history endpoint | no -- hourly rolling snapshot, no history endpoint |
+
+**Why this is not a `SocialProvider` (same reasoning as ApeWisdom, restated
+because it matters more here).** Adanos serves pre-aggregated rows with no
+underlying post text, author or timestamp. `providers.social.hosted_api`'s
+module docstring warns at length against forcing a pre-aggregated vendor into
+fabricated `SocialPost` rows -- doing so would feed `unique_authors`,
+`bot_risk`, `duplicate_ratio` and `manipulation_risk` (all computed from
+post-level identity and text) confident-looking fiction. This provider
+returns `domain.AdanosSnapshot` objects through `fetch_snapshots()`, and the
+ingest path (`data.ingest.DataIngestor.ingest_adanos`) stores them in their
+own `adanos_snapshots` table -- not `symbol_sentiment_daily`'s `"all"`
+aggregate that strategies score against, and not `SymbolAttention`/
+`ingest_attention` either (that path is hard-coded to an
+`apewisdom:<community>` label and has no columns for polarity).
+
+**Two access modes**:
+
+* **Site mode (default, keyless).** One request per enabled feed per
+  collection cycle against adanos.org's own public-page proxy endpoints --
+  the same JSON its website calls, no key required. This is the
+  page-equivalent-cadence courtesy posture ApeWisdom also uses.
+* **Official mode**, when both `prefer_official_api = true` and
+  `api_key_credential` resolves to a real key: the keyed `api.adanos.org`
+  API instead, with an `X-API-Key` header. Gated by a persistent monthly
+  budget (default 250 requests/month, 15 reserved) tracked in a small JSON
+  state file under `paths.cache_dir/adanos/`. Once remaining budget reaches
+  the reserve floor, official mode **fails closed for the rest of the
+  calendar month** -- it never falls back to making extra site-proxy calls
+  to compensate. The counter self-corrects from the vendor's own
+  `X-RateLimit-Remaining-Monthly` response header on every official call.
+
+**Free tier**: 250 requests/month, 100/min burst, 30 days of history
+(official API). Site-proxy mode has no documented numeric limit beyond
+"page-equivalent cadence" -- one request per feed per collection cycle is
+what a logged-out browser tab would generate.
+
+**Polymarket official endpoint**: `api.adanos.org/polymarket/stocks/v1/trending`
+is inferred from the X/Reddit URL pattern, not independently confirmed. If it
+404s at runtime, only the Polymarket feed degrades (reported as
+`adanos_polymarket` in `degraded_sources`) -- the X and Reddit feeds are
+unaffected.
+
+**Licensing** (adanos.org/terms, checked 2026-08-02): commercial use is
+permitted subject to the vendor's terms; raw API data may not be
+redistributed as a competing service, and rate limits may not be
+circumvented. Local personal-research use; no redistribution. Site-proxy
+mode is the vendor's own public page endpoint, used at page-equivalent
+cadence -- an API key is the guaranteed-compliant path and is preferred
+whenever one is configured.
+
+```toml
+[adanos]
+enabled = true
+feed_x = true
+feed_reddit = true
+feed_polymarket = true
+prefer_official_api = false        # true = use the keyed API when api_key_credential resolves
+api_key_credential = "adanos_api_key"
+monthly_budget = 250
+monthly_reserve = 15
+```
+
+**Credentials**: none required for the default site mode.
+`claudetrade secrets set adanos_api_key` (optional) enables official mode
+once `prefer_official_api = true` is also set.
+
+**Surfacing**: not currently wired into `get_trending`'s `source` option --
+that function's query is built directly against `symbol_sentiment_daily`'s
+columns (`post_count`, `bull_bear_ratio`), which `adanos_snapshots`'
+per-platform shape does not share. Adanos data is visible today through
+`claudetrade probe`, provider status, and direct queries against
+`adanos_snapshots`; ranking it alongside ApeWisdom/local mentions in
+`get_trending` (and any deeper fusion into scoring) is a later, deliberate
+change, not a side effect of adding the provider.
+
 ### News RSS/Atom (Default, Live, No Credentials)
 
 **Module**: `src/claudetrade/providers/social/news_rss.py`

@@ -464,6 +464,47 @@ class SymbolAttention:
 
 
 @dataclass(slots=True)
+class AdanosSnapshot:
+    """One platform's pre-aggregated buzz/sentiment reading for one symbol.
+
+    Distinct from :class:`SymbolAttention` in the one way that matters:
+    Adanos (``adanos.org``) publishes real polarity alongside volume --
+    ``sentiment_score``, ``bullish_pct``, ``bearish_pct`` -- where ApeWisdom
+    publishes mention counts only. It is still a *pre-aggregated* reading,
+    exactly like ApeWisdom's: a ticker, a score, a percentage split, with no
+    underlying post text, author or timestamp. Forcing it into
+    :class:`SocialPost` would mean inventing all three, the same fabrication
+    ``providers.social.hosted_api`` warns against and ``SymbolAttention``'s
+    own docstring explains at length -- so this gets its own shape and its
+    own storage path (``db.models.AdanosSnapshotRow``), never
+    ``symbol_sentiment_daily``'s ``"all"`` aggregate that strategies score
+    against.
+
+    ``platform`` is one of ``"x"``, ``"reddit"``, ``"polymarket"`` --
+    Adanos's three source feeds, each fetched and stored separately because
+    the same ticker can read very differently across them.
+
+    ``trend_history`` is the vendor's own 7-point trailing buzz series
+    (oldest first), carried through unmodified rather than recomputed from
+    local history -- this application has no independent way to verify it,
+    so it is stored as reported, not treated as ground truth for scoring.
+    """
+
+    symbol: str
+    platform: str
+    company_name: str = ""
+    buzz_score: float = 0.0
+    mentions: int = 0
+    trend: str = ""
+    sentiment_score: float | None = None
+    bullish_pct: float | None = None
+    bearish_pct: float | None = None
+    engagement: float = 0.0
+    trend_history: list[float] = field(default_factory=list)
+    observed_at: dt.datetime | None = None
+
+
+@dataclass(slots=True)
 class SymbolSentiment:
     """Aggregated, time-decayed sentiment for one symbol on one session."""
 

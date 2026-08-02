@@ -559,6 +559,35 @@ def get_attention_providers(config: AppConfig) -> list:
     return providers
 
 
+def get_adanos_providers(config: AppConfig) -> list:
+    """Construct the Adanos provider, if enabled.
+
+    Kept as its own accessor (rather than folded into
+    :func:`get_attention_providers`) because Adanos rows are stored through
+    an entirely different path -- ``data.ingest.DataIngestor.ingest_adanos``
+    writes ``db.models.AdanosSnapshotRow``, never ``SymbolAttention``/
+    ``symbol_sentiment_daily`` -- see ``providers.social.adanos`` for why. A
+    list, matching every other provider accessor's shape, even though there
+    is exactly one Adanos provider instance covering all three feeds
+    internally.
+    """
+    providers: list = []
+    if not config.adanos.enabled:
+        return providers
+    try:
+        from claudetrade.providers.social.adanos import AdanosProvider
+
+        providers.append(
+            AdanosProvider(config.adanos, cache_dir=config.paths.resolve("cache_dir"))
+        )
+        log.info("loaded attention provider: adanos")
+    except ImportError:
+        log.debug("adanos provider module is not available; skipping")
+    except Exception as exc:
+        log.warning("failed to initialise attention provider 'adanos': %s", exc)
+    return providers
+
+
 def provider_status_report(config: AppConfig) -> list[ProviderStatus]:
     """Generate a status report for the dashboard.
 
@@ -611,6 +640,11 @@ def provider_status_report(config: AppConfig) -> list[ProviderStatus]:
     # with Stocktwits' empty watchlist.
     for attention in get_attention_providers(config):
         statuses.append(attention.status())
+
+    # Adanos (X/Reddit/Polymarket buzz+sentiment) -- reported alongside the
+    # other attention sources for the same reason as ApeWisdom above.
+    for adanos in get_adanos_providers(config):
+        statuses.append(adanos.status())
 
     # AI provider.
     ai = get_ai_provider(config)

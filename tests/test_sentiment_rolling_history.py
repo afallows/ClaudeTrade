@@ -504,6 +504,7 @@ def _pipeline_with_stub_ingest(
     pipeline.market = _StubMarket()
     pipeline.social = [_StubSocial()]
     pipeline.attention = []
+    pipeline.adanos = []
     monkeypatch.setattr(pipeline_module, "DataIngestor", _StubIngestor)
     return pipeline
 

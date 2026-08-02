@@ -1,0 +1,32 @@
+[
+  {
+    "ticker": "NVDA",
+    "company_name": "NVIDIA Corp",
+    "buzz_score": 40.0,
+    "trend": "stable",
+    "trade_count": 1200,
+    "market_count": 8,
+    "current_market_count": 5,
+    "unique_traders": 340,
+    "sentiment_score": 0.15,
+    "bullish_pct": 58.0,
+    "bearish_pct": 42.0,
+    "total_liquidity": 250000.5,
+    "trend_history": [35, 36, 38, 39, 40, 40, 40]
+  },
+  {
+    "ticker": "TSLA",
+    "company_name": "Tesla Inc",
+    "buzz_score": 72.0,
+    "trend": "rising",
+    "trade_count": 3400,
+    "market_count": 12,
+    "current_market_count": 9,
+    "unique_traders": 900,
+    "sentiment_score": null,
+    "bullish_pct": null,
+    "bearish_pct": null,
+    "total_liquidity": 900000.0,
+    "trend_history": [50, 55, 60, 63, 66, 70, 72]
+  }
+]

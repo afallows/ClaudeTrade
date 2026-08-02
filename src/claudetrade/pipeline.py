@@ -48,6 +48,7 @@ from claudetrade.domain import (
 )
 from claudetrade.logging_setup import get_logger
 from claudetrade.providers.registry import (
+    get_adanos_providers,
     get_ai_provider,
     get_attention_providers,
     get_earnings_provider,
@@ -118,6 +119,11 @@ class Pipeline:
         #: Aggregate mention-count sources (ApeWisdom); separate from
         #: ``social`` because they yield per-symbol tallies, not posts.
         self.attention = get_attention_providers(config)
+        #: Adanos (X/Reddit/Polymarket buzz+sentiment); separate from
+        #: ``attention`` because its rows carry real polarity and a platform
+        #: dimension neither ``social`` nor ``attention``'s storage shape has
+        #: room for -- see ``providers.social.adanos``.
+        self.adanos = get_adanos_providers(config)
         self.ai = get_ai_provider(config)
         self.ledger = SignalLedger(db)
         self.universe = UniverseSelector(config, db)
@@ -208,6 +214,7 @@ class Pipeline:
             earnings_provider=self.earnings,
             social_providers=self.social,
             attention_providers=self.attention,
+            adanos_providers=self.adanos,
             progress_callback=progress_callback,
         )
         report = ingestor.run_full_refresh(
@@ -839,7 +846,7 @@ class Pipeline:
         report = IngestReport()
         result.ingest = report
 
-        if not self.social and not self.attention:
+        if not self.social and not self.attention and not self.adanos:
             result.warnings.append(
                 "No social or attention provider is configured; there is nothing to collect. "
                 "Sentiment history cannot accumulate until at least one is enabled."
@@ -863,6 +870,7 @@ class Pipeline:
             earnings_provider=None,
             social_providers=self.social,
             attention_providers=self.attention,
+            adanos_providers=self.adanos,
             progress_callback=progress_callback,
         )
 
@@ -907,6 +915,11 @@ class Pipeline:
             # window with no history endpoint, so today's observation is only
             # ever about today.
             ingestor.ingest_attention(end, report)
+
+        if self.adanos:
+            # Same independence rationale as the attention block above --
+            # Adanos is not gated on the post-level sources being healthy.
+            ingestor.ingest_adanos(end, report)
 
         _report("finishing", 3)
         result.degraded_sources.update(report.provider_failures)

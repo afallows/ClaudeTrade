@@ -1,5 +1,7 @@
 """Adapter seam for a hosted/paid sentiment or news aggregator.
 
+A real hosted aggregator now exists: see ``providers.social.adanos``.
+
 **This module is a stub.** It exists to give the application a documented
 place to plug in a commercial sentiment/news vendor (e.g. one covering more
 outlets than the free RSS/Atom list in ``news_rss.py``, or offering deeper

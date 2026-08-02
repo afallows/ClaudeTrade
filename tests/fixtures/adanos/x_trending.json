@@ -1,0 +1,47 @@
+[
+  {
+    "ticker": "NVDA",
+    "company_name": "NVIDIA Corp",
+    "buzz_score": 87.5,
+    "trend": "rising",
+    "mentions": 950,
+    "sentiment_score": 0.42,
+    "bullish_pct": 68.0,
+    "bearish_pct": 32.0,
+    "total_upvotes": 12000,
+    "unique_tweets": 410,
+    "trend_history": [40.0, 45.0, 50.0, 60.0, 70.0, 80.0, 87.5]
+  },
+  {
+    "ticker": "MU",
+    "company_name": "Micron Technology",
+    "buzz_score": 55.0,
+    "trend": "stable",
+    "mentions": "210",
+    "sentiment_score": null,
+    "bullish_pct": 50.0,
+    "bearish_pct": 50.0,
+    "total_upvotes": 3000,
+    "unique_tweets": 90,
+    "trend_history": [50, 52, 54, 53, 55, 55, 55]
+  },
+  {
+    "ticker": "BTC",
+    "company_name": "Bitcoin",
+    "buzz_score": 99.0,
+    "trend": "rising",
+    "mentions": 5000,
+    "sentiment_score": 0.1,
+    "bullish_pct": 55.0,
+    "bearish_pct": 45.0,
+    "total_upvotes": 90000,
+    "unique_tweets": 2000,
+    "trend_history": []
+  },
+  {
+    "ticker": "",
+    "company_name": "bad row -- empty ticker",
+    "buzz_score": 10.0
+  },
+  "not a dict"
+]

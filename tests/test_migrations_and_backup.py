@@ -462,10 +462,17 @@ class TestSignalResearchRevisionsMigration:
         insp = inspect(memory_db.engine)
         assert "signal_research_revisions" in insp.get_table_names()
 
-    def test_current_version_reaches_9(self, unmigrated_db: Database):
+    def test_current_version_reaches_latest(self, unmigrated_db: Database):
+        """Was pinned to the literal ``9`` (the version this migration
+        landed at); now checks against ``LATEST_VERSION`` so a later
+        migration (e.g. 010's ``adanos_snapshots``) does not need this
+        assertion edited again."""
+        from claudetrade.db.migrations import LATEST_VERSION
+
         assert current_version(unmigrated_db) == 0
         migrate(unmigrated_db)
-        assert current_version(unmigrated_db) == 9
+        assert current_version(unmigrated_db) == LATEST_VERSION
+        assert current_version(unmigrated_db) >= 9
 
     def test_migration_is_idempotent_when_rerun(self, unmigrated_db: Database):
         applied_first = migrate(unmigrated_db)

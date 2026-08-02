@@ -1,0 +1,30 @@
+[
+  {
+    "ticker": "NVDA",
+    "company_name": "NVIDIA Corp",
+    "buzz_score": 76.0,
+    "trend": "falling",
+    "mentions": 300,
+    "sentiment_score": -0.05,
+    "bullish_pct": 45.0,
+    "bearish_pct": 55.0,
+    "total_upvotes": 8000,
+    "unique_posts": 120,
+    "subreddit_count": 4,
+    "trend_history": [80, 78, 77, 76, 75, 76, 76]
+  },
+  {
+    "ticker": "GME",
+    "company_name": "GameStop Corp",
+    "buzz_score": 62.0,
+    "trend": "rising",
+    "mentions": 610,
+    "sentiment_score": 0.31,
+    "bullish_pct": 70.0,
+    "bearish_pct": 30.0,
+    "total_upvotes": 15000,
+    "unique_posts": 250,
+    "subreddit_count": 6,
+    "trend_history": [30, 35, 40, 45, 50, 58, 62]
+  }
+]

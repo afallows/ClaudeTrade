@@ -206,6 +206,11 @@ def credential_catalog(config: Any) -> list[tuple[str, str, str]]:
         (config.ai.anthropic_api_key_credential, "Anthropic (Claude) API key", "sentiment"),
         (config.ai.openai_api_key_credential, "OpenAI (ChatGPT) API key", "sentiment"),
         (config.polygon.api_key_credential, "Polygon.io API key (optional)", "stock_price"),
+        (
+            config.adanos.api_key_credential,
+            "Adanos API key (optional -- keyless site mode works without it)",
+            "sentiment",
+        ),
     ]
     if config.market_data.credential:
         items.append((config.market_data.credential, "Market data API key", "stock_price"))
