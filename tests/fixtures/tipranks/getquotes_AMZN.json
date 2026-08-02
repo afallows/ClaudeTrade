@@ -1,0 +1,35 @@
+{
+  "_fixture_note": "NOT a verbatim owner capture -- the sandbox this fixture was authored in never received the raw response bytes for GetQuotes, only the owner's CONFIRMED field list and shape from a live probe (see providers.market.tipranks module docstring): {ticker, currency, exchangeRate, isomic, marketName, price, open, low, high, volume, changeAmount, changePercent, lastTradeDate, lastClose, marketCap, realTimeMarketCap, isRealTime, isMarketOpen, isPremarket, isAfterMarket, prePostMarket, lastCacheUpdate} nested under top-level {quotes, errors, metadata}. This file is constructed strictly to that confirmed shape with plausible illustrative values for a single-ticker (AMZN) GetQuotes?tickers=AMZN response -- do not treat the numeric values as real market data.",
+  "quotes": [
+    {
+      "ticker": "AMZN",
+      "currency": "USD",
+      "exchangeRate": 1,
+      "isomic": "XNAS",
+      "marketName": "NASDAQ",
+      "price": 231.15,
+      "open": 229.80,
+      "low": 228.10,
+      "high": 232.40,
+      "volume": 32891200,
+      "changeAmount": 1.35,
+      "changePercent": 0.59,
+      "lastTradeDate": "2026-07-30",
+      "lastClose": 229.80,
+      "marketCap": 2456000000000,
+      "realTimeMarketCap": 2461000000000,
+      "isRealTime": true,
+      "isMarketOpen": false,
+      "isPremarket": false,
+      "isAfterMarket": false,
+      "prePostMarket": null,
+      "lastCacheUpdate": "2026-07-30T20:05:00Z"
+    }
+  ],
+  "errors": [],
+  "metadata": {
+    "count": 1,
+    "success": 1,
+    "errors": 0
+  }
+}

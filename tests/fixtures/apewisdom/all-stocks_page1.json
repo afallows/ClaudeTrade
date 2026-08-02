@@ -1,0 +1,14 @@
+{
+  "_fixture_note": "Transcribed from ApeWisdom's published API schema (apewisdom.io/api), not a live capture -- this package is built and tested with egress blocked. Counts are deliberately a mix of JSON numbers and numeric strings because the live API has been observed serving both.",
+  "count": 6,
+  "pages": 2,
+  "current_page": 1,
+  "results": [
+    {"rank": 1, "ticker": "NVDA", "name": "NVIDIA", "mentions": 812, "upvotes": 4210, "rank_24h_ago": 2, "mentions_24h_ago": 500},
+    {"rank": 2, "ticker": "MU", "name": "Micron Technology", "mentions": "430", "upvotes": "1980", "rank_24h_ago": "5", "mentions_24h_ago": "610"},
+    {"rank": 3, "ticker": "RDDT", "name": "Reddit Inc", "mentions": 288, "upvotes": 1502, "rank_24h_ago": 3, "mentions_24h_ago": 250},
+    {"rank": 4, "ticker": "BTC", "name": "Bitcoin", "mentions": 275, "upvotes": 1400, "rank_24h_ago": 4, "mentions_24h_ago": 260},
+    {"rank": 5, "ticker": "ZZZZ", "name": "Not In This Universe", "mentions": 140, "upvotes": 300, "rank_24h_ago": 6, "mentions_24h_ago": 120},
+    {"rank": 6, "ticker": "AAPL", "name": "Apple Inc", "mentions": 3, "upvotes": 12, "rank_24h_ago": 7, "mentions_24h_ago": 4}
+  ]
+}

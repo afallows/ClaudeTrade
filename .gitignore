@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Application data / secrets -- never commit
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+# Runtime directories at the repository root only -- these patterns are
+# anchored with a leading slash so they do not swallow source packages such as
+# src/claudetrade/data/.
+/data/
+/logs/
+/exports/
+/backups/
+/.claudetrade/
+config.local.toml
+secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# PyInstaller
+*.spec.bak

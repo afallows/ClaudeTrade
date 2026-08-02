@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__claudetrade__get_market_status",
+      "mcp__claudetrade__get_refresh_status",
+      "PowerShell(& \"C:\\\\ClaudeTrade\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest \"C:\\\\ClaudeTrade\\\\tests\\\\test_x_provider.py\" -q 2>&1)",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"Name LIKE '%python%' OR Name LIKE '%claudetrade%' OR Name LIKE '%streamlit%'\" | Select-Object ProcessId, ParentProcessId, Name, @{n='Cmd';e={$_.CommandLine}} | Format-List)",
+      "PowerShell(& \"C:\\\\ClaudeTrade\\\\.venv\\\\Scripts\\\\python.exe\" \"C:\\\\Users\\\\adria\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--ClaudeTrade\\\\12a6e88d-4f1f-4fc4-9669-d4b686852917\\\\scratchpad\\\\probe_st.py\" 2>&1)",
+      "PowerShell(& \"C:\\\\ClaudeTrade\\\\.venv\\\\Scripts\\\\python.exe\" -m pip install -q pytest 2>&1)",
+      "PowerShell(& \"C:\\\\ClaudeTrade\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest \"C:\\\\ClaudeTrade\\\\tests\\\\test_stocktwits.py\" \"C:\\\\ClaudeTrade\\\\tests\\\\test_x_provider.py\" -q 2>&1)",
+      "PowerShell(\"---\")",
+      "PowerShell(& \"C:\\\\ClaudeTrade\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest \"C:\\\\ClaudeTrade\\\\tests\\\\test_stocktwits_provider.py\" \"C:\\\\ClaudeTrade\\\\tests\\\\test_x_provider.py\" -q 2>&1)",
+      "PowerShell(& \"C:\\\\ClaudeTrade\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest \"C:\\\\ClaudeTrade\\\\tests\\\\test_stocktwits_provider.py\" -q 2>&1)",
+      "PowerShell(& \"C:\\\\ClaudeTrade\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest \"C:\\\\ClaudeTrade\\\\tests\\\\test_x_provider.py::TestModeSelection\" -q 2>&1)",
+      "PowerShell(\"=== X: mode-selection failures ===\")",
+      "PowerShell(& \"C:\\\\ClaudeTrade\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest \"C:\\\\ClaudeTrade\\\\tests\\\\test_x_provider.py\" \"C:\\\\ClaudeTrade\\\\tests\\\\test_stocktwits_provider.py\" -q 2>&1)"
+    ]
+  }
+}

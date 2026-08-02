@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Example Wire Service - Financial News</title>
+    <link>https://wire.example.com/</link>
+    <description>Recorded fixture: representative RSS 2.0 financial news feed.</description>
+    <item>
+      <title>Shopify beats earnings expectations</title>
+      <link>https://wire.example.com/2024/06/03/shopify-beats-earnings</link>
+      <guid isPermaLink="false">wire-example-guid-shop-1</guid>
+      <pubDate>Mon, 03 Jun 2024 13:05:00 GMT</pubDate>
+      <description>Shopify Inc reported quarterly results ahead of analyst estimates, citing strong merchant growth.</description>
+    </item>
+    <item>
+      <title>Federal Reserve holds interest rates steady</title>
+      <link>https://wire.example.com/2024/06/03/fed-holds-rates</link>
+      <guid isPermaLink="false">wire-example-guid-fed-1</guid>
+      <pubDate>Mon, 03 Jun 2024 18:00:00 GMT</pubDate>
+      <description>The Federal Reserve left its benchmark rate unchanged, citing balanced risks to its dual mandate.</description>
+    </item>
+  </channel>
+</rss>

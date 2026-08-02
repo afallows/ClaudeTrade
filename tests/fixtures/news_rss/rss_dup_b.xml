@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Wire Service B (syndicated republish)</title>
+    <item>
+      <title>Widget Corp announces record quarterly revenue</title>
+      <link>https://wire-b.example.com/republished/widget-corp-revenue</link>
+      <guid isPermaLink="false">wire-b-guid-widget-republish-1</guid>
+      <pubDate>Mon, 03 Jun 2024 14:05:00 GMT</pubDate>
+      <description>Widget Corp said quarterly revenue rose sharply, beating the consensus estimate.</description>
+    </item>
+  </channel>
+</rss>

@@ -1,0 +1,60 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260801232944
+Username: FIG-BOOKS\Adrian
+RunAs User: FIG-BOOKS\Adrian
+Configuration Name: 
+Machine: FIG-BOOKS (Microsoft Windows NT 10.0.26200.0)
+Host Application: powershell -NoProfile -ExecutionPolicy Bypass -File C:\ClaudeTrade\scripts\setup.ps1
+Process ID: 30392
+PSVersion: 5.1.26100.8875
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8875
+BuildVersion: 10.0.26100.8875
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+ClaudeTrade setup
+=================
+Project root: C:\ClaudeTrade
+Log file:     C:\ClaudeTrade\scripts\setup-log-20260801-232944.txt
+
+[1/5] Checking for Python 3.11+
+    OK      Using Python 3.13.7 -- command: py -3.13
+
+[2/5] Setting up the Python environment (.venv, pip, dependencies)
+    OK      .venv already exists at C:\ClaudeTrade\.venv -- skipping creation.
+    ..      Upgrading pip ...
+WARNING: Ignoring invalid distribution ~laudetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~~audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~ (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~-audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~=audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~laudetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~~audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+Requirement already satisfied: pip in .\.venv\Lib\site-packages (26.2)
+WARNING: Ignoring invalid distribution ~ (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~-audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~=audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~laudetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~~audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~ (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~-audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~=audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~laudetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~~audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+    OK      pip is up to date.
+    ..      Installing dependencies from requirements.txt (pandas, SQLAlchemy, the desktop UI stack, ...) -- this can take a few minutes the first time ...
+
+    OK      Dependencies installed.
+    ..      Installing ClaudeTrade itself (editable install; registers the 'claudetrade' command) ...
+
+    ERROR   'pip install -e .' failed (exit code 1). Check the transcript above, then re-run this script.
+
+Setup stopped early (exit code 3). Transcript: C:\ClaudeTrade\scripts\setup-log-20260801-232944.txt
+**********************
+Windows PowerShell transcript end
+End time: 20260801232953
+**********************

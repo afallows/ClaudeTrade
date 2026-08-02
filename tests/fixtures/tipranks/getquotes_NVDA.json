@@ -1,0 +1,35 @@
+{
+  "_fixture_note": "NOT a verbatim owner capture -- see getquotes_AMZN.json's _fixture_note for the full provenance explanation: constructed to the owner's CONFIRMED GetQuotes field list/shape, not copied from a real response body (which this sandbox never received). Plausible illustrative values for a single-ticker (NVDA) GetQuotes?tickers=NVDA response only.",
+  "quotes": [
+    {
+      "ticker": "NVDA",
+      "currency": "USD",
+      "exchangeRate": 1,
+      "isomic": "XNAS",
+      "marketName": "NASDAQ",
+      "price": 128.42,
+      "open": 126.90,
+      "low": 125.75,
+      "high": 129.10,
+      "volume": 210453900,
+      "changeAmount": 1.52,
+      "changePercent": 1.20,
+      "lastTradeDate": "2026-07-30",
+      "lastClose": 126.90,
+      "marketCap": 3140000000000,
+      "realTimeMarketCap": 3145000000000,
+      "isRealTime": true,
+      "isMarketOpen": false,
+      "isPremarket": false,
+      "isAfterMarket": false,
+      "prePostMarket": null,
+      "lastCacheUpdate": "2026-07-30T20:05:00Z"
+    }
+  ],
+  "errors": [],
+  "metadata": {
+    "count": 1,
+    "success": 1,
+    "errors": 0
+  }
+}

@@ -1,0 +1,86 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260801230339
+Username: FIG-BOOKS\Adrian
+RunAs User: FIG-BOOKS\Adrian
+Configuration Name: 
+Machine: FIG-BOOKS (Microsoft Windows NT 10.0.26200.0)
+Host Application: powershell -NoProfile -ExecutionPolicy Bypass -File C:\ClaudeTrade\scripts\setup.ps1
+Process ID: 19756
+PSVersion: 5.1.26100.8875
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8875
+BuildVersion: 10.0.26100.8875
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+ClaudeTrade setup
+=================
+Project root: C:\ClaudeTrade
+Log file:     C:\ClaudeTrade\scripts\setup-log-20260801-230339.txt
+
+[1/5] Checking for Python 3.11+
+    OK      Using Python 3.13.7 -- command: py -3.13
+
+[2/5] Setting up the Python environment (.venv, pip, dependencies)
+    OK      .venv already exists at C:\ClaudeTrade\.venv -- skipping creation.
+    ..      Upgrading pip ...
+WARNING: Ignoring invalid distribution ~laudetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~~audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~ (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~-audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~=audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~laudetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~~audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+Requirement already satisfied: pip in .\.venv\Lib\site-packages (26.2)
+WARNING: Ignoring invalid distribution ~ (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~-audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~=audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~laudetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~~audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~ (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~-audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~=audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~laudetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+WARNING: Ignoring invalid distribution ~~audetrade (C:\ClaudeTrade\.venv\Lib\site-packages)
+    OK      pip is up to date.
+    ..      Installing dependencies from requirements.txt (pandas, SQLAlchemy, the desktop UI stack, ...) -- this can take a few minutes the first time ...
+
+    OK      Dependencies installed.
+    ..      Installing ClaudeTrade itself (editable install; registers the 'claudetrade' command) ...
+
+    OK      ClaudeTrade installed.
+
+[3/5] Initializing the database (claudetrade init)
+
+    OK      Database ready.
+
+[4/5] Backfilling two years of price history (first run only; no API key needed)
+
+    OK      Price history ready.
+
+[5/5] Starting the ClaudeTrade UI (desktop app) -- data loads in the background behind it
+    ..      Launching 'C:\ClaudeTrade\.venv\Scripts\claudetrade.exe ui' as a background process ...
+    OK      UI process started (PID 24616).
+    ..      Waiting for the UI's server to answer on http://127.0.0.1:8501 (up to 30s) ...
+    OK      UI is up.
+    ..      Triggering the first data load in the background (POST http://127.0.0.1:8501/api/system/refresh) ...
+    OK      Data refresh started in the background. Watch its progress at http://127.0.0.1:8501 (Diagnostics) or GET http://127.0.0.1:8501/api/system/refresh/status.
+
+Setup finished (exit code 0). Transcript: C:\ClaudeTrade\scripts\setup-log-20260801-230339.txt
+
+-----------------------------------------------------------------
+Optional: enable AI-assisted sentiment.
+  Open the Configuration screen -> AI Analysis and follow the
+  instructions there to connect Claude or ChatGPT. This is purely
+  optional and setup does not block on it -- rules-based sentiment
+  always runs on its own; AI, if configured, is an ensemble adjunct
+  on top of it, never the sole basis of a signal.
+  Details: docs\ai-setup.md
+-----------------------------------------------------------------
+**********************
+Windows PowerShell transcript end
+End time: 20260801230352
+**********************

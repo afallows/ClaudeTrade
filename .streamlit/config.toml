@@ -1,0 +1,24 @@
+# ClaudeTrade UI theme.
+#
+# One accent colour, dark-first (this is a research terminal, run on a
+# trading desk, not a marketing page). Values are the dark-surface steps
+# from the validated palette in this project's `dataviz` design skill:
+# accent = categorical slot 1 (blue), background = dark page plane, secondary
+# background = dark chart surface. Keep in sync with `claudetrade.ui.theme`
+# if either changes.
+
+[theme]
+base = "dark"
+primaryColor = "#3987e5"
+backgroundColor = "#0d0d0d"
+secondaryBackgroundColor = "#1a1a19"
+textColor = "#ffffff"
+font = "sans serif"
+baseRadius = "small"
+
+[client]
+toolbarMode = "minimal"
+showSidebarNavigation = true
+
+[browser]
+gatherUsageStats = false

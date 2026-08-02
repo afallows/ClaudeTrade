@@ -1,0 +1,64 @@
+{
+  "_fixture_note": "Synthesized (not owner-captured) multi-ticker GetQuotes envelope covering the three shapes the batched cap sweep must handle in one response: a plain USD listing (AAPL), a non-USD listing requiring the exchangeRate normalisation (TSE:TECK.B, CAD), and a per-ticker error entry (BADSYM) that must be skipped without being fatal to the rest of the batch. See getquotes_AMZN.json's _fixture_note for the field-shape provenance -- the same CONFIRMED-but-not-verbatim caveat applies here.",
+  "quotes": [
+    {
+      "ticker": "AAPL",
+      "currency": "USD",
+      "exchangeRate": 1,
+      "isomic": "XNAS",
+      "marketName": "NASDAQ",
+      "price": 215.32,
+      "open": 214.10,
+      "low": 213.55,
+      "high": 216.80,
+      "volume": 45210300,
+      "changeAmount": 1.22,
+      "changePercent": 0.57,
+      "lastTradeDate": "2026-07-30",
+      "lastClose": 214.10,
+      "marketCap": 3260000000000,
+      "realTimeMarketCap": 3265000000000,
+      "isRealTime": true,
+      "isMarketOpen": false,
+      "isPremarket": false,
+      "isAfterMarket": false,
+      "prePostMarket": null,
+      "lastCacheUpdate": "2026-07-30T20:05:00Z"
+    },
+    {
+      "ticker": "TSE:TECK.B",
+      "currency": "CAD",
+      "exchangeRate": 0.729,
+      "isomic": "XTSE",
+      "marketName": "Toronto",
+      "price": 64.85,
+      "open": 63.90,
+      "low": 63.55,
+      "high": 65.10,
+      "volume": 1875400,
+      "changeAmount": 0.95,
+      "changePercent": 1.49,
+      "lastTradeDate": "2026-07-30",
+      "lastClose": 63.90,
+      "marketCap": 34120000000,
+      "realTimeMarketCap": 34205000000,
+      "isRealTime": true,
+      "isMarketOpen": false,
+      "isPremarket": false,
+      "isAfterMarket": false,
+      "prePostMarket": null,
+      "lastCacheUpdate": "2026-07-30T20:05:00Z"
+    }
+  ],
+  "errors": [
+    {
+      "ticker": "BADSYM",
+      "message": "Unknown ticker"
+    }
+  ],
+  "metadata": {
+    "count": 3,
+    "success": 2,
+    "errors": 1
+  }
+}

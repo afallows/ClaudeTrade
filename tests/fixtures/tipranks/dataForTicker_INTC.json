@@ -1,0 +1,236 @@
+{
+  "_fixture_note": "Trimmed-but-structurally-faithful capture of https://widgets.tipranks.com/api/etoro/dataForTicker?ticker=INTC fetched by the project owner on 2026-07-30 from their own machine (endpoint is egress-blocked from the dev sandbox). Arrays are truncated to representative entries; every field name and nesting level matches the live payload. Prices are close-only: {date, d, p} -- no OHLV.",
+  "overview": {
+    "ticker": "INTC",
+    "companyName": "Intel",
+    "companyFullName": "Intel",
+    "stockUid": "5479fcad",
+    "sectorID": 17349,
+    "market": "NASDAQ",
+    "description": "Intel Corporation designs, develops, manufactures, markets, sells, and services computing and related end products and services...",
+    "hasEarnings": true,
+    "hasDividends": true,
+    "prices": [
+      {"date": "2025-07-30T00:00:00", "d": "30/7/25", "p": 20.34},
+      {"date": "2025-07-31T00:00:00", "d": "31/7/25", "p": 19.80},
+      {"date": "2025-08-01T00:00:00", "d": "1/8/25", "p": 19.31},
+      {"date": "2025-12-24T00:00:00", "d": "24/12/25", "p": 36.16},
+      {"date": "2025-12-25T00:00:00", "d": "25/12/25", "p": 36.16},
+      {"date": "2026-01-01T00:00:00", "d": "1/1/26", "p": 36.90},
+      {"date": "2026-04-24T00:00:00", "d": "24/4/26", "p": 82.54},
+      {"date": "2026-07-28T00:00:00", "d": "28/7/26", "p": 86.30},
+      {"date": "2026-07-29T00:00:00", "d": "29/7/26", "p": 81.88}
+    ],
+    "consensuses": [
+      {"rating": 3, "nB": 7, "nH": 24, "nS": 2, "period": 3, "bench": 1, "mStars": 1, "d": "30/7/26", "isLatest": 1, "priceTarget": null, "consensusRate": 33}
+    ],
+    "experts": [
+      {
+        "name": "Vijay Rakesh",
+        "firm": "Mizuho Securities",
+        "expertFirmTypeId": 1,
+        "eUid": "2a8e9e193727c312b54e19f82b81800637221abb",
+        "eTypeId": 1,
+        "expertImg": "2073_FADICBIIC",
+        "ratings": [
+          {
+            "ratingId": 2, "actionId": 5, "date": "2026-07-28T00:00:00", "d": "2d",
+            "url": "https://www.tipranks.com/news/blurbs/example", "pos": 18,
+            "time": "2026-07-28T00:00:00", "urlSlug": "example",
+            "priceTarget": 109.00, "oldPriceTarget": null,
+            "convertedPriceTarget": 109.00, "convertedOldPriceTarget": null,
+            "quote": {"title": "Intel (INTC) Receives a Rating Update from a Top Analyst", "date": "2026-07-28T00:00:00", "quote": "", "site": "tipranks.com", "link": "https://www.tipranks.com/news/blurbs/example", "siteName": "TipRanks Contributor"},
+            "siteName": "TipRanks Contributor", "site": "tipranks.com", "id": 69733290,
+            "rD": "2026-07-28T00:00:00", "timestamp": "2026-07-29T12:49:47.31",
+            "priceTargetCurrency": 1, "convertedPriceTargetCurrency": 1,
+            "convertedPriceTargetCurrencyCode": "USD", "priceTargetCurrencyCode": "USD"
+          }
+        ],
+        "stockSuccessRate": 0.00, "stockAverageReturn": -0.50,
+        "stockTotalRecommendations": 8, "stockGoodRecommendations": 0,
+        "rankings": [{"period": 3, "bench": 1, "lRank": 9, "gRank": 20, "gRecs": 320, "tRecs": 491, "avgReturn": 0.63, "stars": 5.0, "originalStars": 5.00, "tPos": 1.0}],
+        "stockid": 9706, "ticker": "INTC", "companyName": "Intel",
+        "newPictureUrl": "Vijay-Rakesh-FADICBIIC.jpg", "includedInConsensus": true, "aiModel": null
+      },
+      {
+        "name": "Vivek Arya",
+        "firm": "Bank of America Securities",
+        "expertFirmTypeId": 1,
+        "eUid": "fb1bdecbdfa52d511aa21a413df901761e67d17a",
+        "eTypeId": 1,
+        "expertImg": "3130_AJECFAEDHB",
+        "ratings": [
+          {
+            "ratingId": 1, "actionId": 5, "date": "2026-07-28T00:00:00", "d": "2d",
+            "url": "https://www.tipranks.com/news/ratings/example2", "pos": 19,
+            "time": "2026-07-28T00:00:00", "urlSlug": "example2",
+            "priceTarget": 160.00, "oldPriceTarget": null,
+            "convertedPriceTarget": 160.00, "convertedOldPriceTarget": null,
+            "quote": {"title": "Intel: Buy Rating Reaffirmed; Price Target Maintained at $160", "date": "2026-07-28T00:00:00", "quote": "", "site": "tipranks.com", "link": "https://www.tipranks.com/news/ratings/example2", "siteName": "TipRanks Contributor"},
+            "siteName": "TipRanks Contributor", "site": "tipranks.com", "id": 69725427,
+            "rD": "2026-07-28T00:00:00", "timestamp": "2026-07-29T10:15:41.64",
+            "priceTargetCurrency": 1, "convertedPriceTargetCurrency": 1,
+            "convertedPriceTargetCurrencyCode": "USD", "priceTargetCurrencyCode": "USD"
+          }
+        ],
+        "stockSuccessRate": 0.11, "stockAverageReturn": -0.67,
+        "stockTotalRecommendations": 18, "stockGoodRecommendations": 2,
+        "rankings": [{"period": 3, "bench": 1, "lRank": 237, "gRank": 539, "gRecs": 282, "tRecs": 498, "avgReturn": 0.21, "stars": 4.9, "originalStars": 4.90, "tPos": 1.0}],
+        "stockid": 9706, "ticker": "INTC", "companyName": "Intel",
+        "newPictureUrl": "Vivek-Arya-AJECFAEDHB.jpg", "includedInConsensus": true, "aiModel": null
+      }
+    ],
+    "ptConsensus": [
+      {"period": 0, "bench": 0, "priceTarget": 119.11, "priceTargetCurrency": 1, "priceTargetCurrencyCode": "USD", "high": 200.00, "low": 80.00}
+    ],
+    "similarStocks": null,
+    "insiderTrading": null,
+    "numOfAnalysts": 12396,
+    "numOfBloggers": 18518,
+    "numOfExperts": 30914,
+    "marketCap": 435297215393,
+    "tipranksStockScore": {"returnOnAssets": 0.0, "sixMonthsMomentum": 0.0, "volatilityLevel": 0.0, "score": 9, "returnOnEquity": -10.76, "volatilityLevelRating": 2, "twelveMonthsMomentum": 3.01, "simpleMovingAverage": 1.00, "assetGrowth": 5.15},
+    "expertRatingsFilteredCount": null,
+    "consensusOverTime": [
+      {"buy": 1, "hold": 25, "sell": 4, "date": "2025-07-25T00:00:00+00:00", "consensus": 3, "priceTarget": 20.265873015873016},
+      {"buy": 2, "hold": 23, "sell": 5, "date": "2025-09-19T00:00:00+00:00", "consensus": 3, "priceTarget": 27.864035087719298},
+      {"buy": 4, "hold": 19, "sell": 6, "date": "2026-01-02T00:00:00+00:00", "consensus": 3, "priceTarget": 38.2},
+      {"buy": 9, "hold": 20, "sell": 3, "date": "2026-04-24T00:00:00+00:00", "consensus": 3, "priceTarget": 69.611111111111114},
+      {"buy": 8, "hold": 23, "sell": 2, "date": "2026-07-24T00:00:00+00:00", "consensus": 3, "priceTarget": 113.48026315789474}
+    ],
+    "bestConsensusOverTime": [
+      {"buy": 1, "hold": 25, "sell": 3, "date": "2025-07-25T00:00:00+00:00", "consensus": 3, "priceTarget": 22.210317460317459},
+      {"buy": 8, "hold": 23, "sell": 2, "date": "2026-07-24T00:00:00+00:00", "consensus": 3, "priceTarget": 113.48026315789474}
+    ],
+    "latestRankedConsensus": {"rating": 3, "nB": 7, "nH": 23, "nS": 2},
+    "bpBloggers": null,
+    "bloggerArticleDistribution": null,
+    "bloggerSentiment": null,
+    "corporateInsiderTransactions": [
+      {"sharesBought": null, "insidersBuyCount": 0, "sharesSold": null, "insidersSellCount": 0, "month": 7, "year": 2026, "transBuyCount": 0, "transSellCount": 0, "transBuyAmount": null, "transSellAmount": 0.0, "informativeBuyCount": 0, "informativeSellCount": 0, "informativeBuyAmount": 0.0, "informativeSellAmount": 0.0},
+      {"sharesBought": null, "insidersBuyCount": 1, "sharesSold": null, "insidersSellCount": 1, "month": 6, "year": 2026, "transBuyCount": 1, "transSellCount": 1, "transBuyAmount": 18662.0, "transSellAmount": 21024.0, "informativeBuyCount": 0, "informativeSellCount": 1, "informativeBuyAmount": 0.0, "informativeSellAmount": 21024.0},
+      {"sharesBought": null, "insidersBuyCount": 11, "sharesSold": null, "insidersSellCount": 1, "month": 5, "year": 2026, "transBuyCount": 11, "transSellCount": 1, "transBuyAmount": 149116.0, "transSellAmount": 40256.0, "informativeBuyCount": 0, "informativeSellCount": 0, "informativeBuyAmount": 0.0, "informativeSellAmount": 0.0}
+    ],
+    "corporateInsiderActivity": null,
+    "insiders": [
+      {"uId": "fdcc0d48771c4a2d1e3dc794df70cfbe574d5f6a", "name": "David Zinsner", "company": "Intel", "isOfficer": true, "isDirector": false, "isTenPercentOwner": false, "isOther": false, "officerTitle": "EVP, CFO", "otherText": "", "transTypeId": 2, "action": 2, "date": "6m", "amount": 249985.00, "currencyTypeId": 1, "rank": 56401, "stars": 2.4, "expertImg": null, "rDate": "2026-01-27T00:00:00", "newPictureUrl": null, "link": "http://sec.gov/Archives/edgar/data/1330891/000005086326000032/xslF345X03/form4.xml", "numberOfShares": 5882, "insiderOperationDescription": "Buy", "insiderOperationId": 65236643, "insiderOperationTypeId": 2, "estimatedSharesValue": 249985.00}
+    ],
+    "insidrConfidenceSignal": {"stockScore": 0.29, "sectorScore": 0.38, "score": 3},
+    "notRankedExperts": [
+      {"name": "imbossmanjack ", "firm": "StockTwits", "expertFirmTypeId": 1, "eUid": "5004b14de74b6d21d0fb4616af21b083e531fb11", "eTypeId": 3, "expertImg": null, "ratings": [{"ratingId": 3, "actionId": 8, "date": "2026-07-07T00:00:00", "d": "3w", "url": "https://stocktwits.com/imbossmanjack/message/658486755", "pos": 299, "time": "2026-07-07T00:00:00", "urlSlug": null, "priceTarget": null, "oldPriceTarget": null, "convertedPriceTarget": null, "convertedOldPriceTarget": null, "quote": {"title": "imbossmanjack-INTC-Bearish", "date": "2026-07-07T00:00:00", "quote": null, "site": "stocktwits.com", "link": "https://stocktwits.com/imbossmanjack/message/658486755", "siteName": "Stocktwits"}, "siteName": "Stocktwits", "site": "stocktwits.com", "id": 69142964, "rD": "2026-07-07T00:00:00", "timestamp": "2026-07-07T20:04:18.933", "priceTargetCurrency": null, "convertedPriceTargetCurrency": null, "convertedPriceTargetCurrencyCode": null, "priceTargetCurrencyCode": null}], "stockSuccessRate": 0.0, "stockAverageReturn": 0.0, "stockTotalRecommendations": 0, "stockGoodRecommendations": 0, "rankings": [], "stockid": 9706, "ticker": "INTC", "companyName": "Intel", "newPictureUrl": null, "includedInConsensus": false, "aiModel": null}
+    ],
+    "notRankedConsensuses": null,
+    "topStocksBySector": null,
+    "indexStockId": 17349,
+    "numOfInsiders": 28,
+    "yearlyDividendYield": 0.0,
+    "yearlyDividend": 0.0,
+    "insiderslast3MonthsSum": -2486508.48,
+    "insidersLast3MonthsSumCurrencyTypeID": 1,
+    "hedgeFundData": {
+      "stockID": 9706,
+      "holdingsByTime": [
+        {"date": "2025-12-31T00:00:00", "holdingAmount": 83003130, "institutionHoldingPercentage": 0.0, "netSharesChange": -6416227, "numberOfSharesBought": 980538, "numberOfSharesSold": 7396765, "isComplete": true},
+        {"date": "2026-03-31T00:00:00", "holdingAmount": 89268707, "institutionHoldingPercentage": 0.0, "netSharesChange": 6265577, "numberOfSharesBought": 7363046, "numberOfSharesSold": 1097469, "isComplete": true}
+      ],
+      "sentiment": 0.83,
+      "trendAction": 1,
+      "trendValue": 6265577.0,
+      "institutionalHoldings": [
+        {"institutionID": 1073, "managerName": "Stanley Druckenmiller", "institutionName": "Duquesne Family Office LLC", "action": 1, "expertOperationID": 0, "effectiveDate": "2026-03-31T00:00:00", "value": 18155082, "expertUID": "a63797e4b5ba26b33cbc7d24cc2f1ba8cd79146b", "change": 100.0, "changeAmount": 411400.0, "percentageOfPortfolio": 0.01, "rank": 267, "totalRankedInstitutions": 488, "imageURL": "10181100_328F83DA15", "adjRemainingShares": 411400, "isActive": true, "stars": 2.26}
+      ]
+    },
+    "stockId": 9706,
+    "followerCount": 0,
+    "momentum": {"baseDate": "2025-07-30T00:00:00", "basePrice": 20.34, "latestPrice": 81.88, "latestDate": "2026-07-29T00:00:00", "momentum": 3.03},
+    "portfolioHoldingData": {
+      "ticker": "INTC",
+      "stockType": "stock",
+      "stockTypeId": 1,
+      "sectorId": "technology",
+      "analystConsensus": {"consensus": "neutral", "rawConsensus": 3, "distribution": {"buy": 7.0, "hold": 24.0, "sell": 2.0}},
+      "bestAnalystConsensus": {"consensus": "neutral", "rawConsensus": 3, "distribution": {"buy": 7.0, "hold": 23.0, "sell": 2.0}},
+      "nextDividendDate": null,
+      "lastReportedEps": {
+        "date": "2026-07-23T00:00:00", "company": "Intel", "ticker": "INTC",
+        "periodEnding": "Jun 2026", "eps": 0.22, "reportedEPS": 0.42, "lastEps": -0.10,
+        "consensus": null, "bpConsensus": null,
+        "ratingsAndPT": {"priceTarget": null, "numBuys": null, "numHolds": null, "numSells": null},
+        "bpRatingsAndPT": {"priceTarget": null, "numBuys": null, "numHolds": null, "numSells": null},
+        "marketCap": 435297215393, "marketCapCurrencyId": 1,
+        "sector": 17349, "stockId": 9706, "stockTypeId": 1,
+        "surprise": -0.48, "timeOfDay": 1, "isConfirmed": true,
+        "currencyTypeID": 1, "epsCurrencyTypeID": 1,
+        "fiscalPeriod": 2, "fiscalYear": 2026,
+        "fiscalQuarterEndingDate": "2026-06-30T00:00:00",
+        "totalIncome": -11033000000.0, "totalRevenue": 16128000000.0,
+        "revenueIncomeCurrencyID": 1,
+        "urlReport": "https://example.cloudfront.net/intel/Q2-2026-Earnings-Release.pdf",
+        "lowEstimate": null, "highEstimate": null,
+        "salesEstimate": 14434847000.00, "salesLowEstimate": null, "salesHighEstimate": null,
+        "smartScore": null, "externalAudioUrl": null, "externalReportUrl": null,
+        "externalPdfUrl": null, "externalImageUrl": null, "countryId": null
+      },
+      "nextEarningsReport": {
+        "date": "2026-10-22T00:00:00", "company": "Intel", "ticker": "INTC",
+        "periodEnding": "Sep 2026", "eps": 0.38, "reportedEPS": null, "lastEps": 0.23,
+        "consensus": null, "bpConsensus": null,
+        "ratingsAndPT": {"priceTarget": null, "numBuys": null, "numHolds": null, "numSells": null},
+        "bpRatingsAndPT": {"priceTarget": null, "numBuys": null, "numHolds": null, "numSells": null},
+        "marketCap": 435297215393, "marketCapCurrencyId": 1,
+        "sector": 17349, "stockId": 9706, "stockTypeId": 1,
+        "surprise": null, "timeOfDay": 4, "isConfirmed": false,
+        "currencyTypeID": 1, "epsCurrencyTypeID": 1,
+        "fiscalPeriod": 3, "fiscalYear": 2026,
+        "fiscalQuarterEndingDate": "2026-09-30T00:00:00",
+        "totalIncome": null, "totalRevenue": null, "revenueIncomeCurrencyID": 1,
+        "urlReport": null, "lowEstimate": null, "highEstimate": null,
+        "salesEstimate": 16209337000.00, "salesLowEstimate": null, "salesHighEstimate": null,
+        "smartScore": null, "externalAudioUrl": null, "externalReportUrl": null,
+        "externalPdfUrl": null, "externalImageUrl": null, "countryId": null
+      },
+      "stockUid": "5479fcad",
+      "companyName": "Intel",
+      "priceTarget": 119.11,
+      "bestPriceTarget": 119.11,
+      "dividend": 0.13,
+      "dividendYield": null,
+      "peRatio": -40.90,
+      "stockId": 9706,
+      "high52Weeks": 142.35,
+      "low52Weeks": 18.97,
+      "hedgeFundSentimentData": {"rating": 1, "score": 0.83},
+      "insiderSentimentData": {"rating": 3, "stockScore": 0.29},
+      "bloggerSentimentData": {"ratingIfExists": 1, "rating": 1, "bearishCount": 51, "bullishCount": 109},
+      "shouldAddLinkToStockPage": true,
+      "expenseRatio": null,
+      "marketCap": 435297215393,
+      "marketCapCurrencyId": 1,
+      "newsSentiment": 0,
+      "landmarkPrices": {
+        "yearToDate": {"date": "2026-01-01T00:00:00", "d": "1/1/26", "p": 36.90},
+        "threeMonthsAgo": {"date": "2026-05-01T00:00:00", "d": "1/5/26", "p": 99.62},
+        "yearAgo": {"date": "2025-07-30T00:00:00", "d": "30/7/25", "p": 20.34}
+      },
+      "priceTargetCurrencyId": 1,
+      "marketCountryId": 1,
+      "companyFullName": "Intel",
+      "stockCurrencyId": 0
+    },
+    "marketCapCurrencyTypeID": 1,
+    "marketCapUSD": 435297215393,
+    "stockCurrencyTypeID": 1,
+    "marketCountryId": 1,
+    "marketCountry": 1,
+    "isPrimaryStock": true,
+    "primaryStock": null,
+    "isomic": "XNAS",
+    "stockListingId": 0,
+    "supportAddToPortfolio": true,
+    "companyData": {"sector": "Technology", "sectorId": null, "industry": "Semiconductors", "ceo": "Lip-Bu Tan", "employees": 85100, "website": "https://www.intel.com", "companyAddress": "2200 Mission College Blvd, Santa Clara, CA, 95054-1549, US", "isin": null, "companyDescription": null, "ticker": null, "displayName": null, "isomic": null},
+    "isin": "US4581401001",
+    "relatedListings": [
+      {"listingID": 0, "stockID": 0, "listingTicker": "DE:INL", "companyName": null, "mainTicker": null, "mainCurrencyID": 0, "listingCurrency": 0, "stockCountry": 0, "listingMarket": "XETRA", "isPrimary": false, "marketCountryID": 5, "isomic": null, "isin": null, "stockTypeId": 0, "pricesStartDate": null}
+    ]
+  }
+}
