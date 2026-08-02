@@ -15,6 +15,14 @@ Two properties are enforced here rather than left to strategy authors:
   score and low confidence -- that combination means "this looks like a good
   setup, but we do not trust the inputs", and it is the correct output when a
   provider is stale or a sentiment sample is thin.
+* **One piece of evidence occupies one slot.** Each per-source polarity slot
+  is scored from that source's OWN stored snapshot, and a slot whose source
+  did not report contributes no weight at all rather than a neutral 50 or a
+  copy of a neighbouring source. See ``_polarity_axis``.
+* **Attention and polarity are separate axes.** Aggregator mention counts
+  (ApeWisdom) feed the attention axis and nothing else -- never a polarity
+  component, never manipulation risk, never data confidence. See
+  ``_attention_score``.
 """
 
 from __future__ import annotations
@@ -29,7 +37,12 @@ from claudetrade.domain import (
     SecurityInfo,
     SymbolSentiment,
 )
-from claudetrade.strategies.base import StrategyContext, StrategyProposal
+from claudetrade.strategies.base import (
+    StrategyContext,
+    StrategyProposal,
+    is_attention_only,
+)
+from claudetrade.strategies.scoring_utils import percentile_rank
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -113,6 +126,13 @@ def _sentiment_score(sentiment: SymbolSentiment | None, direction: Direction) ->
     Absent data scores neutral rather than zero: missing evidence is not
     negative evidence, and scoring it as negative would systematically suppress
     thinly-discussed names for no analytical reason.
+
+    The 50 returned for an absent sample is a DISPLAY value only. Scoring a
+    missing source as "50 = no opinion" and then weighting it is not neutral
+    at all -- it drags a strongly-evidenced candidate down toward 50 and lifts
+    a weak one up. ``_polarity_axis`` therefore gives an unreported source
+    zero weight, which is what actually leaves the decision to the axes that
+    do have evidence.
     """
     if sentiment is None or sentiment.post_count == 0:
         return 50.0
@@ -135,16 +155,163 @@ def _acceleration_score(sentiment: SymbolSentiment | None, direction: Direction)
     return _scale(sign * sentiment.sentiment_acceleration, -0.5, 0.5)
 
 
-def _attention_score(sentiment: SymbolSentiment | None) -> float:
+@dataclass(frozen=True, slots=True)
+class _PolarityAxis:
+    """Per-source polarity readings plus the weight each one actually earned.
+
+    ``reddit``/``x`` are the 0-100 display values that reach
+    ``ComponentScores``; ``reddit_weight``/``x_weight`` are what the weighted
+    average uses, and are zero for a source that did not report.
+    """
+
+    reddit: float
+    x: float
+    reddit_weight: float
+    x_weight: float
+    #: Source labels that actually contributed, for the score's notes.
+    measured: tuple[str, ...]
+    #: True when no per-source row existed and the combined row stood in.
+    combined_fallback: bool
+
+
+def _polarity_axis(
+    ctx: StrategyContext, direction: Direction, weights: dict[str, float]
+) -> _PolarityAxis:
+    """Score the social-polarity axis from per-source snapshots.
+
+    The defect this replaces: the combined ``"all"`` aggregate -- the only
+    snapshot the context ever carried -- was handed to BOTH the
+    ``reddit_sentiment`` and the ``x_sentiment`` slot whenever it existed. One
+    sample then filled two independently-weighted slots, so a symbol
+    discussed only on Reddit collected X's weight as well, and the score read
+    as two sources agreeing when only one had ever been consulted.
+
+    The rule now, in three parts:
+
+    * **Own evidence only.** A slot is scored from the snapshot stored under
+      its own ``source`` and from nothing else.
+    * **Missing sources are renormalised away, not filled.** A source that did
+      not report contributes no score and no weight; the remaining components
+      divide by a smaller total, so the decision rests proportionally more on
+      the axes that do have evidence. Filling the slot with a neutral 50 and
+      weighting it would be an opinion ("the crowd is undecided") that nobody
+      expressed.
+    * **The combined row is a fallback, not a substitute.** When no per-source
+      row cleared its own sample gate but the combined aggregate did, that
+      aggregate is real evidence and must not be discarded -- but it is ONE
+      unattributed sample, so it earns half the axis's two-source budget,
+      split in the configured proportions. It never earns both slots in full.
+
+    Sources with no dedicated component slot (news, stocktwits) reach the
+    score only through the combined row's fallback; giving them their own
+    weight needs a component of their own, which is a schema change rather
+    than a scoring one.
+    """
+    w_reddit = weights.get("reddit_sentiment", 0.0)
+    w_x = weights.get("x_sentiment", 0.0)
+
+    reddit_row = ctx.polarity_for_source("reddit")
+    x_row = ctx.polarity_for_source("x")
+    measured: list[str] = []
+    reddit_score, x_score = 50.0, 50.0
+    reddit_weight, x_weight = 0.0, 0.0
+    if reddit_row is not None:
+        reddit_score = _sentiment_score(reddit_row, direction)
+        reddit_weight = w_reddit
+        measured.append("reddit")
+    if x_row is not None:
+        x_score = _sentiment_score(x_row, direction)
+        x_weight = w_x
+        measured.append("x")
+    if measured:
+        return _PolarityAxis(
+            reddit_score, x_score, reddit_weight, x_weight, tuple(measured), False
+        )
+
+    combined = ctx.polarity_for_source("all") or ctx.sentiment
+    if combined is None or is_attention_only(combined):
+        return _PolarityAxis(50.0, 50.0, 0.0, 0.0, (), False)
+    score = _sentiment_score(combined, direction)
+    # Both display slots show the same reading because that reading genuinely
+    # pools whatever platforms contributed -- but the WEIGHT behind them is
+    # halved, so the axis counts one sample once.
+    return _PolarityAxis(score, score, w_reddit / 2.0, w_x / 2.0, ("all",), True)
+
+
+@dataclass(frozen=True, slots=True)
+class _AttentionAxis:
+    """Attention reading plus the weight it earned (zero when unmeasured)."""
+
+    score: float
+    weight: float
+    measured: tuple[str, ...]
+
+
+def _attention_score(ctx: StrategyContext, config: AppConfig) -> _AttentionAxis:
     """Attention is *unsigned*: a crowd gathering is neither bullish nor bearish.
 
     This is why mention count is scored on its own axis and never folded into
     polarity -- rising attention on a deteriorating name is a short setup, not
     a long one.
+
+    Two inputs, blended by ``SignalConfig.attention_aggregator_weight``:
+
+    * **Local** -- ``mention_acceleration`` from this application's own posts
+      (the combined row). Narrow: whatever the rate-limited Reddit/X/news
+      fetches happened to catch.
+    * **Aggregator** -- ApeWisdom's per-community tallies, which count a far
+      wider corpus continuously. These were previously excluded from every
+      axis, on the correct reasoning that they carry no polarity. That
+      reasoning does not extend to attention, which is the one thing they
+      measure better than anything else here.
+
+    The aggregator's counts run ~100x the local ones, so its reading is
+    normalised against ITS OWN history -- a percentile rank of today's growth
+    within that same source's trailing series for this symbol -- before it is
+    blended. Ranks are unitless, so nothing about the two corpora's sizes
+    survives into the blend; a raw sum or an unranked ratio comparison would
+    let the wide corpus swamp the local signal, or (since a large corpus
+    swings less) be permanently drowned by it.
+
+    A source without ``attention_min_history_sessions`` observations has no
+    distribution to be ranked against and is skipped entirely rather than
+    mixed in raw. When neither input is available the axis reports zero
+    weight, so it is renormalised away instead of scoring a neutral 50.
+
+    Attention rows reach nothing else. Only ``mention_acceleration`` is ever
+    read from them: they have no polarity, no authors, no text, so they
+    cannot and must not touch ``raw_sentiment``, ``bull_bear_ratio``,
+    ``unique_authors``, ``bot_risk``, ``duplicate_ratio`` or
+    ``manipulation_risk``.
     """
-    if sentiment is None:
-        return 50.0
-    return _scale(sentiment.mention_acceleration, -0.3, 1.0)
+    weight = config.signals.component_weights.get("attention_acceleration", 0.0)
+    measured: list[str] = []
+
+    local: float | None = None
+    if ctx.sentiment is not None:
+        local = _scale(ctx.sentiment.mention_acceleration, -0.3, 1.0)
+        measured.append("local")
+
+    ranked: list[float] = []
+    minimum = max(1, config.signals.attention_min_history_sessions)
+    for source, snapshot in sorted(ctx.attention_by_source.items()):
+        history = [s.mention_acceleration for s in ctx.attention_history.get(source, [])]
+        if len(history) < minimum:
+            continue
+        ranked.append(_scale(percentile_rank(history, snapshot.mention_acceleration), 0.0, 1.0))
+        measured.append(source)
+    aggregate = sum(ranked) / len(ranked) if ranked else None
+
+    if local is None and aggregate is None:
+        return _AttentionAxis(50.0, 0.0, ())
+    if aggregate is None:
+        return _AttentionAxis(_clamp(local or 50.0), weight, tuple(measured))
+    if local is None:
+        return _AttentionAxis(_clamp(aggregate), weight, tuple(measured))
+    share = min(1.0, max(0.0, config.signals.attention_aggregator_weight))
+    return _AttentionAxis(
+        _clamp((1.0 - share) * local + share * aggregate), weight, tuple(measured)
+    )
 
 
 def _catalyst_score(sentiment: SymbolSentiment | None) -> float:
@@ -462,34 +629,45 @@ def score_candidate(
     direction = proposal.direction
     is_hype_short = proposal.strategy == "hype_failure_short"
 
-    reddit_sentiment = sentiment if (sentiment and sentiment.source in {"all", "reddit"}) else None
-    x_sentiment = sentiment if (sentiment and sentiment.source in {"all", "x"}) else None
+    weights = config.signals.component_weights
+    polarity = _polarity_axis(ctx, direction, weights)
+    attention = _attention_score(ctx, config)
 
     components = ComponentScores(
         technical_setup=_technical_score(proposal),
         price_momentum=_momentum_score(ctx, direction),
         volume_confirmation=_volume_score(ctx),
-        reddit_sentiment=_sentiment_score(reddit_sentiment, direction),
-        x_sentiment=_sentiment_score(x_sentiment, direction),
+        reddit_sentiment=polarity.reddit,
+        x_sentiment=polarity.x,
         sentiment_acceleration=_acceleration_score(sentiment, direction),
-        attention_acceleration=_attention_score(sentiment),
+        attention_acceleration=attention.score,
         catalyst_quality=_catalyst_score(sentiment),
         earnings_risk=_earnings_score(ctx, config, permits_earnings_risk),
         liquidity=_liquidity_score(ctx, config),
         market_regime=_regime_score(regime, direction),
+        # Polarity-side risk only, and only ever from the combined row: an
+        # aggregator attention tally reports no authors and no text, so it
+        # has nothing to say about coordinated promotion or data quality.
         manipulation_risk=_manipulation_score(sentiment, invert_for_short=is_hype_short),
         data_confidence=_data_confidence_score(ctx, sentiment, config),
     )
 
-    weights = config.signals.component_weights
     scored = components.as_dict()
-    total_weight = sum(weights.get(k, 0.0) for k in scored if k != "data_confidence")
+    # Effective (not configured) weights: a component whose evidence is
+    # missing earns none. Dividing by the smaller total renormalises the rest,
+    # which is what "we have no reading on this axis" should mean -- unlike
+    # weighting a placeholder 50, which is an active vote for indecision and
+    # pulls every candidate toward the middle in proportion to how quiet its
+    # social coverage happens to be.
+    effective = {k: weights.get(k, 0.0) for k in scored if k != "data_confidence"}
+    effective["reddit_sentiment"] = polarity.reddit_weight
+    effective["x_sentiment"] = polarity.x_weight
+    effective["attention_acceleration"] = attention.weight
+    total_weight = sum(effective.values())
     if total_weight <= 0:
         overall = 50.0
     else:
-        overall = sum(
-            scored[k] * weights.get(k, 0.0) for k in scored if k != "data_confidence"
-        ) / total_weight
+        overall = sum(scored[k] * effective[k] for k in effective) / total_weight
 
     # The regime raises or lowers the bar rather than the score, so a hostile
     # environment shrinks the candidate list instead of silently re-ranking it.
@@ -526,6 +704,26 @@ def score_candidate(
     notes: list[str] = []
     if sentiment is None:
         notes.append("Scored without social sentiment (source disabled or sample too small)")
+    # Which evidence was MISSING, in the signal's own notes (these reach
+    # ``Signal.data_warnings``, so only genuine caveats belong here). A
+    # per-source slot scored from a stand-in used to be indistinguishable
+    # from one scored from its own sample, and that is precisely what made
+    # the double-count invisible for as long as it was. Complete two-source
+    # evidence adds no note: there is nothing to caveat.
+    if polarity.combined_fallback:
+        notes.append(
+            "No per-source sentiment breakdown stored; the combined aggregate was "
+            "weighted as a single source rather than as agreement between several"
+        )
+    elif not polarity.measured:
+        notes.append("No usable sentiment sample; the polarity components carry no weight")
+    elif len(polarity.measured) == 1:
+        notes.append(
+            f"Sentiment scored from {polarity.measured[0]} alone; no other source "
+            "reported a usable sample, so its weight was renormalised away"
+        )
+    if attention.weight <= 0:
+        notes.append("No usable attention sample; the attention component carries no weight")
     if components.earnings_risk < 40:
         notes.append("Earnings risk is materially affecting this score")
 

@@ -239,8 +239,32 @@ def _render_database(config, pipeline) -> None:
 def _render_scheduler(config) -> None:
     st.subheader("Scheduler")
     st.caption(f"Display-only: edit `{resolved_config_path()}` to change these.")
+
+    # Two different things share this config section, and conflating them
+    # made this panel lie. ``social_collection_*`` drives the in-process
+    # hourly collector the web API server actually runs; ``enabled`` + the
+    # ``*_cron`` fields below describe the never-built APScheduler jobs and
+    # still default to off. Reporting "Scheduler disabled" off the latter
+    # told an operator nothing was running while collection was in fact
+    # running every hour -- and hourly collection is the one thing that
+    # cannot be recovered after the fact, so understating it is the worst
+    # possible direction to be wrong in.
+    if config.scheduler.social_collection_enabled:
+        st.success(
+            f"Hourly sentiment/mention collection: ON "
+            f"(every {config.scheduler.social_collection_interval_minutes} min while the "
+            "web app is running)"
+        )
+        st.caption(
+            "Social sources cannot be backfilled -- Reddit, X and ApeWisdom only serve "
+            "roughly the last few days -- so history accumulates forward, one collection "
+            "at a time. Hours the app is closed are permanently lost."
+        )
+    else:
+        st.warning("Hourly sentiment/mention collection: OFF -- no history is accumulating.")
+
     if not config.scheduler.enabled:
-        st.warning("Scheduler disabled")
+        st.info("Cron-style scheduled jobs (below) are not enabled.")
         return
     st.success("Scheduler enabled")
     col1, col2 = st.columns(2)

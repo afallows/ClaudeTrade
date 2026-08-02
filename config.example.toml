@@ -311,7 +311,11 @@ enable_partial_fills = true               # Simulate partial execution on large 
 [sentiment]
 # Sentiment aggregation and weighting.
 half_life_hours = 18.0                    # Exponential decay half-life for aging posts
-lookback_days = 14                        # How far back to aggregate sentiment
+lookback_days = 14                        # How far back to ASK PROVIDERS for posts (they serve ~72h)
+history_window_days = 180                 # How far back to re-read ALREADY-STORED posts for the
+                                          # rolling baseline. Not the same knob as lookback_days:
+                                          # that one is capped by what Reddit/X/news will serve,
+                                          # this one only by disk.
 min_ticker_confidence = 0.60              # Resolution confidence threshold
 min_posts_for_signal = 8                  # Minimum posts before aggregating
 min_unique_authors_for_signal = 4         # Minimum distinct authors
@@ -343,6 +347,12 @@ high_vol_size_multiplier = 0.7            # Position sizing multiplier in high-v
 # Signal generation and scoring.
 enabled_strategies = [
   "sentiment_breakout",
+  # The same breakout with no confirming social sample -- a separate strategy
+  # rather than a branch inside sentiment_breakout, so a signal's name is an
+  # unambiguous answer to "why is this on my list?". The two are mutually
+  # exclusive: whichever takes a candidate, the other declines it. Drop this
+  # entry to run a sentiment-only screen.
+  "volume_breakout",
   "sentiment_pullback",
   "capitulation_reversal",
   "hype_failure_short",
@@ -415,14 +425,33 @@ events = [
 ]
 
 [scheduler]
-# Scheduled background tasks (optional; disabled by default).
+# APScheduler cron jobs: NOT IMPLEMENTED. These settings are inert -- no job
+# runner reads them (see docs/known-limitations.md). Left in place so the
+# shape is documented for whoever wires them up.
 enabled = false
-timezone = "America/New_York"
+timezone = "America/New_York"                   # Also used by the overnight window below
 market_data_refresh_cron = "30 16 * * mon-fri"  # 4:30 PM ET weekdays (after market close)
 social_refresh_cron = "0 */4 * * *"             # Every 4 hours
 scan_cron = "45 16 * * mon-fri"                 # 4:45 PM ET weekdays
 paper_mark_cron = "5 16 * * mon-fri"            # 4:05 PM ET weekdays
 misfire_grace_time_s = 3600                     # Grace period for missed scheduled tasks
+
+# Hourly social/attention collection: IMPLEMENTED, and ON by default. Runs
+# inside the web API server (`python -m claudetrade.webapi`) for as long as it
+# is open. Social posts and ApeWisdom attention only -- never the ~20-minute
+# market pass. It exists because Reddit /new, X recent-search and ApeWisdom's
+# rolling 24h snapshot have no history endpoints: social history can only be
+# accumulated forward, so an hour the app was open but not collecting is an
+# hour permanently missing from every baseline. Run `claudetrade sentiment
+# collect` to do one by hand.
+social_collection_enabled = true
+social_collection_interval_minutes = 60         # Cadence while the app is open
+social_collection_jitter_seconds = 300          # Random 0..N added to every wait
+social_collection_lookback_hours = 72           # Wider than the cadence: recovers missed ticks
+social_collection_overnight_interval_minutes = 0   # 0 = same cadence around the clock
+social_collection_overnight_start_hour = 22     # Half-open [start, end) in `timezone`
+social_collection_overnight_end_hour = 4
+social_collection_max_backoff_minutes = 240     # Ceiling on back-off after repeated failures
 
 [trading]
 # Trading mode and broker configuration.

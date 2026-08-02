@@ -114,13 +114,15 @@ these tools. All of them return plain JSON — no charts, no pandas objects.
 
 | Tool | Reads/Writes | What it returns |
 | --- | --- | --- |
-| `get_signals(min_score, limit)` | read-only | Current ledger signals: symbol, strategy, direction, score, confidence, entry/stop/targets, days to earnings. |
+| `get_signals(min_score, limit, sort)` | read-only | Current ledger signals, **best-scoring first** (so `limit=N` means the N best, matching the web Screener); `sort='created_at'` gives newest-first for audit. Includes `total_matching`/`truncated` so a page is distinguishable from the whole answer. Fields: symbol, strategy, direction, score, confidence, entry/stop/targets, days to earnings. |
 | `get_sentiment(symbol, days)` | read-only | Daily sentiment/mention rows for one symbol over the last N days. |
-| `get_trending(limit)` | read-only | Symbols ranked by recent mention volume. |
-| `get_market_status()` | read-only | Regime, current Eastern time, whether the market is pre-market/open/after-hours/closed, last refresh time, symbol coverage, provider health. |
+| `get_trending(limit, source)` | read-only | Symbols ranked by recent mention *volume*, most-mentioned first. `source='auto'` prefers ApeWisdom's Reddit/4chan counts when present (broader corpus, pre-resolved tickers) and falls back to locally-resolved posts. Absolute volume, so it returns the same large caps most days -- for what is *changing*, use `get_rising_sentiment`. |
+| `get_rising_sentiment(limit, recent_sessions, baseline_sessions, min_recent_mentions)` | read-only | Symbols whose mention rate is accelerating against their **own** recent baseline, so a quiet name waking up ranks above a permanently-loud one. Each row carries mention change, recent vs baseline rate, and sentiment change where polarity was actually measured. Includes a coverage block stating how much stored history backs the ranking. |
+| `get_sentiment_history(symbol, days)` | read-only | One symbol's daily mention/sentiment series, gap-filled across trading sessions so it can be charted or differenced directly. `observed` marks a real stored row, distinguishing a measured zero from absent data. |
+| `get_market_status()` | read-only | Regime, current Eastern time, whether the market is pre-market/open/after-hours/closed, last refresh time, symbol coverage, provider health, and `sentiment_readiness` — how many sessions of social history this installation has actually accumulated, as a tier. |
 | `run_scan()` | **write** | Runs a full scan for today's session and records new signals to the immutable ledger (same as `claudetrade scan`). |
 | `trigger_refresh()` | **write, background** | Starts a data refresh (market data, earnings, sentiment) on a background thread; can take several minutes on a large universe. Refuses (naming the holder) while a refresh started from *any* entry point is running. |
-| `get_refresh_status()` | read-only | Progress of the current refresh, whichever entry point started it — CLI, web UI or this server; `entry_point` names the owner. |
+| `get_refresh_status()` | read-only | Progress of the current refresh or automatic social collection, whichever entry point started it — CLI, web UI, this server, or the web server's hourly collector; `entry_point` names the owner and `scheduled: true` means nobody asked for it. |
 | `get_backtest_report()` | read-only | The latest `claudetrade backtest report` (see `docs/backtest-report.md`): per-strategy walk-forward win rate/expectancy/profit factor/drawdown, each gated behind a prominent significance verdict. Never runs a backtest itself — returns `available: false` with instructions if none has been generated yet. |
 
 Every read-only tool queries the exact same ledger/database objects the web
@@ -136,6 +138,15 @@ Eastern time and whether the market is `pre_market`, `open`, `after_hours` or
 `closed` right now, alongside the regime and how fresh the stored data is.
 A good morning routine is: ask for market status, then trending symbols, then
 sentiment on whatever stands out, then (optionally) a scan.
+
+Market status also carries `sentiment_readiness`, which is worth reading once
+before trusting any mention trend. Social history cannot be backfilled — the
+sources only serve the last few days — so it is accumulated forward, one
+collection at a time, by the hourly collector inside the web API server (and
+by `claudetrade sentiment collect`). The tier says how much of that baseline
+exists: `warming_up` (fewer than 20 sessions), `provisional` (20+), `partial`
+(60+), `ready` (120+). It is a label, never a gate: no tool refuses to answer
+because of it.
 
 ## Concurrent use with the web UI and CLI
 

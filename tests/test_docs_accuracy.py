@@ -21,7 +21,15 @@ from pathlib import Path
 
 import pytest
 
-from claudetrade.cli import app, backtest_app, db_app, paper_app, secrets_app, verify_app
+from claudetrade.cli import (
+    app,
+    backtest_app,
+    db_app,
+    paper_app,
+    secrets_app,
+    sentiment_app,
+    verify_app,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -67,6 +75,7 @@ def _real_command_surface() -> set[tuple[str, str | None]]:
         "db": db_app,
         "verify": verify_app,
         "backtest": backtest_app,
+        "sentiment": sentiment_app,
     }
     # Every group actually mounted on `app` (via add_typer) must be one of the
     # ones this test knows about -- catches a new group being added to cli.py
@@ -116,7 +125,7 @@ def _command_mentions_in_code_blocks(path: Path) -> list[tuple[str, str | None, 
 
 
 REAL_SURFACE = _real_command_surface()
-TOP_LEVEL_GROUPS = {"secrets", "paper", "db", "verify", "backtest"}
+TOP_LEVEL_GROUPS = {"secrets", "paper", "db", "verify", "backtest", "sentiment"}
 
 
 @pytest.mark.parametrize("doc_path", DOC_FILES, ids=lambda p: p.name)
@@ -155,6 +164,7 @@ def test_real_cli_surface_is_nonempty() -> None:
     assert ("db", "backup") in REAL_SURFACE
     assert ("verify", "ledger") in REAL_SURFACE
     assert ("backtest", "report") in REAL_SURFACE
+    assert ("sentiment", "collect") in REAL_SURFACE
 
 
 def test_documented_app_dir_matches_config_default() -> None:

@@ -10,13 +10,44 @@ failure mode it is built to avoid is buying a heavily-promoted name that is
 being distributed into retail attention -- hence the manipulation-risk and
 unique-author checks rather than a raw mention count.
 
+Sentiment is a PRECONDITION here, not a bonus
+---------------------------------------------
+This strategy used to declare ``requires_sentiment = False`` and treat a
+missing social sample as a few lost points: a candidate with no sentiment at
+all -- or with actively negative sentiment -- could still be emitted, under
+the name "sentiment breakout". A recommendation is a claim about why the
+trade exists, and that one was false. There is no meaningful difference for
+an operator between "this fired on rising positive sentiment" and "this fired
+on volume and the name happens to contain the word sentiment".
+
+Confirmation is therefore required and vetoed on, with reason codes that
+reach the scan's rejection funnel so a zero-signal scan still explains
+itself: ``sentiment_unavailable`` (no usable social sample),
+``sentiment_not_positive`` (current polarity at or below
+``calibration.breakout_min_positive_sentiment`` on either the raw decayed
+mean or the one-vote-per-author mean) and ``sentiment_confidence_low`` (a
+sample too unreliable to confirm anything).
+
+The technical-only path is not deleted -- it is *relabelled*. A
+volume-confirmed breakout with no social sample is still a legitimate
+candidate in a multi-strategy scan; what was never legitimate was it arriving
+under this strategy's name and version, indistinguishable in the ledger and
+in every backtest attribution from a trade that genuinely had sentiment
+behind it. It now lives in ``f_volume_breakout`` as ``volume_breakout``,
+sharing the breakout mechanics below through :class:`BreakoutStrategyBase`
+and differing only in what it asks of the social sample. The two are
+mutually exclusive by construction: whichever of them takes a candidate, the
+other declines it, so a signal's strategy name is an unambiguous answer to
+"why is this on my list?".
+
 Known weaknesses:
 
 * Breakouts fail often; expect a modest win rate carried by reward:risk, not a
   high hit rate. This is the correct shape and must not be "fixed" by taking
   profits earlier.
-* Requires social data. With sources disabled it degrades to a volume-confirmed
-  breakout, and its score is capped to reflect the missing evidence.
+* Requires social data, and now says so: with sources disabled or still
+  warming up this strategy emits nothing at all, and its share of the
+  breakout candidates surfaces under ``volume_breakout`` instead.
 
 Scoring model (ADR-0007 Decision 2)
 ------------------------------------
@@ -34,36 +65,53 @@ each condition contributes points in proportion to how strongly it is met
 against the symbol's own trailing distribution for relative volume, trend
 strength and sentiment acceleration -- see ``config.calibration``), and a
 proposal is only emitted once the total clears
-``config.calibration.proposal_score_threshold``. Absent sentiment costs the
-candidate the sentiment components' points rather than declining it outright,
-which is what "degrades rather than disables" now means structurally, not
-just narratively.
+``config.calibration.proposal_score_threshold``. That partial-credit shape is
+unchanged; what changed is that "absent sentiment" is no longer one of the
+things it applies to -- an unconfirmed breakout is now a ``volume_breakout``
+candidate rather than a lower-scoring ``sentiment_breakout`` one.
 
-Only four conditions remain hard vetoes, per the ADR: insufficient history,
-the earnings window, illiquidity, and manipulation risk above the configured
-cap. A missing reference level (no resistance and no Donchian channel) is
-also a hard decline -- not because it is a curve-fit threshold, but because
-there is no structural input left to build an entry/stop/target from; that is
-a data-availability precondition, not a scored opinion.
+Four conditions remain hard vetoes from the ADR: insufficient history, the
+earnings window, illiquidity, and manipulation risk above the configured cap.
+A missing reference level (no resistance and no Donchian channel) is also a
+hard decline -- not because it is a curve-fit threshold, but because there is
+no structural input left to build an entry/stop/target from; that is a
+data-availability precondition, not a scored opinion. Positive sentiment
+confirmation joins them for the reason above: it is what the strategy claims
+to be, not a knob on how strongly it claims it. The STRENGTH of the sentiment
+is still scored, not gated -- only its presence and its sign are absolute.
 """
 
 from __future__ import annotations
 
-from claudetrade.domain import Direction
+from claudetrade.domain import Direction, SymbolSentiment
 from claudetrade.strategies.base import Strategy, StrategyContext, StrategyProposal
 from claudetrade.strategies.registry import register_strategy
 from claudetrade.strategies.scoring_utils import ScoreAccumulator, percentile_rank, ramp_up
 
 
-@register_strategy
-class SentimentBreakoutStrategy(Strategy):
-    name = "sentiment_breakout"
-    version = "v2"
-    description = "Breakout above resistance with volume and rising unique-author attention"
+class BreakoutStrategyBase(Strategy):
+    """Breakout mechanics shared by ``sentiment_breakout`` and ``volume_breakout``.
+
+    Everything about *finding and shaping* a breakout -- the reference level,
+    the extension boundary, the price/volume/trend scoring, the stop and
+    target construction -- is identical between the two, and duplicating it
+    would guarantee the copies drift. What differs is entirely about the
+    social sample, and lives in two hooks:
+
+    * :meth:`_sentiment_precondition` -- the hard question each strategy asks
+      of the sample before it is willing to act at all. This is also what
+      keeps the two mutually exclusive: each declines exactly the candidates
+      the other takes.
+    * :meth:`_score_sentiment` -- what the sample contributes to the score
+      once the precondition passed.
+
+    Never registered and never instantiated directly: it keeps the base
+    ``name = "unnamed"``, which ``register_strategy`` rejects outright.
+    """
+
     direction_bias = Direction.LONG
     min_history_bars = 80
     permits_earnings_risk = False
-    requires_sentiment = False  # degrades rather than disabling
 
     #: Stop distance in ATR when structural support is too far away.
     ATR_STOP_MULTIPLE = 2.0
@@ -144,6 +192,12 @@ class SentimentBreakoutStrategy(Strategy):
         sentiment = ctx.sentiment
         if sentiment is not None and sentiment.manipulation_risk > self.config.filters.max_manipulation_risk:
             self.decline(ctx, "manipulation_risk", f"{sentiment.manipulation_risk:.2f}")
+            return None
+
+        # Each subclass's hard question about the social sample. It records
+        # its own decline (with the reason code the funnel aggregates), so a
+        # False here needs no further explanation.
+        if not self._sentiment_precondition(ctx):
             return None
 
         extension_atr = (price - level) / atr if atr > 0 else 0.0
@@ -242,62 +296,8 @@ class SentimentBreakoutStrategy(Strategy):
                 "(possible absorption, not yet resolved)"
             )
 
-        # --- sentiment confirmation (soft: absent costs points, not the trade) ---
-        if self.sentiment_available(ctx) and sentiment is not None:
-            accel_history = [s.sentiment_acceleration for s in ctx.sentiment_history][
-                -cal.sentiment_percentile_window :
-            ]
-            mention_history = [s.mention_acceleration for s in ctx.sentiment_history][
-                -cal.sentiment_percentile_window :
-            ]
-            accel_pctl = percentile_rank(accel_history, sentiment.sentiment_acceleration)
-            mention_pctl = percentile_rank(mention_history, sentiment.mention_acceleration)
-
-            score.add(
-                "sentiment_accel_pctl",
-                ramp_up(
-                    accel_pctl,
-                    cal.breakout_sentiment_accel_percentile - 0.30,
-                    cal.breakout_sentiment_accel_percentile,
-                ),
-                self.W_SENTIMENT_ACCEL,
-            )
-            score.add(
-                "mention_accel_pctl",
-                ramp_up(
-                    mention_pctl,
-                    cal.breakout_mention_accel_percentile - 0.30,
-                    cal.breakout_mention_accel_percentile,
-                ),
-                self.W_MENTION_ACCEL,
-            )
-            # Unique authors, not raw mentions: fifty posts from five accounts is
-            # a promotion, not a change in opinion. Soft now, not a hard gate --
-            # manipulation_risk (above) remains the hard backstop against that.
-            score.add(
-                "unique_authors",
-                ramp_up(
-                    sentiment.unique_authors,
-                    self.config.filters.min_unique_authors * 0.4,
-                    self.config.filters.min_unique_authors,
-                ),
-                self.W_UNIQUE_AUTHORS,
-            )
-            if sentiment.hype > 0.5:
-                score.penalty("hype", self.PENALTY_HYPE * ramp_up(sentiment.hype, 0.5, 0.85))
-                risks.append(
-                    f"Elevated hype ({sentiment.hype:.2f}); crowded entries reverse quickly"
-                )
-            evidence.append(
-                f"Sentiment acceleration {sentiment.sentiment_acceleration:+.2f} "
-                f"({accel_pctl:.0%} percentile) across {sentiment.unique_authors} unique authors"
-            )
-            evidence.append(
-                f"Mention rate {sentiment.mention_acceleration:+.0%} ({mention_pctl:.0%} percentile)"
-            )
-        else:
-            evidence.append("Social sentiment unavailable: scored on price and volume only")
-            risks.append("No sentiment confirmation available for this candidate")
+        # --- sentiment contribution (subclass hook) --------------------------
+        self._score_sentiment(ctx, sentiment, score, evidence, risks)
 
         threshold = cal.proposal_score_threshold
         if score.score < threshold:
@@ -363,8 +363,7 @@ class SentimentBreakoutStrategy(Strategy):
             risks=risks,
             thesis_hint=(
                 f"{ctx.symbol} traded {extension_atr:+.2f} ATR through {level:.2f} resistance on "
-                f"{rel_volume:.1f}x volume ({vol_pctl:.0%} percentile) with attention broadening "
-                "across new participants."
+                f"{rel_volume:.1f}x volume ({vol_pctl:.0%} percentile){self._thesis_suffix()}."
             ),
             extras={
                 "breakout_level": level,
@@ -372,3 +371,184 @@ class SentimentBreakoutStrategy(Strategy):
                 "score_breakdown": score.breakdown,
             },
         )
+
+    # --- subclass hooks ----------------------------------------------------
+
+    def _sentiment_precondition(self, ctx: StrategyContext) -> bool:
+        """Whether this strategy is willing to act on ``ctx``'s social sample.
+
+        Implementations must call :meth:`decline` with a stable reason code
+        before returning ``False`` -- the scan funnel counts those codes, and
+        a silent ``False`` would make a zero-signal scan unexplainable.
+        """
+        raise NotImplementedError
+
+    def _score_sentiment(
+        self,
+        ctx: StrategyContext,
+        sentiment: SymbolSentiment | None,
+        score: ScoreAccumulator,
+        evidence: list[str],
+        risks: list[str],
+    ) -> None:
+        """Contribute the social sample's points, evidence and risks."""
+        raise NotImplementedError
+
+    def _thesis_suffix(self) -> str:
+        """Clause appended to the thesis hint describing the social evidence."""
+        return ""
+
+
+def breakout_sentiment_is_confirming(
+    strategy: Strategy, ctx: StrategyContext
+) -> tuple[bool, str, str, dict[str, float]]:
+    """Is this candidate's social sample a genuine positive confirmation?
+
+    Single source of truth for the split between ``sentiment_breakout`` and
+    ``volume_breakout``: the first requires ``True`` here and the second
+    requires ``False``, so exactly one of them can ever take a candidate and
+    a signal's strategy name is never ambiguous about what justified it.
+    Written as one shared function rather than two independent conditions
+    precisely so the pair cannot drift into overlapping (the same breakout
+    emitted twice under two names) or into a gap between them (a breakout
+    silently dropped by both).
+
+    Returns:
+        ``(confirming, reason_code, detail, metrics)``. The last three
+        describe *why not* when ``confirming`` is False, ready to hand
+        straight to :meth:`~claudetrade.strategies.base.Strategy.decline`.
+    """
+    sentiment = ctx.sentiment
+    cfg = strategy.config.sentiment
+    if sentiment is None or not strategy.sentiment_available(ctx):
+        return (
+            False,
+            "sentiment_unavailable",
+            (
+                f"{sentiment.post_count} posts from {sentiment.unique_authors} authors"
+                if sentiment is not None
+                else "no stored sentiment for this session"
+            ),
+            {
+                "post_count": float(sentiment.post_count) if sentiment else 0.0,
+                "posts_required": float(cfg.min_posts_for_signal),
+                "unique_authors": float(sentiment.unique_authors) if sentiment else 0.0,
+                "authors_required": float(cfg.min_unique_authors_for_signal),
+            },
+        )
+    # Both the raw decayed mean and the one-vote-per-author mean must be
+    # positive. The author mean alone would ignore a crowd whose loudest
+    # voices are negative; the raw mean alone can be carried by one prolific
+    # poster, which is the exact promotion pattern the breakout strategies
+    # exist to avoid buying into.
+    floor = strategy.config.calibration.breakout_min_positive_sentiment
+    polarity = min(sentiment.raw_sentiment, sentiment.unique_author_sentiment)
+    if polarity <= floor:
+        return (
+            False,
+            "sentiment_not_positive",
+            f"raw {sentiment.raw_sentiment:+.2f} / per-author "
+            f"{sentiment.unique_author_sentiment:+.2f}, need > {floor:+.2f}",
+            {"polarity": polarity, "polarity_required": floor},
+        )
+    minimum = strategy.config.filters.min_sentiment_confidence
+    if sentiment.confidence < minimum:
+        return (
+            False,
+            "sentiment_confidence_low",
+            f"confidence {sentiment.confidence:.2f} below the {minimum:.2f} minimum",
+            {"confidence": sentiment.confidence, "confidence_required": minimum},
+        )
+    return True, "", "", {}
+
+
+@register_strategy
+class SentimentBreakoutStrategy(BreakoutStrategyBase):
+    name = "sentiment_breakout"
+    #: v3: sentiment confirmation became a precondition rather than a scored
+    #: bonus, which changes which candidates this strategy can produce at all.
+    #: Bumping the version keeps v2 signals comparable only with each other
+    #: instead of silently re-labelling a different rule set.
+    version = "v3"
+    description = "Breakout above resistance with volume and confirming positive sentiment"
+    #: The thesis rests on sentiment, so the sentiment-quality hard gates in
+    #: ``signals.scoring.apply_hard_gates`` apply to this strategy's
+    #: candidates too -- consistent with the strategy-level veto below rather
+    #: than in tension with it.
+    requires_sentiment = True
+
+    def _sentiment_precondition(self, ctx: StrategyContext) -> bool:
+        confirming, reason, detail, metrics = breakout_sentiment_is_confirming(self, ctx)
+        if not confirming:
+            self.decline(ctx, reason, detail, metrics=metrics)
+        return confirming
+
+    def _score_sentiment(
+        self,
+        ctx: StrategyContext,
+        sentiment: SymbolSentiment | None,
+        score: ScoreAccumulator,
+        evidence: list[str],
+        risks: list[str],
+    ) -> None:
+        """Score how STRONG the confirmation is; that it exists was vetoed on."""
+        assert sentiment is not None  # guaranteed by the precondition above
+        cal = self.config.calibration
+        accel_history = [s.sentiment_acceleration for s in ctx.sentiment_history][
+            -cal.sentiment_percentile_window :
+        ]
+        mention_history = [s.mention_acceleration for s in ctx.sentiment_history][
+            -cal.sentiment_percentile_window :
+        ]
+        accel_pctl = percentile_rank(accel_history, sentiment.sentiment_acceleration)
+        mention_pctl = percentile_rank(mention_history, sentiment.mention_acceleration)
+
+        score.add(
+            "sentiment_accel_pctl",
+            ramp_up(
+                accel_pctl,
+                cal.breakout_sentiment_accel_percentile - 0.30,
+                cal.breakout_sentiment_accel_percentile,
+            ),
+            self.W_SENTIMENT_ACCEL,
+        )
+        score.add(
+            "mention_accel_pctl",
+            ramp_up(
+                mention_pctl,
+                cal.breakout_mention_accel_percentile - 0.30,
+                cal.breakout_mention_accel_percentile,
+            ),
+            self.W_MENTION_ACCEL,
+        )
+        # Unique authors, not raw mentions: fifty posts from five accounts is
+        # a promotion, not a change in opinion. Soft here, not a hard gate --
+        # manipulation_risk remains the hard backstop against that.
+        score.add(
+            "unique_authors",
+            ramp_up(
+                sentiment.unique_authors,
+                self.config.filters.min_unique_authors * 0.4,
+                self.config.filters.min_unique_authors,
+            ),
+            self.W_UNIQUE_AUTHORS,
+        )
+        if sentiment.hype > 0.5:
+            score.penalty("hype", self.PENALTY_HYPE * ramp_up(sentiment.hype, 0.5, 0.85))
+            risks.append(
+                f"Elevated hype ({sentiment.hype:.2f}); crowded entries reverse quickly"
+            )
+        evidence.append(
+            f"Sentiment positive on both measures (raw {sentiment.raw_sentiment:+.2f}, "
+            f"per-author {sentiment.unique_author_sentiment:+.2f})"
+        )
+        evidence.append(
+            f"Sentiment acceleration {sentiment.sentiment_acceleration:+.2f} "
+            f"({accel_pctl:.0%} percentile) across {sentiment.unique_authors} unique authors"
+        )
+        evidence.append(
+            f"Mention rate {sentiment.mention_acceleration:+.0%} ({mention_pctl:.0%} percentile)"
+        )
+
+    def _thesis_suffix(self) -> str:
+        return " with attention broadening across new participants"

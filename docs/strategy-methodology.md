@@ -1,8 +1,8 @@
 # Strategy Methodology and Performance Evaluation
 
-This document describes the five trading strategies, the scoring framework, and the performance metrics used to evaluate them honestly.
+This document describes the six trading strategies, the scoring framework, and the performance metrics used to evaluate them honestly.
 
-## The Five Strategies
+## The Six Strategies
 
 All strategies are rules-based, deterministic, and documented with their limitations.
 
@@ -15,9 +15,9 @@ All strategies are rules-based, deterministic, and documented with their limitat
 #### Entry Conditions
 
 - Price breaks above a resistance level (identified as touches or Donchian high)
-- Breakout volume is ≥ 1.5x the 20-day average
-- ADX ≥ 18 (trending environment, not choppy)
-- If social data available: sentiment accelerating, mention count accelerating, ≥ 5 unique authors, manipulation risk < 0.60
+- Breakout volume ranks high against the symbol's own trailing distribution
+- Trend strength (ADX) ranks high against the symbol's own trailing distribution
+- **Positive sentiment confirmation is required, not optional**: the social sample must clear the post/author minimums, be positive on BOTH the raw decayed mean and the one-vote-per-author mean, and clear `filters.min_sentiment_confidence`. Manipulation risk < 0.60.
 
 #### Exit Conditions
 
@@ -44,8 +44,9 @@ All strategies are rules-based, deterministic, and documented with their limitat
 **Documented Weaknesses**:
 
 - Breakouts fail often; expect modest win rate carried by reward:risk, not high hit rate
-- Requires social data; degrades to volume-confirmed breakout without sentiment (score capped at 62)
-- Hype component high risk; elevated hype reduces score by 8 points
+- Requires social data and says so: with sources disabled or still warming up this strategy emits nothing. The unconfirmed breakouts are not lost — they surface under Strategy F (`volume_breakout`) instead. A strategy named "sentiment breakout" recommending a name with no or negative sentiment was a false claim about why the trade existed, and it pooled two different edges under one label in every backtest statistic.
+- Hype component high risk; elevated hype reduces the setup score
+- Declines carry reason codes into the scan's rejection funnel: `sentiment_unavailable`, `sentiment_not_positive`, `sentiment_confidence_low`
 
 ---
 
@@ -249,6 +250,32 @@ All strategies are rules-based, deterministic, and documented with their limitat
 
 ---
 
+### Strategy F: Volume-Confirmed Breakout
+
+**File**: `src/claudetrade/strategies/f_volume_breakout.py`
+**Direction**: Long only
+**Thesis**: Identical breakout mechanics to Strategy A — price through a clustered resistance level, on volume that ranks high against the symbol's own history, in a trending context — but with no positive social sample standing behind it. Price and volume are the whole case.
+
+This is the path Strategy A used to carry internally under a name that claimed sentiment confirmation it did not have. Splitting it costs no coverage: the two are mutually exclusive by construction (they share one confirmation predicate, `breakout_sentiment_is_confirming`), so every candidate Strategy A now declines for a sentiment reason is taken here, and every candidate Strategy A takes is declined here as `sentiment_confirmed_elsewhere`.
+
+#### Entry Conditions
+
+- Every Strategy A price/volume/level condition, inherited from the shared `BreakoutStrategyBase` so the two cannot drift apart
+- No positive sentiment confirmation available (that is what makes it this strategy rather than Strategy A)
+
+#### Setup Score Components
+
+- The same price/volume/trend/gap/confluence components as Strategy A
+- **No sentiment components at all**, so its ceiling is 29 points lower than Strategy A's — a confirmed breakout outranks an unconfirmed one, all else equal
+- Contrary (negative) sentiment is an explicit penalty, not merely absent evidence
+
+**Documented Weaknesses**:
+
+- Weaker evidence base than Strategy A by construction; signal confidence is also lower (`data_confidence` discounts a candidate scored without a sentiment row)
+- "Nobody is talking about it" and "the crowd is bearish" are different situations; the second is penalised but still tradeable here, which is a judgement call rather than a measured edge
+
+---
+
 ## Signal Scoring Framework
 
 Every candidate is scored on **13 components**, each mapped to 0–100 where higher is always better.
@@ -260,10 +287,10 @@ Every candidate is scored on **13 components**, each mapped to 0–100 where hig
 | **technical_setup** | Strategy's own conviction in the setup | Strategy proposal |
 | **price_momentum** | ROC agreement across horizons + relative strength | Technical features |
 | **volume_confirmation** | Volume and OBV agreement with move | Technical features |
-| **reddit_sentiment** | Sentiment directional agreement; neutral if unavailable | Social posts |
-| **x_sentiment** | Sentiment directional agreement; neutral if unavailable | Social posts |
-| **sentiment_acceleration** | Rate of change in sentiment attention | Aggregation |
-| **attention_acceleration** | Rate of change in post mention count | Aggregation |
+| **reddit_sentiment** | Reddit's OWN stored snapshot, directional. Unweighted (renormalised away) when Reddit did not report | `symbol_sentiment_daily` source `reddit` |
+| **x_sentiment** | X's OWN stored snapshot, directional. Unweighted when X did not report | `symbol_sentiment_daily` source `x` |
+| **sentiment_acceleration** | Rate of change in sentiment polarity | Aggregation |
+| **attention_acceleration** | Rate of change in mention volume, unsigned. Blends this app's own post rate with ApeWisdom community tallies, each ranked against its OWN history first (the count scales differ ~100x). Unweighted when neither is available | Aggregation + `apewisdom:*` rows |
 | **catalyst_quality** | Quality and specificity of upcoming catalysts | Sentiment labels |
 | **earnings_risk** | **Inverted**: 100 = no risk, 0 = high risk | Calendar + days |
 | **liquidity** | Bid-ask spread, dollar volume | Features |
@@ -293,11 +320,15 @@ The signal engine uses both score and confidence for ranking and filtering.
 
 ```
 overall_score = (
-    sum of (component * weight) for each component
-) / sum of weights
+    sum of (component * effective_weight) for each component
+) / sum of effective weights
 ```
 
 Weights are normalised at use, so they sum to 1.0. This makes the overall score a pure average of 0–100, interpretable as "how ready is this candidate."
+
+**Effective, not configured, weights.** A component with no evidence behind it earns no weight and is renormalised away, rather than being scored at a placeholder 50 and weighted. Scoring "no reading" as "the crowd is undecided" is an opinion nobody expressed, and weighting it drags a strongly-evidenced candidate toward the middle in proportion to how quiet its social coverage happens to be. This applies to `reddit_sentiment`, `x_sentiment` and `attention_acceleration`.
+
+**One piece of evidence, one slot.** Each per-source polarity component scores from that source's own stored row. When no per-source breakdown exists but the combined `"all"` row does, that row is real evidence and is still used — but as ONE unattributed sample, at half the axis's two-source budget, never as two sources agreeing.
 
 ---
 
@@ -413,6 +444,6 @@ Results below these thresholds are flagged as preliminary and should be interpre
 
 ## Summary
 
-The five strategies are deliberately simple and rules-based. They are documented with their failure modes. Performance is reported honestly: win/loss ratio is always accompanied by expectancy, profit factor, and validation warnings. High win rate with negative expectancy is explicitly flagged, not hidden.
+The six strategies are deliberately simple and rules-based. They are documented with their failure modes. Performance is reported honestly: win/loss ratio is always accompanied by expectancy, profit factor, and validation warnings. High win rate with negative expectancy is explicitly flagged, not hidden.
 
 This framework prevents the single most common pit fall of backtesting: taking profits early and letting losers run, which produces high win rates and low profits, then misleading you into thinking you've found the holy grail.

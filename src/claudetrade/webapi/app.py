@@ -12,6 +12,8 @@ control beyond "can reach this loopback port".
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -20,14 +22,51 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from claudetrade.config import AppConfig
+from claudetrade.logging_setup import get_logger
 from claudetrade.pipeline import Pipeline
+from claudetrade.scheduler import SocialCollectionScheduler
 from claudetrade.version import CODE_VERSION, DISCLAIMER
 from claudetrade.webapi.refresh_state import RefreshState
 from claudetrade.webapi.routers import dashboard, paper, signals, system, tickers
 
+log = get_logger(__name__)
+
 #: Built frontend assets (``npm run build`` output), committed to the repo so
 #: end users never need Node -- see ``frontend/DESIGN.md``.
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Own the hourly social/attention collector for the server's lifetime.
+
+    "While the application is open" is this process: the operator's server is
+    the only thing guaranteed to be running when they are using the app, so
+    the collection loop lives here rather than in a separate daemon nobody
+    would remember to start. It collects social posts and attention ONLY --
+    never the ~20-minute market pass; see ``claudetrade.scheduler`` for why
+    that distinction is the whole point.
+
+    Started after the pipeline is on ``app.state`` and cancelled before the
+    server finishes shutting down, so a tick can never be mid-write against a
+    database handle the process is tearing down. Nothing here can prevent the
+    server from serving: a scheduler that fails to start is logged and the app
+    comes up anyway -- losing collection is bad, losing the UI is worse.
+
+    Note for tests: Starlette only runs lifespan when ``TestClient`` is used as
+    a context manager, so the many suites that construct a bare ``TestClient``
+    never start this loop and stay offline by construction.
+    """
+    scheduler = SocialCollectionScheduler(app.state.pipeline, app.state.config)
+    app.state.collection_scheduler = scheduler
+    try:
+        scheduler.start()
+    except Exception:  # pragma: no cover - defensive; start() only creates a task
+        log.exception("hourly social collection failed to start; serving without it")
+    try:
+        yield
+    finally:
+        await scheduler.stop()
 
 
 def create_app(config: AppConfig, pipeline: Pipeline | None = None) -> FastAPI:
@@ -46,6 +85,7 @@ def create_app(config: AppConfig, pipeline: Pipeline | None = None) -> FastAPI:
         docs_url="/api/docs",
         redoc_url="/api/redoc",
         openapi_url="/api/openapi.json",
+        lifespan=_lifespan,
     )
     # The server binds 127.0.0.1 only, but binding alone does not stop DNS
     # rebinding: a hostile page can point its own hostname at 127.0.0.1 and

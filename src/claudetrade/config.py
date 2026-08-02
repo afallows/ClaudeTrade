@@ -1040,6 +1040,23 @@ class SentimentConfig(BaseModel):
     #: Exponential time decay; a post loses half its weight after this long.
     half_life_hours: float = 18.0
     lookback_days: int = 14
+    #: Hard ceiling (calendar days) on how far back the PERSISTED post
+    #: history may be re-read when a refresh rebuilds its rolling baseline
+    #: (``sentiment.store.load_stored_posts``, driven from
+    #: ``Pipeline.refresh``). Sized for a 120-day analysis window plus
+    #: buffer, so a symbol's own normal is measured over quarters rather
+    #: than over whatever one fetch happened to return.
+    #:
+    #: NOT the same thing as ``lookback_days`` above, and conflating the two
+    #: is a trap worth naming: ``lookback_days`` is how far back the
+    #: PROVIDERS are asked to fetch (every entry point passes it as
+    #: ``social_lookback_hours = lookback_days * 24``) and is bounded by
+    #: what Reddit/X/news will actually serve, ~72 hours in practice. This
+    #: one bounds how much of what we ALREADY STORED is read back, which is
+    #: limited only by disk. Raising ``lookback_days`` to get a longer
+    #: baseline would just make every refresh beg providers for history they
+    #: do not have.
+    history_window_days: int = 180
     #: Minimum resolution confidence before a mention is counted at all.
     min_ticker_confidence: float = 0.60
     min_posts_for_signal: int = 8
@@ -1066,8 +1083,34 @@ class SentimentConfig(BaseModel):
         }
     )
     #: Windows (days) used for acceleration measures.
+    #:
+    #: ``fast_window_days`` is the *recent* window. For MENTION growth (see
+    #: ``sentiment.aggregation._mention_growth``) the baseline it is compared
+    #: against is the ``slow_window_days - fast_window_days`` stretch
+    #: IMMEDIATELY PRECEDING it, so the two windows never overlap and the
+    #: total span stays ``slow_window_days``. They used to overlap -- the slow
+    #: bucket contained every fast post -- which made the "growth" reading an
+    #: artifact of the window ratio rather than a measurement: a first-ever
+    #: burst of 2 posts and a burst of 200 both scored exactly
+    #: ``slow_days/fast_days - 1``.
     fast_window_days: int = 2
     slow_window_days: int = 10
+    #: Additive (Laplace-style) smoothing applied to BOTH mention rates, in
+    #: posts per covered session, before they are divided. This is what stops
+    #: a ratio built on a handful of posts reading as loudly as the same ratio
+    #: on a real sample: at a prior of 0.5, one post per session becoming
+    #: three reads as +133% instead of the raw +200%, while 10 -> 30 posts per
+    #: session -- the identical ratio, on a sample large enough to mean
+    #: something -- still reads +190%. Set to 0.0 to compare the raw rates
+    #: (not recommended: small samples then dominate every percentile rank
+    #: downstream).
+    mention_growth_prior_per_session: float = 0.5
+    #: Total mentions (recent + baseline window) below which mention growth is
+    #: reported as 0.0 -- "not measurable", not "flat". A gate rather than a
+    #: smaller prior because below a handful of posts the *sign* is noise too,
+    #: and ``mention_acceleration`` is percentile-ranked by strategies a/c
+    #: where a noisy sign is worse than an absent reading.
+    min_mentions_for_growth: int = 5
     #: Above this share of posts from one author/community, flag concentration.
     source_concentration_alert: float = 0.40
     duplicate_ratio_alert: float = 0.35
@@ -1125,6 +1168,14 @@ class SignalConfig(BaseModel):
     enabled_strategies: list[str] = Field(
         default_factory=lambda: [
             "sentiment_breakout",
+            # The breakout with no confirming social sample. It is a separate
+            # strategy rather than a branch inside ``sentiment_breakout``
+            # because it is a different thesis with a different edge, and the
+            # two are mutually exclusive by construction -- see
+            # ``strategies.f_volume_breakout``. Disable it to run a
+            # sentiment-only screen without also losing the confirmed
+            # breakouts.
+            "volume_breakout",
             "sentiment_pullback",
             "capitulation_reversal",
             "hype_failure_short",
@@ -1160,6 +1211,26 @@ class SignalConfig(BaseModel):
             "manipulation_risk": 0.04,
         }
     )
+    #: Share of the ATTENTION component taken from aggregator sources
+    #: (ApeWisdom's ``apewisdom:<community>`` rows) rather than from this
+    #: application's own post counts. Aggregators watch whole communities
+    #: continuously where the local fetches are narrow, rate-limited windows
+    #: into the same populations, so their mention volume is the better
+    #: attention input -- but only after each source is ranked against its
+    #: OWN history (see ``signals.scoring._attention_score``); the two count
+    #: scales differ by ~100x and must never be summed. Applies to the
+    #: attention axis ONLY: an aggregator row carries no polarity, no authors
+    #: and no text, so it can never reach ``reddit_sentiment``,
+    #: ``x_sentiment``, ``manipulation_risk`` or ``data_confidence``. Set to
+    #: 0.0 to score attention from local post counts alone.
+    attention_aggregator_weight: float = 0.45
+    #: Observations of an aggregator source's own history (including today's)
+    #: required before its reading is used at all. Below this the percentile
+    #: rank that normalises it has no distribution to rank against, and using
+    #: the raw ratio instead would mix a wide-corpus scale into a
+    #: narrow-corpus one -- the exact swamping this normalisation exists to
+    #: prevent. Under-covered sources are simply absent from the axis.
+    attention_min_history_sessions: int = 10
 
 
 class StrategyCalibrationConfig(BaseModel):
@@ -1206,6 +1277,16 @@ class StrategyCalibrationConfig(BaseModel):
     breakout_trend_percentile: float = 0.55
     breakout_sentiment_accel_percentile: float = 0.65
     breakout_mention_accel_percentile: float = 0.60
+    #: Minimum CURRENT polarity for ``sentiment_breakout`` to fire at all --
+    #: not a scored component but a hard precondition, because a strategy
+    #: named "sentiment breakout" recommending a name with no social sample,
+    #: or with negative sentiment, is mislabelled rather than merely
+    #: degraded. Applied to the raw decayed mean AND to the
+    #: manipulation-resistant one-vote-per-author mean, so a single prolific
+    #: poster cannot supply the confirmation on his own. Deliberately just
+    #: above zero: this asks for "positive, not merely not-negative", and the
+    #: strength of the reading is what the scored components measure.
+    breakout_min_positive_sentiment: float = 0.05
 
     # --- Strategy B: sentiment_pullback --------------------------------------
     pullback_trend_percentile: float = 0.55
@@ -1288,6 +1369,25 @@ class NotificationConfig(BaseModel):
 
 
 class SchedulerConfig(BaseModel):
+    """Background scheduling.
+
+    Two unrelated things live here, and only the second one is wired up:
+
+    * ``enabled`` + the ``*_cron`` fields describe the never-built APScheduler
+      job runner (see ``docs/known-limitations.md``). They remain inert, and
+      default off, so nothing that already reads them changes meaning.
+    * ``social_collection_*`` drives :mod:`claudetrade.scheduler` -- the
+      in-process hourly social/attention collector the web API server starts
+      from its lifespan. It is ON by default, unlike the cron block, because
+      the data it collects **cannot be backfilled**: Reddit ``/new`` paging,
+      X recent-search and ApeWisdom's rolling 24h snapshot only ever serve
+      roughly the last few days, so the 120-session baseline this
+      application's premise needs can only be accumulated forward. An hour
+      the app was open but not collecting is an hour permanently missing
+      from that baseline, which is a far worse default than the modest
+      request volume of collecting it.
+    """
+
     enabled: bool = False
     timezone: str = "America/New_York"
     #: Cron-ish schedules; the CLI can also run any job once, on demand.
@@ -1296,6 +1396,44 @@ class SchedulerConfig(BaseModel):
     scan_cron: str = "45 16 * * mon-fri"
     paper_mark_cron: str = "5 16 * * mon-fri"
     misfire_grace_time_s: int = 3600
+
+    # --- in-app hourly social/attention collection -------------------------
+    #: Collect social posts + aggregator attention on a timer for as long as
+    #: the web API server is running. Set false to opt out entirely (the
+    #: operator then owns keeping history alive via `claudetrade sentiment
+    #: collect` or an OS timer -- there is no other way to recover the gap).
+    social_collection_enabled: bool = True
+    #: Cadence. Hourly is the default because ApeWisdom's snapshot is a
+    #: rolling 24h window with no history endpoint, so sampling it once a day
+    #: throws away 23/24 of what it could have told us.
+    social_collection_interval_minutes: int = 60
+    #: Random 0..N seconds added to every wait. Without it, every restart
+    #: (and every install) fires on the same wall-clock boundary, which both
+    #: synchronises load against the upstream APIs and makes two ClaudeTrade
+    #: processes on one machine collide on the refresh lock every single hour
+    #: instead of drifting apart.
+    social_collection_jitter_seconds: int = 300
+    #: How far back each collection asks the social providers to look. Wider
+    #: than the cadence ON PURPOSE: a tick skipped (lock held) or missed (the
+    #: machine was asleep) is then recovered by the next one rather than lost,
+    #: and 72h still covers the current session's aggregation window across a
+    #: weekend gap (Friday close -> Monday). It also matches what the Reddit
+    #: and news providers are already configured to look back, so it does not
+    #: push any provider past its own window; page caps bound the cost.
+    social_collection_lookback_hours: int = 72
+    #: Optional quieter overnight cadence, in minutes; 0 (the default) means
+    #: "same cadence around the clock". Social flows 24/7 -- the ApeWisdom
+    #: snapshot moves overnight and Asian-hours chatter is real -- so slowing
+    #: down at night costs real samples; it is offered, not recommended.
+    social_collection_overnight_interval_minutes: int = 0
+    #: Half-open [start, end) hour range, in ``timezone``, that counts as
+    #: overnight when the field above is non-zero. Wraps past midnight.
+    social_collection_overnight_start_hour: int = 22
+    social_collection_overnight_end_hour: int = 4
+    #: Ceiling on the exponential back-off applied after consecutive failed
+    #: collections. Bounded so a source that was down for a night is retried
+    #: within a few hours rather than effectively never again.
+    social_collection_max_backoff_minutes: int = 240
 
 
 class TradingModeConfig(BaseModel):
@@ -1474,6 +1612,9 @@ class AppConfig(BaseSettings):
             "ai": self.ai.provider != "none",
             "notifications": self.notifications.enabled,
             "scheduler": self.scheduler.enabled,
+            # Listed separately from "scheduler" because it is the only
+            # scheduling that is actually implemented -- see SchedulerConfig.
+            "hourly_social_collection": self.scheduler.social_collection_enabled,
         }
 
 

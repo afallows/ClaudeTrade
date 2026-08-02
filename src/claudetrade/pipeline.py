@@ -28,7 +28,7 @@ import pandas as pd
 
 from claudetrade.config import AppConfig
 from claudetrade.data.context import DatabaseContextProvider
-from claudetrade.data.ingest import DataIngestor, IngestReport
+from claudetrade.data.ingest import DataIngestor, IngestReport, _social_fetch_window
 from claudetrade.data.quality import QualityReport
 from claudetrade.data.snapshot import build_snapshot, persist_snapshot
 from claudetrade.data.universe import UniverseSelector
@@ -42,6 +42,7 @@ from claudetrade.domain import (
     SecurityInfo,
     SentimentScores,
     SocialPost,
+    SocialSource,
     SymbolSentiment,
     TickerMention,
 )
@@ -58,10 +59,17 @@ from claudetrade.regime.market_regime import RegimeClassifier
 from claudetrade.sentiment.aggregation import SentimentAggregator
 from claudetrade.sentiment.classifiers import RuleSentimentClassifier
 from claudetrade.sentiment.entity_resolution import TickerResolver
+from claudetrade.sentiment.store import (
+    SourceCollection,
+    load_stored_posts,
+    record_collection_coverage,
+    sessions_covered_by_fetch,
+)
 from claudetrade.signals import funnel_store
 from claudetrade.signals.engine import ScanResult, SignalEngine
 from claudetrade.signals.ledger import SignalLedger
 from claudetrade.utils.timeutils import (
+    current_trading_session,
     ensure_utc,
     previous_trading_day,
     session_close_utc,
@@ -217,11 +225,22 @@ class Pipeline:
         # not query the providers a second time.
         posts = report.posts
 
+        # Coverage is recorded whether or not anything was fetched, and
+        # BEFORE the early-return below: "the collector ran and found
+        # nothing" is a confirmed zero and must be written down, while "the
+        # collector was down" must not be mistaken for one. Recording only
+        # on the happy path would make an outage indistinguishable from
+        # silence, which is the whole failure this table exists to end.
+        self._record_collection_coverage(
+            report, start=start, end=end, social_lookback_hours=social_lookback_hours
+        )
+
         if posts:
             directory = {s.symbol: s for s in securities}
             rows = self.build_sentiment(
                 posts=posts,
                 directory=directory,
+                history=self._stored_history_for(posts),
                 start=start,
                 end=end,
                 progress_callback=progress_callback,
@@ -237,6 +256,99 @@ class Pipeline:
         log.info("refresh complete: %s", result.summary())
         return result
 
+    def _stored_history_for(self, fresh: list[SocialPost]) -> list[SocialPost]:
+        """Persisted posts this run's sessions need as trailing context.
+
+        This is the read that makes the baseline *rolling*. Without it
+        ``build_sentiment`` only ever sees one fetch's worth of posts (~72
+        hours, all the providers will serve), so every daily aggregate is
+        built from that single fetch and no amount of running the
+        application accumulates a longer history -- the defect that turned
+        1,830 posts into 14 rows.
+
+        The window is bounded twice over, because an unbounded read of
+        ``social_posts`` is the largest scan in the database:
+
+        * Forward: the earliest session this run can rewrite is the session
+          its OLDEST fresh post belongs to (nothing earlier is in scope --
+          see ``build_sentiment``), and aggregating that session honestly
+          needs the posts leading up to it. ``sentiment.lookback_days`` is
+          that trailing context, the same padding ``rebuild_sentiment``
+          uses.
+        * Backward: ``sentiment.history_window_days`` is the hard floor, so
+          a one-off backfill covering a year of price history still cannot
+          make one refresh read the entire post table.
+        """
+        if not fresh:
+            return []
+        earliest_session = min(
+            session_for_instant(ensure_utc(p.created_at)) for p in fresh
+        )
+        context_start = session_close_utc(earliest_session) - dt.timedelta(
+            days=max(0, self.config.sentiment.lookback_days)
+        )
+        floor = utc_now() - dt.timedelta(
+            days=max(1, self.config.sentiment.history_window_days)
+        )
+        return load_stored_posts(self.db, since=max(context_start, floor))
+
+    def _record_collection_coverage(
+        self,
+        report: IngestReport,
+        *,
+        start: dt.date,
+        end: dt.date,
+        social_lookback_hours: int | None,
+    ) -> None:
+        """Write down which sessions this run's collection actually covered.
+
+        Best-effort: a coverage write must never take a refresh down. Losing
+        one run's coverage row degrades a baseline denominator; raising here
+        would lose the refresh that produced the data in the first place.
+        """
+        if not self.social and not self.attention:
+            return
+        try:
+            now = utc_now()
+            # The ingestor's own window helper, imported rather than
+            # recomputed: coverage claiming a window the fetch did not
+            # actually cover is worse than no coverage at all, and two
+            # copies of this arithmetic would drift apart silently.
+            since, until = _social_fetch_window(start, end, social_lookback_hours)
+            # `until` may sit in the future (the calendar-window path ends at
+            # end-of-day); a session cannot have been collected before it has
+            # closed, so the claim is clamped to now.
+            until = min(ensure_utc(until), now) if until is not None else now
+
+            if self.social:
+                outcomes = [
+                    _source_outcome(provider, report.provider_failures)
+                    for provider in self.social
+                ]
+                record_collection_coverage(
+                    self.db,
+                    sessions=sessions_covered_by_fetch(since, until),
+                    outcomes=outcomes,
+                    posts=report.posts,
+                )
+            if self.attention:
+                # Attention sources report a rolling current-24h tally with
+                # no history endpoint, so `ingest_attention` keys them to the
+                # current session and only that session is theirs to claim.
+                record_collection_coverage(
+                    self.db,
+                    sessions=[current_trading_session(now)],
+                    outcomes=[
+                        _source_outcome(provider, report.provider_failures)
+                        for provider in self.attention
+                    ],
+                )
+        except Exception:
+            log.exception(
+                "recording social collection coverage failed; this refresh's data is "
+                "unaffected but the sessions it covered will read as untracked"
+            )
+
     # --- sentiment ---------------------------------------------------------
 
     def build_sentiment(
@@ -246,14 +358,30 @@ class Pipeline:
         directory: dict[str, SecurityInfo],
         start: dt.date,
         end: dt.date,
+        history: list[SocialPost] | None = None,
         progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> int:
         """Resolve mentions, classify posts and store daily aggregates.
 
+        ``posts`` is the DRIVING set -- what this run just learned -- and it
+        alone decides which (symbol, session) pairs are recomputed.
+        ``history`` is persisted context (``sentiment.store.
+        load_stored_posts``): it feeds every aggregate so a session's numbers
+        reflect the whole rolling window rather than one ~72-hour fetch, but
+        it never widens the write scope. Keeping those two roles apart is
+        what makes the rolling baseline possible without turning every
+        refresh into a whole-universe rebuild: a refresh recomputes a few
+        sessions of a few hundred symbols, not 2,400 symbols x 90 sessions.
+
+        ``rebuild_sentiment`` passes everything as ``posts`` and no
+        ``history``, which is how it still rebuilds its full window -- the
+        maintenance path's scope is deliberately unbounded, the refresh
+        path's deliberately is not.
+
         A row is written for a (symbol, session) pair only when at least one
-        of this run's posts for the symbol actually falls inside that
-        session's own window -- after the previous session's close, at or
-        before its own. Two failure modes this prevents, both observed live:
+        DRIVING post for the symbol actually falls inside that session's own
+        window -- after the previous session's close, at or before its own.
+        Two failure modes this prevents, both observed live:
 
         * **Fabricated freshness.** Aggregating one static post set for every
           session in the range produced a current-session row byte-identical
@@ -269,9 +397,11 @@ class Pipeline:
           live data. Sessions outside this fetch's real post coverage are now
           left untouched.
 
-        Each written row still aggregates the full decayed post set as of its
-        session close (a rolling read, not a one-day slice) -- only *which*
-        sessions get written is bounded by post coverage.
+        Each written row aggregates the full decayed post set as of its
+        session close -- driving posts UNION persisted history, deduped by
+        ``(source, external_id)`` with the fresh copy winning because it may
+        carry updated engagement counts. Only *which* sessions get written is
+        bounded by driving-post coverage.
 
         Transaction scope (QA handoff v3, F26): one short write transaction
         PER SYMBOL, with all aggregation compute done before it opens. This
@@ -284,6 +414,9 @@ class Pipeline:
         mid-loop just re-covers the same ground next time.
 
         Args:
+            history: Persisted posts to aggregate alongside ``posts``,
+                contributing evidence but never scope. ``None`` reproduces
+                the pre-rolling-baseline behaviour exactly.
             progress_callback: Optional ``(phase, done, total)`` hook, the
                 same shape as ``data.ingest.ProgressCallback``. Reports
                 ``("sentiment_aggregate", symbols_done, symbols_total)`` per
@@ -302,9 +435,25 @@ class Pipeline:
         threshold = self.config.sentiment.min_ticker_confidence
 
         # Resolve once; a post mentioning three symbols contributes to three.
+        # Mentions are re-derived here even for stored posts rather than read
+        # from ``ticker_mentions``: the refresh and the rebuild must agree
+        # symbol-for-symbol on identical stored input, and that table is
+        # cleared wholesale by a rebuild (see ``sentiment.store``).
         by_symbol: dict[str, list[SocialPost]] = {}
         mentions_by_symbol: dict[str, list[TickerMention]] = {}
         scores_by_symbol: dict[str, dict[str, SentimentScores]] = {}
+        #: symbol -> instants of the DRIVING posts only. This is the scope
+        #: key: history contributes to the numbers, never to which rows get
+        #: rewritten, or a refresh would recompute the entire stored window
+        #: from whatever subset of it the providers happened to re-serve.
+        driving_times: dict[str, list[dt.datetime]] = {}
+
+        def _absorb(post: SocialPost, symbol: str, mention: TickerMention) -> None:
+            by_symbol.setdefault(symbol, []).append(post)
+            mentions_by_symbol.setdefault(symbol, []).append(mention)
+            scores_by_symbol.setdefault(symbol, {})[post.external_id] = classifier.classify(
+                post, symbol, [mention]
+            )
 
         for post in posts:
             for mention in resolver.resolve(post):
@@ -313,30 +462,52 @@ class Pipeline:
                     # down-weighted: an unreliable resolution is noise, and
                     # counting it would let ordinary English inflate attention.
                     continue
-                symbol = mention.symbol
-                by_symbol.setdefault(symbol, []).append(post)
-                mentions_by_symbol.setdefault(symbol, []).append(mention)
-                scores_by_symbol.setdefault(symbol, {})[post.external_id] = classifier.classify(
-                    post, symbol, [mention]
+                _absorb(post, mention.symbol, mention)
+                driving_times.setdefault(mention.symbol, []).append(
+                    ensure_utc(post.created_at)
                 )
 
-        # The session range must reach far enough forward to *hold* every
-        # post, or posts silently belong to nothing. Refreshes run after the
-        # close (the owner's ran at 22:13 ET), so most gathered posts are
-        # dated after the last session's close -- they were falling outside
-        # every window and vanishing: 1,830 posts produced 14 rows, with the
-        # remainder reported as "look-ahead violations" they never were.
-        # Such a post is early information about the NEXT session, which is
-        # exactly what ``session_for_instant`` returns; attributing it to the
-        # session that already closed would be the real look-ahead.
-        last_session = end
-        if by_symbol:
-            latest_post = max(
-                ensure_utc(p.created_at) for posts_ in by_symbol.values() for p in posts_
-            )
-            last_session = max(last_session, session_for_instant(latest_post))
+        # History is absorbed only for symbols this run is actually
+        # recomputing. Classifying every stored post against every symbol it
+        # happens to name would pay for hundreds of symbols whose rows this
+        # refresh will not touch -- the cost that makes a rolling read
+        # affordable per refresh instead of a nightly job.
+        driving_keys = {(p.source.value, p.external_id) for p in posts}
+        history_used = 0
+        for post in history or []:
+            if (post.source.value, post.external_id) in driving_keys:
+                continue  # superseded: the fresh copy has current engagement
+            absorbed = False
+            for mention in resolver.resolve(post):
+                if mention.confidence < threshold or mention.symbol not in driving_times:
+                    continue
+                _absorb(post, mention.symbol, mention)
+                absorbed = True
+            history_used += int(absorbed)
 
-        sessions = trading_day_range(start, last_session)
+        # The session range must reach far enough forward to *hold* every
+        # driving post, or posts silently belong to nothing. Refreshes run
+        # after the close (the owner's ran at 22:13 ET), so most gathered
+        # posts are dated after the last session's close -- they were falling
+        # outside every window and vanishing: 1,830 posts produced 14 rows,
+        # with the remainder reported as "look-ahead violations" they never
+        # were. Such a post is early information about the NEXT session,
+        # which is exactly what ``session_for_instant`` returns; attributing
+        # it to the session that already closed would be the real look-ahead.
+        # History deliberately cannot extend this horizon: a stale stored
+        # post must not conjure a row for a session this run learned nothing
+        # about.
+        all_driving_times = [t for times in driving_times.values() for t in times]
+        last_session = end
+        first_session = start
+        if all_driving_times:
+            last_session = max(last_session, session_for_instant(max(all_driving_times)))
+            # Sessions before the oldest driving post cannot change, so they
+            # are never even considered -- this is what keeps a refresh
+            # incremental instead of a whole-window rebuild.
+            first_session = max(start, session_for_instant(min(all_driving_times)))
+
+        sessions = trading_day_range(first_session, last_session)
         # Per-session freshness window: (previous session's close, own close].
         session_windows: list[tuple[dt.date, dt.datetime, dt.datetime]] = []
         for trading_session in sessions:
@@ -346,9 +517,9 @@ class Pipeline:
             )
 
         written = 0
-        total_symbols = len(by_symbol)
-        for done, (symbol, symbol_posts) in enumerate(by_symbol.items(), start=1):
-            post_times = [ensure_utc(p.created_at) for p in symbol_posts]
+        total_symbols = len(driving_times)
+        for done, (symbol, post_times) in enumerate(driving_times.items(), start=1):
+            symbol_posts = by_symbol.get(symbol, [])
             # All compute happens BEFORE the write transaction opens -- the
             # transaction below holds the write lock only for this symbol's
             # upserts, never for aggregation work.
@@ -379,7 +550,14 @@ class Pipeline:
         drop_summary = aggregator.drain_drop_summary()
         if drop_summary:
             log.warning(drop_summary)
-        log.info("stored %d daily sentiment rows across %d symbols", written, len(by_symbol))
+        log.info(
+            "stored %d daily sentiment rows across %d symbols (%d fresh post(s) plus "
+            "%d contributing from stored history)",
+            written,
+            total_symbols,
+            len(posts),
+            history_used,
+        )
         return written
 
     # --- regime ------------------------------------------------------------
@@ -603,6 +781,162 @@ class Pipeline:
         regimes = self.classify_regimes(provider.sessions(), provider.bars_by_symbol())
         provider._regimes.update(regimes)
         return provider
+
+    # --- social-only collection ---------------------------------------------
+
+    def collect_social(
+        self,
+        *,
+        lookback_hours: int,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+    ) -> PipelineResult:
+        """Social posts and aggregator attention ONLY -- never the market pass.
+
+        The narrow entry point ``claudetrade.scheduler`` runs every hour, and
+        the reason it must be narrow is cost asymmetry: a full ``refresh``
+        spends ~20 rate-limit-bound minutes on per-symbol price/earnings
+        fetches that change once a day, while the data that is genuinely
+        perishable -- Reddit ``/new``, X recent-search, ApeWisdom's rolling
+        24h snapshot -- is cheap and unrecoverable once its window rolls past.
+        Running the whole refresh hourly would burn the market provider's rate
+        budget for nothing; running nothing hourly loses baseline forever.
+
+        Structurally, not just conventionally, market-free: the
+        ``DataIngestor`` built here is given ``market_provider=None`` and
+        ``earnings_provider=None``, so no code path from this method can
+        reach a price fetch even if it were changed to call one.
+
+        The symbol directory (needed to resolve mentions and to gate attention
+        rows to tracked tickers) comes from ``UniverseSelector.load_all`` --
+        stored securities, falling back to the packaged seed lists -- never
+        from ``market.list_universe()``, which for the live providers is a
+        network call and would reintroduce exactly the cost this method
+        exists to avoid.
+
+        Aggregation reuses ``build_sentiment`` unchanged, over this
+        collection's own posts, exactly as ``refresh`` does; the session
+        window is bounded by ``lookback_hours`` so an hourly run rewrites only
+        the sessions its posts actually cover and leaves older history alone.
+
+        Returns:
+            A ``PipelineResult`` whose ``ingest`` report carries the post and
+            mention counts, plus ``sentiment_rows`` and any degraded sources.
+        """
+        # Local import: this is the only method that needs the ET session
+        # helper, and keeping it out of the module import block keeps this
+        # addition to a single self-contained block.
+        from claudetrade.utils.timeutils import current_trading_session
+
+        result = PipelineResult()
+        report = IngestReport()
+        result.ingest = report
+
+        if not self.social and not self.attention:
+            result.warnings.append(
+                "No social or attention provider is configured; there is nothing to collect. "
+                "Sentiment history cannot accumulate until at least one is enabled."
+            )
+            result.finished_at = utc_now()
+            return result
+
+        securities = self.universe.load_all()
+        directory = {s.symbol: s for s in securities}
+        result.universe_size = len(directory)
+        if not directory:
+            result.warnings.append(
+                "No securities are known, so ticker mentions cannot be resolved. "
+                "Run 'claudetrade refresh' once to populate the universe."
+            )
+
+        ingestor = DataIngestor(
+            self.config,
+            self.db,
+            market_provider=None,
+            earnings_provider=None,
+            social_providers=self.social,
+            attention_providers=self.attention,
+            progress_callback=progress_callback,
+        )
+
+        def _report(phase: str, done: int) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(phase, done, 3)
+            except Exception:
+                log.debug("progress callback raised; ignored", exc_info=True)
+
+        end = current_trading_session()
+        since = utc_now() - dt.timedelta(hours=max(1, lookback_hours))
+        start = since.date()
+
+        posts: list[SocialPost] = []
+        if self.social:
+            _report("social", 0)
+            posts = ingestor.ingest_social(since=since, until=None, report=report)
+            if directory:
+                ingestor.resolve_and_persist_mentions(posts, directory, report)
+
+        if posts and directory:
+            _report("sentiment", 1)
+            result.sentiment_rows = self.build_sentiment(
+                posts=posts,
+                directory=directory,
+                start=start,
+                end=end,
+                progress_callback=progress_callback,
+            )
+        elif self.social and not posts:
+            result.warnings.append(
+                "No social posts were returned in this window; sentiment aggregates are "
+                "unchanged for this collection."
+            )
+
+        if self.attention:
+            _report("attention", 2)
+            # Keyed to the ET trading session for the same reason
+            # ``run_full_refresh`` does: the API reports a rolling current-24h
+            # window with no history endpoint, so today's observation is only
+            # ever about today.
+            ingestor.ingest_attention(end, report)
+
+        _report("finishing", 3)
+        result.degraded_sources.update(report.provider_failures)
+        report.finished_at = utc_now()
+        result.finished_at = utc_now()
+        log.info(
+            "social collection complete: %d post(s) fetched, %d new, %d mention(s), "
+            "%d sentiment row(s)%s",
+            len(posts),
+            report.posts_inserted,
+            report.mentions_inserted,
+            result.sentiment_rows,
+            f", degraded: {sorted(result.degraded_sources)}" if result.degraded_sources else "",
+        )
+        return result
+
+
+def _source_outcome(provider: object, failures: dict[str, str]) -> SourceCollection:
+    """One provider's coverage outcome for this run.
+
+    Labelled by the ``SocialSource`` the provider emits rather than by the
+    adapter's own name, so coverage rows line up with the ``source`` column
+    in ``symbol_sentiment_daily`` and an operator reading both sees the same
+    vocabulary. Attention providers have no ``SocialSource`` (they yield
+    tallies, not posts) and fall back to their name, which is the same stem
+    their aggregate rows use (``apewisdom:*``).
+
+    A provider absent from ``failures`` succeeded -- including when it
+    returned nothing, which is the confirmed-zero case this whole table
+    exists to make visible.
+    """
+    name = str(getattr(provider, "name", "social"))
+    source = getattr(provider, "source", None)
+    label = source.value if isinstance(source, SocialSource) else name
+    error = failures.get(name, "")
+    return SourceCollection(
+        source=label, ok=not error, error=f"{name}: {error}"[:300] if error else ""
+    )
 
 
 def _bars_to_frame(bars: list[Bar]) -> pd.DataFrame:

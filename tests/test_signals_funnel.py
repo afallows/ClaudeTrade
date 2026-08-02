@@ -674,6 +674,10 @@ class TestProductionStrategiesCarryMetrics:
             name: req["min_history_bars"] for name, req in requirements.items()
         } == {
             "sentiment_breakout": 80,
+            # The relabelled unconfirmed-breakout path (QA #7). It inherits
+            # sentiment_breakout's mechanics, including its bar minimum, so
+            # the two cannot drift apart on how a breakout is found.
+            "volume_breakout": 80,
             "sentiment_pullback": 100,
             "capitulation_reversal": 100,
             "hype_failure_short": 80,

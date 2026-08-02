@@ -45,7 +45,7 @@ from claudetrade.domain import (
 )
 from claudetrade.features.feature_builder import FeatureBuilder
 from claudetrade.logging_setup import get_logger
-from claudetrade.strategies.base import StrategyContext
+from claudetrade.strategies.base import StrategyContext, is_attention_only
 from claudetrade.utils.timeutils import trading_day_range
 
 log = get_logger(__name__)
@@ -152,7 +152,19 @@ class ContextBuilder:
             security=data.security,
             regime=regime,
             sentiment=self._sentiment_for(data, session),
-            sentiment_history=[s for s in data.sentiment if s.session <= session],
+            sentiment_by_source=self._polarity_by_source(data, session),
+            attention_by_source=self._attention_by_source(data, session),
+            attention_history=self._attention_history(data, session),
+            # COMBINED rows only. This list is what strategies percentile-rank
+            # today's snapshot against, and it used to carry every row for the
+            # symbol -- per-source breakdowns and aggregator attention rows
+            # interleaved with the combined series -- so a value was ranked
+            # against a distribution built from other sources entirely. With
+            # ApeWisdom rows in the mix that distribution was mostly a
+            # different corpus at a different scale.
+            sentiment_history=[
+                s for s in data.sentiment if s.session <= session and s.source == "all"
+            ],
             earnings=self._known_earnings(data, session),
             benchmark_features=dict(benchmark_features or {}),
             sector_features=dict(sector_features or {}),
@@ -185,25 +197,84 @@ class ContextBuilder:
         return out
 
     def _sentiment_for(self, data: SymbolData, session: dt.date) -> SymbolSentiment | None:
-        """Aggregated sentiment for the session, if the sample is usable."""
-        candidates = [s for s in data.sentiment if s.session == session]
-        if not candidates:
-            return None
-        # A session can carry several rows -- the combined "all" aggregate
-        # plus per-source (reddit/x/news) breakdowns. Strategies score against
-        # the combined view; taking whichever row the query returned first
-        # silently substituted an arbitrary single-source sample.
-        snapshot = next((s for s in candidates if s.source == "all"), candidates[0])
+        """The COMBINED aggregate for the session, if the sample is usable."""
+        return self._polarity_by_source(data, session).get("all")
+
+    def _polarity_by_source(
+        self, data: SymbolData, session: dt.date
+    ) -> dict[str, SymbolSentiment]:
+        """Usable polarity snapshots for ``session``, keyed by source.
+
+        A session can carry several rows -- the combined ``"all"`` aggregate,
+        per-source (reddit/x/news/stocktwits) breakdowns, and aggregator
+        attention tallies. All three used to be collapsed to one row here and
+        that row was then handed to every per-source scoring slot, so one
+        sample could stand in as several sources' independent agreement. Each
+        source now travels separately and is scored from its own evidence;
+        ``signals.scoring`` drops the weight of a source that is absent
+        rather than substituting another source's reading.
+
+        Attention rows are excluded outright: they have no polarity to
+        contribute (see ``strategies.base.is_attention_only``).
+
+        Each source is gated on sample adequacy INDEPENDENTLY. A per-source
+        row is a subset of the combined one, so a source that reported only a
+        handful of posts drops out while the combined aggregate it fed can
+        still be usable -- which is correct: the thin single-source view is
+        not reliable on its own, and it is already represented inside the
+        combined row. Omitting a source is meaningfully different from
+        storing a zeroed reading for it: absent sentiment is renormalised
+        away downstream, never scored as evidence against the candidate.
+        """
         cfg = self.config.sentiment
-        if (
-            snapshot.post_count < cfg.min_posts_for_signal
-            or snapshot.unique_authors < cfg.min_unique_authors_for_signal
-        ):
-            # Too thin to rely on. Returning None is meaningfully different from
-            # returning a zeroed reading: the scorer treats absent sentiment as
-            # neutral rather than as evidence against the candidate.
-            return None
-        return snapshot
+        out: dict[str, SymbolSentiment] = {}
+        for snapshot in data.sentiment:
+            if snapshot.session != session or is_attention_only(snapshot):
+                continue
+            if (
+                snapshot.post_count < cfg.min_posts_for_signal
+                or snapshot.unique_authors < cfg.min_unique_authors_for_signal
+            ):
+                continue
+            out.setdefault(snapshot.source, snapshot)
+        return out
+
+    def _attention_by_source(
+        self, data: SymbolData, session: dt.date
+    ) -> dict[str, SymbolSentiment]:
+        """Aggregator attention tallies for ``session``, keyed by source.
+
+        Deliberately NOT gated on ``min_posts_for_signal`` /
+        ``min_unique_authors_for_signal``: those measure whether a POLARITY
+        sample is large enough to trust, and an attention row reports no
+        authors at all (it has none to report), so the author gate would
+        reject every row for a reason that does not apply to it. The only
+        thing an attention row must have is a mention count.
+        """
+        return {
+            s.source: s
+            for s in data.sentiment
+            if s.session == session and is_attention_only(s) and s.post_count > 0
+        }
+
+    def _attention_history(
+        self, data: SymbolData, session: dt.date
+    ) -> dict[str, list[SymbolSentiment]]:
+        """Each attention source's own trailing series, ascending, through ``session``.
+
+        Per source, never pooled: ApeWisdom's ``all-stocks`` filter watches a
+        far larger corpus than its ``4chan`` one, so their mention counts and
+        the swings in them are on different scales. Scoring ranks a reading
+        against the history of the very source that produced it.
+        """
+        out: dict[str, list[SymbolSentiment]] = {}
+        for snapshot in data.sentiment:
+            if snapshot.session > session or not is_attention_only(snapshot):
+                continue
+            out.setdefault(snapshot.source, []).append(snapshot)
+        for series in out.values():
+            series.sort(key=lambda s: s.session)
+        return out
 
     def _known_earnings(self, data: SymbolData, session: dt.date) -> list[EarningsEvent]:
         """Earnings entries whose knowledge date is on or before ``session``.
