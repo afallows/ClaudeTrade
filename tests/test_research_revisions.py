@@ -296,6 +296,87 @@ class TestAppendResearchRevision:
         assert forbidden.isdisjoint(sig.parameters)
 
 
+class TestCarryForwardSemantics:
+    """``None`` means unchanged, and unchanged means carried forward.
+
+    The newest revision is the one readers consult, so a revision that
+    updates only one field must inherit the rest from its predecessor --
+    otherwise a thesis-only update would silently wipe earlier score
+    adjustments. An explicit empty dict clears adjustments on purpose.
+    """
+
+    THESIS = (
+        "Research view: channel checks and the latest filing both support the "
+        "engine's setup; holding the original read on this name."
+    )
+
+    def _submit(self, tmp_db, tmp_app_config, sig, **overrides):
+        kwargs = {
+            "thesis": None,
+            "invalidation": None,
+            "score_adjustments": None,
+            "rationale": "carry-forward test",
+            "sources": ["https://example.com/research"],
+            "config": tmp_app_config,
+        }
+        kwargs.update(overrides)
+        return ResearchLedger(tmp_db).append_research_revision(sig.signal_id, **kwargs)
+
+    def test_omitted_adjustments_are_carried_forward(
+        self, tmp_db: Database, tmp_app_config: AppConfig, recorded_signal
+    ):
+        first = self._submit(
+            tmp_db, tmp_app_config, recorded_signal,
+            score_adjustments={"catalyst_quality": 10.0},
+        )
+        second = self._submit(tmp_db, tmp_app_config, recorded_signal, thesis=self.THESIS)
+
+        assert second.applied_adjustments == {"catalyst_quality": 10.0}
+        assert second.effective_score == pytest.approx(first.effective_score)
+        latest = ResearchLedger(tmp_db).latest_research_revisions(
+            [recorded_signal.signal_id]
+        )[recorded_signal.signal_id]
+        assert latest["revision"] == 2
+        assert latest["score_adjustments"] == {"catalyst_quality": 10.0}
+        assert latest["thesis"] == self.THESIS
+
+    def test_omitted_thesis_and_invalidation_are_carried_forward(
+        self, tmp_db: Database, tmp_app_config: AppConfig, recorded_signal
+    ):
+        conditions = ["Momentum stalls for three consecutive sessions"]
+        self._submit(
+            tmp_db, tmp_app_config, recorded_signal,
+            thesis=self.THESIS, invalidation=conditions,
+        )
+        self._submit(
+            tmp_db, tmp_app_config, recorded_signal,
+            score_adjustments={"liquidity": -5.0},
+        )
+
+        latest = ResearchLedger(tmp_db).latest_research_revisions(
+            [recorded_signal.signal_id]
+        )[recorded_signal.signal_id]
+        assert latest["thesis"] == self.THESIS
+        assert latest["invalidation"] == conditions
+        assert latest["score_adjustments"] == {"liquidity": -5.0}
+
+    def test_explicit_empty_dict_clears_adjustments(
+        self, tmp_db: Database, tmp_app_config: AppConfig, recorded_signal
+    ):
+        self._submit(
+            tmp_db, tmp_app_config, recorded_signal,
+            score_adjustments={"catalyst_quality": 10.0},
+        )
+        cleared = self._submit(tmp_db, tmp_app_config, recorded_signal, score_adjustments={})
+
+        assert cleared.applied_adjustments == {}
+        assert cleared.effective_score == pytest.approx(recorded_signal.overall_score)
+        latest = ResearchLedger(tmp_db).latest_research_revisions(
+            [recorded_signal.signal_id]
+        )[recorded_signal.signal_id]
+        assert latest["score_adjustments"] == {}
+
+
 class TestResearchHistoryAndLatest:
     def test_research_history_is_oldest_first(
         self, tmp_db: Database, tmp_app_config: AppConfig, recorded_signal

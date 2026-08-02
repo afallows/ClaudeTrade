@@ -177,6 +177,16 @@ class ResearchLedger:
     ) -> ResearchRevisionResult:
         """Validate, clamp and append one research revision.
 
+        ``None`` means "unchanged", and unchanged means *carried forward*:
+        a revision that submits only a new thesis inherits the previous
+        revision's invalidation list and score adjustments (re-clamped under
+        the current cap), so every stored row is complete in itself and
+        readers only ever need the latest one. Without this, updating one
+        field would silently discard the others -- the newest row is what
+        takes effect. An explicit empty dict ``{}`` for ``score_adjustments``
+        clears the adjustments on purpose; to walk back a thesis or
+        invalidation rewrite, resubmit the engine's original text.
+
         Raises:
             ResearchGuardrailError: for every rejection -- unknown signal,
                 missing rationale/sources, an unknown component name, or a
@@ -221,13 +231,13 @@ class ResearchLedger:
                 if not safe:
                     raise ResearchGuardrailError(f"invalidation item rejected: {why}")
 
+        cap = config.mcp.max_component_adjustment
         applied: dict[str, float] = {}
         clamped: dict[str, dict[str, float]] = {}
         if score_adjustments:
             unknown = sorted(set(score_adjustments) - VALID_COMPONENT_NAMES)
             if unknown:
                 raise ResearchGuardrailError(f"unknown component(s): {unknown}")
-            cap = config.mcp.max_component_adjustment
             for name, raw_delta in score_adjustments.items():
                 delta = float(raw_delta)
                 bounded = max(-cap, min(cap, delta))
@@ -238,12 +248,33 @@ class ResearchLedger:
         with self.db.session() as session:
             if session.get(SignalRow, signal_id) is None:
                 raise ResearchGuardrailError(f"unknown signal {signal_id}")
-            current = session.execute(
-                select(func.max(SignalResearchRevisionRow.revision)).where(
-                    SignalResearchRevisionRow.signal_id == signal_id
+            prior = (
+                session.execute(
+                    select(SignalResearchRevisionRow)
+                    .where(SignalResearchRevisionRow.signal_id == signal_id)
+                    .order_by(SignalResearchRevisionRow.revision.desc())
+                    .limit(1)
                 )
-            ).scalar()
-            revision = int(current or 0) + 1
+                .scalars()
+                .first()
+            )
+            revision = (prior.revision if prior is not None else 0) + 1
+            # ``None`` = unchanged = carried forward from the prior revision,
+            # so the newest row (the only one readers consult) stays complete.
+            # Inherited values were validated when first stored; adjustments
+            # are re-clamped in case the cap has been lowered since.
+            if prior is not None:
+                if thesis is None:
+                    thesis = prior.thesis
+                if invalidation is None:
+                    invalidation = (
+                        list(prior.invalidation) if prior.invalidation is not None else None
+                    )
+                if score_adjustments is None and prior.score_adjustments:
+                    applied = {
+                        name: max(-cap, min(cap, float(value)))
+                        for name, value in prior.score_adjustments.items()
+                    }
             integrity = content_hash(
                 research_integrity_payload(
                     signal_id=signal_id,

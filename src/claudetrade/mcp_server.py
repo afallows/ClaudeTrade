@@ -871,6 +871,13 @@ def submit_research_revision(
     .max_component_adjustment`` before it is stored. ``rationale`` and
     ``sources`` are required and non-empty.
 
+    Revision semantics: the NEWEST revision is what takes effect, and a
+    ``None``/omitted field means "unchanged" -- it is carried forward from
+    the previous revision, so updating only the thesis never silently drops
+    earlier score adjustments. Pass an explicit empty dict ``{}`` for
+    ``score_adjustments`` to deliberately clear them; to walk back a thesis
+    or invalidation rewrite, resubmit the engine's original text.
+
     Refuses outright, without writing anything, when
     ``config.mcp.research_writes_enabled`` is false. A guardrail rejection
     returns ``{"accepted": false, "reason": ...}`` rather than raising --
@@ -1216,7 +1223,10 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "can re-rank a signal, never re-price or re-size one. Thesis and "
             "invalidation text are guardrailed against introducing an "
             "unrecognised price level or a directive phrase (e.g. 'widen the "
-            "stop'). Returns accepted=false with a reason on any rejection "
+            "stop'). The newest revision takes effect: an omitted field is "
+            "carried forward unchanged from the previous revision, and an "
+            "explicit empty score_adjustments dict clears the adjustments. "
+            "Returns accepted=false with a reason on any rejection "
             "(including when research writes are disabled for this "
             "installation) rather than raising. " + DISCLAIMER
         ),
