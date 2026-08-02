@@ -20,6 +20,7 @@ Each test pins the fix for a specific finding:
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 
 from claudetrade.config import SentimentConfig
@@ -221,6 +222,52 @@ class TestBuildSentimentSessionWindows:
         # fabricated rows for 08-03/08-04 carrying 07-31's numbers forward.
         assert written == 1
         assert sessions == [_SESSION]
+
+    def test_after_hours_posts_are_stored_against_the_next_session(
+        self, tmp_app_config, tmp_db
+    ):
+        """The defect that stopped sentiment ever accumulating.
+
+        Refreshes run after the close -- the owner's ran at 22:13 ET -- so
+        the posts they gather are dated after the last session's close. Those
+        posts fell outside every session window and were written nowhere,
+        then counted as "look-ahead violations": one production run turned
+        1,830 posts into 14 rows while reporting 7,489 dropped.
+
+        A Friday-evening post is early information about Monday. Storing it
+        against Monday is correct and is NOT look-ahead (Monday's close comes
+        after the post); storing it against Friday would be.
+        """
+        from sqlalchemy import select
+
+        from claudetrade.db.models import SymbolSentimentDaily
+        from claudetrade.pipeline import Pipeline
+
+        pipeline = Pipeline(tmp_app_config, tmp_db)
+        directory = {"AMZN": SecurityInfo(symbol="AMZN", name="Amazon.com Inc")}
+        posts, _, _ = _bullish_corpus()
+        # Re-date every post to Friday 2026-07-31 ~19:00 ET (23:00 UTC),
+        # i.e. three hours AFTER that session's 20:00 UTC close.
+        evening = dt.datetime(2026, 7, 31, 23, 0, tzinfo=dt.UTC)
+        posts = [
+            dataclasses.replace(p, created_at=evening - dt.timedelta(minutes=i))
+            for i, p in enumerate(posts)
+        ]
+
+        # The refresh window ends on the Friday -- exactly as a Friday-night
+        # `claudetrade refresh` would.
+        written = pipeline.build_sentiment(
+            posts=posts, directory=directory,
+            start=_SESSION - dt.timedelta(days=5),
+            end=_SESSION,
+        )
+
+        with tmp_db.read_session() as session:
+            rows = session.execute(select(SymbolSentimentDaily)).scalars().all()
+
+        assert written >= 1, "after-hours posts were discarded again"
+        assert [r.session for r in rows] == [dt.date(2026, 8, 3)]  # the Monday
+        assert rows[0].post_count > 0
 
     def test_refetch_without_in_window_posts_leaves_history_alone(
         self, tmp_app_config, tmp_db

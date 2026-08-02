@@ -65,6 +65,7 @@ from claudetrade.utils.timeutils import (
     ensure_utc,
     previous_trading_day,
     session_close_utc,
+    session_for_instant,
     trading_day_range,
     utc_now,
 )
@@ -319,7 +320,23 @@ class Pipeline:
                     post, symbol, [mention]
                 )
 
-        sessions = trading_day_range(start, end)
+        # The session range must reach far enough forward to *hold* every
+        # post, or posts silently belong to nothing. Refreshes run after the
+        # close (the owner's ran at 22:13 ET), so most gathered posts are
+        # dated after the last session's close -- they were falling outside
+        # every window and vanishing: 1,830 posts produced 14 rows, with the
+        # remainder reported as "look-ahead violations" they never were.
+        # Such a post is early information about the NEXT session, which is
+        # exactly what ``session_for_instant`` returns; attributing it to the
+        # session that already closed would be the real look-ahead.
+        last_session = end
+        if by_symbol:
+            latest_post = max(
+                ensure_utc(p.created_at) for posts_ in by_symbol.values() for p in posts_
+            )
+            last_session = max(last_session, session_for_instant(latest_post))
+
+        sessions = trading_day_range(start, last_session)
         # Per-session freshness window: (previous session's close, own close].
         session_windows: list[tuple[dt.date, dt.datetime, dt.datetime]] = []
         for trading_session in sessions:

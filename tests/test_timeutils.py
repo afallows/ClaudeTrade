@@ -46,6 +46,61 @@ def test_holiday_monday_resolves_to_the_preceding_friday() -> None:
     assert current_trading_session(_utc(2026, 9, 7, 16, 0)) == dt.date(2026, 9, 4)
 
 
+class TestSessionForInstant:
+    """Which session a post's information belongs to.
+
+    The after-hours case is why sentiment never accumulated: refreshes run
+    after the close, so most gathered posts were dated after the last
+    session's close, fell outside every session window, and were discarded
+    as "look-ahead violations" they never were.
+    """
+
+    def test_during_the_session_belongs_to_that_session(self) -> None:
+        from claudetrade.utils.timeutils import session_for_instant
+
+        # Friday 2026-07-31, 11:00 ET.
+        assert session_for_instant(_utc(2026, 7, 31, 15, 0)) == dt.date(2026, 7, 31)
+
+    def test_at_the_close_still_belongs_to_that_session(self) -> None:
+        from claudetrade.utils.timeutils import session_close_utc, session_for_instant
+
+        friday = dt.date(2026, 7, 31)
+        assert session_for_instant(session_close_utc(friday)) == friday
+
+    def test_after_the_close_belongs_to_the_next_session(self) -> None:
+        """A Friday-evening post is early information about Monday -- not
+        late information about Friday, and not a violation."""
+        from claudetrade.utils.timeutils import session_for_instant
+
+        # Friday 2026-07-31, 19:00 ET (the owner's refresh ran at 22:13 ET).
+        assert session_for_instant(_utc(2026, 8, 1, 2, 0)) == dt.date(2026, 8, 3)
+
+    def test_weekend_posts_belong_to_monday(self) -> None:
+        from claudetrade.utils.timeutils import session_for_instant
+
+        saturday_noon_et = _utc(2026, 8, 1, 16, 0)
+        sunday_noon_et = _utc(2026, 8, 2, 16, 0)
+        assert session_for_instant(saturday_noon_et) == dt.date(2026, 8, 3)
+        assert session_for_instant(sunday_noon_et) == dt.date(2026, 8, 3)
+
+    def test_pre_market_belongs_to_that_same_session(self) -> None:
+        """07:00 ET Monday is before Monday's close, so it is Monday's."""
+        from claudetrade.utils.timeutils import session_for_instant
+
+        assert session_for_instant(_utc(2026, 8, 3, 11, 0)) == dt.date(2026, 8, 3)
+
+    def test_the_result_is_always_a_tradable_session_at_or_after_the_post(self) -> None:
+        from claudetrade.utils.timeutils import session_close_utc, session_for_instant
+
+        moment = _utc(2026, 8, 1, 2, 0)
+        for _ in range(40):
+            session = session_for_instant(moment)
+            assert is_trading_day(session)
+            # Never look-ahead: the session's close is at or after the post.
+            assert moment <= session_close_utc(session)
+            moment += dt.timedelta(hours=11)
+
+
 def test_result_is_never_a_weekend_or_holiday() -> None:
     moment = _utc(2026, 1, 1, 12, 0)  # New Year's Day, itself a holiday
     for _ in range(45):

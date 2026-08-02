@@ -152,6 +152,29 @@ def previous_trading_day(day: dt.date, *, skip: int = 1) -> dt.date:
     return cur
 
 
+def session_for_instant(moment: dt.datetime) -> dt.date:
+    """The trading session an instant's information belongs to.
+
+    Defined as the session ``d`` whose freshness window contains ``moment``:
+    ``session_close(previous_trading_day(d)) < moment <= session_close(d)``.
+    Equivalently -- the first session that could still *act* on it.
+
+    The after-hours case is the one that matters. A post made at 19:00 ET on
+    a Friday is not late information about Friday, and it is emphatically not
+    a look-ahead violation: it is early information about Monday, available
+    to anyone before Monday's close. Attributing it to Friday would be
+    look-ahead; dropping it (the previous behaviour, because no session's
+    window contained it) silently discarded every post gathered by an
+    evening refresh -- which is most of them, since refreshes run after the
+    close.
+    """
+    et = to_display(moment, "America/New_York")
+    day = et.date()
+    if is_trading_day(day) and moment <= session_close_utc(day):
+        return day
+    return next_trading_day(day)
+
+
 def current_trading_session(now: dt.datetime | None = None) -> dt.date:
     """The trading session ``now`` belongs to, in exchange (ET) terms.
 
