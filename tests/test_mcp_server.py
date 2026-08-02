@@ -49,7 +49,13 @@ def _record(db: Database, sig: Signal) -> None:
 
 def test_get_signals_empty_ledger_is_an_honest_empty_list(pipeline: Pipeline) -> None:
     result = mcp_server.get_signals(pipeline)
-    assert result == {"disclaimer": DISCLAIMER, "count": 0, "signals": []}
+    assert result["disclaimer"] == DISCLAIMER
+    assert result["count"] == 0
+    assert result["signals"] == []
+    # An empty ledger is complete, not truncated -- the caller must be able
+    # to tell "there is nothing" from "there is more you did not get".
+    assert result["total_matching"] == 0
+    assert result["truncated"] is False
 
 
 def test_get_signals_returns_recorded_signals_with_disclaimer_once(
@@ -94,6 +100,103 @@ def test_get_signals_respects_limit(pipeline: Pipeline, tmp_db: Database, make_s
     result = mcp_server.get_signals(pipeline, limit=2)
     assert result["count"] == 2
     assert len(result["signals"]) == 2
+
+
+def test_get_signals_returns_the_best_scoring_not_the_most_recently_written(
+    pipeline: Pipeline, tmp_db: Database, make_signal
+) -> None:
+    """The bug this ordering exists to fix.
+
+    Signals were read newest-first and truncated in Python, so ``limit=N``
+    returned the N most recently *written* rows. A scan writes in roughly
+    symbol order, so that was an alphabetical slice that silently excluded
+    the best candidates: QA's limit=20 call returned GIL/TTEK/THC while
+    MSFT (73.90), LPLA (75.53) and AMZN (73.40) sat outside the window, and
+    two reviewers comparing the same scan via this tool and the UI reached
+    different conclusions.
+
+    Written here in the order the scan would write them -- alphabetically,
+    with the best scores deliberately written FIRST so a newest-first read
+    pushes them out of the window.
+    """
+    for symbol, score in [
+        ("AMZN", 73.40), ("LPLA", 75.53), ("MSFT", 73.90),  # best, written first
+        ("GIL", 70.84), ("GSAT", 70.97), ("THC", 71.20), ("TTEK", 70.83),
+    ]:
+        _record(tmp_db, make_signal(symbol=symbol, overall_score=score))
+
+    result = mcp_server.get_signals(pipeline, limit=3)
+
+    assert [r["symbol"] for r in result["signals"]] == ["LPLA", "MSFT", "AMZN"]
+    assert result["sorted_by"] == "score"
+
+
+def test_get_signals_reports_that_it_truncated(
+    pipeline: Pipeline, tmp_db: Database, make_signal
+) -> None:
+    """A caller could not previously tell 20-of-47 from 20-of-20, so a
+    non-representative slice looked like the whole answer."""
+    for i in range(7):
+        _record(tmp_db, make_signal(symbol=f"SYM{i}", overall_score=50.0 + i))
+
+    result = mcp_server.get_signals(pipeline, limit=3)
+
+    assert result["count"] == 3
+    assert result["total_matching"] == 7
+    assert result["truncated"] is True
+
+    full = mcp_server.get_signals(pipeline, limit=20)
+    assert full["truncated"] is False
+    assert full["total_matching"] == 7
+
+
+def test_get_signals_total_matching_respects_min_score(
+    pipeline: Pipeline, tmp_db: Database, make_signal
+) -> None:
+    _record(tmp_db, make_signal(symbol="WEAK", overall_score=20.0))
+    for i in range(3):
+        _record(tmp_db, make_signal(symbol=f"OK{i}", overall_score=80.0 + i))
+
+    result = mcp_server.get_signals(pipeline, min_score=50.0, limit=1)
+
+    assert result["total_matching"] == 3  # not 4 -- the filter is applied first
+    assert result["truncated"] is True
+
+
+def test_get_signals_can_still_be_read_chronologically(
+    pipeline: Pipeline, tmp_db: Database, make_signal
+) -> None:
+    """Chronological access stays available -- audit and ledger inspection
+    are real needs. It is simply the wrong default for 'show me candidates'."""
+    # Distinct sessions, because make_signal derives created_at from the
+    # session date -- same-session records share a timestamp.
+    _record(
+        tmp_db,
+        make_signal(symbol="FIRST", overall_score=99.0, session=dt.date(2024, 1, 3)),
+    )
+    _record(
+        tmp_db,
+        make_signal(symbol="SECOND", overall_score=10.0, session=dt.date(2024, 1, 4)),
+    )
+
+    by_time = mcp_server.get_signals(pipeline, limit=1, sort="created_at")
+    assert by_time["signals"][0]["symbol"] == "SECOND"
+    assert by_time["sorted_by"] == "created_at"
+
+    by_score = mcp_server.get_signals(pipeline, limit=1)
+    assert by_score["signals"][0]["symbol"] == "FIRST"
+
+
+def test_get_signals_ties_break_deterministically(
+    pipeline: Pipeline, tmp_db: Database, make_signal
+) -> None:
+    """Equal scores must not shuffle between identical calls."""
+    for symbol in ("CCC", "AAA", "BBB"):
+        _record(tmp_db, make_signal(symbol=symbol, overall_score=70.0))
+
+    first = [r["symbol"] for r in mcp_server.get_signals(pipeline)["signals"]]
+    second = [r["symbol"] for r in mcp_server.get_signals(pipeline)["signals"]]
+    assert first == second
 
 
 # --------------------------------------------------------------------------
@@ -782,7 +885,7 @@ def test_build_server_tool_schemas_match_the_documented_signatures(
     def properties(name: str) -> set[str]:
         return set(tools[name].parameters.get("properties", {}))
 
-    assert properties("get_signals") == {"min_score", "limit"}
+    assert properties("get_signals") == {"min_score", "limit", "sort"}
     assert properties("get_sentiment") == {"symbol", "days"}
     assert properties("get_trending") == {"limit", "source"}
     assert properties("get_market_status") == set()

@@ -438,6 +438,73 @@ class SignalLedger:
                 for row, status in rows
             ]
 
+    def list_with_status(
+        self,
+        *,
+        min_score: float = 0.0,
+        limit: int = 200,
+        order: str = "score",
+    ) -> tuple[list[tuple[Signal, SignalStatus | None]], int]:
+        """Signals with status, ordered and filtered IN THE DATABASE.
+
+        ``recent_with_status`` answers "what was written last", which is a
+        real question (audit, ledger inspection) and the wrong default for
+        "show me the candidates". Filtering and truncating a
+        newest-first slab in Python meant ``limit=N`` returned the N most
+        recently *written* rows that happened to clear the filter -- and
+        because a scan writes in roughly symbol order, that is an
+        alphabetical slice, not the top of the list. Callers had no way to
+        tell, since the response looked identical either way.
+
+        Pushing ``min_score`` and the ordering into SQL is what makes
+        ``limit`` mean "the N best". ``overall_score`` is indexed, so this
+        costs nothing extra.
+
+        Args:
+            order: ``"score"`` (default, highest first) or ``"created_at"``
+                (newest first -- the old behaviour, kept because
+                chronological access is legitimate for audit).
+
+        Returns:
+            ``(rows, total_matching)``. The total counts every signal
+            clearing ``min_score``, not just the returned page, so a caller
+            can tell a complete answer from a truncated one.
+        """
+        latest = self._latest_revision_join()
+        order_column = (
+            SignalRow.created_at.desc()
+            if order == "created_at"
+            else SignalRow.overall_score.desc()
+        )
+        with self.db.read_session() as session:
+            total = session.execute(
+                select(func.count())
+                .select_from(SignalRow)
+                .where(SignalRow.overall_score >= min_score)
+            ).scalar_one()
+            rows = session.execute(
+                select(SignalRow, SignalRevisionRow.status)
+                .join(latest, latest.c.signal_id == SignalRow.signal_id, isouter=True)
+                .join(
+                    SignalRevisionRow,
+                    (SignalRevisionRow.signal_id == SignalRow.signal_id)
+                    & (SignalRevisionRow.revision == latest.c.max_revision),
+                    isouter=True,
+                )
+                .where(SignalRow.overall_score >= min_score)
+                # Ties broken deterministically so paging and repeated calls
+                # do not shuffle equal-scored rows around.
+                .order_by(order_column, SignalRow.signal_id)
+                .limit(limit)
+            ).all()
+            return (
+                [
+                    (_row_to_signal(row), SignalStatus(status) if status else None)
+                    for row, status in rows
+                ],
+                int(total),
+            )
+
     def history(self, signal_id: str) -> list[dict[str, object]]:
         """Full revision history, oldest first."""
         with self.db.read_session() as session:
