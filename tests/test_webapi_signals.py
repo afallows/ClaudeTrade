@@ -18,6 +18,7 @@ from claudetrade.db.session import Database
 from claudetrade.domain import Direction, Signal
 from claudetrade.pipeline import Pipeline
 from claudetrade.signals.ledger import SignalLedger
+from claudetrade.signals.research import ResearchLedger
 from claudetrade.webapi.app import create_app
 
 
@@ -99,6 +100,78 @@ def test_list_signals_filters_by_max_days_to_earnings(client: TestClient, tmp_db
     assert {r["symbol"] for r in resp.json()["signals"]} == {"SOON"}
 
 
+# --- GET /api/signals: effective_score / has_research -----------------------
+
+
+def test_list_signals_reports_overall_score_as_effective_when_no_research(
+    client: TestClient, tmp_db, make_signal
+):
+    _record(tmp_db, make_signal(symbol="AAA", overall_score=70.0))
+
+    resp = client.get("/api/signals")
+    row = resp.json()["signals"][0]
+    assert row["effective_score"] == row["overall_score"] == 70.0
+    assert row["has_research"] is False
+
+
+def test_list_signals_effective_score_reflects_research_adjustment(
+    client: TestClient, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+):
+    sig = make_signal(symbol="AAA", overall_score=60.0)
+    _record(tmp_db, sig)
+
+    ResearchLedger(tmp_db).append_research_revision(
+        sig.signal_id,
+        thesis=None,
+        invalidation=None,
+        score_adjustments={"technical_setup": 20.0},
+        rationale="Strong new catalyst confirmed by two independent sources.",
+        sources=["https://example.com/a", "https://example.com/b"],
+        config=tmp_app_config,
+    )
+
+    resp = client.get("/api/signals")
+    row = resp.json()["signals"][0]
+    assert row["has_research"] is True
+    assert row["overall_score"] == 60.0
+    # technical_setup's default weight (0.20) applied to the +20.0 delta over
+    # the full 1.00 total weight -- a deterministic +4.0 move.
+    assert row["effective_score"] == pytest.approx(64.0)
+
+
+def test_list_signals_sorted_by_effective_score_orders_research_adjusted_rows_first(
+    client: TestClient, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+):
+    """The Screener grid sorts client-side on whichever column it's given --
+    this just confirms the field it would sort on (``effective_score``)
+    correctly re-ranks a research-adjusted row above a higher raw-score one,
+    the same re-rank ``mcp_server.get_signals`` performs server-side."""
+    high = make_signal(symbol="HIGH", overall_score=63.0)
+    low = make_signal(symbol="LOW", overall_score=60.0)
+    _record(tmp_db, high)
+    _record(tmp_db, low)
+
+    ResearchLedger(tmp_db).append_research_revision(
+        low.signal_id,
+        thesis=None,
+        invalidation=None,
+        score_adjustments={"technical_setup": 20.0},
+        rationale="Strong new catalyst confirmed by two independent sources.",
+        sources=["https://example.com/a", "https://example.com/b"],
+        config=tmp_app_config,
+    )
+
+    resp = client.get("/api/signals")
+    rows = {r["symbol"]: r for r in resp.json()["signals"]}
+
+    assert rows["LOW"]["has_research"] is True
+    assert rows["LOW"]["effective_score"] == pytest.approx(64.0)
+    assert rows["HIGH"]["has_research"] is False
+    assert rows["HIGH"]["overall_score"] == rows["HIGH"]["effective_score"] == 63.0
+    ranked = sorted(rows.values(), key=lambda r: r["effective_score"], reverse=True)
+    assert [r["symbol"] for r in ranked] == ["LOW", "HIGH"]
+
+
 # --- GET /api/signals/{id} ---------------------------------------------------
 
 
@@ -113,11 +186,64 @@ def test_get_signal_detail(client: TestClient, tmp_db, make_signal):
     assert "components" in body and "plan" in body
     assert body["plan"]["entry_low"] == sig.plan.entry_low
     assert set(body["components"].keys()) == set(sig.components.as_dict().keys())
+    assert body["effective_score"] == body["overall_score"] == 55.0
+    assert body["has_research"] is False
+    assert body["research"] is None
+    assert body["research_history"] == []
 
 
 def test_get_signal_detail_404_for_unknown_id(client: TestClient):
     resp = client.get("/api/signals/does-not-exist")
     assert resp.status_code == 404
+
+
+def test_get_signal_detail_includes_latest_research_and_full_history(
+    client: TestClient, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+):
+    sig = make_signal(symbol="RSCH", overall_score=50.0)
+    _record(tmp_db, sig)
+
+    ledger = ResearchLedger(tmp_db)
+    ledger.append_research_revision(
+        sig.signal_id,
+        thesis=None,
+        invalidation=None,
+        score_adjustments={"technical_setup": 5.0},
+        rationale="Initial confirmation from an earnings call transcript.",
+        sources=["https://example.com/transcript"],
+        config=tmp_app_config,
+    )
+    ledger.append_research_revision(
+        sig.signal_id,
+        thesis=None,
+        invalidation=[f"Close below the {sig.plan.stop_loss:.2f} stop level"],
+        score_adjustments={"technical_setup": 8.0},
+        rationale="Follow-up: guidance raise confirmed by two analysts.",
+        sources=["https://example.com/followup"],
+        config=tmp_app_config,
+    )
+
+    resp = client.get(f"/api/signals/{sig.signal_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["has_research"] is True
+    assert body["overall_score"] == 50.0
+    # technical_setup's default weight (0.20) applied to the latest
+    # revision's own +8.0 delta (revisions don't stack) -- a +1.6 move.
+    assert body["effective_score"] == pytest.approx(51.6)
+
+    assert body["research"] is not None
+    assert body["research"]["revision"] == 2
+    assert body["research"]["actor"] == "mcp"
+    assert body["research"]["invalidation"] == [f"Close below the {sig.plan.stop_loss:.2f} stop level"]
+    assert body["research"]["score_adjustments"] == {"technical_setup": 8.0}
+    assert "guidance raise" in body["research"]["rationale"]
+    assert body["research"]["sources"] == ["https://example.com/followup"]
+
+    history = body["research_history"]
+    assert [r["revision"] for r in history] == [1, 2]
+    assert history[0]["score_adjustments"] == {"technical_setup": 5.0}
 
 
 # --- GET /api/signals/rejected ----------------------------------------------

@@ -13,6 +13,7 @@ import { SkeletonRows } from '../components/Skeleton';
 import { DirectionBadge } from '../components/DirectionBadge';
 import { StatusChip } from '../components/StatusChip';
 import { ScoreBar, ConfidenceBar } from '../components/ScoreBar';
+import { ResearchBadge } from '../components/ResearchBadge';
 import { RejectionFunnelPanel } from '../components/RejectionFunnelPanel';
 import { formatPrice, formatRatio, daysToEarningsLabel } from '../lib/format';
 
@@ -27,12 +28,22 @@ const columnDefs: ColDef<SignalRow>[] = [
     cellRenderer: (p: ICellRendererParams<SignalRow>) => <DirectionBadge direction={p.value} />,
   },
   {
-    field: 'overall_score',
+    field: 'effective_score',
     headerName: 'Score',
-    width: 140,
+    width: 190,
     sortable: true,
     sort: 'desc',
-    cellRenderer: (p: ICellRendererParams<SignalRow>) => <ScoreBar value={p.value} />,
+    // Sorts/filters by the research-adjusted score -- what the ledger's own
+    // re-rank (mcp_server.get_signals) uses -- not the frozen engine number.
+    cellRenderer: (p: ICellRendererParams<SignalRow>) => {
+      const row = p.data;
+      return (
+        <div className="flex h-full items-center gap-1.5">
+          <ScoreBar value={p.value} />
+          {row && row.has_research && <ResearchBadge engineScore={row.overall_score} />}
+        </div>
+      );
+    },
   },
   {
     field: 'confidence',

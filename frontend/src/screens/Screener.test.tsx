@@ -86,6 +86,8 @@ const SIGNAL: SignalRow = {
   status: 'actionable',
   regime: 'bull_quiet',
   overall_score: 82,
+  effective_score: 82,
+  has_research: false,
   confidence: 0.7,
   reward_risk_ratio: 2.5,
   entry_low: 190,

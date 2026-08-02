@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
+
+from claudetrade.config import AppConfig
 from claudetrade.db.models import EarningsEventRow, PriceBar, SymbolSentimentDaily
+from claudetrade.db.session import Database
+from claudetrade.signals.ledger import SignalLedger
+from claudetrade.signals.research import ResearchLedger
 from claudetrade.ui.data_access import (
     data_freshness,
     earnings_dates,
     known_symbols,
     price_bars,
+    research_overlay,
     sentiment_timeline,
 )
 
@@ -88,3 +95,79 @@ def test_known_symbols_sorted_and_distinct(memory_db):
         session.add(PriceBar(symbol="AAA", session=dt.date(2024, 1, 1), open=1, high=1, low=1, close=1, volume=1))
 
     assert known_symbols(memory_db) == ["AAA", "ZZZ"]
+
+
+# --- research_overlay ---------------------------------------------------------
+
+
+def _record(db: Database, sig) -> None:
+    SignalLedger(db).record(sig)
+
+
+def test_research_overlay_reports_overall_score_as_effective_when_no_research(
+    tmp_db: Database, tmp_app_config: AppConfig, make_signal
+):
+    sig = make_signal(symbol="AAA", overall_score=70.0)
+    _record(tmp_db, sig)
+
+    overlay = research_overlay(tmp_db, [sig], tmp_app_config)
+
+    result = overlay[sig.signal_id]
+    assert result.effective_score == 70.0
+    assert result.has_research is False
+    assert result.latest is None
+
+
+def test_research_overlay_computes_effective_score_from_latest_revision(
+    tmp_db: Database, tmp_app_config: AppConfig, make_signal
+):
+    sig = make_signal(symbol="AAA", overall_score=60.0)
+    _record(tmp_db, sig)
+
+    ResearchLedger(tmp_db).append_research_revision(
+        sig.signal_id,
+        thesis=None,
+        invalidation=None,
+        score_adjustments={"technical_setup": 20.0},
+        rationale="Strong new catalyst confirmed by two independent sources.",
+        sources=["https://example.com/a", "https://example.com/b"],
+        config=tmp_app_config,
+    )
+
+    overlay = research_overlay(tmp_db, [sig], tmp_app_config)
+
+    result = overlay[sig.signal_id]
+    assert result.has_research is True
+    # technical_setup's default weight (0.20) applied to the +20.0 delta over
+    # the full 1.00 total weight -- a deterministic +4.0 move.
+    assert result.effective_score == pytest.approx(64.0)
+    assert result.latest is not None
+    assert result.latest["revision"] == 1
+
+
+def test_research_overlay_uses_one_batched_query_for_multiple_signals(
+    tmp_db: Database, tmp_app_config: AppConfig, make_signal
+):
+    """Same F26 discipline as ``mcp_server.get_signals``/``webapi.routers
+    .signals.list_signals``: research must be fetched once for the whole
+    page, never per-row."""
+    from sqlalchemy import event
+
+    signals = [make_signal(symbol=f"SYM{i}", overall_score=50.0 + i) for i in range(5)]
+    for sig in signals:
+        _record(tmp_db, sig)
+
+    statements: list[str] = []
+
+    def _record_stmt(conn, cursor, statement, params, context, executemany):
+        statements.append(statement)
+
+    event.listen(tmp_db.engine, "before_cursor_execute", _record_stmt)
+    try:
+        overlay = research_overlay(tmp_db, signals, tmp_app_config)
+    finally:
+        event.remove(tmp_db.engine, "before_cursor_execute", _record_stmt)
+
+    selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+    assert len(overlay) == 5
+    assert len(selects) == 1

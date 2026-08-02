@@ -14,6 +14,8 @@ import datetime as dt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from claudetrade.pipeline import Pipeline
+from claudetrade.signals.research import ResearchLedger
+from claudetrade.signals.scoring import adjusted_overall
 from claudetrade.utils.timeutils import current_trading_session, utc_now
 from claudetrade.webapi.deps import get_config, get_last_scan, get_pipeline, set_last_scan
 from claudetrade.webapi.schemas import (
@@ -36,6 +38,7 @@ router = APIRouter(prefix="/api", tags=["signals"])
 @router.get("/signals", response_model=SignalListOut)
 def list_signals(
     pipeline: Pipeline = Depends(get_pipeline),
+    config=Depends(get_config),
     direction: list[str] | None = Query(default=None, description="long, short, or both"),
     min_score: float = Query(default=0.0, ge=0.0, le=100.0),
     min_confidence: float = Query(default=0.0, ge=0.0, le=1.0),
@@ -54,12 +57,22 @@ def list_signals(
     replaces issued up to ``limit`` extra queries per request, which under a
     concurrent data refresh compounded into multi-minute responses (QA
     handoff v3, F26; the MCP server's ``get_signals`` shared the pattern).
+
+    Each row also carries ``effective_score`` (``overall_score`` re-ranked by
+    any accepted research revisions, via ``signals.scoring.adjusted_overall``)
+    and ``has_research``, fetched with ONE extra batched query keyed to
+    exactly the signal ids on this page (``ResearchLedger
+    .latest_research_revisions``) -- never a per-row lookup, mirroring
+    ``mcp_server.get_signals``'s discipline. The response itself stays in
+    ledger (recency) order for client-side sorting/filtering (the Screener
+    grid sorts by whichever column -- including ``effective_score`` -- the
+    user picks); it is not re-sorted here.
     """
     recent = pipeline.ledger.recent_with_status(limit=limit)
     directions = {d.lower() for d in direction} if direction else None
     strategies = set(strategy) if strategy else None
 
-    rows = []
+    matched: list[tuple] = []
     for sig, status in recent:
         if sig.overall_score < min_score:
             continue
@@ -73,7 +86,29 @@ def list_signals(
             sig.days_to_earnings is None or sig.days_to_earnings > max_days_to_earnings
         ):
             continue
-        rows.append(signal_to_row(sig, status))
+        matched.append((sig, status))
+
+    # Batched, not per-row (same F26 discipline as recent_with_status above).
+    research = ResearchLedger(pipeline.db).latest_research_revisions(
+        [sig.signal_id for sig, _ in matched]
+    )
+
+    rows = []
+    for sig, status in matched:
+        revision = research.get(sig.signal_id)
+        has_research = revision is not None
+        if revision is not None:
+            effective = adjusted_overall(
+                sig.components.as_dict(),
+                sig.overall_score,
+                revision["score_adjustments"],
+                config,
+            )
+        else:
+            effective = sig.overall_score
+        rows.append(
+            signal_to_row(sig, status, effective_score=effective, has_research=has_research)
+        )
 
     return SignalListOut(signals=rows, total=len(rows))
 
@@ -135,12 +170,42 @@ def rejected_candidates(scan_result=Depends(get_last_scan)) -> RejectedResponse:
 
 
 @router.get("/signals/{signal_id}", response_model=SignalDetailOut)
-def get_signal(signal_id: str, pipeline: Pipeline = Depends(get_pipeline)) -> SignalDetailOut:
+def get_signal(
+    signal_id: str,
+    pipeline: Pipeline = Depends(get_pipeline),
+    config=Depends(get_config),
+) -> SignalDetailOut:
+    """One signal's full detail, plus its latest research revision and history.
+
+    ``research``/``research_history`` come straight from ``ResearchLedger``
+    (the same append-only store ``mcp_server.submit_research_revision``
+    writes to); ``effective_score``/``has_research`` are derived from the
+    latest revision the same way ``list_signals`` derives them for the grid.
+    """
     sig = pipeline.ledger.get(signal_id)
     if sig is None:
         raise HTTPException(status_code=404, detail=f"unknown signal {signal_id}")
     status = pipeline.ledger.current_status(signal_id)
-    return signal_to_detail(sig, status)
+
+    ledger = ResearchLedger(pipeline.db)
+    history = ledger.research_history(signal_id)
+    latest = history[-1] if history else None
+    has_research = latest is not None
+    if latest is not None:
+        effective = adjusted_overall(
+            sig.components.as_dict(), sig.overall_score, latest["score_adjustments"], config
+        )
+    else:
+        effective = sig.overall_score
+
+    return signal_to_detail(
+        sig,
+        status,
+        effective_score=effective,
+        has_research=has_research,
+        research=latest,
+        research_history=history,
+    )
 
 
 @router.post("/scan", response_model=ScanResponse)

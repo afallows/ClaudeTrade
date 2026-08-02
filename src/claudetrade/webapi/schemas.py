@@ -68,6 +68,13 @@ class SignalRowOut(BaseModel):
     status: str
     regime: str
     overall_score: float
+    #: ``overall_score`` re-ranked by any accepted research revisions (see
+    #: ``signals.scoring.adjusted_overall``). Equals ``overall_score`` exactly
+    #: when ``has_research`` is False -- never null/omitted, so the frontend
+    #: can always read this field without a fallback.
+    effective_score: float
+    #: Whether at least one research revision exists for this signal.
+    has_research: bool
     confidence: float
     reward_risk_ratio: float
     entry_low: float
@@ -76,6 +83,24 @@ class SignalRowOut(BaseModel):
     days_to_earnings: int | None
     session: dt.date
     created_at: dt.datetime
+
+
+class ResearchRevisionOut(BaseModel):
+    """One entry from ``signals.research.ResearchLedger`` (latest or history).
+
+    Mirrors the dict shape ``ResearchLedger.latest_research_revisions``/
+    ``research_history`` return -- ``thesis``/``invalidation`` of ``None``
+    means "the engine's own text is unchanged by this revision", not "blank".
+    """
+
+    revision: int
+    created_at: dt.datetime
+    actor: str
+    thesis: str | None
+    invalidation: list[str] | None
+    score_adjustments: dict[str, float]
+    rationale: str
+    sources: list[str]
 
 
 class SignalDetailOut(SignalRowOut):
@@ -90,6 +115,12 @@ class SignalDetailOut(SignalRowOut):
     evidence: list[str]
     next_earnings_date: dt.date | None
     data_warnings: list[str]
+    #: The latest research revision, if any -- ``None`` means no research has
+    #: been submitted for this signal yet.
+    research: ResearchRevisionOut | None = None
+    #: Every research revision for this signal, oldest first. Empty when
+    #: ``research`` is ``None``.
+    research_history: list[ResearchRevisionOut] = Field(default_factory=list)
 
 
 class SignalListOut(BaseModel):
@@ -420,6 +451,7 @@ __all__ = [
     "RegimeCardOut",
     "RejectedCandidateOut",
     "RejectedResponse",
+    "ResearchRevisionOut",
     "ScanFunnelOut",
     "ScanRequest",
     "ScanResponse",

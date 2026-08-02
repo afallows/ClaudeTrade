@@ -47,6 +47,11 @@ export interface SignalRow {
   status: string;
   regime: string;
   overall_score: number;
+  /** overall_score re-ranked by any accepted research revisions. Equals
+   * overall_score exactly when has_research is false -- never null. */
+  effective_score: number;
+  /** Whether at least one research revision exists for this signal. */
+  has_research: boolean;
   confidence: number;
   reward_risk_ratio: number;
   entry_low: number;
@@ -55,6 +60,19 @@ export interface SignalRow {
   days_to_earnings: number | null;
   session: string;
   created_at: string;
+}
+
+/** One research-ledger entry (latest or history). thesis/invalidation of
+ * null means "the engine's own text is unchanged by this revision". */
+export interface ResearchRevision {
+  revision: number;
+  created_at: string;
+  actor: string;
+  thesis: string | null;
+  invalidation: string[] | null;
+  score_adjustments: Record<string, number>;
+  rationale: string;
+  sources: string[];
 }
 
 export interface SignalDetail extends SignalRow {
@@ -67,6 +85,10 @@ export interface SignalDetail extends SignalRow {
   evidence: string[];
   next_earnings_date: string | null;
   data_warnings: string[];
+  /** The latest research revision, if any. */
+  research: ResearchRevision | null;
+  /** Every research revision for this signal, oldest first. */
+  research_history: ResearchRevision[];
 }
 
 export interface SignalList {

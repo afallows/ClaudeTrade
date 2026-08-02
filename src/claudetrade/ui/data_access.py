@@ -15,9 +15,12 @@ from dataclasses import dataclass
 
 from sqlalchemy import func, select
 
+from claudetrade.config import AppConfig
 from claudetrade.db.models import EarningsEventRow, PriceBar, SymbolSentimentDaily
 from claudetrade.db.session import Database
-from claudetrade.domain import Bar
+from claudetrade.domain import Bar, Signal
+from claudetrade.signals.research import ResearchLedger
+from claudetrade.signals.scoring import adjusted_overall
 
 
 @dataclass(slots=True)
@@ -140,6 +143,57 @@ def earnings_dates(db: Database, symbol: str) -> list[dt.date]:
     return list(rows)
 
 
+@dataclass(slots=True, frozen=True)
+class ResearchOverlay:
+    """Read-time research overlay for one signal (``signals.research``).
+
+    ``effective_score`` equals the signal's own ``overall_score`` and
+    ``has_research`` is False when no revision exists -- the same "never
+    null, equal to overall_score when absent" contract ``webapi`` and the
+    MCP server report, so all three surfaces agree.
+    """
+
+    effective_score: float
+    has_research: bool
+    #: The latest revision, in ``ResearchLedger.latest_research_revisions``'s
+    #: dict shape (``revision``, ``created_at``, ``actor``, ``thesis``,
+    #: ``invalidation``, ``score_adjustments``, ``rationale``, ``sources``,
+    #: ``detail``), or ``None`` when ``has_research`` is False.
+    latest: dict[str, object] | None
+
+
+def research_overlay(
+    db: Database, signals: list[Signal], config: AppConfig
+) -> dict[str, ResearchOverlay]:
+    """Effective score + latest research revision per signal, ONE batched query.
+
+    Mirrors ``webapi.routers.signals.list_signals``/``mcp_server.get_signals``:
+    ``ResearchLedger.latest_research_revisions`` is fetched once for every
+    signal id in ``signals`` -- never per-row -- and ``signals.scoring
+    .adjusted_overall`` computes the same read-time overlay those layers use,
+    so the Streamlit screens agree with the API/MCP surfaces on both the
+    effective score and whether research exists. Signal ids with no revision
+    are still present in the result, with ``has_research=False`` and
+    ``effective_score`` equal to the signal's own ``overall_score``.
+    """
+    revisions = ResearchLedger(db).latest_research_revisions([s.signal_id for s in signals])
+    overlay: dict[str, ResearchOverlay] = {}
+    for sig in signals:
+        revision = revisions.get(sig.signal_id)
+        if revision is None:
+            overlay[sig.signal_id] = ResearchOverlay(
+                effective_score=sig.overall_score, has_research=False, latest=None
+            )
+        else:
+            effective = adjusted_overall(
+                sig.components.as_dict(), sig.overall_score, revision["score_adjustments"], config
+            )
+            overlay[sig.signal_id] = ResearchOverlay(
+                effective_score=effective, has_research=True, latest=revision
+            )
+    return overlay
+
+
 def known_symbols(db: Database, *, limit: int = 5000) -> list[str]:
     """Every symbol with at least one stored bar, for the ticker-detail picker."""
     with db.read_session() as session:
@@ -155,10 +209,12 @@ def known_symbols(db: Database, *, limit: int = 5000) -> list[str]:
 
 __all__ = [
     "DataFreshness",
+    "ResearchOverlay",
     "SentimentPoint",
     "data_freshness",
     "earnings_dates",
     "known_symbols",
     "price_bars",
+    "research_overlay",
     "sentiment_timeline",
 ]

@@ -3,14 +3,15 @@ import type { ReactNode } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ChevronDown, TrendingUp } from 'lucide-react';
 import { api, ApiError } from '../api/client';
-import type { SignalDetail, TickerDetail as TickerDetailData } from '../api/types';
+import type { ResearchRevision, SignalDetail, TickerDetail as TickerDetailData } from '../api/types';
 import { Card } from '../components/Card';
 import { EmptyState } from '../components/EmptyState';
 import { Skeleton, SkeletonCard } from '../components/Skeleton';
 import { DirectionBadge } from '../components/DirectionBadge';
 import { StatusChip } from '../components/StatusChip';
+import { ResearchBadge } from '../components/ResearchBadge';
 import { TickerChart } from '../charts/TickerChart';
-import { formatDate, formatPrice, formatConfidence } from '../lib/format';
+import { formatDate, formatDateTime, formatPrice, formatConfidence } from '../lib/format';
 
 const LOOKBACK_OPTIONS = [60, 90, 180, 365, 1000];
 
@@ -25,6 +26,7 @@ export function TickerDetailScreen() {
   const [openTradeMessage, setOpenTradeMessage] = useState<string | null>(null);
   const [openingTrade, setOpeningTrade] = useState(false);
   const [thesisOpen, setThesisOpen] = useState(false);
+  const [researchHistoryOpen, setResearchHistoryOpen] = useState(false);
 
   useEffect(() => {
     api.listTickers().then(setSymbols).catch(() => setSymbols([]));
@@ -113,7 +115,22 @@ export function TickerDetailScreen() {
             {sig && (
               <div className="flex flex-col gap-4">
                 <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-                  <Stat label="Score" value={sig.overall_score.toFixed(0)} />
+                  <Stat
+                    label="Score"
+                    value={
+                      <div className="flex flex-col gap-0.5">
+                        <span className="flex items-center gap-2">
+                          {sig.effective_score.toFixed(0)}
+                          {sig.has_research && <ResearchBadge engineScore={sig.overall_score} />}
+                        </span>
+                        {sig.has_research && (
+                          <span className="text-[11px] font-normal text-ink-muted">
+                            engine: {sig.overall_score.toFixed(0)}
+                          </span>
+                        )}
+                      </div>
+                    }
+                  />
                   <Stat label="Confidence" value={formatConfidence(sig.confidence)} />
                   <Stat label="Status" value={<StatusChip status={sig.status} />} />
                   <Stat label="Direction" value={<DirectionBadge direction={sig.direction} />} />
@@ -176,6 +193,15 @@ export function TickerDetailScreen() {
               </div>
             )}
           </Card>
+
+          {sig !== null && sig.has_research && sig.research && (
+            <ResearchSection
+              research={sig.research}
+              history={sig.research_history}
+              historyOpen={researchHistoryOpen}
+              onHistoryToggle={setResearchHistoryOpen}
+            />
+          )}
 
           <Card title="Price Action">
             <TickerChart
@@ -245,5 +271,150 @@ function Stat({ label, value, small = false }: { label: string; value: ReactNode
       <p className={`capitalize text-ink-muted ${small ? 'text-[11px]' : 'text-xs'}`}>{label}</p>
       <div className={`mt-0.5 font-semibold text-ink ${small ? 'text-sm' : 'text-base'}`}>{value}</div>
     </div>
+  );
+}
+
+/** The current signal's latest research revision -- revised thesis/invalidation
+ * (if any), score adjustments, rationale, sources, actor/timestamp, plus a
+ * collapsible full revision history. Only rendered when a signal has at
+ * least one accepted MCP research revision (see `signals.research
+ * .ResearchLedger`); `SignalRow.thesis`/`overall_score` are never touched by
+ * research, so this section is purely additive alongside the engine's own
+ * "Thesis, invalidation and component scores" expander above it. */
+function ResearchSection({
+  research,
+  history,
+  historyOpen,
+  onHistoryToggle,
+}: {
+  research: ResearchRevision;
+  history: ResearchRevision[];
+  historyOpen: boolean;
+  onHistoryToggle: (open: boolean) => void;
+}) {
+  const hasInvalidation = research.invalidation !== null && research.invalidation.length > 0;
+  const adjustments = Object.entries(research.score_adjustments);
+
+  return (
+    <Card
+      title="Research"
+      subtitle={`Revision r${research.revision} -- ${research.actor} -- ${formatDateTime(research.created_at)}`}
+    >
+      <div className="flex flex-col gap-4 text-sm">
+        {research.thesis && (
+          <p>
+            <span className="font-medium text-ink-secondary">Revised thesis: </span>
+            {research.thesis}
+          </p>
+        )}
+        {hasInvalidation && research.invalidation && (
+          <p>
+            <span className="font-medium text-ink-secondary">Revised invalidation: </span>
+            {research.invalidation.join(', ')}
+          </p>
+        )}
+        {!research.thesis && !hasInvalidation && (
+          <p className="text-ink-muted">
+            No thesis or invalidation change in this revision -- the engine&apos;s own text
+            stands.
+          </p>
+        )}
+
+        {adjustments.length > 0 && (
+          <div>
+            <p className="mb-1 font-medium text-ink-secondary">Score adjustments</p>
+            <table className="w-full max-w-sm border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-gridline text-left text-xs uppercase tracking-wide text-ink-muted">
+                  <th className="py-1.5 pr-4 font-medium">Component</th>
+                  <th className="py-1.5 font-medium">Delta</th>
+                </tr>
+              </thead>
+              <tbody>
+                {adjustments.map(([component, delta]) => (
+                  <tr key={component} className="border-b border-gridline/60">
+                    <td className="py-1.5 pr-4 capitalize text-ink-secondary">
+                      {component.replace(/_/g, ' ')}
+                    </td>
+                    <td
+                      className={`py-1.5 tabular-nums font-medium ${
+                        delta >= 0 ? 'text-long' : 'text-short'
+                      }`}
+                    >
+                      {delta >= 0 ? '+' : ''}
+                      {delta.toFixed(1)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <p>
+          <span className="font-medium text-ink-secondary">Rationale: </span>
+          {research.rationale}
+        </p>
+
+        {research.sources.length > 0 && (
+          <div>
+            <p className="mb-1 font-medium text-ink-secondary">Sources</p>
+            <ul className="flex flex-col gap-1">
+              {research.sources.map((source, i) => (
+                <li key={`${source}-${i}`}>
+                  <a
+                    href={source}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="break-all text-accent hover:underline"
+                  >
+                    {source}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {history.length > 1 && (
+          <details
+            open={historyOpen}
+            onToggle={(e) => onHistoryToggle((e.target as HTMLDetailsElement).open)}
+            className="rounded-lg border border-gridline bg-page/40 p-3"
+          >
+            <summary className="flex cursor-pointer list-none items-center gap-2 text-sm font-medium text-ink">
+              <ChevronDown
+                className={`h-4 w-4 transition-transform ${historyOpen ? '' : '-rotate-90'}`}
+                strokeWidth={2}
+                aria-hidden="true"
+              />
+              Revision history ({history.length})
+            </summary>
+            <div className="mt-3 overflow-x-auto">
+              <table className="w-full min-w-[520px] border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-gridline text-left text-xs uppercase tracking-wide text-ink-muted">
+                    <th className="py-2 pr-4 font-medium">Rev</th>
+                    <th className="py-2 pr-4 font-medium">When</th>
+                    <th className="py-2 pr-4 font-medium">Actor</th>
+                    <th className="py-2 font-medium">Rationale</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...history].reverse().map((rev) => (
+                    <tr key={rev.revision} className="border-b border-gridline/60">
+                      <td className="py-2 pr-4 tabular-nums text-ink">r{rev.revision}</td>
+                      <td className="py-2 pr-4 text-ink-secondary">{formatDateTime(rev.created_at)}</td>
+                      <td className="py-2 pr-4 text-ink-secondary">{rev.actor}</td>
+                      <td className="py-2 text-ink-secondary">{rev.rationale}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        )}
+      </div>
+    </Card>
   );
 }

@@ -24,6 +24,7 @@ from claudetrade.features.indicators import bollinger_bands, rsi, sma
 from claudetrade.webapi.schemas import (
     ComponentScoresOut,
     IndicatorsOut,
+    ResearchRevisionOut,
     SignalDetailOut,
     SignalRowOut,
     TradePlanOut,
@@ -66,8 +67,35 @@ def _plan_out(sig: Signal) -> TradePlanOut:
     )
 
 
-def signal_to_row(sig: Signal, status: SignalStatus | None) -> SignalRowOut:
-    """One flat Screener/candidate-table row for ``sig``."""
+def _research_out(entry: dict[str, object]) -> ResearchRevisionOut:
+    """One ``ResearchLedger``-shaped dict (latest or history) to the wire model."""
+    return ResearchRevisionOut(
+        revision=entry["revision"],  # type: ignore[arg-type]
+        created_at=entry["created_at"],  # type: ignore[arg-type]
+        actor=entry["actor"],  # type: ignore[arg-type]
+        thesis=entry["thesis"],  # type: ignore[arg-type]
+        invalidation=entry["invalidation"],  # type: ignore[arg-type]
+        score_adjustments=entry["score_adjustments"],  # type: ignore[arg-type]
+        rationale=entry["rationale"],  # type: ignore[arg-type]
+        sources=entry["sources"],  # type: ignore[arg-type]
+    )
+
+
+def signal_to_row(
+    sig: Signal,
+    status: SignalStatus | None,
+    *,
+    effective_score: float | None = None,
+    has_research: bool = False,
+) -> SignalRowOut:
+    """One flat Screener/candidate-table row for ``sig``.
+
+    ``effective_score``/``has_research`` are supplied by the caller (the
+    router, which owns the ``ResearchLedger`` lookup and the
+    ``adjusted_overall`` call) -- this stays a pure translation function with
+    no DB access. Omitting ``effective_score`` defaults it to
+    ``sig.overall_score``, matching "no research" (``has_research=False``).
+    """
     return SignalRowOut(
         signal_id=sig.signal_id,
         symbol=sig.symbol,
@@ -77,6 +105,8 @@ def signal_to_row(sig: Signal, status: SignalStatus | None) -> SignalRowOut:
         status=status.value if status else "unknown",
         regime=str(sig.regime),
         overall_score=sig.overall_score,
+        effective_score=effective_score if effective_score is not None else sig.overall_score,
+        has_research=has_research,
         confidence=sig.confidence,
         reward_risk_ratio=sig.plan.reward_risk_ratio,
         entry_low=sig.plan.entry_low,
@@ -88,9 +118,22 @@ def signal_to_row(sig: Signal, status: SignalStatus | None) -> SignalRowOut:
     )
 
 
-def signal_to_detail(sig: Signal, status: SignalStatus | None) -> SignalDetailOut:
-    """Full ticker-detail/thesis view of ``sig``."""
-    row = signal_to_row(sig, status)
+def signal_to_detail(
+    sig: Signal,
+    status: SignalStatus | None,
+    *,
+    effective_score: float | None = None,
+    has_research: bool = False,
+    research: dict[str, object] | None = None,
+    research_history: list[dict[str, object]] | None = None,
+) -> SignalDetailOut:
+    """Full ticker-detail/thesis view of ``sig``.
+
+    ``research``/``research_history`` are the raw dicts
+    ``ResearchLedger.latest_research_revisions``/``research_history`` return
+    (the router fetches them); ``None``/empty means no research exists.
+    """
+    row = signal_to_row(sig, status, effective_score=effective_score, has_research=has_research)
     return SignalDetailOut(
         **row.model_dump(),
         components=_components_out(sig),
@@ -102,6 +145,8 @@ def signal_to_detail(sig: Signal, status: SignalStatus | None) -> SignalDetailOu
         evidence=list(sig.evidence),
         next_earnings_date=sig.next_earnings_date,
         data_warnings=list(sig.data_warnings),
+        research=_research_out(research) if research is not None else None,
+        research_history=[_research_out(r) for r in (research_history or [])],
     )
 
 

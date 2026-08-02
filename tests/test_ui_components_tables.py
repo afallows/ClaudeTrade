@@ -11,6 +11,7 @@ from claudetrade.ui.components.tables import (
     signals_column_config,
     signals_dataframe,
 )
+from claudetrade.ui.data_access import ResearchOverlay
 
 
 def test_signals_dataframe_has_expected_columns_and_row_count(make_signal):
@@ -42,6 +43,34 @@ def test_signals_dataframe_target_1_none_when_no_targets(make_signal):
     sig = make_signal(targets=[])
     df = signals_dataframe([sig])
     assert df.iloc[0]["Target 1"] is None
+
+
+def test_signals_dataframe_without_research_matches_prior_shape(make_signal):
+    """Backward-compat guard: omitting ``research`` (every existing caller,
+    e.g. the Dashboard's top-candidate tables) must keep the exact same
+    column set and ``Score`` == ``overall_score`` as before this field was
+    added."""
+    df = signals_dataframe([make_signal(overall_score=65.0)])
+    assert "Research" not in df.columns
+    assert df.iloc[0]["Score"] == 65.0
+
+
+def test_signals_dataframe_score_is_effective_when_research_given(make_signal):
+    sig = make_signal(overall_score=60.0)
+    research = {
+        sig.signal_id: ResearchOverlay(effective_score=64.0, has_research=True, latest={"revision": 1})
+    }
+    df = signals_dataframe([sig], research=research)
+    assert df.iloc[0]["Score"] == 64.0
+    assert "engine: 60" in df.iloc[0]["Research"]
+
+
+def test_signals_dataframe_research_column_blank_without_a_revision(make_signal):
+    sig = make_signal(overall_score=60.0)
+    research = {sig.signal_id: ResearchOverlay(effective_score=60.0, has_research=False, latest=None)}
+    df = signals_dataframe([sig], research=research)
+    assert df.iloc[0]["Score"] == 60.0
+    assert df.iloc[0]["Research"] == ""
 
 
 def test_signals_column_config_covers_progress_and_price_columns():

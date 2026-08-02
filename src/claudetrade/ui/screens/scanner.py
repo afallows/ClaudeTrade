@@ -22,6 +22,7 @@ from claudetrade.ui.components.tables import (
     signals_column_config,
     signals_dataframe,
 )
+from claudetrade.ui.data_access import research_overlay
 from claudetrade.ui.formatting import format_date, format_datetime, format_price
 from claudetrade.ui.state import (
     get_config,
@@ -161,7 +162,12 @@ def _render_filters_and_table(config, pipeline, recent):
         s.signal_id: (pipeline.ledger.current_status(s.signal_id) or None) for s in filtered
     }
     status_by_id = {k: (v.value if v else None) for k, v in status_by_id.items()}
-    df = signals_dataframe(filtered, status_by_id)
+    # ONE batched research lookup for the whole filtered page -- never a
+    # per-row query (same F26 discipline as webapi.routers.signals and
+    # mcp_server.get_signals). Score shows the research-adjusted effective
+    # score; the Research column names the original engine score.
+    overlay = research_overlay(pipeline.db, filtered, config)
+    df = signals_dataframe(filtered, status_by_id, research=overlay)
 
     event = st.dataframe(
         df,

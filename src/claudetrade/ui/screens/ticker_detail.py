@@ -17,7 +17,13 @@ from claudetrade.ui import theme
 from claudetrade.ui.charts import create_ticker_chart
 from claudetrade.ui.components.layout import page_header
 from claudetrade.ui.components.tables import empty_state
-from claudetrade.ui.data_access import earnings_dates, known_symbols, price_bars, sentiment_timeline
+from claudetrade.ui.data_access import (
+    earnings_dates,
+    known_symbols,
+    price_bars,
+    research_overlay,
+    sentiment_timeline,
+)
 from claudetrade.ui.formatting import format_confidence, format_date, format_price, format_status
 from claudetrade.ui.state import get_config, get_pipeline
 
@@ -70,7 +76,7 @@ def page_ticker_detail() -> None:
         st.error(f"Error loading signals for {symbol}: {exc}")
         signals = []
 
-    _render_current_signal(pipeline, symbol, signals)
+    _render_current_signal(config, pipeline, symbol, signals)
     _render_chart(config, pipeline, symbol, signals)
     _render_signal_history(pipeline, signals)
 
@@ -86,7 +92,7 @@ def _default_symbol(pipeline, symbols: list[str]) -> str | None:
     return best.symbol
 
 
-def _render_current_signal(pipeline, symbol: str, signals) -> None:
+def _render_current_signal(config, pipeline, symbol: str, signals) -> None:
     st.subheader(f"Current Signal: {symbol}")
     sig = active_signal(signals)
     if sig is None:
@@ -97,9 +103,16 @@ def _render_current_signal(pipeline, symbol: str, signals) -> None:
         return
 
     status = pipeline.ledger.current_status(sig.signal_id)
+    # Single-signal lookup: still ONE batched ResearchLedger query (a list of
+    # one), matching the same helper the Scanner grid uses -- never a
+    # separate ad hoc query path for this screen.
+    overlay = research_overlay(pipeline.db, [sig], config)[sig.signal_id]
+
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Score", f"{sig.overall_score:.0f}")
+        st.metric("Score", f"{overlay.effective_score:.0f}")
+        if overlay.has_research:
+            st.caption(f"engine: {sig.overall_score:.0f}")
         st.metric("Confidence", format_confidence(sig.confidence))
     with col2:
         st.metric("Status", format_status(status.value if status else "unknown"))
@@ -109,14 +122,46 @@ def _render_current_signal(pipeline, symbol: str, signals) -> None:
         st.metric("Stop Loss", format_price(sig.plan.stop_loss))
 
     with st.expander("Thesis, invalidation and component scores", expanded=False):
-        st.write(f"**Thesis**: {sig.thesis or 'No thesis available'}")
+        if overlay.has_research and overlay.latest is not None:
+            _render_research_revision(overlay.latest)
+            st.divider()
+
+        st.write(f"**Thesis** (engine): {sig.thesis or 'No thesis available'}")
         st.write(
-            "**Invalidation**: "
+            "**Invalidation** (engine): "
             + (", ".join(sig.invalidation) if sig.invalidation else "none recorded")
         )
         cols = st.columns(4)
         for i, (name, score) in enumerate(sig.components.as_dict().items()):
             cols[i % 4].metric(name.replace("_", " ").title(), f"{score:.0f}")
+
+
+def _render_research_revision(latest: dict) -> None:
+    """The latest accepted research revision, ahead of the engine's own text.
+
+    ``latest`` is the dict shape ``ResearchLedger.latest_research_revisions``
+    returns (via ``data_access.research_overlay``): ``thesis``/
+    ``invalidation`` of ``None`` means the engine's own text is unchanged by
+    this revision, not that the fields are blank.
+    """
+    created = latest["created_at"]
+    created_label = created.strftime("%Y-%m-%d") if hasattr(created, "strftime") else str(created)
+    st.markdown(f"**Research revision (r{latest['revision']}, {latest['actor']}, {created_label})**")
+    st.write(f"**Revised thesis**: {latest['thesis'] or 'unchanged from the engine text'}")
+    revised_invalidation = latest["invalidation"]
+    st.write(
+        "**Revised invalidation**: "
+        + (", ".join(revised_invalidation) if revised_invalidation else "unchanged from the engine text")
+    )
+    adjustments = latest["score_adjustments"]
+    if adjustments:
+        st.write(
+            "**Score adjustments**: "
+            + ", ".join(f"{name}: {delta:+.1f}" for name, delta in adjustments.items())
+        )
+    st.write(f"**Rationale**: {latest['rationale']}")
+    if latest["sources"]:
+        st.write("**Sources**: " + ", ".join(latest["sources"]))
 
 
 def _render_chart(config, pipeline, symbol: str, signals) -> None:

@@ -13,6 +13,7 @@ import streamlit as st
 from claudetrade.domain import Signal
 from claudetrade.signals.engine import RejectedCandidate
 from claudetrade.ui import theme
+from claudetrade.ui.data_access import ResearchOverlay
 
 
 def empty_state(message: str, command: str | None = None) -> None:
@@ -47,36 +48,57 @@ CANDIDATE_COLUMN_ORDER = [
 
 
 def signals_dataframe(
-    signals: list[Signal], status_by_id: dict[str, str] | None = None
+    signals: list[Signal],
+    status_by_id: dict[str, str] | None = None,
+    research: dict[str, ResearchOverlay] | None = None,
 ) -> pd.DataFrame:
     """Flatten signals into a display-ready DataFrame.
 
     One row per signal. ``Signal ID`` is retained (not in
     ``CANDIDATE_COLUMN_ORDER``) so a caller can map a selected row back to its
     originating signal without a second lookup.
+
+    ``research`` is optional and, when omitted, this behaves exactly as
+    before -- ``Score`` is the engine's own ``overall_score`` and no
+    ``Research`` column is added. Callers that pass ``research`` (a signal id
+    -> ``ui.data_access.ResearchOverlay`` map, e.g. from
+    ``data_access.research_overlay``) get ``Score`` as the research-adjusted
+    *effective* score plus a ``Research`` column naming the original engine
+    score for any row a revision adjusted -- mirrors ``webapi``/MCP's
+    ``effective_score``/``has_research`` contract without changing this
+    function's output shape for callers that don't opt in.
     """
     status_by_id = status_by_id or {}
     rows = []
     for sig in signals:
-        rows.append(
-            {
-                "Symbol": sig.symbol,
-                "Direction": theme.direction_label(str(sig.direction)),
-                "Strategy": sig.strategy,
-                "Score": round(sig.overall_score, 1),
-                "Confidence %": round(sig.confidence * 100.0, 1),
-                "Status": theme.status_label(status_by_id.get(sig.signal_id)),
-                "Entry Low": sig.plan.entry_low,
-                "Entry High": sig.plan.entry_high,
-                "Stop": sig.plan.stop_loss,
-                "Target 1": sig.plan.targets[0] if sig.plan.targets else None,
-                "R:R": round(sig.plan.reward_risk_ratio, 2),
-                "Days to Earnings": sig.days_to_earnings,
-                "Session": sig.session,
-                "Signal ID": sig.signal_id,
-            }
-        )
+        overlay = (research or {}).get(sig.signal_id)
+        score = overlay.effective_score if overlay is not None else sig.overall_score
+        row = {
+            "Symbol": sig.symbol,
+            "Direction": theme.direction_label(str(sig.direction)),
+            "Strategy": sig.strategy,
+            "Score": round(score, 1),
+            "Confidence %": round(sig.confidence * 100.0, 1),
+            "Status": theme.status_label(status_by_id.get(sig.signal_id)),
+            "Entry Low": sig.plan.entry_low,
+            "Entry High": sig.plan.entry_high,
+            "Stop": sig.plan.stop_loss,
+            "Target 1": sig.plan.targets[0] if sig.plan.targets else None,
+            "R:R": round(sig.plan.reward_risk_ratio, 2),
+            "Days to Earnings": sig.days_to_earnings,
+            "Session": sig.session,
+            "Signal ID": sig.signal_id,
+        }
+        if research is not None:
+            row["Research"] = (
+                f"🔬 engine: {sig.overall_score:.0f}"
+                if overlay is not None and overlay.has_research
+                else ""
+            )
+        rows.append(row)
     columns = [*CANDIDATE_COLUMN_ORDER, "Signal ID"]
+    if research is not None:
+        columns = [*columns, "Research"]
     return pd.DataFrame(rows, columns=columns)
 
 
@@ -84,11 +106,21 @@ def signals_column_config() -> dict[str, object]:
     """``st.dataframe`` column_config for ``signals_dataframe``'s output.
 
     Score renders as a progress bar (0-100); confidence as a percentage bar;
-    prices as formatted currency; session as a plain date.
+    prices as formatted currency; session as a plain date. ``Research`` is
+    only present in the underlying DataFrame when ``signals_dataframe`` was
+    called with a ``research`` overlay -- Streamlit ignores column_config
+    entries for columns that aren't in the DataFrame, so it's safe to always
+    include it here.
     """
     return {
         "Score": st.column_config.ProgressColumn(
-            "Score", help="Blended overall signal score (0-100).", min_value=0, max_value=100, format="%.0f"
+            "Score", help="Blended overall signal score (0-100), research-adjusted when a "
+            "revision exists.", min_value=0, max_value=100, format="%.0f"
+        ),
+        "Research": st.column_config.TextColumn(
+            "Research",
+            help="Set when an accepted research revision adjusted this signal's score; "
+            "names the original, unadjusted engine score.",
         ),
         "Confidence %": st.column_config.ProgressColumn(
             "Confidence", help="Model confidence in this signal.", min_value=0, max_value=100, format="%.0f%%"
