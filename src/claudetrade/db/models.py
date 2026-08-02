@@ -359,6 +359,53 @@ class SentimentRecordRow(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class SocialCoverageRow(Base):
+    """Proof that social collection actually ran for a (session, source).
+
+    ``symbol_sentiment_daily`` is sparse on purpose -- a row exists only for
+    a symbol/session that gained data -- which makes "no row" ambiguous in
+    the one way that matters: it means *nobody posted* when the collector
+    ran, and it means *we do not know* when the collector was down. Those
+    are opposite facts. A collection outage read as a run of confirmed zeros
+    silently depresses every baseline and then manufactures a surge the
+    moment collection resumes, which is precisely the false positive this
+    application exists not to produce.
+
+    So collection records itself here, per session and source, whether or
+    not it found anything: an ``ok`` row with ``posts_collected == 0`` is a
+    CONFIRMED zero, a ``failed`` row is a known outage, and no row at all
+    (at or after coverage tracking began) is a session nobody even
+    attempted. ``sentiment.history`` divides baselines by collected sessions
+    on the strength of this table; see ``sentiment.store`` for the write and
+    read paths and for why sessions before the first recorded row are
+    treated as unknown-but-collected rather than as gaps.
+    """
+
+    __tablename__ = "social_coverage"
+    __table_args__ = (
+        UniqueConstraint("session", "source", name="uq_social_coverage"),
+        # Name must not collide with the auto-generated single-column index
+        # SQLAlchemy derives from ``session``'s ``index=True``
+        # (``ix_social_coverage_session``), or a fresh create_all and the
+        # migration fight over the same index name.
+        Index("ix_social_coverage_session_status", "session", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session: Mapped[dt.date] = mapped_column(Date, index=True)
+    #: ``SocialSource`` value ("reddit", "news", ...) or an attention
+    #: provider's name ("apewisdom"), matching the labels used in
+    #: ``symbol_sentiment_daily.source`` so the two can be read together.
+    source: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(20), default="ok")  # ok | failed
+    posts_collected: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(String(300), default="")
+    first_collected_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class SymbolSentimentDaily(Base):
     """Aggregated daily sentiment per symbol and source.
 

@@ -17,6 +17,14 @@ This module therefore provides two layers:
   stored mentions and the aggregate rows inside the window, re-aggregate from
   the sanitised posts already on disk using the CURRENT resolver/classifier,
   and return a summary. Pure aggregation over stored rows -- no network.
+
+  **This module owns the destruction, and only this module.** The READ side
+  -- reconstructing ``SocialPost`` objects from ``social_posts`` -- moved to
+  ``sentiment.store`` so ``Pipeline.refresh`` can build a rolling baseline
+  from persisted history without inheriting the deletes. Calling
+  ``rebuild_sentiment`` per refresh instead would wipe every ticker mention
+  and every aggregate in a 90-day window on every run; the shared loader
+  exists precisely so nobody is tempted to.
 * :func:`ensure_extraction_version` -- the bootstrap self-heal.
   ``sentiment.entity_resolution.EXTRACTION_VERSION`` names the extraction
   code generation; the version the stored aggregates were last built with is
@@ -43,9 +51,9 @@ from claudetrade.db.models import (
     SymbolSentimentDaily,
     TickerMentionRow,
 )
-from claudetrade.domain import SecurityInfo, SocialPost, SocialSource
 from claudetrade.sentiment.entity_resolution import EXTRACTION_VERSION
-from claudetrade.utils.timeutils import ensure_utc, utc_now
+from claudetrade.sentiment.store import load_securities_directory, load_stored_posts
+from claudetrade.utils.timeutils import utc_now
 
 if TYPE_CHECKING:  # imported lazily at call time -- see rebuild_sentiment()
     from claudetrade.config import AppConfig
@@ -143,74 +151,21 @@ def rebuild_sentiment(
         start - dt.timedelta(days=config.sentiment.lookback_days), dt.time.min, tzinfo=dt.UTC
     )
 
-    def _read_utc(value: dt.datetime) -> dt.datetime:
-        # SQLite hands DateTime(timezone=True) columns back naive; every
-        # write went through ensure_utc, so re-attaching UTC reproduces the
-        # stored instant (same convention as signals.ledger's read path).
-        if value.tzinfo is None:
-            return value.replace(tzinfo=dt.UTC)
-        return ensure_utc(value)
+    # Reads first, and OUTSIDE any write transaction: the loader below is the
+    # same non-destructive read ``Pipeline.refresh`` uses for its rolling
+    # baseline (``sentiment.store``), so the two paths cannot drift apart
+    # about what "the stored history" is. Everything destructive stays in
+    # this function, after the refusal check.
+    directory = load_securities_directory(db)
+    if not directory:
+        # Checked BEFORE any delete: aborting must not leave the stored
+        # aggregates wiped with nothing rebuilt in their place.
+        raise RebuildUnavailableError(
+            "No securities stored -- run 'claudetrade refresh' first."
+        )
+    posts = load_stored_posts(db, since=post_cutoff)
 
     with db.session() as session:
-        securities = session.execute(select(Security)).scalars().all()
-        directory = {
-            r.symbol: SecurityInfo(
-                symbol=r.symbol,
-                name=r.name,
-                exchange=r.exchange,
-                sector=r.sector,
-                industry=r.industry,
-                market_cap_usd=r.market_cap_usd,
-                shares_outstanding=r.shares_outstanding,
-                is_etf=r.is_etf,
-                is_leveraged_or_inverse=r.is_leveraged_or_inverse,
-                listed_date=r.listed_date,
-                delisted_date=r.delisted_date,
-            )
-            for r in securities
-        }
-        if not directory:
-            # Checked BEFORE any delete: aborting must not leave the stored
-            # aggregates wiped with nothing rebuilt in their place.
-            raise RebuildUnavailableError(
-                "No securities stored -- run 'claudetrade refresh' first."
-            )
-        # Datetime filtering happens in Python, after tz normalisation --
-        # comparing an aware bound against SQLite's naive storage in SQL is
-        # backend-dependent behaviour this maintenance path has no need to
-        # depend on.
-        post_rows = [
-            r
-            for r in session.execute(select(SocialPostRow)).scalars().all()
-            if _read_utc(r.created_at) >= post_cutoff
-        ]
-        posts = [
-            SocialPost(
-                source=SocialSource(r.source),
-                external_id=r.external_id,
-                created_at=_read_utc(r.created_at),
-                text=r.text,
-                community=r.community,
-                score=r.score,
-                num_comments=r.num_comments,
-                num_reposts=r.num_reposts,
-                num_replies=r.num_replies,
-                author_hash=r.author_hash,
-                author_age_days=r.author_age_days,
-                author_karma=r.author_karma,
-                author_followers=r.author_followers,
-                is_comment=r.is_comment,
-                parent_id=r.parent_id,
-                is_removed=r.is_removed,
-                is_crosspost=r.is_crosspost,
-                crosspost_parent=r.crosspost_parent,
-                text_hash=r.text_hash,
-                duplicate_group=r.duplicate_group,
-                injection_risk=r.injection_risk,
-                flair=r.flair,
-            )
-            for r in post_rows
-        ]
         # Mentions are re-derivable diagnostics and are cleared wholesale;
         # aggregates are only cleared inside the rebuild window, so history
         # older than the window (whose posts may already be pruned) survives.

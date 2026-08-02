@@ -1040,6 +1040,23 @@ class SentimentConfig(BaseModel):
     #: Exponential time decay; a post loses half its weight after this long.
     half_life_hours: float = 18.0
     lookback_days: int = 14
+    #: Hard ceiling (calendar days) on how far back the PERSISTED post
+    #: history may be re-read when a refresh rebuilds its rolling baseline
+    #: (``sentiment.store.load_stored_posts``, driven from
+    #: ``Pipeline.refresh``). Sized for a 120-day analysis window plus
+    #: buffer, so a symbol's own normal is measured over quarters rather
+    #: than over whatever one fetch happened to return.
+    #:
+    #: NOT the same thing as ``lookback_days`` above, and conflating the two
+    #: is a trap worth naming: ``lookback_days`` is how far back the
+    #: PROVIDERS are asked to fetch (every entry point passes it as
+    #: ``social_lookback_hours = lookback_days * 24``) and is bounded by
+    #: what Reddit/X/news will actually serve, ~72 hours in practice. This
+    #: one bounds how much of what we ALREADY STORED is read back, which is
+    #: limited only by disk. Raising ``lookback_days`` to get a longer
+    #: baseline would just make every refresh beg providers for history they
+    #: do not have.
+    history_window_days: int = 180
     #: Minimum resolution confidence before a mention is counted at all.
     min_ticker_confidence: float = 0.60
     min_posts_for_signal: int = 8

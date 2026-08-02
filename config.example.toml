@@ -311,7 +311,11 @@ enable_partial_fills = true               # Simulate partial execution on large 
 [sentiment]
 # Sentiment aggregation and weighting.
 half_life_hours = 18.0                    # Exponential decay half-life for aging posts
-lookback_days = 14                        # How far back to aggregate sentiment
+lookback_days = 14                        # How far back to ASK PROVIDERS for posts (they serve ~72h)
+history_window_days = 180                 # How far back to re-read ALREADY-STORED posts for the
+                                          # rolling baseline. Not the same knob as lookback_days:
+                                          # that one is capped by what Reddit/X/news will serve,
+                                          # this one only by disk.
 min_ticker_confidence = 0.60              # Resolution confidence threshold
 min_posts_for_signal = 8                  # Minimum posts before aggregating
 min_unique_authors_for_signal = 4         # Minimum distinct authors

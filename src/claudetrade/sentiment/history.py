@@ -16,6 +16,17 @@ of news. Absence is not missing data here -- "no posts that session" *is*
 zero mentions -- so :func:`symbol_series` fills the gaps at read time and
 the stored table stays small.
 
+**...but only when collection actually ran.** The sentence above is true
+exactly once: when the collector ran and nobody posted. When the collector
+was DOWN, the same absent row means "unknown", and reading it as a zero is
+how an outage turns into a fake surge -- baselines sag through the gap and
+then every symbol looks like it is waking up the day collection resumes.
+``social_coverage`` (see ``sentiment.store``) records which sessions were
+really collected, and every rate here is divided by COLLECTED sessions
+rather than by elapsed ones. Coverage only claims authority from the first
+session it ever recorded onwards, so history predating the table keeps its
+old, assume-collected reading instead of being retroactively voided.
+
 **Sources are kept apart, never blended.** ``"all"`` is this installation's
 own post-derived aggregate: it carries real polarity, from text this app
 resolved and classified itself. ``apewisdom:*`` rows carry attention volume
@@ -39,6 +50,7 @@ from sqlalchemy import func, select
 from claudetrade.db.models import Security, SymbolSentimentDaily
 from claudetrade.db.session import Database
 from claudetrade.logging_setup import get_logger
+from claudetrade.sentiment.store import coverage_window
 from claudetrade.utils.timeutils import trading_day_range
 
 log = get_logger(__name__)
@@ -54,10 +66,27 @@ ATTENTION_PREFIX = "apewisdom:"
 #: ratios without a floor surfaces exactly that garbage.
 DEFAULT_MIN_RECENT_MENTIONS = 5
 
+#: Fewest COLLECTED baseline sessions a symbol's "normal" may rest on. A
+#: correctly-divided rate over two surviving sessions is arithmetically
+#: right and evidentially worthless: two quiet days become a baseline that
+#: any ordinary day beats, and the ranking fills with outage artefacts. Below
+#: this, the honest answer is to say the baseline is untrustworthy rather
+#: than to rank on it.
+DEFAULT_MIN_BASELINE_SESSIONS = 5
+
 
 @dataclass(slots=True)
 class HistoryPoint:
-    """One symbol, one session. ``observed`` marks a real stored row."""
+    """One symbol, one session.
+
+    ``observed`` and ``collected`` answer different questions and the pair
+    is the point: ``observed`` says a stored aggregate row exists for this
+    symbol, ``collected`` says social collection ran for this session at
+    all. ``mentions == 0`` with ``collected`` true is a CONFIRMED zero --
+    real evidence that nobody talked about this symbol. The same zero with
+    ``collected`` false is no evidence whatsoever, and treating the two
+    alike is how a collection outage manufactures a surge.
+    """
 
     session: dt.date
     mentions: int = 0
@@ -67,6 +96,7 @@ class HistoryPoint:
     confidence: float = 0.0
     unique_authors: int = 0
     observed: bool = False
+    collected: bool = True
 
     @property
     def total_mentions(self) -> int:
@@ -91,6 +121,7 @@ class HistoryPoint:
             "confidence": round(self.confidence, 4),
             "unique_authors": self.unique_authors,
             "observed": self.observed,
+            "collected": self.collected,
         }
 
 
@@ -116,6 +147,15 @@ class SymbolTrend:
     sentiment_change: float | None = None
     sessions_observed: int = 0
     has_polarity: bool = False
+    #: Sessions in each window that collection actually covered -- the
+    #: denominators the rates above were computed with. Exposed because
+    #: "3x its normal" means something different when "normal" rests on 20
+    #: collected sessions than on 6 that survived an outage.
+    recent_sessions_covered: int = 0
+    baseline_sessions_covered: int = 0
+    #: False when part of the baseline window was never collected, so a
+    #: caller can caveat the row rather than having to re-derive coverage.
+    baseline_fully_covered: bool = True
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -138,6 +178,9 @@ class SymbolTrend:
             ),
             "sessions_observed": self.sessions_observed,
             "has_polarity": self.has_polarity,
+            "recent_sessions_covered": self.recent_sessions_covered,
+            "baseline_sessions_covered": self.baseline_sessions_covered,
+            "baseline_fully_covered": self.baseline_fully_covered,
         }
 
 
@@ -184,12 +227,16 @@ def symbol_series(
     Sessions with no stored row come back as real zeros with
     ``observed=False``, so a caller can tell "nobody mentioned it" from
     "we have no data for that day" while still doing arithmetic over a
-    continuous series.
+    continuous series. ``collected`` carries the stronger distinction: a
+    zero on a collected session is evidence, a zero on an uncollected one is
+    a hole the collector left.
     """
     symbol = symbol.strip().upper()
     sessions = trading_day_range(as_of - dt.timedelta(days=days), as_of)
     if not sessions:
         return HistoryWindow(symbol=symbol, start=as_of, end=as_of)
+
+    coverage = coverage_window(db, start=sessions[0], end=as_of)
 
     with db.read_session() as session:
         rows = session.execute(
@@ -203,7 +250,7 @@ def symbol_series(
         ).scalars().all()
 
     by_session: dict[dt.date, HistoryPoint] = {
-        s: HistoryPoint(session=s) for s in sessions
+        s: HistoryPoint(session=s, collected=coverage.is_collected(s)) for s in sessions
     }
     for row in rows:
         point = by_session.get(row.session)
@@ -239,6 +286,7 @@ def rising_symbols(
     baseline_sessions: int = 20,
     limit: int = 25,
     min_recent_mentions: int = DEFAULT_MIN_RECENT_MENTIONS,
+    min_baseline_sessions: int = DEFAULT_MIN_BASELINE_SESSIONS,
 ) -> list[SymbolTrend]:
     """Symbols whose chatter is accelerating against their own baseline.
 
@@ -263,6 +311,21 @@ def rising_symbols(
       turned sharply negative is a different trade (see the hype-failure
       strategy), not a filtered-out one -- so it stays in the list with its
       negative ``sentiment_change`` visible.
+    * **Rates divide by COLLECTED sessions, not elapsed ones.** This one is
+      a fix, not a preference. Dividing a baseline's mentions by the number
+      of sessions in the window assumes every one of them was collected; a
+      week of collector downtime inside a 20-session baseline then halves
+      the apparent baseline rate and doubles every symbol's
+      ``mention_change`` on the day collection resumes -- a universe-wide
+      fake surge with no post behind it. The mentions and the denominator
+      must come from the same sessions, so the denominator comes from
+      ``social_coverage``.
+    * **A baseline too thin to trust is dropped, not "corrected".**
+      ``min_baseline_sessions`` is the floor: dividing correctly by two
+      surviving sessions still yields a two-day "normal" that any ordinary
+      day beats. Symbols are skipped rather than ranked on it, and
+      :func:`coverage_summary` reports the gap so an empty list can be
+      explained instead of read as "nothing is rising".
 
     Only symbols present in ``securities`` are considered, the same guard
     ``mcp_server.get_trending`` applies -- an aggregator naming a ticker
@@ -281,6 +344,29 @@ def rising_symbols(
     recent_window = set(sessions[-recent_sessions:])
     baseline_window = set(sessions[:-recent_sessions])
     if not baseline_window:
+        return []
+
+    coverage = coverage_window(db, start=sessions[0], end=as_of)
+    recent_covered = {s for s in recent_window if coverage.is_collected(s)}
+    baseline_covered = {s for s in baseline_window if coverage.is_collected(s)}
+    # Capped by the window actually asked for: a caller who deliberately
+    # requests a 3-session baseline is asking a different question, not
+    # suffering an outage, and must not be answered with a permanent empty
+    # list because the default floor exceeds their own window.
+    required = max(1, min(min_baseline_sessions, len(baseline_window)))
+    if len(baseline_covered) < required:
+        # Coverage is a property of the window, not of any one symbol, so a
+        # baseline this thin invalidates every comparison in this call --
+        # there is no subset worth returning. Logged rather than silent: an
+        # empty ranking must be explainable.
+        log.warning(
+            "rising-symbols screen suppressed for %s: only %d of %d baseline session(s) "
+            "were collected (need %d). Social collection has gaps -- see coverage_summary.",
+            as_of,
+            len(baseline_covered),
+            len(baseline_window),
+            required,
+        )
         return []
 
     with db.read_session() as db_session:
@@ -322,8 +408,14 @@ def rising_symbols(
         if source == LOCAL_SOURCE and post_count:
             bucket["recent_pol" if in_recent else "baseline_pol"].append(raw_sentiment)
 
-    recent_n = max(1, len(recent_window))
-    baseline_n = max(1, len(baseline_window))
+    # Denominators are the COLLECTED sessions, so the mentions and the
+    # sessions they are averaged over describe the same stretch of time. The
+    # ``max(1, ...)`` guards are unreachable for the baseline (the floor
+    # above already returned) and only bite for a recent window that is
+    # entirely uncollected, where any rate is arbitrary anyway.
+    recent_n = max(1, len(recent_covered))
+    baseline_n = max(1, len(baseline_covered))
+    baseline_complete = len(baseline_covered) == len(baseline_window)
 
     trends: list[SymbolTrend] = []
     for symbol, bucket in agg.items():
@@ -363,6 +455,9 @@ def rising_symbols(
                 sentiment_change=sentiment_change,
                 sessions_observed=len(bucket["seen"]),
                 has_polarity=bool(recent_pol),
+                recent_sessions_covered=len(recent_covered),
+                baseline_sessions_covered=len(baseline_covered),
+                baseline_fully_covered=baseline_complete,
             )
         )
 
@@ -379,8 +474,36 @@ def coverage_summary(db: Database, *, as_of: dt.date, days: int = 90) -> dict[st
     cannot supply one no matter how good the code is. Reporting coverage
     alongside the trends is what keeps an empty or warming-up installation
     from reading as "nothing is rising".
+
+    Two different kinds of coverage are reported side by side, and mixing
+    them up is the mistake this function exists to prevent:
+
+    * ``sessions_with_data`` counts sessions that produced at least one
+      aggregate row. It cannot distinguish "collection ran, nobody posted"
+      from "collection was down" -- both look like no row.
+    * ``sessions_collected`` / ``sessions_not_collected`` /
+      ``max_consecutive_gap`` come from ``social_coverage``, which records
+      collection runs themselves. THIS is the pair that separates a
+      confirmed zero from an outage, and it is what ``rising_symbols``
+      divides its baselines by.
+
+    ``collection_tracked_from`` is when coverage recording began. Sessions
+    before it are unknown rather than uncollected -- an installation that
+    upgraded yesterday keeps every baseline it had (see
+    ``sentiment.store.CoverageWindow``).
     """
     start = as_of - dt.timedelta(days=days)
+    expected = trading_day_range(start, as_of)
+    coverage = coverage_window(db, start=start, end=as_of)
+    collected = [s for s in expected if coverage.is_collected(s)]
+    uncollected = [s for s in expected if not coverage.is_collected(s)]
+
+    longest_gap = 0
+    run = 0
+    for session_date in expected:
+        run = run + 1 if not coverage.is_collected(session_date) else 0
+        longest_gap = max(longest_gap, run)
+
     with db.read_session() as session:
         distinct_sessions = session.execute(
             select(func.count(func.distinct(SymbolSentimentDaily.session))).where(
@@ -415,11 +538,25 @@ def coverage_summary(db: Database, *, as_of: dt.date, days: int = 90) -> dict[st
         "symbols_with_attention_data": int(with_attention),
         "earliest_session": earliest.isoformat() if earliest else None,
         "latest_session": latest.isoformat() if latest else None,
+        # Collection coverage -- see the docstring for why this is not the
+        # same question as "sessions_with_data".
+        "collection_tracked": coverage.tracked,
+        "collection_tracked_from": (
+            coverage.tracked_from.isoformat() if coverage.tracked_from else None
+        ),
+        "sessions_expected": len(expected),
+        "sessions_collected": len(collected),
+        "sessions_not_collected": len(uncollected),
+        "max_consecutive_gap": longest_gap,
+        "uncollected_sessions": [s.isoformat() for s in uncollected[-10:]],
+        "collection_sources": sorted(coverage.sources()),
     }
 
 
 __all__ = [
     "ATTENTION_PREFIX",
+    "DEFAULT_MIN_BASELINE_SESSIONS",
+    "DEFAULT_MIN_RECENT_MENTIONS",
     "LOCAL_SOURCE",
     "HistoryPoint",
     "HistoryWindow",
