@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import threading
+import time
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -23,6 +24,7 @@ from claudetrade.providers.base import (
     RateLimitError,
     SourceBlockedError,
 )
+from claudetrade.scheduler import collection_readiness, is_scheduled_run
 from claudetrade.secrets import delete_secret, get_secret, set_secret
 from claudetrade.utils.timeutils import utc_now
 from claudetrade.webapi.deps import get_config, get_pipeline
@@ -598,7 +600,58 @@ def refresh_status(
     server shows up here too, with ``entry_point`` naming the owner -- the
     in-process snapshot alone reported "idle" while another process was
     actively writing.
+
+    Carries three things the raw merged status does not:
+
+    * ``scheduled`` -- whether the run in progress was started automatically
+      by this server's hourly collector rather than by a person. Same
+      ``entry_point`` field, decoded once (``scheduler.is_scheduled_run``) so
+      the UI never has to know the magic string.
+    * ``collection`` -- the hourly collector's own loop state (on/off,
+      cadence, tick counts, next run). A background job the operator cannot
+      see is one they cannot trust; this is where they see it.
+    * ``readiness`` -- the collected-history tier, computed from stored
+      coverage. Advisory only: nothing in this application is gated on it.
     """
-    return refresh_state_store.merged_status(
+    payload = refresh_state_store.merged_status(
         pipeline.db, _get_refresh_state(request).snapshot(), "webapi"
     )
+    payload["scheduled"] = is_scheduled_run(payload)
+    scheduler = getattr(request.app.state, "collection_scheduler", None)
+    payload["collection"] = (
+        scheduler.state()
+        if scheduler is not None
+        # No lifespan has run (a bare TestClient, or an embedder driving the
+        # app itself), so there is no loop -- say so rather than implying one
+        # is running.
+        else {"enabled": _config_scheduler_enabled(request), "running": False}
+    )
+    payload["readiness"] = _cached_readiness(request, pipeline)
+    return payload
+
+
+def _config_scheduler_enabled(request: Request) -> bool:
+    """Configured intent when no collector object exists to ask."""
+    config = getattr(request.app.state, "config", None)
+    return bool(config and config.scheduler.social_collection_enabled)
+
+
+#: How long one computed readiness block is reused for. This endpoint is
+#: POLLED -- the setup script and the UI's progress banner hit it every couple
+#: of seconds for the whole duration of a refresh -- while readiness can only
+#: move once per collection, i.e. hourly. Recomputing per request would spend a
+#: credential-store lookup per provider plus several 400-day aggregate scans to
+#: re-derive an answer that cannot have changed, and it would do it while a
+#: refresh is writing to the same database.
+READINESS_CACHE_SECONDS = 30.0
+
+
+def _cached_readiness(request: Request, pipeline: Pipeline) -> dict[str, object]:
+    """Readiness with a short TTL, cached per running app (so per process)."""
+    now = time.monotonic()
+    cached = getattr(request.app.state, "readiness_cache", None)
+    if cached is not None and now - cached[0] < READINESS_CACHE_SECONDS:
+        return cached[1]
+    readiness = collection_readiness(pipeline.db, pipeline.config)
+    request.app.state.readiness_cache = (now, readiness)
+    return readiness

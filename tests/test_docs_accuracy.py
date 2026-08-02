@@ -125,7 +125,7 @@ def _command_mentions_in_code_blocks(path: Path) -> list[tuple[str, str | None, 
 
 
 REAL_SURFACE = _real_command_surface()
-TOP_LEVEL_GROUPS = {"secrets", "paper", "db", "verify", "backtest"}
+TOP_LEVEL_GROUPS = {"secrets", "paper", "db", "verify", "backtest", "sentiment"}
 
 
 @pytest.mark.parametrize("doc_path", DOC_FILES, ids=lambda p: p.name)
@@ -164,6 +164,7 @@ def test_real_cli_surface_is_nonempty() -> None:
     assert ("db", "backup") in REAL_SURFACE
     assert ("verify", "ledger") in REAL_SURFACE
     assert ("backtest", "report") in REAL_SURFACE
+    assert ("sentiment", "collect") in REAL_SURFACE
 
 
 def test_documented_app_dir_matches_config_default() -> None:

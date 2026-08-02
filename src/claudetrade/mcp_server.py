@@ -484,7 +484,17 @@ def get_market_status(pipeline: Pipeline) -> dict[str, Any]:
     plus the current Eastern time, alongside the same regime (most recent
     signal's), freshness (``ui.data_access.data_freshness``) and provider
     status (``pipeline.provider_status()``) the dashboard shows.
+
+    Also carries ``sentiment_readiness`` (``scheduler.collection_readiness``):
+    how many sessions of social history this installation has actually
+    accumulated, as a tier. Social history cannot be backfilled, so "the app
+    has been running for a week" and "the app has a usable baseline" are
+    genuinely different facts, and an assistant reading a rising-sentiment
+    list needs the second one to weight it. It is a label, not a gate --
+    nothing here or anywhere refuses to answer because of a tier.
     """
+    from claudetrade.scheduler import collection_readiness
+
     now_utc = utc_now()
     now_et = to_display(now_utc, "America/New_York")
 
@@ -521,6 +531,7 @@ def get_market_status(pipeline: Pipeline) -> dict[str, Any]:
         "providers": providers,
         "degraded_providers": degraded_providers,
         "sentiment_rebuild_pending": _sentiment_rebuild_pending(pipeline),
+        "sentiment_readiness": collection_readiness(pipeline.db, pipeline.config),
     }
 
 
@@ -708,8 +719,17 @@ def get_refresh_status(pipeline: Pipeline, state: RefreshState) -> dict[str, Any
     nothing about it) must be visible here. The DB row is the cross-process
     truth; the in-process snapshot supplies the finer-grained detail when
     the running refresh is this server's own.
+
+    ``scheduled`` decodes ``entry_point`` for the one case a caller cannot
+    infer from context: the web API server's hourly collector
+    (``claudetrade.scheduler``) starts collections on its own, so "a refresh
+    is running" here does not imply anybody asked for one.
     """
-    return refresh_state_store.merged_status(pipeline.db, state.snapshot(), "mcp")
+    from claudetrade.scheduler import is_scheduled_run
+
+    payload = refresh_state_store.merged_status(pipeline.db, state.snapshot(), "mcp")
+    payload["scheduled"] = is_scheduled_run(payload)
+    return payload
 
 
 def get_backtest_report(config: AppConfig) -> dict[str, Any]:
@@ -932,7 +952,12 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "Read-only. Market regime, current Eastern Time, and whether the market "
             "is pre-market/open/after-hours/closed right now; last data-refresh time, "
             "how many symbols have stored data, and provider health/degradations. "
-            "The tool to check before asking about 'this morning's' sentiment."
+            "The tool to check before asking about 'this morning's' sentiment. Also "
+            "reports sentiment_readiness: how many sessions of social history this "
+            "installation has actually accumulated, as a tier (warming_up < 20, "
+            "provisional 20+, partial 60+, ready 120+), plus which social sources are "
+            "currently degraded. Social history cannot be backfilled, so use the tier "
+            "to weight any mention/sentiment trend -- it never blocks an answer."
         ),
     )
     async def _get_market_status() -> dict[str, Any]:
@@ -983,8 +1008,11 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
     @server.tool(
         name="get_refresh_status",
         description=(
-            "Read-only. Progress of the current data refresh, whichever entry point "
-            "started it (CLI, web UI, or this server) -- entry_point names the owner."
+            "Read-only. Progress of the current data refresh or automatic social "
+            "collection, whichever entry point started it (CLI, web UI, this server, "
+            "or the web server's hourly collector) -- entry_point names the owner and "
+            "scheduled=true means nobody asked for it, the app collects social data "
+            "on its own schedule because that data cannot be backfilled later."
         ),
     )
     async def _get_refresh_status() -> dict[str, Any]:

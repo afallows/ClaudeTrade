@@ -1288,6 +1288,25 @@ class NotificationConfig(BaseModel):
 
 
 class SchedulerConfig(BaseModel):
+    """Background scheduling.
+
+    Two unrelated things live here, and only the second one is wired up:
+
+    * ``enabled`` + the ``*_cron`` fields describe the never-built APScheduler
+      job runner (see ``docs/known-limitations.md``). They remain inert, and
+      default off, so nothing that already reads them changes meaning.
+    * ``social_collection_*`` drives :mod:`claudetrade.scheduler` -- the
+      in-process hourly social/attention collector the web API server starts
+      from its lifespan. It is ON by default, unlike the cron block, because
+      the data it collects **cannot be backfilled**: Reddit ``/new`` paging,
+      X recent-search and ApeWisdom's rolling 24h snapshot only ever serve
+      roughly the last few days, so the 120-session baseline this
+      application's premise needs can only be accumulated forward. An hour
+      the app was open but not collecting is an hour permanently missing
+      from that baseline, which is a far worse default than the modest
+      request volume of collecting it.
+    """
+
     enabled: bool = False
     timezone: str = "America/New_York"
     #: Cron-ish schedules; the CLI can also run any job once, on demand.
@@ -1296,6 +1315,44 @@ class SchedulerConfig(BaseModel):
     scan_cron: str = "45 16 * * mon-fri"
     paper_mark_cron: str = "5 16 * * mon-fri"
     misfire_grace_time_s: int = 3600
+
+    # --- in-app hourly social/attention collection -------------------------
+    #: Collect social posts + aggregator attention on a timer for as long as
+    #: the web API server is running. Set false to opt out entirely (the
+    #: operator then owns keeping history alive via `claudetrade sentiment
+    #: collect` or an OS timer -- there is no other way to recover the gap).
+    social_collection_enabled: bool = True
+    #: Cadence. Hourly is the default because ApeWisdom's snapshot is a
+    #: rolling 24h window with no history endpoint, so sampling it once a day
+    #: throws away 23/24 of what it could have told us.
+    social_collection_interval_minutes: int = 60
+    #: Random 0..N seconds added to every wait. Without it, every restart
+    #: (and every install) fires on the same wall-clock boundary, which both
+    #: synchronises load against the upstream APIs and makes two ClaudeTrade
+    #: processes on one machine collide on the refresh lock every single hour
+    #: instead of drifting apart.
+    social_collection_jitter_seconds: int = 300
+    #: How far back each collection asks the social providers to look. Wider
+    #: than the cadence ON PURPOSE: a tick skipped (lock held) or missed (the
+    #: machine was asleep) is then recovered by the next one rather than lost,
+    #: and 72h still covers the current session's aggregation window across a
+    #: weekend gap (Friday close -> Monday). It also matches what the Reddit
+    #: and news providers are already configured to look back, so it does not
+    #: push any provider past its own window; page caps bound the cost.
+    social_collection_lookback_hours: int = 72
+    #: Optional quieter overnight cadence, in minutes; 0 (the default) means
+    #: "same cadence around the clock". Social flows 24/7 -- the ApeWisdom
+    #: snapshot moves overnight and Asian-hours chatter is real -- so slowing
+    #: down at night costs real samples; it is offered, not recommended.
+    social_collection_overnight_interval_minutes: int = 0
+    #: Half-open [start, end) hour range, in ``timezone``, that counts as
+    #: overnight when the field above is non-zero. Wraps past midnight.
+    social_collection_overnight_start_hour: int = 22
+    social_collection_overnight_end_hour: int = 4
+    #: Ceiling on the exponential back-off applied after consecutive failed
+    #: collections. Bounded so a source that was down for a night is retried
+    #: within a few hours rather than effectively never again.
+    social_collection_max_backoff_minutes: int = 240
 
 
 class TradingModeConfig(BaseModel):
@@ -1474,6 +1531,9 @@ class AppConfig(BaseSettings):
             "ai": self.ai.provider != "none",
             "notifications": self.notifications.enabled,
             "scheduler": self.scheduler.enabled,
+            # Listed separately from "scheduler" because it is the only
+            # scheduling that is actually implemented -- see SchedulerConfig.
+            "hourly_social_collection": self.scheduler.social_collection_enabled,
         }
 
 
