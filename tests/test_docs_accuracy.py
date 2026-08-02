@@ -24,6 +24,7 @@ import pytest
 from claudetrade.cli import (
     app,
     backtest_app,
+    config_app,
     db_app,
     paper_app,
     secrets_app,
@@ -76,6 +77,7 @@ def _real_command_surface() -> set[tuple[str, str | None]]:
         "verify": verify_app,
         "backtest": backtest_app,
         "sentiment": sentiment_app,
+        "config": config_app,
     }
     # Every group actually mounted on `app` (via add_typer) must be one of the
     # ones this test knows about -- catches a new group being added to cli.py
@@ -125,7 +127,11 @@ def _command_mentions_in_code_blocks(path: Path) -> list[tuple[str, str | None, 
 
 
 REAL_SURFACE = _real_command_surface()
-TOP_LEVEL_GROUPS = {"secrets", "paper", "db", "verify", "backtest", "sentiment"}
+#: Derived from the CLI, not hand-listed. A hand-written copy here silently
+#: reclassified every subcommand of a new group as a top-level command, so a
+#: correctly-documented `claudetrade config path` was reported as fictional
+#: while the group itself was already introspected two functions above.
+TOP_LEVEL_GROUPS = _typer_group_names(app)
 
 
 @pytest.mark.parametrize("doc_path", DOC_FILES, ids=lambda p: p.name)

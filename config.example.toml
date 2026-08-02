@@ -153,6 +153,19 @@ store_author_names = false
 session_enabled = true                    # Explicit disable knob; auto-activates when auth_token/ct0 resolve
 auth_token_credential = "x_auth_token"
 ct0_credential = "x_ct0"
+# REQUIRED for session mode, and settable nowhere but here. The opaque path
+# segment from x.com's internal GraphQL search URL
+# (https://x.com/i/api/graphql/<THIS>/SearchTimeline). It rotates without
+# notice and no value ships with the app -- a current one only exists in your
+# own browser traffic. Capture: log in to x.com, devtools -> Network, filter
+# "graphql", search any cashtag, copy the segment before "/SearchTimeline".
+# Not a credential (account-independent, carries no authority), so it belongs
+# in this file rather than the secrets store. Until it is set, session mode
+# fails closed WITHOUT issuing a request and says so.
+session_query_id = ""
+# REQUIRED for session mode: it only searches cashtags from this list. Left
+# empty it fetches nothing, every cycle, while every status surface reports
+# healthy.
 session_symbols = []                      # Cashtag-searched watchlist, e.g. ["AAPL", "MSFT"]
 session_max_results_per_query = 40
 session_rate_limit_per_minute = 6

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
@@ -58,6 +59,12 @@ sentiment_app = typer.Typer(
     )
 )
 verify_app = typer.Typer(help="Integrity and reproducibility checks.")
+config_app = typer.Typer(
+    help=(
+        "Find, create and inspect config.toml -- the settings that have no "
+        "credential-store or UI path."
+    )
+)
 #: A Typer group rather than a plain command so ``claudetrade backtest report``
 #: (the multi-strategy owner report, see ``backtest.report``) can live
 #: alongside the original single-run ``claudetrade backtest`` -- which keeps
@@ -69,6 +76,7 @@ app.add_typer(paper_app, name="paper")
 app.add_typer(db_app, name="db")
 app.add_typer(sentiment_app, name="sentiment")
 app.add_typer(verify_app, name="verify")
+app.add_typer(config_app, name="config")
 app.add_typer(backtest_app, name="backtest")
 
 ConfigOption = Annotated[
@@ -1841,6 +1849,121 @@ def verify_survivorship(
     start_date = _parse_date(start, end_date - dt.timedelta(days=1095))
     selector = UniverseSelector(cfg, get_database(cfg))
     _echo_json(selector.survivorship_check(start_date, end_date))
+
+
+# --------------------------------------------------------------------------
+# config
+# --------------------------------------------------------------------------
+
+#: Written by ``config init``. Deliberately a *commented* file whose every
+#: uncommented line is already the built-in default, so writing it changes
+#: nothing about how the application behaves -- it exists to show an operator
+#: where the file lives and what its shape is. The settings called out here
+#: are specifically the ones with no other home: they cannot be set from the
+#: credential store (they are not secrets) and have no UI field, so before
+#: this command an operator had to know the path, the section names and the
+#: key names to reach them at all.
+_STARTER_CONFIG = '''# ClaudeTrade configuration.
+#
+# Every setting here is optional -- the application runs fully on built-in
+# defaults with no config file at all. Uncomment only what you want to change,
+# then restart the app.
+#
+# Credentials NEVER go in this file. Use `claudetrade secrets set <name>` or
+# the Configuration screen; values placed here are ignored on purpose.
+
+[x]
+# X (Twitter) cookie-session mode. Both of these are required for it to fetch
+# anything, and neither can be set anywhere but here.
+#
+# session_query_id: the opaque path segment from x.com's internal GraphQL
+# search URL. It rotates without notice and no value ships with the app -- a
+# current one only exists in your own browser traffic. To capture it: log in
+# to x.com, open devtools -> Network, filter "graphql", search any cashtag,
+# then copy the path segment immediately before "/SearchTimeline".
+# session_query_id = ""
+#
+# session_symbols: cookie-session mode ONLY searches cashtags from this list.
+# Left empty it fetches nothing, every cycle, while reporting healthy.
+# session_symbols = ["AAPL", "MSFT", "NVDA"]
+
+[market_data]
+# provider = "tipranks"    # "synthetic" fabricates tickers -- demo only
+
+[signals]
+# min_overall_score = 60.0
+# min_confidence = 0.50
+
+[scheduler]
+# Hourly sentiment/mention collection while the app is open. Social sources
+# cannot be backfilled, so hours the app is closed are lost permanently.
+# social_collection_enabled = true
+# social_collection_interval_minutes = 60
+'''
+
+
+def _resolved_config_path() -> tuple[Path, str]:
+    """Where ``AppConfig.load()`` would look, and why -- mirroring its order."""
+    from claudetrade.config import ENV_PREFIX, default_app_dir
+
+    override = os.environ.get(f"{ENV_PREFIX}CONFIG")
+    if override:
+        return Path(override).expanduser(), f"${ENV_PREFIX}CONFIG"
+    return default_app_dir() / "config.toml", "default location"
+
+
+@config_app.command("path")
+def config_path() -> None:
+    """Print where config.toml is read from, whether or not it exists.
+
+    A missing config file is not an error anywhere else in this application
+    (built-in defaults run fine), which is exactly why its absence is silent
+    and its location is impossible to guess.
+    """
+    path, source = _resolved_config_path()
+    typer.echo(f"{path}  ({source})")
+    if path.exists():
+        typer.echo("status: exists")
+    else:
+        typer.echo("status: does not exist -- running entirely on built-in defaults")
+        typer.echo("create it with: claudetrade config init")
+
+
+@config_app.command("init")
+def config_init(
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite an existing config.toml (a backup is written first)."
+    ),
+) -> None:
+    """Write a commented starter config.toml at the default location.
+
+    Every uncommented line in the generated file is already the built-in
+    default, so this is safe to run on a working install: it changes no
+    behaviour, it just gives the settings a visible home.
+    """
+    path, _ = _resolved_config_path()
+    if path.exists() and not force:
+        typer.echo(f"already exists: {path}")
+        typer.echo("nothing written. Use --force to replace it (a backup is kept).")
+        raise typer.Exit(0)
+    if path.exists():
+        backup = path.with_suffix(".toml.bak")
+        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        typer.echo(f"backed up existing config to {backup}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_STARTER_CONFIG, encoding="utf-8")
+    typer.echo(f"wrote {path}")
+    typer.echo("Everything in it is commented out -- uncomment what you need, then restart.")
+
+
+@config_app.command("show")
+def config_show(config: ConfigOption = None) -> None:
+    """Print the effective configuration, with credential values redacted."""
+    cfg = _load(config)
+    path, source = _resolved_config_path()
+    typer.echo(f"# config file: {path} ({source}, {'found' if path.exists() else 'not found'})")
+    typer.echo(f"# config hash: {cfg.config_hash[:16]}")
+    _echo_json(cfg.public_dict())
 
 
 @app.command()

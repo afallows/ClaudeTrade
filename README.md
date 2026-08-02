@@ -194,7 +194,23 @@ collected on a timer rather than fetched on demand.
 
 ## Configuration
 
-All configuration is in TOML format. A fully-commented example is provided in `config.example.toml`.
+All configuration is in TOML format. A fully-commented example of every
+setting is provided in `config.example.toml`.
+
+No config file is created at install time, and a missing one is not an error
+-- the application runs entirely on built-in defaults. To find or create
+yours:
+
+```bash
+claudetrade config path    # where it is read from, and whether it exists
+claudetrade config init    # write a commented starter file there
+claudetrade config show    # the effective config, credentials redacted
+```
+
+`config init` writes every setting commented out, so running it on a working
+install changes no behaviour. It exists because a handful of settings -- most
+notably `x.session_query_id` and `x.session_symbols` -- have no credential
+store and no UI field, so this file is the only way to reach them.
 
 Configuration is resolved in layers (later layers win):
 
