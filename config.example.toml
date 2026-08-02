@@ -490,3 +490,11 @@ port = 8501                               # Streamlit port
 # slow storage); the defaults leave plenty of headroom over the normal case.
 tool_timeout_seconds = 30                 # Deadline for ordinary read tools
 scan_timeout_seconds = 300                # Deadline for run_scan only (a full-universe scan is legitimately slow)
+# Research revisions (submit_research_revision): an MCP client's web research
+# may append a revised thesis/invalidation and bounded component-score
+# adjustments to the append-only research ledger. It can re-rank a signal; it
+# can never touch entry/stop/targets/size, and SignalRow itself is never
+# edited. Set research_writes_enabled = false to make the MCP surface
+# strictly read-only again.
+research_writes_enabled = true            # Allow submit_research_revision writes
+max_component_adjustment = 20.0           # Clamp per-component score deltas to +/- this many points (max 50)

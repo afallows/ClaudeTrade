@@ -114,7 +114,7 @@ these tools. All of them return plain JSON — no charts, no pandas objects.
 
 | Tool | Reads/Writes | What it returns |
 | --- | --- | --- |
-| `get_signals(min_score, limit, sort)` | read-only | Current ledger signals, **best-scoring first** (so `limit=N` means the N best, matching the web Screener); `sort='created_at'` gives newest-first for audit. Includes `total_matching`/`truncated` so a page is distinguishable from the whole answer. Fields: symbol, strategy, direction, score, confidence, entry/stop/targets, days to earnings. |
+| `get_signals(min_score, limit, sort)` | read-only | Current ledger signals, **best-scoring first** (so `limit=N` means the N best, matching the web Screener); `sort='created_at'` gives newest-first for audit. Includes `total_matching`/`truncated` so a page is distinguishable from the whole answer. Fields: symbol, strategy, direction, score, confidence, entry/stop/targets, days to earnings, plus `effective_score`/`has_research` reflecting any accepted research revisions (rows re-sort by effective score). |
 | `get_sentiment(symbol, days)` | read-only | Daily sentiment/mention rows for one symbol over the last N days. |
 | `get_trending(limit, source)` | read-only | Symbols ranked by recent mention *volume*, most-mentioned first. `source='auto'` prefers ApeWisdom's Reddit/4chan counts when present (broader corpus, pre-resolved tickers) and falls back to locally-resolved posts. Absolute volume, so it returns the same large caps most days -- for what is *changing*, use `get_rising_sentiment`. |
 | `get_rising_sentiment(limit, recent_sessions, baseline_sessions, min_recent_mentions)` | read-only | Symbols whose mention rate is accelerating against their **own** recent baseline, so a quiet name waking up ranks above a permanently-loud one. Each row carries mention change, recent vs baseline rate, and sentiment change where polarity was actually measured. Includes a coverage block stating how much stored history backs the ranking. |
@@ -124,6 +124,8 @@ these tools. All of them return plain JSON — no charts, no pandas objects.
 | `trigger_refresh()` | **write, background** | Starts a data refresh (market data, earnings, sentiment) on a background thread; can take several minutes on a large universe. Refuses (naming the holder) while a refresh started from *any* entry point is running. |
 | `get_refresh_status()` | read-only | Progress of the current refresh or automatic social collection, whichever entry point started it — CLI, web UI, this server, or the web server's hourly collector; `entry_point` names the owner and `scheduled: true` means nobody asked for it. |
 | `get_backtest_report()` | read-only | The latest `claudetrade backtest report` (see `docs/backtest-report.md`): per-strategy walk-forward win rate/expectancy/profit factor/drawdown, each gated behind a prominent significance verdict. Never runs a backtest itself — returns `available: false` with instructions if none has been generated yet. |
+| `submit_research_revision(signal_id, thesis, invalidation, score_adjustments, rationale, sources)` | **write** | Appends the client's web research to a signal's **append-only research ledger** — the original signal row is never edited. May revise the thesis, the invalidation list, and nudge component scores by a clamped delta (± `mcp.max_component_adjustment`, default 20 points), which changes the read-time `effective_score` and ranking. Entry/stop/targets/size are engine-owned and have no parameter here at all. Thesis/invalidation text is guardrailed (no new price levels, no directive phrases). `rationale` and `sources` are required. The newest revision takes effect; omitted fields are carried forward. Disable entirely with `mcp.research_writes_enabled = false`. |
+| `get_research_revisions(signal_id)` | read-only | Full research-revision history for one signal, oldest first — the audit trail behind its current `effective_score`. |
 
 Every read-only tool queries the exact same ledger/database objects the web
 UI and CLI use (`pipeline.ledger`, the daily sentiment table, provider
@@ -146,7 +148,26 @@ collection at a time, by the hourly collector inside the web API server (and
 by `claudetrade sentiment collect`). The tier says how much of that baseline
 exists: `warming_up` (fewer than 20 sessions), `provisional` (20+), `partial`
 (60+), `ready` (120+). It is a label, never a gate: no tool refuses to answer
-because of it.
+because of it. To keep the baseline growing when the app is closed, register
+the Windows scheduled tasks — see `docs/scheduled-collection.md`.
+
+### The research-revision workflow
+
+The write tools exist for one loop: pull candidates, research them on the
+web, record what you found — without ever being able to move a stop.
+
+1. `get_signals` for today's ranked candidates.
+2. Research the interesting ones (news, filings, guidance, short interest —
+   whatever the thesis hinges on).
+3. `submit_research_revision` with a revised thesis and/or invalidation list
+   and small `score_adjustments` (e.g. `{"catalyst_quality": -12}` after
+   finding the catalyst is stale), plus the `rationale` and `sources`.
+4. `get_signals` again — rows now rank by `effective_score`, and
+   `get_research_revisions` shows the audit trail.
+
+The engine's numbers stay authoritative: revisions are append-only, price
+levels and sizing are structurally out of reach, adjustments are clamped,
+and `claudetrade verify research` integrity-checks the stored history.
 
 ## Concurrent use with the web UI and CLI
 

@@ -13,6 +13,7 @@ ClaudeTrade is a Python-based framework for systematic swing-trading research, b
 - **Paper trading** framework for simulation before any live deployment
 - **Database persistence** (SQLite by default; PostgreSQL-compatible)
 - **Optional LLM-powered sentiment classification** (OpenAI, Anthropic, or rule-based only)
+- **MCP research revisions** — a local MCP client (Claude Desktop) can append web-research findings to a signal: revised thesis, invalidation conditions, and clamped component-score adjustments that re-rank signals at read time. Append-only, fully audited, and structurally unable to touch entry/stop/targets/size (see [docs/claude-desktop-mcp.md](docs/claude-desktop-mcp.md))
 
 All computation is deterministic, reproducible, and auditable. Every signal carries a reproducibility triple (code version, config hash, data snapshot).
 
@@ -167,8 +168,9 @@ claudetrade ui                    # launch the Streamlit dashboard
 claudetrade secrets set|list|delete   # manage credentials in the OS credential store
 claudetrade paper status|positions|kill-switch   # inspect/drive the paper account
 claudetrade sentiment collect|history|rising     # social collection and mention history
+claudetrade schedule install|uninstall|status    # Windows Task Scheduler automation (see docs/scheduled-collection.md)
 claudetrade db migrate|backup|restore            # database maintenance
-claudetrade verify ledger|survivorship           # integrity and reproducibility checks
+claudetrade verify ledger|survivorship|research  # integrity and reproducibility checks
 ```
 
 Run `claudetrade --help` or `claudetrade <command> --help` for full option lists.
