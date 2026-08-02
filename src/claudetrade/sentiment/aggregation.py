@@ -36,7 +36,7 @@ from claudetrade.domain import (
 )
 from claudetrade.sentiment.lexicon import FLAIR_CATALYST_TERMS
 from claudetrade.sentiment.manipulation import ManipulationDetector
-from claudetrade.utils.timeutils import ensure_utc, session_close_utc
+from claudetrade.utils.timeutils import ensure_utc, session_close_utc, trading_days_between
 
 log = logging.getLogger(__name__)
 
@@ -145,6 +145,90 @@ def _engagement_weight(post: SocialPost, decay: float) -> float:
     if post.source == SocialSource.NEWS:
         return decay * 1.0
     return decay * math.log1p(max(0.0, post.engagement))
+
+
+def _mention_growth(
+    created_at: list[dt.datetime], *, close: dt.datetime, config: SentimentConfig
+) -> float:
+    """Growth in mention RATE: the recent window against the one before it.
+
+    This is the attention axis's only input and it is measured, deliberately,
+    from nothing but post timestamps -- no polarity, no engagement, no author
+    identity.
+
+    Two properties the previous formula did not have:
+
+    * **Non-overlapping windows.** It compared a ``fast_window_days`` bucket
+      against a ``slow_window_days`` bucket that *contained* it, so every
+      recent post was counted on both sides of the comparison. The pathology
+      that exposes: for a symbol whose posts ALL fall in the recent window (a
+      first-ever burst), the old expression collapsed to
+      ``slow_days/fast_days - 1`` exactly -- ``+400%`` on the shipped 2/10
+      windows -- for a burst of two posts and a burst of two hundred alike.
+      The number described the configuration, not the symbol. The baseline
+      here is the ``slow_window_days - fast_window_days`` stretch immediately
+      *preceding* the recent window, so a post is counted once, on one side.
+    * **Rates per COVERED SESSION, not per calendar day.** Weekends and market
+      holidays carry a fraction of a trading day's chatter, so dividing by
+      calendar days makes any window straddling a weekend look quiet and any
+      window inside a trading week look busy. Sessions are counted with the
+      exchange calendar (``utils.timeutils``), which is a local computation
+      over the posts supplied -- it does not know whether a zero-mention
+      session was *confirmed* quiet or simply never collected (see the
+      known-limitation note below).
+
+    Small samples are handled two ways rather than one, because they fail two
+    ways: additive smoothing (``mention_growth_prior_per_session``) shrinks
+    the *magnitude* of a ratio built on few posts toward zero, and a hard
+    ``min_mentions_for_growth`` floor suppresses the reading entirely when
+    even its *sign* would be noise. Without them a symbol going from one
+    mention to three read as a +200% surge and outranked a genuine, heavily
+    -sampled acceleration on every percentile rank downstream.
+
+    Known limitation (deliberately not papered over here): a baseline window
+    with no mentions is treated as genuinely quiet, so a symbol whose history
+    was never collected can look like a standing start. Distinguishing
+    "confirmed zero" from "not collected" needs per-session collection
+    coverage, which this function is not given.
+
+    Returns:
+        Fractional change in mentions per covered session, clipped to the
+        same +/-10 band ``domain.SymbolAttention.mention_acceleration`` uses
+        so the two attention measures stay on one scale, and 0.0 when the
+        sample is too small to measure ("unmeasured", not "flat").
+    """
+    recent_days = max(1, config.fast_window_days)
+    # The baseline is what is left of the slow window once the recent window
+    # is carved out of it; a misconfigured slow <= fast still leaves a real
+    # baseline to compare against rather than dividing by an empty window.
+    baseline_days = max(1, config.slow_window_days - recent_days)
+
+    recent_start = close - dt.timedelta(days=recent_days)
+    baseline_start = recent_start - dt.timedelta(days=baseline_days)
+
+    recent_count = sum(1 for t in created_at if t > recent_start)
+    baseline_count = sum(1 for t in created_at if baseline_start < t <= recent_start)
+    if recent_count + baseline_count < config.min_mentions_for_growth:
+        return 0.0
+
+    # ``trading_days_between`` counts the half-open interval ``(start, end]``,
+    # which is exactly the shape of both windows above.
+    recent_sessions = max(1, trading_days_between(recent_start.date(), close.date()))
+    baseline_sessions = max(
+        1, trading_days_between(baseline_start.date(), recent_start.date())
+    )
+
+    prior = max(0.0, config.mention_growth_prior_per_session)
+    recent_rate = recent_count / recent_sessions
+    baseline_rate = baseline_count / baseline_sessions
+    denominator = baseline_rate + prior
+    if denominator <= 1e-12:
+        # Only reachable with the prior configured to zero and a genuinely
+        # empty baseline; report the sample as unmeasured rather than
+        # inventing an infinite surge.
+        return 0.0
+    growth = (recent_rate + prior) / denominator - 1.0
+    return max(-10.0, min(10.0, growth))
 
 
 class SentimentAggregator:
@@ -268,13 +352,14 @@ class SentimentAggregator:
         # mentions tells you people are talking, not what they are saying --
         # counting mentions toward bullishness is exactly the mistake this
         # module exists to avoid. `mention_acceleration` is deliberately
-        # computed with no reference to polarity at all.
-        fast_days = max(1, self.config.fast_window_days)
-        slow_days = max(1, self.config.slow_window_days)
-        fast_rate = len(fast_bucket) / fast_days
-        slow_rate = len(slow_bucket) / slow_days
-        mention_acceleration = (fast_rate - slow_rate) / (slow_rate + 1e-6)
-        mention_acceleration = max(-10.0, min(10.0, mention_acceleration))
+        # computed with no reference to polarity at all (note it is derived
+        # from the post TIMESTAMPS below, never from `fast_bucket`/
+        # `slow_bucket`, which carry polarity alongside them).
+        mention_acceleration = _mention_growth(
+            [ensure_utc(p.created_at) for p, _, _ in weighted],
+            close=close,
+            config=self.config,
+        )
 
         bull_sum = sum(s.bullish * d for _, s, d in weighted)
         bear_sum = sum(s.bearish * d for _, s, d in weighted)

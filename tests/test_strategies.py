@@ -39,6 +39,7 @@ from claudetrade.strategies.base import StrategyContext
 from claudetrade.strategies.c_capitulation_reversal import CapitulationReversalStrategy
 from claudetrade.strategies.d_hype_failure_short import HypeFailureShortStrategy
 from claudetrade.strategies.e_post_earnings_drift import PostEarningsDriftStrategy
+from claudetrade.strategies.f_volume_breakout import VolumeBreakoutStrategy
 
 SESSION = dt.date(2024, 3, 15)
 SYMBOL = "TEST"
@@ -80,6 +81,13 @@ def make_sentiment(
     post_count: int = 50,
     unique_authors: int = 20,
     raw_sentiment: float = 0.3,
+    # Defaults to a positive one-vote-per-author mean alongside the positive
+    # raw mean. ``sentiment_breakout`` now requires BOTH to be positive (a
+    # raw mean can be carried by one prolific poster), so leaving this at the
+    # dataclass default of 0.0 would have made every "healthy sentiment"
+    # fixture describe a crowd whose individual members were, on average,
+    # neutral -- not the sample these tests mean to build.
+    unique_author_sentiment: float = 0.25,
     sentiment_acceleration: float = 0.4,
     mention_acceleration: float = 0.5,
     manipulation_risk: float = 0.1,
@@ -97,6 +105,7 @@ def make_sentiment(
         post_count=post_count,
         unique_authors=unique_authors,
         raw_sentiment=raw_sentiment,
+        unique_author_sentiment=unique_author_sentiment,
         sentiment_acceleration=sentiment_acceleration,
         mention_acceleration=mention_acceleration,
         manipulation_risk=manipulation_risk,
@@ -196,17 +205,40 @@ class TestSentimentBreakout:
             "dist_from_52w_high_pct": -1.0,
         }
 
-    def test_satisfied_setup_produces_sensible_proposal(self, cfg: AppConfig):
-        bars = make_bars(90, close=101.5)
-        sentiment = make_sentiment(sentiment_acceleration=0.4, mention_acceleration=0.5)
-        history = make_sentiment_history(final=sentiment)
-        ctx = make_context(
+    def _confirmed_ctx(
+        self,
+        cfg: AppConfig,
+        features: dict[str, float],
+        *,
+        close: float = 101.5,
+        sentiment: SymbolSentiment | None = None,
+    ) -> StrategyContext:
+        """A context carrying the positive sentiment confirmation this
+        strategy now REQUIRES.
+
+        Before QA #7 these price/volume-focused cases could omit sentiment
+        entirely and still expect a proposal, because ``sentiment_breakout``
+        declared ``requires_sentiment = False`` and merely lost points when
+        the social sample was missing. That was the mislabelling bug itself,
+        not an incidental fixture convenience: a strategy named "sentiment
+        breakout" was emitting trades with no sentiment behind them. The
+        unconfirmed path did not disappear -- it moved to ``volume_breakout``,
+        which ``TestVolumeBreakout`` covers -- so the cases below now supply
+        the confirmation and assert what they always meant to assert about
+        the price/volume components.
+        """
+        snapshot = sentiment if sentiment is not None else make_sentiment()
+        return make_context(
             config=cfg,
-            bars=bars,
-            features=self._good_features(),
-            sentiment=sentiment,
-            sentiment_history=history,
+            bars=make_bars(90, close=close),
+            features=features,
+            sentiment=snapshot,
+            sentiment_history=make_sentiment_history(final=snapshot),
         )
+
+    def test_satisfied_setup_produces_sensible_proposal(self, cfg: AppConfig):
+        sentiment = make_sentiment(sentiment_acceleration=0.4, mention_acceleration=0.5)
+        ctx = self._confirmed_ctx(cfg, self._good_features(), sentiment=sentiment)
         strategy = SentimentBreakoutStrategy(cfg)
 
         proposal = strategy.evaluate(ctx)
@@ -275,7 +307,6 @@ class TestSentimentBreakout:
         """
         # Price sits below the level (no breakout yet, but within the
         # not-near-breakout veto's tolerance) and every other axis is weak.
-        bars = make_bars(90, close=99.0)
         features = self._good_features()
         features.update(
             {
@@ -287,7 +318,15 @@ class TestSentimentBreakout:
                 "dist_from_sma50_pct": -3.5,
             }
         )
-        ctx = make_context(config=cfg, bars=bars, features=features)
+        # Sentiment confirms (positive, adequately sampled) but is flat, so
+        # the ONLY thing left to decline on is the score -- which is what
+        # this test is about.
+        ctx = self._confirmed_ctx(
+            cfg,
+            features,
+            close=99.0,
+            sentiment=make_sentiment(sentiment_acceleration=0.0, mention_acceleration=0.0),
+        )
         strategy = SentimentBreakoutStrategy(cfg)
 
         proposal = strategy.evaluate(ctx)
@@ -308,17 +347,16 @@ class TestSentimentBreakout:
         """A gap_pct at or beyond GAP_UP_FULL_CREDIT_PCT earns full W_GAP_UP
         credit; no gap (the feature absent, defaulting to 0.0) earns none --
         proving both direction and the exact magnitude bound."""
-        bars = make_bars(90, close=101.5)
         strategy = SentimentBreakoutStrategy(cfg)
 
         features_no_gap = self._good_features()
-        proposal_no_gap = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_no_gap))
+        proposal_no_gap = strategy.evaluate(self._confirmed_ctx(cfg, features_no_gap))
         assert proposal_no_gap is not None
         assert "gap_up=+0.0/6" in proposal_no_gap.extras["score_breakdown"]
 
         features_gap = self._good_features()
         features_gap["gap_pct"] = 5.0  # well beyond GAP_UP_FULL_CREDIT_PCT (2.5)
-        proposal_gap = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_gap))
+        proposal_gap = strategy.evaluate(self._confirmed_ctx(cfg, features_gap))
         assert proposal_gap is not None
         assert f"gap_up=+{SentimentBreakoutStrategy.W_GAP_UP:.1f}/{SentimentBreakoutStrategy.W_GAP_UP:.0f}" in (
             proposal_gap.extras["score_breakdown"]
@@ -326,17 +364,16 @@ class TestSentimentBreakout:
         assert "Gapped up" in " ".join(proposal_gap.evidence)
 
     def test_gap_continuation_up_is_boolean_full_credit(self, cfg: AppConfig):
-        bars = make_bars(90, close=101.5)
         strategy = SentimentBreakoutStrategy(cfg)
 
         features_off = self._good_features()
-        proposal_off = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_off))
+        proposal_off = strategy.evaluate(self._confirmed_ctx(cfg, features_off))
         assert proposal_off is not None
         assert "gap_continuation=+0.0/5" in proposal_off.extras["score_breakdown"]
 
         features_on = self._good_features()
         features_on["gap_continuation_up"] = 1.0
-        proposal_on = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_on))
+        proposal_on = strategy.evaluate(self._confirmed_ctx(cfg, features_on))
         assert proposal_on is not None
         assert (
             f"gap_continuation=+{SentimentBreakoutStrategy.W_GAP_CONTINUATION:.1f}"
@@ -344,21 +381,20 @@ class TestSentimentBreakout:
         ) in proposal_on.extras["score_breakdown"]
 
     def test_level_confluence_ramps_between_one_and_three_methods(self, cfg: AppConfig):
-        bars = make_bars(90, close=101.5)
         strategy = SentimentBreakoutStrategy(cfg)
 
         # 1 agreeing method (or fewer) earns zero credit -- a single level is
         # not "confluence".
         features_one = self._good_features()
         features_one["level_confluence_count"] = 1.0
-        proposal_one = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_one))
+        proposal_one = strategy.evaluate(self._confirmed_ctx(cfg, features_one))
         assert proposal_one is not None
         assert "level_confluence=+0.0/6" in proposal_one.extras["score_breakdown"]
 
         # 3+ agreeing methods earns full credit.
         features_three = self._good_features()
         features_three["level_confluence_count"] = 3.0
-        proposal_three = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_three))
+        proposal_three = strategy.evaluate(self._confirmed_ctx(cfg, features_three))
         assert proposal_three is not None
         assert "level_confluence=+6.0/6" in proposal_three.extras["score_breakdown"]
         assert "independent methods" in " ".join(proposal_three.evidence)
@@ -366,20 +402,17 @@ class TestSentimentBreakout:
     def test_volume_divergence_is_a_penalty_not_a_veto(self, cfg: AppConfig):
         """A moderate (non-saturating) scenario so the penalty is visible on
         the clamped setup_score too, not just in the raw breakdown."""
-        bars = make_bars(90, close=101.5)
         strategy = SentimentBreakoutStrategy(cfg)
         moderate = self._good_features()
         moderate.update({"adx_pctl_120": 0.5, "rel_volume_pctl_120": 0.55, "rs_percentile": 60.0})
 
         features_clean = dict(moderate)
-        proposal_clean = strategy.evaluate(make_context(config=cfg, bars=bars, features=features_clean))
+        proposal_clean = strategy.evaluate(self._confirmed_ctx(cfg, features_clean))
         assert proposal_clean is not None
 
         features_divergent = dict(moderate)
         features_divergent["volume_divergence"] = 1.0
-        proposal_divergent = strategy.evaluate(
-            make_context(config=cfg, bars=bars, features=features_divergent)
-        )
+        proposal_divergent = strategy.evaluate(self._confirmed_ctx(cfg, features_divergent))
         assert proposal_divergent is not None
         assert (
             f"volume_divergence={SentimentBreakoutStrategy.PENALTY_VOLUME_DIVERGENCE:.1f}"
@@ -398,7 +431,6 @@ class TestSentimentBreakout:
         predates this package (none of gap_pct/gap_continuation_up/
         level_confluence_count/volume_divergence present) must still produce
         a coherent proposal -- degrade to zero contribution, never crash."""
-        bars = make_bars(90, close=101.5)
         features = self._good_features()
         for key in (
             "gap_pct",
@@ -409,10 +441,188 @@ class TestSentimentBreakout:
             features.pop(key, None)
         strategy = SentimentBreakoutStrategy(cfg)
 
-        proposal = strategy.evaluate(make_context(config=cfg, bars=bars, features=features))
+        proposal = strategy.evaluate(self._confirmed_ctx(cfg, features))
 
         assert proposal is not None
         proposal.validate()
+
+    # ---- QA #7: the name is a claim, and it is now enforced ------------------
+
+    def test_missing_sentiment_declines_with_a_funnel_reason_code(self, cfg: AppConfig):
+        """A strategy named "sentiment breakout" must not recommend a name it
+        has no social sample for.
+
+        This deliberately reverses the old expectation. ``requires_sentiment``
+        was False and a missing sample only cost the candidate the sentiment
+        components' points, so the strategy emitted price-and-volume trades
+        under a name that claimed sentiment confirmation -- indistinguishable
+        in the ledger and in every per-strategy backtest statistic from one
+        that genuinely had it. The candidate is not lost: ``volume_breakout``
+        takes it (see ``TestVolumeBreakout``).
+        """
+        bars = make_bars(90, close=101.5)
+        ctx = make_context(config=cfg, bars=bars, features=self._good_features())
+        strategy = SentimentBreakoutStrategy(cfg)
+
+        assert strategy.evaluate(ctx) is None
+        rejections = strategy.drain_rejections()
+        assert [r.reason for r in rejections] == ["sentiment_unavailable"]
+        # The funnel aggregates the numbers, not just the count.
+        assert rejections[0].metrics["posts_required"] == float(
+            cfg.sentiment.min_posts_for_signal
+        )
+
+    def test_thin_sample_declines_rather_than_confirming(self, cfg: AppConfig):
+        """A sample below the post/author minimums is missing evidence, not a
+        quiet confirmation."""
+        thin = make_sentiment(post_count=2, unique_authors=1)
+        ctx = self._confirmed_ctx(cfg, self._good_features(), sentiment=thin)
+        strategy = SentimentBreakoutStrategy(cfg)
+
+        assert strategy.evaluate(ctx) is None
+        assert [r.reason for r in strategy.drain_rejections()] == ["sentiment_unavailable"]
+
+    @pytest.mark.parametrize(
+        ("raw", "per_author"),
+        [
+            (-0.4, -0.3),  # both negative
+            (-0.4, 0.3),  # raw negative, authors positive
+            (0.4, -0.3),  # one prolific bull over a bearish crowd
+            (0.01, 0.01),  # positive but below the confirmation floor
+        ],
+    )
+    def test_non_positive_sentiment_declines(self, cfg: AppConfig, raw, per_author):
+        """Confirmation requires BOTH polarity measures above the floor.
+
+        The raw decayed mean alone can be carried by one prolific poster --
+        exactly the promotion pattern this strategy exists to avoid buying
+        into -- and the per-author mean alone ignores a crowd whose loudest
+        voices are bearish.
+        """
+        sentiment = make_sentiment(raw_sentiment=raw, unique_author_sentiment=per_author)
+        ctx = self._confirmed_ctx(cfg, self._good_features(), sentiment=sentiment)
+        strategy = SentimentBreakoutStrategy(cfg)
+
+        assert strategy.evaluate(ctx) is None
+        assert [r.reason for r in strategy.drain_rejections()] == ["sentiment_not_positive"]
+
+    def test_low_confidence_sentiment_declines(self, cfg: AppConfig):
+        """Positive but untrustworthy is not confirmation."""
+        sentiment = make_sentiment(
+            confidence=cfg.filters.min_sentiment_confidence - 0.01
+        )
+        ctx = self._confirmed_ctx(cfg, self._good_features(), sentiment=sentiment)
+        strategy = SentimentBreakoutStrategy(cfg)
+
+        assert strategy.evaluate(ctx) is None
+        assert [r.reason for r in strategy.drain_rejections()] == ["sentiment_confidence_low"]
+
+    def test_declares_that_it_requires_sentiment(self, cfg: AppConfig):
+        """The engine reads this flag into the scan funnel's
+        ``strategy_requirements`` and into ``apply_hard_gates``; it must agree
+        with the strategy's actual behaviour."""
+        assert SentimentBreakoutStrategy(cfg).requires_sentiment is True
+
+
+# --------------------------------------------------------------------------
+# Strategy F -- volume_breakout (the relabelled unconfirmed path)
+# --------------------------------------------------------------------------
+
+
+class TestVolumeBreakout:
+    """The breakout with no confirming social sample, under an honest name.
+
+    Coverage is unchanged by the split -- every candidate ``sentiment_breakout``
+    now declines for a sentiment reason is taken here -- so these tests are as
+    much about the *partition* being exhaustive and non-overlapping as about
+    this strategy's own behaviour.
+    """
+
+    def _features(self) -> dict[str, float]:
+        return TestSentimentBreakout()._good_features()
+
+    def _ctx(self, cfg: AppConfig, sentiment: SymbolSentiment | None = None) -> StrategyContext:
+        return make_context(
+            config=cfg,
+            bars=make_bars(90, close=101.5),
+            features=self._features(),
+            sentiment=sentiment,
+            sentiment_history=(
+                make_sentiment_history(final=sentiment) if sentiment is not None else []
+            ),
+        )
+
+    def test_takes_the_candidate_sentiment_breakout_declines(self, cfg: AppConfig):
+        """No social sample: declined as sentiment_breakout, proposed here."""
+        ctx = self._ctx(cfg)
+
+        assert SentimentBreakoutStrategy(cfg).evaluate(ctx) is None
+
+        proposal = VolumeBreakoutStrategy(cfg).evaluate(ctx)
+        assert proposal is not None
+        proposal.validate()
+        assert proposal.strategy == "volume_breakout"
+        assert any("no usable social sample" in e.lower() for e in proposal.evidence)
+        assert any("No sentiment confirmation" in r for r in proposal.risks)
+
+    def test_declines_what_sentiment_breakout_takes(self, cfg: AppConfig):
+        """The other half of the partition: exactly one of the two may fire,
+        so a signal's strategy name is an unambiguous answer to "why is this
+        on my list?"."""
+        ctx = self._ctx(cfg, sentiment=make_sentiment())
+
+        assert SentimentBreakoutStrategy(cfg).evaluate(ctx) is not None
+
+        strategy = VolumeBreakoutStrategy(cfg)
+        assert strategy.evaluate(ctx) is None
+        assert [r.reason for r in strategy.drain_rejections()] == [
+            "sentiment_confirmed_elsewhere"
+        ]
+
+    def test_negative_sentiment_is_penalised_but_not_vetoed(self, cfg: AppConfig):
+        """"Nobody is talking about it" and "the people talking about it are
+        bearish" must not score alike -- the second is contrary evidence, and
+        costs the candidate rank without costing it its existence (price and
+        volume are the thesis here)."""
+        silent = VolumeBreakoutStrategy(cfg).evaluate(self._ctx(cfg))
+        bearish = VolumeBreakoutStrategy(cfg).evaluate(
+            self._ctx(
+                cfg,
+                sentiment=make_sentiment(raw_sentiment=-0.5, unique_author_sentiment=-0.5),
+            )
+        )
+
+        assert silent is not None
+        assert bearish is not None  # penalised, not vetoed
+        assert bearish.setup_score < silent.setup_score
+        assert "contrary_sentiment" in bearish.extras["score_breakdown"]
+        assert any("bearish" in r for r in bearish.risks)
+
+    def test_scores_no_sentiment_components_at_all(self, cfg: AppConfig):
+        """Its ceiling is genuinely lower: none of the three sentiment
+        components can contribute, so a confirmed breakout outranks an
+        otherwise identical unconfirmed one."""
+        proposal = VolumeBreakoutStrategy(cfg).evaluate(self._ctx(cfg))
+        assert proposal is not None
+        breakdown = proposal.extras["score_breakdown"]
+        for label in ("sentiment_accel_pctl", "mention_accel_pctl", "unique_authors"):
+            assert label not in breakdown
+
+    def test_shares_every_hard_veto_with_sentiment_breakout(self, cfg: AppConfig):
+        """Inherited, not re-implemented: the two cannot drift apart on how a
+        breakout is found."""
+        bars = make_bars(10, close=101.5)
+        strategy = VolumeBreakoutStrategy(cfg)
+
+        assert strategy.evaluate(make_context(config=cfg, bars=bars, features=self._features())) is None
+        assert [r.reason for r in strategy.drain_rejections()] == ["insufficient_history"]
+
+    def test_is_registered_and_enabled_by_default(self, cfg: AppConfig):
+        """A strategy nobody runs is not a home for the relabelled path."""
+        from claudetrade.strategies.registry import available_strategies, build_strategies
+
+        assert "volume_breakout" in available_strategies()
+        assert "volume_breakout" in [s.name for s in build_strategies(cfg)]
 
 
 # --------------------------------------------------------------------------

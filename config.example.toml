@@ -343,6 +343,12 @@ high_vol_size_multiplier = 0.7            # Position sizing multiplier in high-v
 # Signal generation and scoring.
 enabled_strategies = [
   "sentiment_breakout",
+  # The same breakout with no confirming social sample -- a separate strategy
+  # rather than a branch inside sentiment_breakout, so a signal's name is an
+  # unambiguous answer to "why is this on my list?". The two are mutually
+  # exclusive: whichever takes a candidate, the other declines it. Drop this
+  # entry to run a sentiment-only screen.
+  "volume_breakout",
   "sentiment_pullback",
   "capitulation_reversal",
   "hype_failure_short",

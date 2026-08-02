@@ -39,6 +39,36 @@ class LookaheadError(AssertionError):
     """Raised when data dated after the decision session reaches a strategy."""
 
 
+#: ``SymbolSentiment.source`` prefix used by aggregator ATTENTION rows -- see
+#: ``providers.social.apewisdom`` and ``data.ingest.ingest_attention``. These
+#: rows are mention/upvote tallies over a community, with no post text, no
+#: authors and no polarity, stored in the same table as the polarity
+#: aggregates purely because the table is keyed by (symbol, session, source).
+ATTENTION_SOURCE_PREFIX = "apewisdom:"
+
+
+def is_attention_only(snapshot: SymbolSentiment) -> bool:
+    """Whether ``snapshot`` carries attention volume but no polarity at all.
+
+    The single most important design rule in the sentiment subsystem is that
+    attention and polarity are separate axes, and this predicate is where the
+    two kinds of stored row are told apart. An attention row's polarity
+    columns are not "measured as zero" -- they were never measured, and
+    averaging them into a polarity aggregate would silently pull every
+    reading toward neutral in proportion to how many communities the
+    aggregator happened to cover. Its ``unique_authors`` is 0 for the same
+    reason, which is why these rows must also stay out of
+    ``manipulation_risk``, ``bot_risk`` and ``duplicate_ratio``, all of which
+    are derived from post-level identity and text this source does not have.
+
+    Both the ``source`` prefix and the ``attention_only`` label are checked so
+    a row survives either being relabelled or losing its label.
+    """
+    return snapshot.source.startswith(ATTENTION_SOURCE_PREFIX) or bool(
+        snapshot.labels.get("attention_only")
+    )
+
+
 @dataclass(slots=True)
 class StrategyContext:
     """Everything a strategy is permitted to know on one session.
@@ -49,9 +79,32 @@ class StrategyContext:
         symbol: Security under evaluation.
         bars: Ascending daily bars, last element dated ``session``.
         features: Indicator values as of ``session``.
-        sentiment: Aggregated sentiment as of ``session``, or ``None`` when the
-            social sources are disabled or the sample was too small.
-        sentiment_history: Recent daily sentiment, ascending, ending at ``session``.
+        sentiment: The COMBINED (``source == "all"``) aggregate as of
+            ``session``, or ``None`` when the social sources are disabled or
+            the sample was too small.
+        sentiment_by_source: Per-source polarity snapshots for ``session``,
+            keyed by ``SymbolSentiment.source`` ("all", "reddit", "x",
+            "news", ...). Each is an independently stored row aggregated from
+            that source's own posts. This exists so scoring can weight each
+            source from ITS OWN evidence: the combined row used to be handed
+            to every per-source scoring slot, which let one sample fill
+            several independently-weighted slots and read as corroboration
+            between sources that had never been compared. Attention-only rows
+            are never in here -- see ``attention_by_source``.
+        attention_by_source: Aggregator ATTENTION snapshots for ``session``
+            (``apewisdom:<community>``), keyed by source. Mention volume
+            only: no polarity, no authors, no text. Consumed by the attention
+            axis alone.
+        attention_history: Per-source attention snapshots, ascending and
+            ending at ``session``, keyed by source. Needed because an
+            aggregator's counts live on a completely different scale from
+            this application's own fetches (~100x), so a reading is only
+            usable once ranked against its OWN history.
+        sentiment_history: Recent daily COMBINED sentiment, ascending, ending
+            at ``session``. Per-source and attention rows are deliberately
+            excluded: strategies percentile-rank today's combined snapshot
+            against this series, and interleaving rows from other sources
+            would rank a value against a distribution it does not belong to.
         earnings: Known earnings events, past and scheduled.
         security: Reference data.
         regime: Market environment on ``session``.
@@ -67,6 +120,9 @@ class StrategyContext:
     security: SecurityInfo
     regime: RegimeState
     sentiment: SymbolSentiment | None = None
+    sentiment_by_source: dict[str, SymbolSentiment] = field(default_factory=dict)
+    attention_by_source: dict[str, SymbolSentiment] = field(default_factory=dict)
+    attention_history: dict[str, list[SymbolSentiment]] = field(default_factory=dict)
     sentiment_history: list[SymbolSentiment] = field(default_factory=list)
     earnings: list[EarningsEvent] = field(default_factory=list)
     benchmark_features: dict[str, float] = field(default_factory=dict)
@@ -85,6 +141,11 @@ class StrategyContext:
             self.sentiment_history = [
                 s for s in self.sentiment_history if s.session <= self.session
             ]
+        if self.attention_history:
+            self.attention_history = {
+                source: [s for s in series if s.session <= self.session]
+                for source, series in self.attention_history.items()
+            }
         # Everything that cannot be safely clipped -- a single sentiment
         # snapshot, an earnings row's knowledge date, the regime -- is validated
         # here, at construction. Leaving that to an explicit
@@ -128,6 +189,21 @@ class StrategyContext:
     def has_feature(self, name: str) -> bool:
         value = self.features.get(name)
         return value is not None and float(value) == float(value)
+
+    def polarity_for_source(self, source: str) -> SymbolSentiment | None:
+        """This session's polarity snapshot for one source, or ``None``.
+
+        ``None`` means "that source did not report a usable sample", which is
+        NOT the same as "that source reported neutral": the caller must drop
+        the source's weight rather than score it 50, and must not substitute
+        another source's row. Attention-only rows can never be returned here
+        even if one were mis-keyed into ``sentiment_by_source``, because they
+        carry no polarity to return.
+        """
+        snapshot = self.sentiment_by_source.get(source)
+        if snapshot is None or is_attention_only(snapshot):
+            return None
+        return snapshot
 
     def next_earnings(self) -> EarningsEvent | None:
         """The soonest earnings event on or after ``session``."""
@@ -177,12 +253,28 @@ class StrategyContext:
                 f"{self.symbol}: sentiment dated {self.sentiment.session} "
                 f"exceeds session {self.session}"
             )
+        # Per-source and attention snapshots are single readings for THIS
+        # session, so -- like ``sentiment`` above and unlike the histories --
+        # they cannot be safely clipped; a future-dated one is a bug upstream.
+        for label, snapshot in (*self.sentiment_by_source.items(), *self.attention_by_source.items()):
+            if snapshot.session > self.session:
+                raise LookaheadError(
+                    f"{self.symbol}: {label} sentiment dated {snapshot.session} "
+                    f"exceeds session {self.session}"
+                )
         for snapshot in self.sentiment_history:
             if snapshot.session > self.session:
                 raise LookaheadError(
                     f"{self.symbol}: sentiment history dated {snapshot.session} "
                     f"exceeds session {self.session}"
                 )
+        for source, series in self.attention_history.items():
+            for snapshot in series:
+                if snapshot.session > self.session:
+                    raise LookaheadError(
+                        f"{self.symbol}: {source} attention history dated "
+                        f"{snapshot.session} exceeds session {self.session}"
+                    )
         # The regime may legitimately be absent (unclassified session); only a
         # regime dated in the future is a leak.
         if self.regime is not None and self.regime.session > self.session:

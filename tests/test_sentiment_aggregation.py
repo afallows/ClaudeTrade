@@ -13,8 +13,10 @@ from claudetrade.sentiment.aggregation import (
     SentimentAggregator,
     _credibility_score,
     _engagement_weight,
+    _mention_growth,
     time_decay_weight,
 )
+from claudetrade.utils.timeutils import session_close_utc
 
 
 def _post(**overrides) -> SocialPost:
@@ -530,3 +532,124 @@ class TestOptionsChatterLabels:
         )
 
         assert result.labels["options_call"] > 0.9
+
+
+class TestMentionGrowth:
+    """QA #4: mention growth compares NON-OVERLAPPING windows, as rates per
+    covered session, with small samples shrunk and very small ones suppressed.
+
+    The formula this replaced compared a ``fast_window_days`` bucket against a
+    ``slow_window_days`` bucket that *contained* it, so every recent post was
+    counted on both sides. These tests pin the properties that fixes, not the
+    arithmetic itself -- the constants are configurable.
+    """
+
+    #: A Monday, so the recent window's sessions and the baseline window's
+    #: sessions are both non-empty and the exchange calendar is exercised.
+    SESSION = dt.date(2024, 6, 3)
+
+    def _growth(self, spec: list[tuple[float, int]], **overrides) -> float:
+        """``spec`` is ``(days before the session close, how many posts)``."""
+        close = session_close_utc(self.SESSION)
+        created = [close - dt.timedelta(days=d) for d, n in spec for _ in range(n)]
+        return _mention_growth(
+            created, close=close, config=SentimentConfig(**overrides)
+        )
+
+    def test_a_fresh_burst_no_longer_reports_the_window_ratio_artifact(self):
+        """The headline defect. With overlapping windows, a symbol whose posts
+        ALL landed in the recent window collapsed to
+        ``slow_days/fast_days - 1`` -- exactly +4.0 on the shipped 2/10
+        windows -- for a burst of 6 posts and a burst of 300 alike. The number
+        described the configuration, not the symbol. A standing start now
+        saturates the clip band, which is a statement about the symbol."""
+        assert self._growth([(0.5, 6)]) != pytest.approx(4.0)
+        assert self._growth([(0.5, 300)]) != pytest.approx(4.0)
+
+    def test_burst_size_moves_the_reading(self):
+        """Against the same baseline, a bigger burst reads as more growth --
+        the property the old formula lost entirely."""
+        small = self._growth([(0.5, 6), (5, 2)])
+        large = self._growth([(0.5, 300), (5, 2)])
+        assert large > small
+
+    def test_a_post_is_counted_once_not_on_both_sides(self):
+        """Moving a post from the baseline window into the recent window must
+        change the comparison in one direction only. Under the old overlapping
+        buckets it moved BOTH rates up, muting the very growth it evidenced."""
+        before = self._growth([(0.5, 10), (5, 10)])
+        after = self._growth([(0.5, 15), (5, 5)])
+        assert after > before
+
+    def test_tiny_samples_are_suppressed_not_reported_as_surges(self):
+        """1 -> 3 mentions is not a +200% surge; it is four posts."""
+        assert self._growth([(0.5, 3), (5, 1)]) == 0.0
+
+    def test_the_same_ratio_on_an_adequate_sample_is_reported(self):
+        """The gate is about sample size, not about the ratio: the identical
+        one-to-three shape on real volume still reads as strong growth."""
+        assert self._growth([(0.5, 60), (5, 20)]) > 0.5
+
+    def test_shrinkage_damps_a_small_sample_below_its_raw_ratio(self):
+        """A ratio built on few posts reports a smaller magnitude than the
+        same ratio built on many -- additive smoothing, not a cliff."""
+        small = self._growth([(0.5, 6), (5, 6)], mention_growth_prior_per_session=0.5)
+        large = self._growth([(0.5, 600), (5, 600)], mention_growth_prior_per_session=0.5)
+        assert 0.0 < small < large
+
+    def test_rates_are_per_covered_session_not_per_calendar_day(self):
+        """Weekends carry a fraction of a trading day's chatter, so a window
+        straddling one must not look quiet purely for containing it. Same post
+        counts, same window lengths, different weekday alignment -> different
+        reading."""
+        monday_close = session_close_utc(dt.date(2024, 6, 3))
+        wednesday_close = session_close_utc(dt.date(2024, 6, 5))
+        spec = [(0.5, 20), (5, 40)]
+        cfg = SentimentConfig()
+        monday = _mention_growth(
+            [monday_close - dt.timedelta(days=d) for d, n in spec for _ in range(n)],
+            close=monday_close,
+            config=cfg,
+        )
+        wednesday = _mention_growth(
+            [wednesday_close - dt.timedelta(days=d) for d, n in spec for _ in range(n)],
+            close=wednesday_close,
+            config=cfg,
+        )
+        assert monday != pytest.approx(wednesday)
+
+    def test_a_collapse_in_chatter_reads_negative(self):
+        """Direction, not just magnitude: attention falling away is a real
+        reading and must keep its sign."""
+        assert self._growth([(0.5, 2), (5, 80)]) < -0.5
+
+    def test_stays_inside_the_shared_clip_band(self):
+        """``domain.SymbolAttention.mention_acceleration`` uses the same
+        +/-10 band, so the aggregator's measure and the attention provider's
+        stay comparable and sortable."""
+        assert self._growth([(0.5, 5_000)]) == 10.0
+        assert -10.0 <= self._growth([(0.5, 1), (5, 5_000)]) <= 10.0
+
+    def test_end_to_end_through_aggregate_uses_the_new_measure(self):
+        """Not just the helper: the stored snapshot carries it."""
+        close = session_close_utc(self.SESSION)
+        posts, mentions, scores = [], [], {}
+        for i in range(12):
+            pid = f"p{i}"
+            posts.append(_post(external_id=pid, created_at=close - dt.timedelta(hours=6)))
+            mentions.append(
+                TickerMention(
+                    post_external_id=pid, symbol="ACME", confidence=0.9, method="cashtag"
+                )
+            )
+            scores[pid] = SentimentScores(bullish=0.5)
+
+        result = SentimentAggregator(SentimentConfig()).aggregate(
+            "ACME", self.SESSION, posts, mentions, scores
+        )
+        # All twelve posts sit in the recent window with an empty baseline --
+        # a genuine standing start, which saturates rather than reporting the
+        # old windows-ratio artifact.
+        assert result.mention_acceleration == 10.0
+        # And attention has not leaked into polarity on the way through.
+        assert result.raw_sentiment == pytest.approx(0.5)

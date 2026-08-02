@@ -424,13 +424,14 @@ def test_generate_backtest_report_short_window_falls_back_to_in_sample_for_every
     assert report.coverage.symbol_count >= 1
     assert report.coverage.config_hash == synthetic_pipeline.config.config_hash
     assert report.coverage.code_version == CODE_VERSION
-    assert {s.strategy for s in report.sections} == {
-        "capitulation_reversal",
-        "hype_failure_short",
-        "post_earnings_drift",
-        "sentiment_breakout",
-        "sentiment_pullback",
-    }
+    # Every enabled strategy, read from config rather than hard-coded: the
+    # point of the assertion is "no strategy is silently missing a section",
+    # and pinning the list meant registering one (``volume_breakout``, the
+    # relabelled unconfirmed-breakout path) failed this test for the very
+    # reason it exists to prevent -- it DID get its section.
+    assert {s.strategy for s in report.sections} == set(
+        synthetic_pipeline.config.signals.enabled_strategies
+    )
     for section in report.sections:
         assert section.evidence_basis == "in_sample_single_pass_fallback"
         assert section.fold_count == 0

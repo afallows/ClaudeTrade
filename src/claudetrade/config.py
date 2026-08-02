@@ -1066,8 +1066,34 @@ class SentimentConfig(BaseModel):
         }
     )
     #: Windows (days) used for acceleration measures.
+    #:
+    #: ``fast_window_days`` is the *recent* window. For MENTION growth (see
+    #: ``sentiment.aggregation._mention_growth``) the baseline it is compared
+    #: against is the ``slow_window_days - fast_window_days`` stretch
+    #: IMMEDIATELY PRECEDING it, so the two windows never overlap and the
+    #: total span stays ``slow_window_days``. They used to overlap -- the slow
+    #: bucket contained every fast post -- which made the "growth" reading an
+    #: artifact of the window ratio rather than a measurement: a first-ever
+    #: burst of 2 posts and a burst of 200 both scored exactly
+    #: ``slow_days/fast_days - 1``.
     fast_window_days: int = 2
     slow_window_days: int = 10
+    #: Additive (Laplace-style) smoothing applied to BOTH mention rates, in
+    #: posts per covered session, before they are divided. This is what stops
+    #: a ratio built on a handful of posts reading as loudly as the same ratio
+    #: on a real sample: at a prior of 0.5, one post per session becoming
+    #: three reads as +133% instead of the raw +200%, while 10 -> 30 posts per
+    #: session -- the identical ratio, on a sample large enough to mean
+    #: something -- still reads +190%. Set to 0.0 to compare the raw rates
+    #: (not recommended: small samples then dominate every percentile rank
+    #: downstream).
+    mention_growth_prior_per_session: float = 0.5
+    #: Total mentions (recent + baseline window) below which mention growth is
+    #: reported as 0.0 -- "not measurable", not "flat". A gate rather than a
+    #: smaller prior because below a handful of posts the *sign* is noise too,
+    #: and ``mention_acceleration`` is percentile-ranked by strategies a/c
+    #: where a noisy sign is worse than an absent reading.
+    min_mentions_for_growth: int = 5
     #: Above this share of posts from one author/community, flag concentration.
     source_concentration_alert: float = 0.40
     duplicate_ratio_alert: float = 0.35
@@ -1125,6 +1151,14 @@ class SignalConfig(BaseModel):
     enabled_strategies: list[str] = Field(
         default_factory=lambda: [
             "sentiment_breakout",
+            # The breakout with no confirming social sample. It is a separate
+            # strategy rather than a branch inside ``sentiment_breakout``
+            # because it is a different thesis with a different edge, and the
+            # two are mutually exclusive by construction -- see
+            # ``strategies.f_volume_breakout``. Disable it to run a
+            # sentiment-only screen without also losing the confirmed
+            # breakouts.
+            "volume_breakout",
             "sentiment_pullback",
             "capitulation_reversal",
             "hype_failure_short",
@@ -1160,6 +1194,26 @@ class SignalConfig(BaseModel):
             "manipulation_risk": 0.04,
         }
     )
+    #: Share of the ATTENTION component taken from aggregator sources
+    #: (ApeWisdom's ``apewisdom:<community>`` rows) rather than from this
+    #: application's own post counts. Aggregators watch whole communities
+    #: continuously where the local fetches are narrow, rate-limited windows
+    #: into the same populations, so their mention volume is the better
+    #: attention input -- but only after each source is ranked against its
+    #: OWN history (see ``signals.scoring._attention_score``); the two count
+    #: scales differ by ~100x and must never be summed. Applies to the
+    #: attention axis ONLY: an aggregator row carries no polarity, no authors
+    #: and no text, so it can never reach ``reddit_sentiment``,
+    #: ``x_sentiment``, ``manipulation_risk`` or ``data_confidence``. Set to
+    #: 0.0 to score attention from local post counts alone.
+    attention_aggregator_weight: float = 0.45
+    #: Observations of an aggregator source's own history (including today's)
+    #: required before its reading is used at all. Below this the percentile
+    #: rank that normalises it has no distribution to rank against, and using
+    #: the raw ratio instead would mix a wide-corpus scale into a
+    #: narrow-corpus one -- the exact swamping this normalisation exists to
+    #: prevent. Under-covered sources are simply absent from the axis.
+    attention_min_history_sessions: int = 10
 
 
 class StrategyCalibrationConfig(BaseModel):
@@ -1206,6 +1260,16 @@ class StrategyCalibrationConfig(BaseModel):
     breakout_trend_percentile: float = 0.55
     breakout_sentiment_accel_percentile: float = 0.65
     breakout_mention_accel_percentile: float = 0.60
+    #: Minimum CURRENT polarity for ``sentiment_breakout`` to fire at all --
+    #: not a scored component but a hard precondition, because a strategy
+    #: named "sentiment breakout" recommending a name with no social sample,
+    #: or with negative sentiment, is mislabelled rather than merely
+    #: degraded. Applied to the raw decayed mean AND to the
+    #: manipulation-resistant one-vote-per-author mean, so a single prolific
+    #: poster cannot supply the confirmation on his own. Deliberately just
+    #: above zero: this asks for "positive, not merely not-negative", and the
+    #: strength of the reading is what the scored components measure.
+    breakout_min_positive_sentiment: float = 0.05
 
     # --- Strategy B: sentiment_pullback --------------------------------------
     pullback_trend_percentile: float = 0.55
