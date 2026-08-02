@@ -146,15 +146,31 @@ def get_signals(
     *,
     min_score: float = 0.0,
     limit: int = 20,
+    sort: str = "score",
 ) -> dict[str, Any]:
-    """Read-only. Current signals from the immutable ledger, most-recent-first.
+    """Read-only. Current signals from the immutable ledger, best-scoring first.
 
     Mirrors ``webapi.routers.signals.list_signals`` (the Screener grid's data
     source) filtered to ``min_score``, via the same ``pipeline.ledger`` calls
     -- not the HTTP layer. The standing research-only disclaimer is included
     once at the top level, not repeated per row.
 
+    **Ordering is score-descending, and that is a correction.** This used to
+    return the most recently *written* rows: the ledger was read newest-first
+    and truncated in Python, so ``limit=N`` yielded whatever the last scan
+    happened to write last. Scans write in roughly symbol order, so the
+    result was an alphabetical slice that silently excluded the best
+    candidates -- QA saw a ``limit=20`` call return GIL/TTEK/THC while MSFT
+    (73.90), LPLA (75.53) and AMZN (73.40) sat outside the window, and two
+    reviewers comparing the same scan through this tool and the UI reached
+    different conclusions. ``min_score`` was the only way to reach the top,
+    which required already knowing the score distribution.
+
     Args:
+        sort: ``"score"`` (default, best first -- matches the UI screener) or
+            ``"created_at"`` (newest first). Chronological order is a real
+            need for audit and ledger inspection, so it stays available; it
+            is simply the wrong default for "show me the candidates".
         config: When given and there are no matching signals, a
             ``why_no_signals`` block is added from the most recent scan's
             persisted rejection funnel (see :func:`_why_no_signals`) -- "why
@@ -164,23 +180,28 @@ def get_signals(
             :func:`build_server` always passes one.
     """
     limit = max(1, min(int(limit), 200))
-    # One query for signals AND statuses. The previous per-row
-    # ``current_status`` loop issued up to SIGNAL_SCAN_LIMIT+1 sequential
-    # queries -- and whenever fewer than ``limit`` rows cleared ``min_score``
-    # it never broke early, so a concurrent refresh's per-query slowdown
-    # multiplied by the full scan width. That aggregate, executed on the MCP
-    # event loop, is what QA observed as a hung-then-dead server (F26).
-    recent = pipeline.ledger.recent_with_status(limit=SIGNAL_SCAN_LIMIT)
+    order = "created_at" if str(sort).lower() == "created_at" else "score"
+    # Ordering and filtering happen in SQL (``overall_score`` is indexed), so
+    # ``limit`` genuinely means "the N best" rather than "the N newest that
+    # happened to qualify". One query for signals AND statuses: the per-row
+    # ``current_status`` loop this replaced issued up to SIGNAL_SCAN_LIMIT+1
+    # sequential queries and never broke early when fewer than ``limit`` rows
+    # cleared the filter -- that aggregate, on the MCP event loop, is what QA
+    # observed as a hung-then-dead server (F26).
+    matches, total = pipeline.ledger.list_with_status(
+        min_score=min_score, limit=limit, order=order
+    )
+    rows = [_signal_summary(sig, status) for sig, status in matches]
 
-    rows: list[dict[str, Any]] = []
-    for sig, status in recent:
-        if sig.overall_score < min_score:
-            continue
-        rows.append(_signal_summary(sig, status))
-        if len(rows) >= limit:
-            break
-
-    result: dict[str, Any] = {"disclaimer": DISCLAIMER, "count": len(rows), "signals": rows}
+    result: dict[str, Any] = {
+        "disclaimer": DISCLAIMER,
+        "count": len(rows),
+        # Callers could not previously tell a complete answer from a slice.
+        "total_matching": total,
+        "truncated": total > len(rows),
+        "sorted_by": order,
+        "signals": rows,
+    }
     if not rows and config is not None:
         result["why_no_signals"] = _why_no_signals(config)
     return result
@@ -845,19 +866,27 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
         name="get_signals",
         description=(
             "Read-only. Current signals/recommendations from the immutable ledger, "
-            "most-recent-first: symbol, strategy, direction, score, confidence, "
-            "entry/stop/targets and days_to_earnings. Includes the standing "
-            "research-only disclaimer once, not per row. When there are no matching "
-            "signals, includes a why_no_signals block: the rejection funnel (reasons "
-            "and counts) and closest near-misses from the most recent scan on this "
-            "installation, so 'why no picks today?' has a real answer."
+            "BEST-SCORING FIRST by default, so limit=N means the N best candidates "
+            "and matches what the web Screener shows. Returns symbol, strategy, "
+            "direction, score, confidence, entry/stop/targets and days_to_earnings, "
+            "plus total_matching and truncated so you can tell a complete answer "
+            "from a page. sort='created_at' gives newest-first instead, for audit or "
+            "ledger inspection. Includes the standing research-only disclaimer once, "
+            "not per row. When there are no matching signals, includes a "
+            "why_no_signals block: the rejection funnel (reasons and counts) and "
+            "closest near-misses from the most recent scan on this installation, so "
+            "'why no picks today?' has a real answer."
         ),
     )
-    async def _get_signals(min_score: float = 0.0, limit: int = 20) -> dict[str, Any]:
+    async def _get_signals(
+        min_score: float = 0.0, limit: int = 20, sort: str = "score"
+    ) -> dict[str, Any]:
         return await _call_bounded(
             "get_signals",
             config.mcp.tool_timeout_seconds,
-            lambda: get_signals(pipeline, config, min_score=min_score, limit=limit),
+            lambda: get_signals(
+                pipeline, config, min_score=min_score, limit=limit, sort=sort
+            ),
         )
 
     @server.tool(
