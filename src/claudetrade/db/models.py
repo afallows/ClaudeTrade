@@ -507,6 +507,77 @@ class AdanosSnapshotRow(Base):
     fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class AnalystSnapshotRow(Base):
+    """One TipRanks-sourced analyst-sentiment snapshot for one symbol on one
+    session.
+
+    Parsed entirely from fields already present in the ``dataForTicker``
+    ``overview`` payload ``providers.market.tipranks.TipRanksProvider``
+    fetches (and caches) for reference data, market caps and earnings -- see
+    ``providers.market.tipranks_analyst`` for the parser and
+    ``domain.AnalystSnapshot`` for what each field means and where it comes
+    from.
+
+    A **mutable daily snapshot, not the immutable signal ledger** -- same
+    posture as ``AdanosSnapshotRow`` immediately above (see that class's own
+    docstring): dedup/upsert is on ``(session, symbol)``, so a re-refresh
+    within the same session updates the existing row rather than duplicating
+    it or triggering an append-only guard. No immutability trigger is
+    installed for this table, matching migration 010's rationale for
+    ``adanos_snapshots`` -- these rows are re-collected and upserted every
+    cycle (see ``data.ingest.DataIngestor.ingest_analyst_snapshots``), not an
+    audit trail.
+
+    ``consensus_over_time``/``recent_rating_actions`` are stored as JSON
+    lists of plain dicts (mirroring ``trend_history`` above and
+    ``SymbolSentimentDaily.labels`` elsewhere in this module) rather than as
+    child tables -- both are read-mostly, bounded-length, and always read
+    whole alongside their parent row; a normalised child table would add
+    join cost for a shape nothing here ever queries independently.
+    """
+
+    __tablename__ = "analyst_snapshots"
+    __table_args__ = (
+        UniqueConstraint("session", "symbol", name="uq_analyst_snapshot"),
+        Index("ix_analyst_snapshot_lookup", "symbol", "session"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    session: Mapped[dt.date] = mapped_column(Date, index=True)
+    #: TipRanks' own opaque 1-5 rating scale (see ``domain.AnalystSnapshot``
+    #: for the scale-direction caveat) -- ``None`` when the selected
+    #: ``consensuses`` row was itself absent.
+    consensus_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    buy_count: Mapped[int] = mapped_column(Integer, default=0)
+    hold_count: Mapped[int] = mapped_column(Integer, default=0)
+    sell_count: Mapped[int] = mapped_column(Integer, default=0)
+    consensus_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price_target_mean: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price_target_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price_target_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price_target_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    #: ``buy_count + hold_count + sell_count`` at write time -- stored
+    #: rather than recomputed on read so a stored row is a complete,
+    #: self-consistent record of what was seen (see
+    #: ``domain.AnalystSnapshot``'s docstring for why this sum, not
+    #: ``overview.numOfAnalysts``, is used).
+    analyst_count: Mapped[int] = mapped_column(Integer, default=0)
+    #: List of ``{date, buy, hold, sell, consensus, price_target}`` dicts,
+    #: date-ascending, bounded by
+    #: ``providers.market.tipranks_analyst.CONSENSUS_OVER_TIME_MAX``.
+    consensus_over_time: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    #: List of ``{date, firm, analyst_name, rating_id, rating_label,
+    #: action_id, action_label, price_target, old_price_target,
+    #: analyst_stars, analyst_success_rate, included_in_consensus}`` dicts,
+    #: date-descending (most recent first), bounded by
+    #: ``providers.market.tipranks_analyst.RECENT_RATING_ACTIONS_MAX``.
+    recent_rating_actions: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    last_eps_surprise_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    next_earnings_estimate_eps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 # --------------------------------------------------------------------------
 # Features, signals, ledger
 # --------------------------------------------------------------------------

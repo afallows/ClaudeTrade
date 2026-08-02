@@ -330,6 +330,26 @@ def _m010_adanos_snapshots(session: Session) -> None:
     AdanosSnapshotRow.__table__.create(session.get_bind(), checkfirst=True)
 
 
+def _m011_analyst_snapshots(session: Session) -> None:
+    """Create the ``analyst_snapshots`` table (TipRanks analyst-sentiment rows).
+
+    Same fresh-vs-migrated shape as ``_m010_adanos_snapshots``: a brand-new
+    database already gets the table from ``_m001_create_schema``'s
+    ``create_all`` (the ORM model exists now), so ``checkfirst=True`` makes
+    this a no-op there and real work only on a database that reached
+    version 10 before the model did.
+
+    No append-only triggers, for the same reason migration 010 has none:
+    ``data.ingest.DataIngestor.ingest_analyst_snapshots`` re-collects and
+    upserts this table every cycle (dedup key ``(session, symbol)``), it is
+    not an immutable ledger. See ``db.models.AnalystSnapshotRow`` for the
+    full column rationale.
+    """
+    from claudetrade.db.models import AnalystSnapshotRow
+
+    AnalystSnapshotRow.__table__.create(session.get_bind(), checkfirst=True)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_schema", _m001_create_schema, "Initial tables, indexes and constraints"),
     Migration(2, "immutability_triggers", _m002_immutability_triggers, "Append-only ledger guards"),
@@ -365,6 +385,12 @@ MIGRATIONS: tuple[Migration, ...] = (
         "adanos_snapshots",
         _m010_adanos_snapshots,
         "Per-(session, platform, symbol) Adanos buzz/sentiment rows (X/Reddit/Polymarket)",
+    ),
+    Migration(
+        11,
+        "analyst_snapshots",
+        _m011_analyst_snapshots,
+        "Per-(session, symbol) TipRanks analyst-consensus/rating-action snapshot rows",
     ),
 )
 

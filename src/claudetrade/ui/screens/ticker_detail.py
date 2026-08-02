@@ -18,6 +18,7 @@ from claudetrade.ui.charts import create_ticker_chart
 from claudetrade.ui.components.layout import page_header
 from claudetrade.ui.components.tables import empty_state
 from claudetrade.ui.data_access import (
+    analyst_sentiment,
     earnings_dates,
     known_symbols,
     price_bars,
@@ -78,6 +79,7 @@ def page_ticker_detail() -> None:
 
     _render_current_signal(config, pipeline, symbol, signals)
     _render_chart(config, pipeline, symbol, signals)
+    _render_analyst_sentiment(pipeline, symbol)
     _render_signal_history(pipeline, signals)
 
 
@@ -242,6 +244,112 @@ def _render_chart(config, pipeline, symbol: str, signals) -> None:
         st.caption(f"Next earnings: {format_date(upcoming[0])} ({(upcoming[0] - end).days} days out)")
     else:
         st.caption("No upcoming earnings date on file for this symbol.")
+
+
+def _render_analyst_sentiment(pipeline, symbol: str) -> None:
+    """TipRanks-sourced analyst-consensus block: consensus + B/H/S counts,
+    price-target mean vs. the most recent stored close, recent rating
+    actions, and the last earnings surprise. Never makes a network call --
+    reads only what the last ``claudetrade refresh`` already stored (see
+    ``ui.data_access.analyst_sentiment``).
+    """
+    st.subheader("Analyst Sentiment")
+    try:
+        overlay = analyst_sentiment(pipeline.db, symbol)
+    except Exception as exc:
+        st.error(f"Could not load analyst sentiment: {exc}")
+        return
+
+    if not overlay.available or overlay.snapshot is None:
+        empty_state(
+            f"No stored analyst-sentiment snapshot for {symbol} -- either this "
+            "installation has not refreshed since this feature was added, or "
+            "TipRanks has no analyst coverage for this symbol at all.",
+            "claudetrade refresh",
+        )
+        return
+
+    snap = overlay.snapshot
+    delta = overlay.delta
+
+    try:
+        recent_bars = price_bars(pipeline.db, symbol)
+        current_price = recent_bars[-1].close if recent_bars else None
+    except Exception:
+        current_price = None
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(
+            "Consensus Rating",
+            snap.consensus_rating if snap.consensus_rating is not None else "n/a",
+        )
+        st.caption("TipRanks' own 1-5 scale (direction unconfirmed)")
+    with col2:
+        st.metric("Buy / Hold / Sell", f"{snap.buy_count} / {snap.hold_count} / {snap.sell_count}")
+        if delta is not None and delta.has_previous:
+            st.caption(
+                f"vs prior: {delta.buy_count_change:+d} / {delta.hold_count_change:+d} / "
+                f"{delta.sell_count_change:+d}"
+            )
+    with col3:
+        pt_mean = format_price(snap.price_target_mean) if snap.price_target_mean is not None else "n/a"
+        st.metric("Price Target (mean)", f"{pt_mean} {snap.price_target_currency or ''}".strip())
+        if current_price is not None and snap.price_target_mean is not None and current_price:
+            upside = (snap.price_target_mean - current_price) / current_price * 100.0
+            st.caption(f"{upside:+.1f}% vs last close ({format_price(current_price)})")
+    with col4:
+        st.metric("Analyst Count", snap.analyst_count)
+        if delta is not None and delta.has_previous and delta.coverage_change is not None:
+            st.caption(f"coverage change: {delta.coverage_change:+d}")
+
+    surprise_col, next_col = st.columns(2)
+    with surprise_col:
+        surprise = (
+            f"{snap.last_eps_surprise_pct:+.1f}%" if snap.last_eps_surprise_pct is not None else "n/a"
+        )
+        st.caption(f"Last EPS surprise: {surprise}")
+    with next_col:
+        next_eps = (
+            f"{snap.next_earnings_estimate_eps:.2f}"
+            if snap.next_earnings_estimate_eps is not None
+            else "n/a"
+        )
+        st.caption(f"Next earnings EPS estimate: {next_eps}")
+
+    with st.expander("Recent analyst rating actions", expanded=False):
+        if not snap.recent_rating_actions:
+            st.caption("No individual rating actions stored for this symbol.")
+        else:
+            rows = [
+                {
+                    "Date": a.date,
+                    "Firm": a.firm,
+                    "Analyst": a.analyst_name,
+                    "Rating": (a.rating_label or "unknown").title(),
+                    "Action": (a.action_label or f"id {a.action_id}") if a.action_id else "n/a",
+                    "Price Target": a.price_target,
+                    "Prior Target": a.old_price_target,
+                    "Stars": a.analyst_stars,
+                }
+                for a in snap.recent_rating_actions
+            ]
+            st.dataframe(
+                rows,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Date": st.column_config.DateColumn(),
+                    "Price Target": st.column_config.NumberColumn(format="$%.2f"),
+                    "Prior Target": st.column_config.NumberColumn(format="$%.2f"),
+                    "Stars": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
+        st.caption(
+            "actionId semantics beyond 'upgrade'/'reiterate' are not documented by "
+            "TipRanks; an unrecognised action shows its raw id rather than a guessed "
+            "label -- see docs/api-providers.md."
+        )
 
 
 def _render_signal_history(pipeline, signals) -> None:

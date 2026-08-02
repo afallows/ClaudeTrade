@@ -244,6 +244,7 @@ import httpx
 from claudetrade.config import TipRanksConfig
 from claudetrade.data.universe import load_packaged_universe
 from claudetrade.domain import (
+    AnalystSnapshot,
     Bar,
     DataQualityIssue,
     DataQualitySeverity,
@@ -260,6 +261,7 @@ from claudetrade.providers.base import (
     SourceBlockedError,
     parallel_map,
 )
+from claudetrade.providers.market.tipranks_analyst import parse_analyst_snapshot
 from claudetrade.utils.timeutils import trading_days_between, utc_now
 
 log = logging.getLogger(__name__)
@@ -670,6 +672,9 @@ class TipRanksProvider(MarketDataProvider):
                 "corporate_actions": False,
                 "getquotes_batch_enabled": self._config.use_getquotes_batch,
                 "getquotes_current_bar": self._config.use_getquotes_batch,
+                #: See ``get_analyst_snapshots`` -- harvested from the same
+                #: ``overview`` responses at zero additional HTTP cost.
+                "analyst_sentiment": True,
             },
         )
 
@@ -1574,3 +1579,62 @@ class TipRanksProvider(MarketDataProvider):
             source="tipranks",
             as_of=as_of,
         )
+
+    # --- analyst sentiment (zero-new-calls harvest of the same overview) -----------
+
+    def get_analyst_snapshots(
+        self, symbols: list[str], *, as_of_session: dt.date | None = None
+    ) -> dict[str, AnalystSnapshot]:
+        """Analyst-consensus snapshots parsed from the SAME ``overview``
+        responses ``get_market_caps``/``get_security_info``/the earnings
+        methods above already fetch or serve from cache -- this issues no
+        additional HTTP call of its own; it always goes through
+        ``_resolve_map``, the one shared fetch/cache path every capability
+        on this class uses. Calling this after (or before, or instead of)
+        those other capabilities for the same ``symbols`` within one
+        process/session costs nothing extra, because a symbol resolved once
+        is cached for the rest of the configured TTL (see the module
+        docstring).
+
+        A symbol with no analyst-coverage layer at all (unknown ticker,
+        ``prices_only`` state, or a real "found" overview with no
+        consensus/expert data) is simply absent from the returned dict --
+        see ``providers.market.tipranks_analyst.parse_analyst_snapshot``'s
+        own "returns None" contract, which this method never overrides with
+        a placeholder.
+
+        Args:
+            as_of_session: The session every produced snapshot is stamped
+                with. Defaults to today (UTC date) when not given -- callers
+                doing a same-session refresh should pass the actual trading
+                session explicitly (see ``data.ingest.DataIngestor
+                .ingest_analyst_snapshots``) so the stored row's ``session``
+                matches the rest of that refresh's rows exactly, rather than
+                drifting from a UTC-vs-trading-session mismatch near a
+                session boundary.
+        """
+        out: dict[str, AnalystSnapshot] = {}
+        if not symbols:
+            return out
+        session_date = as_of_session or dt.datetime.now(tz=dt.UTC).date()
+        fetched_at = utc_now()
+        resolved = self._resolve_map(symbols)
+        for symbol in symbols:
+            resolution = resolved.get(symbol)
+            overview = resolution.overview if resolution else None
+            if overview is None:
+                continue
+            try:
+                snapshot = parse_analyst_snapshot(overview, symbol, session_date, fetched_at)
+            except Exception:
+                # Parsing is defensive throughout (see tipranks_analyst's own
+                # docstring); an exception here would be a genuine bug in
+                # this adapter, not a vendor-shape surprise -- logged and
+                # skipped rather than aborting the rest of the batch, same
+                # per-symbol-degrades posture as every other capability on
+                # this class.
+                log.warning("analyst snapshot parsing failed for %s", symbol, exc_info=True)
+                continue
+            if snapshot is not None:
+                out[symbol] = snapshot
+        return out

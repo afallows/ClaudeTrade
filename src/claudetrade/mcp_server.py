@@ -343,6 +343,119 @@ def get_sentiment(pipeline: Pipeline, symbol: str, *, days: int = 7) -> dict[str
     }
 
 
+def _analyst_rating_action_payload(action) -> dict[str, Any]:
+    return {
+        "date": action.date.isoformat(),
+        "firm": action.firm,
+        "analyst_name": action.analyst_name,
+        "rating_id": action.rating_id,
+        "rating_label": action.rating_label,
+        "action_id": action.action_id,
+        "action_label": action.action_label,
+        "price_target": action.price_target,
+        "old_price_target": action.old_price_target,
+        "analyst_stars": action.analyst_stars,
+        "analyst_success_rate": action.analyst_success_rate,
+        "included_in_consensus": action.included_in_consensus,
+    }
+
+
+def _analyst_snapshot_payload(snapshot) -> dict[str, Any]:
+    return {
+        "as_of_session": snapshot.as_of_session.isoformat(),
+        "consensus_rating": snapshot.consensus_rating,
+        "buy_count": snapshot.buy_count,
+        "hold_count": snapshot.hold_count,
+        "sell_count": snapshot.sell_count,
+        "analyst_count": snapshot.analyst_count,
+        "consensus_rate": snapshot.consensus_rate,
+        "price_target_mean": snapshot.price_target_mean,
+        "price_target_high": snapshot.price_target_high,
+        "price_target_low": snapshot.price_target_low,
+        "price_target_currency": snapshot.price_target_currency,
+        "consensus_over_time": [
+            {
+                "date": p.date.isoformat(),
+                "buy": p.buy,
+                "hold": p.hold,
+                "sell": p.sell,
+                "consensus": p.consensus,
+                "price_target": p.price_target,
+            }
+            for p in snapshot.consensus_over_time
+        ],
+        "recent_rating_actions": [
+            _analyst_rating_action_payload(a) for a in snapshot.recent_rating_actions
+        ],
+        "last_eps_surprise_pct": snapshot.last_eps_surprise_pct,
+        "next_earnings_estimate_eps": snapshot.next_earnings_estimate_eps,
+        "fetched_at": snapshot.fetched_at.isoformat() if snapshot.fetched_at else None,
+    }
+
+
+def get_analyst_sentiment(pipeline: Pipeline, symbol: str) -> dict[str, Any]:
+    """Read-only. TipRanks-sourced analyst-consensus snapshot for one symbol.
+
+    Reads ``data.analyst.latest_and_previous_snapshots`` -- the same batched
+    read helper the Streamlit ticker-detail screen's "Analyst sentiment"
+    block uses -- for the latest stored ``analyst_snapshots`` row plus the
+    prior stored session, and ``data.analyst.analyst_delta`` for the
+    comparison between them. Nothing here makes a network call: this only
+    reads what the last ``claudetrade refresh`` already harvested from
+    TipRanks' ``dataForTicker`` response for this symbol (see
+    ``providers.market.tipranks_analyst`` for the field mapping and its
+    documented ``ratingId``/``actionId`` semantics, including where those
+    are confirmed vs. best-effort).
+
+    ``available=False`` (with ``snapshot``/``delta`` both ``None``) means
+    this installation has never stored a snapshot for the symbol -- either
+    it has not been refreshed yet, or TipRanks has no analyst-coverage layer
+    for it at all (common for small/illiquid names) -- never an error.
+    """
+    from claudetrade.data.analyst import analyst_delta, latest_and_previous_snapshots
+
+    symbol = symbol.strip().upper()
+    latest, previous = latest_and_previous_snapshots(pipeline.db, [symbol])[symbol]
+    if latest is None:
+        return {
+            "symbol": symbol,
+            "available": False,
+            "snapshot": None,
+            "delta": None,
+            "note": (
+                f"No stored analyst-sentiment snapshot for {symbol}. Either this "
+                "installation has not refreshed since this feature was added, or "
+                "TipRanks has no analyst-coverage layer for this symbol at all "
+                "(common for small/illiquid names) -- run `claudetrade refresh` "
+                "(or the trigger_refresh tool) and check again."
+            ),
+        }
+
+    delta = analyst_delta(latest, previous)
+    return {
+        "symbol": symbol,
+        "available": True,
+        "snapshot": _analyst_snapshot_payload(latest),
+        "delta": {
+            "previous_session": (
+                delta.previous_session.isoformat() if delta.previous_session else None
+            ),
+            "has_previous": delta.has_previous,
+            "buy_count_change": delta.buy_count_change,
+            "hold_count_change": delta.hold_count_change,
+            "sell_count_change": delta.sell_count_change,
+            "coverage_change": delta.coverage_change,
+            "consensus_rating_change": delta.consensus_rating_change,
+            "price_target_mean_change": delta.price_target_mean_change,
+            "price_target_mean_change_pct": delta.price_target_mean_change_pct,
+            "new_rating_actions": [
+                _analyst_rating_action_payload(a) for a in delta.new_rating_actions
+            ],
+        },
+        "note": None,
+    }
+
+
 def get_trending(pipeline: Pipeline, *, limit: int = 20, source: str = "auto") -> dict[str, Any]:
     """Read-only. Symbols ranked by recent mention volume.
 
@@ -1059,6 +1172,30 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "get_sentiment",
             config.mcp.tool_timeout_seconds,
             lambda: get_sentiment(pipeline, symbol, days=days),
+        )
+
+    @server.tool(
+        name="get_analyst_sentiment",
+        description=(
+            "Read-only. TipRanks-sourced analyst-consensus snapshot for one symbol: "
+            "consensus rating, ranked Buy/Hold/Sell counts and analyst count, price-"
+            "target mean/high/low, a bounded consensus-over-time series, recent "
+            "individual analyst rating actions (firm, analyst, rating, best-effort "
+            "action label, new/old price target, analyst stars/success rate), and "
+            "the last earnings surprise / next earnings EPS estimate. Also reports "
+            "the delta against the previous stored session (count/coverage/rating/"
+            "price-target changes, plus rating actions dated after that prior "
+            "session). Makes no network call -- reads only what the last "
+            "`claudetrade refresh` already stored; available=false (never an error) "
+            "means no snapshot has been stored yet, or TipRanks has no analyst "
+            "coverage for this symbol at all."
+        ),
+    )
+    async def _get_analyst_sentiment(symbol: str) -> dict[str, Any]:
+        return await _call_bounded(
+            "get_analyst_sentiment",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_analyst_sentiment(pipeline, symbol),
         )
 
     @server.tool(

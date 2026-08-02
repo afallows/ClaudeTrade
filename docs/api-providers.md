@@ -696,6 +696,106 @@ only daily-history source in this codebase; TipRanks' role is real-time
 (GetQuotes) and last-resort close-only/`prices_only` backfill, never the
 historical backbone.
 
+**Analyst sentiment (`get_analyst_snapshots`, `providers.market
+.tipranks_analyst`) -- harvested from the SAME `dataForTicker` response,
+ZERO new HTTP calls**: `overview` carries a rich analyst-consensus layer
+this adapter used to discard entirely (only refdata/caps/earnings were
+read). `TipRanksProvider.get_analyst_snapshots` reads more of the exact
+response every other capability on this class already fetches/caches --
+never a separate request, never a separate cache entry. Before adding this,
+the on-disk cache record was checked end to end and confirmed to already
+store the FULL `overview` dict verbatim (`_store_cache_record` never trims
+it) -- so no cache-record version bump was needed; every field below was
+already surviving a cache round-trip in every cache file this adapter has
+ever written.
+
+Fields consumed, and where each comes from:
+
+- `consensus_rating`/`consensus_rate` -- the `overview.consensuses[]` row
+  with `isLatest == 1` and `bench == 1` (both committed fixtures carry
+  exactly one such row). `consensus_rating` is TipRanks' own opaque 1-5
+  scale; this adapter stores it as reported and does **not** assert a
+  Strong-Buy-to-Strong-Sell direction, since that direction is not
+  independently confirmed from either fixture.
+- `buy_count`/`hold_count`/`sell_count`/`analyst_count` -- `overview.
+  latestRankedConsensus` (`nB`/`nH`/`nS`), the RANKED-analyst subset --
+  CONFIRMED distinct from the broader `consensuses[]` row on the INTC
+  fixture (ranked `nH=23` vs. the unranked row's `nH=24`). `analyst_count`
+  is the sum of these same three ranked counts, deliberately not `overview.
+  numOfAnalysts` (an unrelated, much larger all-time/global TipRanks
+  figure), so the four numbers stay internally consistent.
+- `price_target_mean`/`high`/`low`/`currency` -- `overview.ptConsensus[]`,
+  preferring a `bench == 1` row, falling back to the first row present (both
+  fixtures carry one `bench == 0` row, so that fallback is the path
+  actually exercised today).
+- `consensus_over_time` -- `overview.consensusOverTime[]`, capped at
+  `tipranks_analyst.CONSENSUS_OVER_TIME_MAX` (24) most-recent points,
+  chronological.
+- `recent_rating_actions` -- flattened from `overview.experts[]` AND
+  `overview.notRankedExperts[]` (both pools are inspected), filtered to
+  `eTypeId == 1` (TipRanks' own professional-analyst type) and capped at
+  `tipranks_analyst.RECENT_RATING_ACTIONS_MAX` (30) most-recent actions.
+  **Non-analyst expert types are excluded**: `eTypeId == 3` is a Stocktwits
+  social-media author (confirmed via the INTC fixture's own
+  `notRankedExperts` row, headlined "...-Bearish"), and this is an
+  allow-list (only `1` passes), not a deny-list of the one excluded value
+  observed -- an unrecognised `eTypeId` is excluded by default.
+- `last_eps_surprise_pct`/`next_earnings_estimate_eps` -- the same
+  `portfolioHoldingData.lastReportedEps.surprise` /
+  `nextEarningsReport.eps` fields `_map_earnings_event` already reads,
+  duplicated onto the snapshot so a caller does not have to also query
+  `EarningsEventRow`.
+
+**`ratingId`/`actionId` semantics -- confirmed vs. best-effort, stated
+honestly**:
+
+- `ratingId`: `1 == "buy"` is CONFIRMED by the INTC fixture's Vivek Arya row,
+  whose own headline text reads "Buy Rating Reaffirmed"; `3 == "sell"` is
+  CONFIRMED by the excluded `notRankedExperts` Stocktwits row, headlined
+  "...-Bearish". `2 == "hold"` follows by elimination (only three rating ids
+  are observed across both fixtures, and this is consistent with every
+  `nB`/`nH`/`nS` count seen) -- not independently headline-confirmed, but
+  not a guess either.
+- `actionId`: **NOT documented by TipRanks anywhere reachable from this
+  adapter.** Exactly two values are confirmed from headline text: `3` on
+  the TECK.B fixture's Brian MacArthur row ("upgraded to Outperform from
+  Market Perform") maps to `"upgrade"`; `5`, seen on three rows across both
+  fixtures whose headlines describe an unchanged rating ("Buy Rating
+  Reaffirmed", a same-firm price-target raise with no rating change), maps
+  to `"reiterate"`. `8` appears only on the excluded non-analyst Stocktwits
+  row and is left unmapped. **No initiate or downgrade value has been
+  observed in either committed fixture** -- any `actionId` this module has
+  not confirmed is stored as the raw id with `action_label=None` rather
+  than guessed, per ADR-0008 Decision 1's "never fabricate meaning for an
+  unconfirmed field" posture.
+
+**Storage**: `db.models.AnalystSnapshotRow` (`analyst_snapshots` table,
+migration 011), one row per `(session, symbol)` -- a MUTABLE daily snapshot,
+not the immutable signal ledger: a re-refresh within the same session
+upserts/replaces the existing row rather than duplicating it, the same
+posture `adanos_snapshots` (migration 010) already applies. `data.ingest
+.DataIngestor.ingest_analyst_snapshots` wires this into the market pass
+immediately after `ingest_earnings`, keyed to the current trading session; a
+symbol with no analyst-coverage layer at all contributes no row (an empty
+snapshot is never stored), and any fetch/parse failure degrades per symbol
+(logged, counted in `IngestReport.analyst_snapshots_upserted`/
+`provider_failures`, never aborting the refresh).
+
+**Diffs**: `data.analyst.analyst_delta(current, previous)` is a pure,
+read-time comparison between two stored snapshots -- rating-count changes,
+a coverage-count delta, a consensus-rating delta, a price-target-mean
+delta (absolute and percent), and any rating actions dated after the
+previous snapshot's own session. `data.analyst
+.latest_and_previous_snapshots` is the batched read every caller (the
+Streamlit ticker-detail screen, the `get_analyst_sentiment` MCP tool) goes
+through -- two SQL queries total regardless of how many symbols are asked
+for, mirroring `signals.research.ResearchLedger
+.latest_research_revisions`'s own batched-join discipline (there is a
+documented past incident, F26, from a per-symbol read loop in production).
+
+**Not fed to `ComponentScores`/strategy scoring** -- explicitly deferred;
+this is a read-only research surface (Streamlit + the MCP tool) only.
+
 **Limitations**:
 
 - **Unauthenticated partner-widget endpoint, not a published/contracted

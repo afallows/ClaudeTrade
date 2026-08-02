@@ -24,9 +24,11 @@ from dataclasses import dataclass, field, replace
 from sqlalchemy import func, select
 
 from claudetrade.config import AppConfig
+from claudetrade.data.analyst import snapshot_to_row_fields
 from claudetrade.data.quality import DataQualityChecker, QualityReport
 from claudetrade.db.models import (
     AdanosSnapshotRow,
+    AnalystSnapshotRow,
     CorporateActionRow,
     EarningsEventRow,
     PaperTradeRow,
@@ -110,6 +112,12 @@ class IngestReport:
     bars_revised: int = 0
     corporate_actions: int = 0
     earnings_upserted: int = 0
+    #: Rows written/replaced in ``analyst_snapshots`` this run (see
+    #: ``DataIngestor.ingest_analyst_snapshots``). Zero on an installation
+    #: with no TipRanks-backed market/earnings provider configured, or when
+    #: every resolved symbol had no analyst-coverage layer -- both honest,
+    #: not a failure.
+    analyst_snapshots_upserted: int = 0
     posts_inserted: int = 0
     mentions_inserted: int = 0
     provider_failures: dict[str, str] = field(default_factory=dict)
@@ -129,6 +137,7 @@ class IngestReport:
             "bars_inserted": self.bars_inserted,
             "bars_revised": self.bars_revised,
             "earnings": self.earnings_upserted,
+            "analyst_snapshots": self.analyst_snapshots_upserted,
             "posts": self.posts_inserted,
             "mentions": self.mentions_inserted,
             "quality_errors": len(self.quality.errors),
@@ -1285,6 +1294,113 @@ class DataIngestor:
         self.checker.persist(report.quality)
         return merged
 
+    # --- analyst sentiment (zero-new-calls harvest of the tipranks overview) ---
+
+    def _tipranks_analyst_provider(self) -> object | None:
+        """The TipRanks adapter instance to harvest analyst snapshots
+        through -- whichever of ``self.earnings``/``self.market`` actually
+        is (or wraps) one.
+
+        ``get_market_provider``/``get_earnings_provider`` (``providers.
+        registry``) construct ``self.market`` and ``self.earnings`` as TWO
+        SEPARATE ``TipRanksProvider`` instances when both are configured as
+        ``"tipranks"`` (the default for both) -- but both are given the
+        SAME ``cache_dir``, so they share one on-disk response cache
+        regardless of which instance resolves a symbol first. Calling
+        ``get_analyst_snapshots`` through either instance costs zero extra
+        HTTP calls beyond whatever ``ingest_earnings``/``enrich_market_caps``
+        already paid for in this same refresh -- this method just picks
+        whichever instance is actually present, preferring ``self.earnings``
+        since ``ingest_earnings`` (immediately above) already resolved every
+        one of ``symbols`` through it moments earlier.
+        """
+        earnings = self.earnings
+        if getattr(earnings, "name", None) == "tipranks" and hasattr(
+            earnings, "get_analyst_snapshots"
+        ):
+            return earnings
+        return self._market_provider_named("tipranks")
+
+    def ingest_analyst_snapshots(
+        self, symbols: list[str], session_date: dt.date, report: IngestReport
+    ) -> int:
+        """Harvest analyst-consensus snapshots from the SAME ``overview``
+        responses ``ingest_earnings``/``enrich_market_caps`` already fetched
+        or served from cache for ``symbols`` this refresh -- ZERO additional
+        HTTP calls (see ``providers.market.tipranks.TipRanksProvider
+        .get_analyst_snapshots`` and ``providers.market.tipranks_analyst``).
+
+        Written into ``db.models.AnalystSnapshotRow``, one row per
+        ``(session_date, symbol)`` -- re-collection within the same session
+        replaces the existing row rather than duplicating it, the same
+        posture ``ingest_adanos`` applies to ``adanos_snapshots`` (see that
+        table's own docstring): this is a mutable daily snapshot, not the
+        immutable signal ledger.
+
+        A symbol with no analyst-coverage layer at all contributes no row
+        (see ``tipranks_analyst.parse_analyst_snapshot``'s "returns None"
+        contract) -- an empty snapshot must never be stored. No configured
+        TipRanks-backed provider at all is an honest zero, not a failure
+        (``TipRanksProvider`` is the only adapter in this codebase that
+        implements ``get_analyst_snapshots``; any other market/earnings
+        provider simply has nothing for this method to call). A genuine
+        fetch/parse failure degrades per symbol -- logged and skipped, never
+        aborting the rest of the batch or the refresh -- and is reflected in
+        ``report.provider_failures`` when it affects the whole capability.
+        """
+        provider = self._tipranks_analyst_provider()
+        get_snapshots = getattr(provider, "get_analyst_snapshots", None)
+        if provider is None or get_snapshots is None:
+            return 0
+
+        try:
+            snapshots = get_snapshots(symbols, as_of_session=session_date)
+        except Exception as exc:
+            log.warning("analyst snapshot fetch failed: %s", exc, exc_info=True)
+            report.provider_failures["tipranks_analyst"] = str(exc)
+            return 0
+        if not snapshots:
+            return 0
+
+        with self.db.read_session() as session:
+            known = {row[0] for row in session.execute(select(Security.symbol)).all()}
+
+        written = 0
+        failed = 0
+        for chunk in _chunks(list(snapshots.items()), PERSIST_CHUNK_ROWS):
+            with self.db.session() as session:
+                for symbol, snapshot in chunk:
+                    if symbol not in known:
+                        continue
+                    try:
+                        existing = (
+                            session.query(AnalystSnapshotRow)
+                            .filter_by(symbol=symbol, session=session_date)
+                            .one_or_none()
+                        )
+                        row = existing or AnalystSnapshotRow(symbol=symbol, session=session_date)
+                        for field_name, value in snapshot_to_row_fields(snapshot).items():
+                            setattr(row, field_name, value)
+                        if existing is None:
+                            session.add(row)
+                        written += 1
+                    except Exception:
+                        log.warning(
+                            "failed to persist analyst snapshot for %s", symbol, exc_info=True
+                        )
+                        failed += 1
+
+        report.analyst_snapshots_upserted += written
+        if failed:
+            report.provider_failures.setdefault(
+                "tipranks_analyst_persist", f"{failed} symbol(s) failed to persist"
+            )
+        log.info(
+            "analyst snapshots: stored %d row(s) for %s%s",
+            written, session_date, f" ({failed} failed)" if failed else "",
+        )
+        return written
+
     # --- social ---------------------------------------------------------------
 
     def _social_symbol_hints(self, candidates: list[str] | None) -> list[str] | None:
@@ -1908,6 +2024,13 @@ class DataIngestor:
         self.ingest_prices(symbols, start, end, report, securities=reference)
         self.ingest_corporate_actions(symbols, start, end, report)
         self.ingest_earnings(symbols, start, end, report)
+        # Same TipRanks ``overview`` responses ``ingest_earnings`` just
+        # fetched/cached -- this harvests the analyst-consensus fields from
+        # them at zero additional HTTP cost. Keyed to the current trading
+        # session (a mutable daily snapshot), the same convention as the
+        # attention/adanos blocks below, not the ``[start, end]`` backfill
+        # window ``ingest_earnings`` uses for historical events.
+        self.ingest_analyst_snapshots(symbols, current_trading_session(), report)
 
         if self.social:
             self._report_progress("sentiment", 0, 1)

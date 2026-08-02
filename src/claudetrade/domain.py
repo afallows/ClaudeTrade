@@ -272,6 +272,140 @@ class EarningsEvent:
         return (self.report_date - pad, self.report_date + pad)
 
 
+@dataclass(frozen=True, slots=True)
+class AnalystConsensusPoint:
+    """One dated point of TipRanks' ``consensusOverTime`` series.
+
+    A trailing history of the Buy/Hold/Sell split and blended price target,
+    as TipRanks itself computed and reported it at that date -- this
+    application never recomputes or backfills a point, it only stores what
+    was served. ``consensus`` is the same 1-5 opaque rating scale as
+    ``AnalystSnapshot.consensus_rating`` (see that field's docstring for the
+    scale-direction caveat).
+    """
+
+    date: dt.date
+    buy: int
+    hold: int
+    sell: int
+    consensus: int | None = None
+    price_target: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AnalystRatingAction:
+    """One analyst's single rating action from TipRanks' ``experts[].ratings[]``.
+
+    ``rating_id``/``rating_label``: TipRanks' own 1/2/3 rating code, and a
+    best-effort label derived from it. Confirmed against the committed
+    fixtures, not merely assumed: the INTC fixture's Vivek Arya row is
+    literally titled "Buy Rating Reaffirmed" under ``rating_id=1``, and the
+    non-analyst StockTwits row in ``notRankedExperts`` is titled
+    "...-Bearish" under ``rating_id=3`` -- so ``1="buy"``, ``3="sell"`` are
+    confirmed and ``2="hold"`` follows by elimination (also consistent with
+    every ``nB``/``nH``/``nS`` ordering seen). Any other value is stored with
+    ``rating_label=None`` rather than guessed.
+
+    ``action_id``/``action_label``: TipRanks does NOT document this code
+    anywhere reachable from this adapter. Only two values are confirmed from
+    the fixtures' own headline text: ``action_id=3`` on the TECK.B fixture's
+    Brian MacArthur row, titled "upgraded to Outperform from Market Perform"
+    ("upgrade"), and ``action_id=5`` on three separate rows whose titles
+    read as a maintained rating ("Buy Rating Reaffirmed", a same-firm price
+    target raise with no rating change) ("reiterate"). ``action_id=8``
+    appears only on the excluded non-analyst StockTwits row and is left
+    unmapped. Every other value this adapter has never seen (an initiation,
+    a downgrade, ...) is stored as the raw ``action_id`` with
+    ``action_label=None`` -- never guessed silently, per the module's own
+    ADR-0008 Decision 1 posture of never fabricating meaning for an
+    unconfirmed field.
+    """
+
+    date: dt.date
+    firm: str
+    analyst_name: str
+    rating_id: int | None = None
+    rating_label: str | None = None
+    action_id: int | None = None
+    action_label: str | None = None
+    price_target: float | None = None
+    old_price_target: float | None = None
+    analyst_stars: float | None = None
+    analyst_success_rate: float | None = None
+    included_in_consensus: bool = False
+
+
+@dataclass(slots=True)
+class AnalystSnapshot:
+    """TipRanks-sourced analyst-sentiment snapshot for one symbol, one session.
+
+    Harvested entirely from fields already present in the ``dataForTicker``
+    ``overview`` payload ``providers.market.tipranks.TipRanksProvider``
+    fetches (and caches) for reference data, market caps and earnings --
+    this domain object adds no new HTTP calls of its own. See
+    ``providers.market.tipranks_analyst`` for the parser and the fixture
+    cross-references behind every field mapping below.
+
+    ``buy_count``/``hold_count``/``sell_count``/``analyst_count`` come from
+    ``overview.latestRankedConsensus`` (``nB``/``nH``/``nS``) -- the
+    RANKED-analyst subset TipRanks itself distinguishes from the broader,
+    unranked pool in ``overview.consensuses[]`` (confirmed different on the
+    INTC fixture: ranked ``nH=23`` vs. the unranked row's ``nH=24``).
+    ``analyst_count`` is deliberately the sum of these same three ranked
+    counts, not ``overview.numOfAnalysts`` (a much larger, all-time/global
+    TipRanks figure unrelated to this one symbol's current coverage) -- so
+    the four numbers are always internally consistent with each other.
+
+    ``consensus_rating``/``consensus_rate`` come from the
+    ``overview.consensuses[]`` row selected by ``isLatest == 1`` (and
+    ``bench == 1`` when more than one such row is present -- both fixtures
+    only ever carry a single row satisfying both, so multi-row selection is
+    exercised defensively, not against a captured real case).
+    ``consensus_rating`` is TipRanks' own opaque 1-5 scale; this adapter
+    stores it as reported without asserting a Strong-Buy-to-Strong-Sell
+    direction, since that direction is not independently confirmed from
+    either fixture (the raw counts on both do not obviously order by it).
+
+    ``price_target_mean``/``high``/``low``/``currency`` come from
+    ``overview.ptConsensus[]``, preferring a ``bench == 1`` row (mirroring
+    the ``consensuses`` selection) and falling back to whatever row is
+    present when none is -- both fixtures carry exactly one row, with
+    ``bench == 0``, so that fallback is the path actually exercised today.
+
+    ``last_eps_surprise_pct``/``next_earnings_estimate_eps`` are the same
+    ``portfolioHoldingData.lastReportedEps.surprise`` /
+    ``nextEarningsReport.eps`` fields ``TipRanksProvider``'s own earnings
+    mapping already reads (see ``_map_earnings_event``) -- duplicated onto
+    this object so a caller wanting the analyst picture does not also have
+    to separately query ``EarningsEventRow``.
+
+    An empty/no-coverage symbol (no ``consensuses``, no ``experts``, no
+    ``ptConsensus``) parses to ``None`` from
+    ``tipranks_analyst.parse_analyst_snapshot`` rather than an all-zero
+    instance of this class -- see that function's docstring. This class
+    itself carries no "did this symbol have coverage" flag because an
+    instance of it, by construction, only ever exists for a covered symbol.
+    """
+
+    symbol: str
+    as_of_session: dt.date
+    consensus_rating: int | None = None
+    buy_count: int = 0
+    hold_count: int = 0
+    sell_count: int = 0
+    consensus_rate: float | None = None
+    price_target_mean: float | None = None
+    price_target_high: float | None = None
+    price_target_low: float | None = None
+    price_target_currency: str | None = None
+    analyst_count: int = 0
+    consensus_over_time: list[AnalystConsensusPoint] = field(default_factory=list)
+    recent_rating_actions: list[AnalystRatingAction] = field(default_factory=list)
+    last_eps_surprise_pct: float | None = None
+    next_earnings_estimate_eps: float | None = None
+    fetched_at: dt.datetime | None = None
+
+
 # --------------------------------------------------------------------------
 # Social data
 # --------------------------------------------------------------------------

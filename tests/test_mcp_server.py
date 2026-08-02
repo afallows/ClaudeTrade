@@ -1132,6 +1132,7 @@ def test_get_backtest_report_reads_back_the_latest_saved_report(tmp_app_config: 
 EXPECTED_TOOL_NAMES = {
     "get_signals",
     "get_sentiment",
+    "get_analyst_sentiment",
     "get_sentiment_history",
     "get_rising_sentiment",
     "get_trending",

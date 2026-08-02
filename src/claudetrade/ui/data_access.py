@@ -16,9 +16,10 @@ from dataclasses import dataclass
 from sqlalchemy import func, select
 
 from claudetrade.config import AppConfig
+from claudetrade.data.analyst import AnalystDelta, analyst_delta, latest_and_previous_snapshots
 from claudetrade.db.models import EarningsEventRow, PriceBar, SymbolSentimentDaily
 from claudetrade.db.session import Database
-from claudetrade.domain import Bar, Signal
+from claudetrade.domain import AnalystSnapshot, Bar, Signal
 from claudetrade.signals.research import ResearchLedger
 from claudetrade.signals.scoring import adjusted_overall
 
@@ -194,6 +195,39 @@ def research_overlay(
     return overlay
 
 
+@dataclass(slots=True, frozen=True)
+class AnalystOverlay:
+    """Read-time analyst-sentiment picture for one symbol
+    (``analyst_snapshots``), for the ticker-detail screen's "Analyst
+    sentiment" block.
+
+    ``available=False`` (with ``snapshot``/``delta`` both ``None``) means
+    this installation has never stored a snapshot for the symbol -- never an
+    error; see ``data.analyst.latest_and_previous_snapshots``.
+    """
+
+    available: bool
+    snapshot: AnalystSnapshot | None
+    delta: AnalystDelta | None
+
+
+def analyst_sentiment(db: Database, symbol: str) -> AnalystOverlay:
+    """Latest analyst-sentiment snapshot plus its delta vs. the previous
+    stored session, for one symbol.
+
+    Goes through the same batched ``data.analyst.latest_and_previous_snapshots``
+    helper the ``get_analyst_sentiment`` MCP tool uses (a single-symbol list
+    is still exactly one batched call, matching how ``_render_current_signal``
+    already calls ``research_overlay`` with a one-element signal list rather
+    than maintaining a separate unbatched read path for the single-symbol
+    case).
+    """
+    latest, previous = latest_and_previous_snapshots(db, [symbol])[symbol]
+    if latest is None:
+        return AnalystOverlay(available=False, snapshot=None, delta=None)
+    return AnalystOverlay(available=True, snapshot=latest, delta=analyst_delta(latest, previous))
+
+
 def known_symbols(db: Database, *, limit: int = 5000) -> list[str]:
     """Every symbol with at least one stored bar, for the ticker-detail picker."""
     with db.read_session() as session:
@@ -208,9 +242,11 @@ def known_symbols(db: Database, *, limit: int = 5000) -> list[str]:
 
 
 __all__ = [
+    "AnalystOverlay",
     "DataFreshness",
     "ResearchOverlay",
     "SentimentPoint",
+    "analyst_sentiment",
     "data_freshness",
     "earnings_dates",
     "known_symbols",
