@@ -12,6 +12,7 @@ surfaced when the provider is actually invoked.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from types import SimpleNamespace
 
@@ -24,6 +25,29 @@ from claudetrade.providers.ai.anthropic_provider import AnthropicProvider
 from claudetrade.providers.ai.openai_provider import DEFAULT_MODEL as OPENAI_DEFAULT_MODEL
 from claudetrade.providers.ai.openai_provider import OpenAIProvider
 from claudetrade.providers.base import AIRequest
+
+# The SDKs are optional extras (``claudetrade[anthropic]`` / ``[openai]``).
+# Tests that drive ``complete()`` past the SDK import -- or raise the SDK's
+# own typed exceptions -- need the real package; the no-credentials and
+# missing-dependency degradation tests must keep running without it.
+requires_anthropic_sdk = pytest.mark.skipif(
+    importlib.util.find_spec("anthropic") is None,
+    reason="anthropic SDK not installed (pip install claudetrade[anthropic])",
+)
+requires_openai_sdk = pytest.mark.skipif(
+    importlib.util.find_spec("openai") is None,
+    reason="openai SDK not installed (pip install claudetrade[openai])",
+)
+
+
+def _isolate_credentials(monkeypatch) -> None:
+    """Make 'no credentials' mean it: clear env AND the OS credential store.
+
+    Secret resolution falls back to the Windows Credential Manager / Keychain
+    (``claudetrade.secrets._keyring_backend``), so a developer machine with a
+    real key stored would otherwise flip the no-credential assertions.
+    """
+    monkeypatch.setattr("claudetrade.secrets._keyring_backend", lambda: None)
 
 
 def _valid_sentiment_payload() -> dict:
@@ -65,6 +89,7 @@ def _request() -> AIRequest:
 
 class TestAnthropicProvider:
     def test_no_credentials_degrades_cleanly(self, monkeypatch):
+        _isolate_credentials(monkeypatch)
         monkeypatch.delenv("CLAUDETRADE_SECRET_ANTHROPIC_API_KEY", raising=False)
         provider = AnthropicProvider(AIConfig(provider="anthropic"))
         assert provider.has_credentials is False
@@ -93,6 +118,7 @@ class TestAnthropicProvider:
         assert response.fallback_used == "missing_dependency"
         assert "anthropic" in response.error
 
+    @requires_anthropic_sdk
     def test_successful_classification_parses_structured_output(self, monkeypatch):
         monkeypatch.setenv("CLAUDETRADE_SECRET_ANTHROPIC_API_KEY", "sk-ant-test")
         provider = AnthropicProvider(AIConfig(provider="anthropic"))
@@ -126,6 +152,7 @@ class TestAnthropicProvider:
         assert captured["thinking"] == {"type": "disabled"}
         assert captured["output_config"]["format"]["type"] == "json_schema"
 
+    @requires_anthropic_sdk
     def test_refusal_stop_reason_degrades_without_raising(self, monkeypatch):
         monkeypatch.setenv("CLAUDETRADE_SECRET_ANTHROPIC_API_KEY", "sk-ant-test")
         provider = AnthropicProvider(AIConfig(provider="anthropic"))
@@ -138,6 +165,7 @@ class TestAnthropicProvider:
         assert response.parsed_ok is False
         assert "refus" in response.error
 
+    @requires_anthropic_sdk
     def test_rate_limit_error_degrades_without_raising(self, monkeypatch):
         import anthropic as real_anthropic
 
@@ -157,6 +185,7 @@ class TestAnthropicProvider:
         assert response.parsed_ok is False
         assert "rate limited" in response.error.lower()
 
+    @requires_anthropic_sdk
     def test_api_status_error_degrades_without_raising(self, monkeypatch):
         import anthropic as real_anthropic
 
@@ -176,6 +205,7 @@ class TestAnthropicProvider:
         assert response.parsed_ok is False
         assert "api error" in response.error.lower()
 
+    @requires_anthropic_sdk
     def test_connection_error_degrades_without_raising(self, monkeypatch):
         import anthropic as real_anthropic
 
@@ -195,6 +225,7 @@ class TestAnthropicProvider:
         assert "connection error" in response.error.lower()
 
     def test_complete_batch_never_raises_on_mixed_failures(self, monkeypatch):
+        _isolate_credentials(monkeypatch)
         monkeypatch.delenv("CLAUDETRADE_SECRET_ANTHROPIC_API_KEY", raising=False)
         provider = AnthropicProvider(AIConfig(provider="anthropic"))
         responses = provider.complete_batch([_request(), _request()])
@@ -209,6 +240,7 @@ class TestAnthropicProvider:
 
 class TestOpenAIProvider:
     def test_no_credentials_degrades_cleanly(self, monkeypatch):
+        _isolate_credentials(monkeypatch)
         monkeypatch.delenv("CLAUDETRADE_SECRET_OPENAI_API_KEY", raising=False)
         provider = OpenAIProvider(AIConfig(provider="openai"))
         assert provider.has_credentials is False
@@ -236,6 +268,7 @@ class TestOpenAIProvider:
         assert response.parsed_ok is False
         assert response.fallback_used == "missing_dependency"
 
+    @requires_openai_sdk
     def test_successful_classification_parses_structured_output(self, monkeypatch):
         monkeypatch.setenv("CLAUDETRADE_SECRET_OPENAI_API_KEY", "sk-test")
         provider = OpenAIProvider(AIConfig(provider="openai"))
@@ -264,6 +297,7 @@ class TestOpenAIProvider:
         assert response.output_tokens == 12
         assert captured["response_format"]["type"] == "json_schema"
 
+    @requires_openai_sdk
     def test_rate_limit_error_degrades_without_raising(self, monkeypatch):
         import openai as real_openai
 
@@ -285,6 +319,7 @@ class TestOpenAIProvider:
         assert response.parsed_ok is False
         assert "rate limited" in response.error.lower()
 
+    @requires_openai_sdk
     def test_connection_error_degrades_without_raising(self, monkeypatch):
         import openai as real_openai
 
@@ -306,6 +341,7 @@ class TestOpenAIProvider:
         assert "connection error" in response.error.lower()
 
     def test_complete_batch_never_raises_on_mixed_failures(self, monkeypatch):
+        _isolate_credentials(monkeypatch)
         monkeypatch.delenv("CLAUDETRADE_SECRET_OPENAI_API_KEY", raising=False)
         provider = OpenAIProvider(AIConfig(provider="openai"))
         responses = provider.complete_batch([_request(), _request()])
