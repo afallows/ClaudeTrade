@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 
 from claudetrade.db.backup import create_backup, restore_backup
 from claudetrade.db.migrations import (
@@ -15,7 +16,15 @@ from claudetrade.db.migrations import (
     migrate,
     verify_schema,
 )
-from claudetrade.db.models import Base, PriceBar, SchemaVersion, Security, SocialPostRow
+from claudetrade.db.models import (
+    Base,
+    PriceBar,
+    SchemaVersion,
+    Security,
+    SignalResearchRevisionRow,
+    SignalRow,
+    SocialPostRow,
+)
 from claudetrade.db.session import Database
 
 
@@ -438,3 +447,101 @@ class TestSentimentPriorColumnMigration:
         assert migrate(unmigrated_db) == []
         insp = inspect(unmigrated_db.engine)
         assert "sentiment_prior" in {c["name"] for c in insp.get_columns("social_posts")}
+
+
+class TestSignalResearchRevisionsMigration:
+    """Migration 009 creates ``signal_research_revisions`` plus its
+    append-only triggers -- the research-revision counterpart of migration
+    002's guards on ``signals``/``signal_revisions``.
+    """
+
+    def test_fresh_schema_already_has_the_table(self, memory_db: Database):
+        """A brand-new database gets the table from ``_m001_create_schema``
+        (``create_all`` always reflects the current ORM model) -- same
+        fresh-vs-migrated shape as every additive table before it."""
+        insp = inspect(memory_db.engine)
+        assert "signal_research_revisions" in insp.get_table_names()
+
+    def test_current_version_reaches_9(self, unmigrated_db: Database):
+        assert current_version(unmigrated_db) == 0
+        migrate(unmigrated_db)
+        assert current_version(unmigrated_db) == 9
+
+    def test_migration_is_idempotent_when_rerun(self, unmigrated_db: Database):
+        applied_first = migrate(unmigrated_db)
+        assert 9 in applied_first
+        applied_second = migrate(unmigrated_db)
+        assert applied_second == []
+        insp = inspect(unmigrated_db.engine)
+        assert "signal_research_revisions" in insp.get_table_names()
+
+    def _seed_signal(self, db: Database, signal_id: str) -> None:
+        with db.session() as session:
+            session.add(
+                SignalRow(
+                    signal_id=signal_id,
+                    created_at=dt.datetime(2024, 1, 3, tzinfo=dt.UTC),
+                    session=dt.date(2024, 1, 3),
+                    symbol="TEST",
+                    strategy="test",
+                    direction="long",
+                    initial_status="actionable",
+                    reference_price=10.0,
+                    price_as_of=dt.datetime(2024, 1, 3, tzinfo=dt.UTC),
+                    overall_score=50.0,
+                    confidence=0.5,
+                )
+            )
+
+    def test_table_accepts_a_row_for_an_existing_signal(self, memory_db: Database):
+        self._seed_signal(memory_db, "SIGX")
+        with memory_db.session() as session:
+            session.add(
+                SignalResearchRevisionRow(
+                    signal_id="SIGX",
+                    revision=1,
+                    created_at=dt.datetime(2024, 1, 3, tzinfo=dt.UTC),
+                    rationale="checked filings",
+                    sources=["https://example.com"],
+                )
+            )
+        with memory_db.read_session() as session:
+            row = session.query(SignalResearchRevisionRow).filter_by(signal_id="SIGX").one()
+            assert row.rationale == "checked filings"
+
+    def test_raw_sql_update_is_rejected_by_the_trigger(self, memory_db: Database):
+        self._seed_signal(memory_db, "SIGX")
+        with memory_db.session() as session:
+            session.add(
+                SignalResearchRevisionRow(
+                    signal_id="SIGX",
+                    revision=1,
+                    created_at=dt.datetime(2024, 1, 3, tzinfo=dt.UTC),
+                    rationale="original",
+                    sources=["https://example.com"],
+                )
+            )
+        with pytest.raises(IntegrityError), memory_db.engine.begin() as conn:
+            conn.execute(
+                text("UPDATE signal_research_revisions SET rationale = 'HACKED'")
+            )
+        with memory_db.read_session() as session:
+            row = session.query(SignalResearchRevisionRow).filter_by(signal_id="SIGX").one()
+            assert row.rationale == "original"
+
+    def test_raw_sql_delete_is_rejected_by_the_trigger(self, memory_db: Database):
+        self._seed_signal(memory_db, "SIGX")
+        with memory_db.session() as session:
+            session.add(
+                SignalResearchRevisionRow(
+                    signal_id="SIGX",
+                    revision=1,
+                    created_at=dt.datetime(2024, 1, 3, tzinfo=dt.UTC),
+                    rationale="original",
+                    sources=["https://example.com"],
+                )
+            )
+        with pytest.raises(IntegrityError), memory_db.engine.begin() as conn:
+            conn.execute(text("DELETE FROM signal_research_revisions"))
+        with memory_db.read_session() as session:
+            assert session.query(SignalResearchRevisionRow).count() == 1

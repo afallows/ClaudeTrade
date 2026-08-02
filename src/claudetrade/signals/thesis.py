@@ -92,23 +92,50 @@ def build_thesis(
 
 _PRICE_RE = re.compile(r"\b\d+\.\d{1,2}\b")
 
+#: Default plausible-length bounds for a thesis-length rewrite. Kept as the
+#: defaults on :func:`validate_research_text` so :func:`_is_safe_rewrite`
+#: (the AI-thesis-polish caller) needs no bounds of its own; a caller
+#: validating shorter prose -- e.g. one invalidation-condition bullet from an
+#: MCP research revision, see ``signals.research`` -- passes tighter ones.
+DEFAULT_MIN_CHARS = 60
+DEFAULT_MAX_CHARS = MAX_THESIS_CHARS * 2
 
-def _is_safe_rewrite(original: str, rewrite: str, allowed_levels: list[float]) -> tuple[bool, str]:
-    """Whether an AI rewrite may replace the deterministic thesis.
 
-    Rejects the rewrite when it:
+def validate_research_text(
+    original: str,
+    rewrite: str,
+    allowed_levels: list[float],
+    *,
+    min_chars: int = DEFAULT_MIN_CHARS,
+    max_chars: int = DEFAULT_MAX_CHARS,
+) -> tuple[bool, str]:
+    """Whether externally supplied prose may stand alongside the engine's own text.
 
-    * is empty or implausibly short/long,
-    * introduces a decimal price level that is not one the engine computed, or
-    * contains an instruction-like directive (a rewritten thesis is prose, not
-      a command to the system).
+    The shared guardrail behind two independent callers that both hand this
+    application text an AI or a human did not compute: the AI thesis-polish
+    path (:func:`polish_thesis`, wrapped as :func:`_is_safe_rewrite` below for
+    backwards compatibility) and an MCP client's web-research revision
+    (``signals.research.ResearchLedger.append_research_revision``, submitting
+    an updated thesis and/or invalidation conditions). Both need exactly the
+    same three checks and neither may duplicate them, or the two guardrails
+    would drift apart the first time one is tightened and the other is not.
+
+    Rejects the text when it:
+
+    * is empty or implausibly short/long for what it claims to be (bounds are
+      parameters because a thesis paragraph and a one-line invalidation
+      condition have very different plausible lengths),
+    * introduces a decimal price level that is not one the engine computed
+      (already present in ``original`` or in ``allowed_levels``), or
+    * contains an instruction-like directive -- submitted prose is a research
+      finding, never a command to widen a stop or raise size.
     """
     text = rewrite.strip()
     if not text:
         return False, "empty"
-    if len(text) < 60:
-        return False, "too short to be a thesis"
-    if len(text) > MAX_THESIS_CHARS * 2:
+    if len(text) < min_chars:
+        return False, "too short to be plausible"
+    if len(text) > max_chars:
         return False, "implausibly long"
 
     permitted = {f"{level:.2f}" for level in allowed_levels}
@@ -124,6 +151,17 @@ def _is_safe_rewrite(original: str, rewrite: str, allowed_levels: list[float]) -
         if directive in lowered:
             return False, f"contained a directive ({directive})"
     return True, ""
+
+
+def _is_safe_rewrite(original: str, rewrite: str, allowed_levels: list[float]) -> tuple[bool, str]:
+    """Whether an AI rewrite may replace the deterministic thesis.
+
+    Thin, backwards-compatible wrapper around :func:`validate_research_text`
+    at the original thesis-length bounds -- kept as a separate name because
+    it is the established call site inside :func:`polish_thesis` and other
+    code/tests may still import it directly.
+    """
+    return validate_research_text(original, rewrite, allowed_levels)
 
 
 def polish_thesis(

@@ -14,12 +14,15 @@ Design notes:
   CLI, web UI -- makes) so it works whether or not ``claudetrade ui`` is
   running. SQLite is configured WAL-mode (see ``claudetrade.db.session``),
   so a second process reading concurrently is safe.
-* Every tool below except ``run_scan``/``trigger_refresh`` is read-only and
-  side-effect-free: no writes, no vendor requests, no recomputation of a
-  score or filter rule the rest of the app doesn't already own. Reads go
-  through the exact same objects the CLI and the web API use --
-  ``pipeline.ledger``, ``ui.data_access``, ``pipeline.provider_status()`` --
-  never a second implementation of the same query.
+* Every tool below except ``run_scan``/``trigger_refresh``/
+  ``submit_research_revision`` is read-only and side-effect-free: no writes,
+  no vendor requests, no recomputation of a score or filter rule the rest of
+  the app doesn't already own. Reads go through the exact same objects the
+  CLI and the web API use -- ``pipeline.ledger``, ``ui.data_access``,
+  ``pipeline.provider_status()`` -- never a second implementation of the same
+  query. ``submit_research_revision`` writes too, but only to the append-only
+  research ledger (``signals.research``) -- it can never touch a
+  ``SignalRow`` or its trade plan; see that module for the guarantee.
 * ``mcp`` (the PyPI package providing the high-level ``FastMCP`` API used
   here) is an optional dependency (the ``claudetrade[mcp]`` extra). Nothing
   at import time of this module requires it to be installed; only
@@ -58,6 +61,8 @@ from claudetrade.domain import Signal, SignalStatus
 from claudetrade.logging_setup import get_logger
 from claudetrade.pipeline import Pipeline
 from claudetrade.signals import funnel_store
+from claudetrade.signals.research import ResearchGuardrailError, ResearchLedger
+from claudetrade.signals.scoring import adjusted_overall
 from claudetrade.ui.data_access import data_freshness, sentiment_timeline
 from claudetrade.utils.timeutils import (
     MARKET_CLOSE,
@@ -117,8 +122,17 @@ def _require_fastmcp() -> type[FastMCP]:
 # --------------------------------------------------------------------------
 
 
-def _signal_summary(sig: Signal, status: SignalStatus | None) -> dict[str, Any]:
-    """One signal, flattened to the fields an MCP client needs to act on it."""
+def _signal_summary(
+    sig: Signal, status: SignalStatus | None, *, effective_score: float, has_research: bool
+) -> dict[str, Any]:
+    """One signal, flattened to the fields an MCP client needs to act on it.
+
+    ``effective_score`` is ``overall_score`` re-ranked by any accepted MCP
+    research revisions (``signals.scoring.adjusted_overall``); it equals
+    ``overall_score`` exactly when ``has_research`` is False. ``overall_score``
+    itself is always the original, engine-computed, audited number -- research
+    never rewrites it.
+    """
     return {
         "signal_id": sig.signal_id,
         "symbol": sig.symbol,
@@ -128,6 +142,8 @@ def _signal_summary(sig: Signal, status: SignalStatus | None) -> dict[str, Any]:
         "status": status.value if status else "unknown",
         "regime": str(sig.regime),
         "overall_score": sig.overall_score,
+        "effective_score": effective_score,
+        "has_research": has_research,
         "confidence": sig.confidence,
         "entry_low": sig.plan.entry_low,
         "entry_high": sig.plan.entry_high,
@@ -175,9 +191,25 @@ def get_signals(
             ``why_no_signals`` block is added from the most recent scan's
             persisted rejection funnel (see :func:`_why_no_signals`) -- "why
             no picks today?" answered from data instead of a bare empty list.
-            Optional (defaults to omitting that block) only so callers that
-            genuinely do not have a config on hand still get a valid result;
-            :func:`build_server` always passes one.
+            Also supplies the component weights ``effective_score`` needs
+            (see below); without it every row's ``effective_score`` falls
+            back to the unadjusted ``overall_score``. Optional only so
+            callers that genuinely do not have a config on hand still get a
+            valid result; :func:`build_server` always passes one.
+
+    Each row carries ``effective_score`` (``overall_score`` re-ranked by any
+    accepted MCP research revisions -- see ``submit_research_revision`` --
+    via ``signals.scoring.adjusted_overall``) and ``has_research`` (whether
+    any revision exists at all). When ``sort="score"`` and at least one
+    returned row has research, the page is re-sorted by ``effective_score``
+    instead of the raw ``overall_score`` the SQL query used to select and
+    order it -- a revision's clamped adjustment can only ever move a score by
+    a bounded amount (``McpConfig.max_component_adjustment``), so it can
+    reorder rows already on the page, but it cannot pull in a row that did
+    not qualify for the page on ``overall_score`` in the first place. Research
+    revisions are fetched with ONE extra batched query, keyed to exactly the
+    signal ids on this page (see ``ResearchLedger.latest_research_revisions``)
+    -- never a per-row lookup.
     """
     limit = max(1, min(int(limit), 200))
     order = "created_at" if str(sort).lower() == "created_at" else "score"
@@ -191,7 +223,28 @@ def get_signals(
     matches, total = pipeline.ledger.list_with_status(
         min_score=min_score, limit=limit, order=order
     )
-    rows = [_signal_summary(sig, status) for sig, status in matches]
+
+    # Batched, not per-row (same F26 discipline as the query above).
+    research = ResearchLedger(pipeline.db).latest_research_revisions(
+        [sig.signal_id for sig, _ in matches]
+    )
+    rows: list[dict[str, Any]] = []
+    for sig, status in matches:
+        revision = research.get(sig.signal_id)
+        has_research = revision is not None
+        if revision is not None and config is not None:
+            effective = adjusted_overall(
+                sig.components.as_dict(),
+                sig.overall_score,
+                revision["score_adjustments"],
+                config,
+            )
+        else:
+            effective = sig.overall_score
+        rows.append(_signal_summary(sig, status, effective_score=effective, has_research=has_research))
+
+    if order == "score" and any(row["has_research"] for row in rows):
+        rows.sort(key=lambda row: row["effective_score"], reverse=True)
 
     result: dict[str, Any] = {
         "disclaimer": DISCLAIMER,
@@ -782,6 +835,103 @@ def get_backtest_report(config: AppConfig) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Research revisions
+# --------------------------------------------------------------------------
+
+
+def submit_research_revision(
+    pipeline: Pipeline,
+    config: AppConfig,
+    signal_id: str,
+    thesis: str | None,
+    invalidation: list[str] | None,
+    score_adjustments: dict[str, float] | None,
+    rationale: str,
+    sources: list[str],
+) -> dict[str, Any]:
+    """WRITE -- appends an MCP client's web research to the research ledger.
+
+    The intended flow: an MCP client (Claude Desktop) does web research on a
+    signal ``get_signals`` returned, then calls this to record an updated
+    thesis, updated invalidation conditions and/or small score nudges as a
+    new, append-only ``SignalResearchRevisionRow``. ``SignalRow`` itself is
+    NEVER touched -- this is a new row, not an edit -- and entry, stop,
+    targets and position size (``TradePlan``) are engine-owned and
+    structurally unreachable here: this function's signature has no
+    plan/price/size/direction parameter at all, on purpose. Research can
+    re-rank a signal; it cannot re-price or re-size one.
+
+    Guardrails (``signals.research.ResearchLedger.append_research_revision``):
+    ``thesis``/each ``invalidation`` item is checked against the same
+    rewrite guardrail the AI thesis-polish path uses -- no unrecognised
+    decimal price level beyond the signal's own plan, no directive phrase
+    ("widen the stop", "increase the position", ...), plausible length.
+    ``score_adjustments`` component names must be real ``ComponentScores``
+    fields and every delta is clamped to +/- ``McpConfig
+    .max_component_adjustment`` before it is stored. ``rationale`` and
+    ``sources`` are required and non-empty.
+
+    Refuses outright, without writing anything, when
+    ``config.mcp.research_writes_enabled`` is false. A guardrail rejection
+    returns ``{"accepted": false, "reason": ...}`` rather than raising --
+    this is an expected, common outcome (an AI proposing a bad rewrite), not
+    a system error.
+    """
+    if not config.mcp.research_writes_enabled:
+        return {
+            "accepted": False,
+            "reason": (
+                "research writes are disabled on this installation "
+                "(config.mcp.research_writes_enabled is false)"
+            ),
+        }
+
+    ledger = ResearchLedger(pipeline.db)
+    try:
+        result = ledger.append_research_revision(
+            signal_id,
+            thesis=thesis,
+            invalidation=invalidation,
+            score_adjustments=score_adjustments,
+            rationale=rationale,
+            sources=sources,
+            config=config,
+            actor="mcp",
+        )
+    except ResearchGuardrailError as exc:
+        return {"accepted": False, "reason": str(exc)}
+
+    return {
+        "disclaimer": DISCLAIMER,
+        "accepted": True,
+        "signal_id": result.signal_id,
+        "revision": result.revision,
+        "original_score": result.original_score,
+        "effective_score": result.effective_score,
+        "clamped": result.clamped,
+    }
+
+
+def get_research_revisions(pipeline: Pipeline, signal_id: str) -> dict[str, Any]:
+    """Read-only. Full research-revision history for one signal, oldest first.
+
+    Every accepted call to ``submit_research_revision`` for this signal, in
+    the order they were recorded -- the audit trail behind whatever
+    ``effective_score``/``has_research`` ``get_signals`` is currently
+    reporting for it.
+    """
+    history = ResearchLedger(pipeline.db).research_history(signal_id)
+    revisions = [
+        {**entry, "created_at": entry["created_at"].isoformat()} for entry in history
+    ]
+    return {
+        "signal_id": signal_id,
+        "count": len(revisions),
+        "revisions": revisions,
+    }
+
+
+# --------------------------------------------------------------------------
 # Server wiring
 # --------------------------------------------------------------------------
 
@@ -1052,6 +1202,65 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
         )
 
     @server.tool(
+        name="submit_research_revision",
+        description=(
+            "WRITE -- appends web research to a signal's append-only research "
+            "ledger; never edits the original signal. Submit an updated thesis "
+            "and/or invalidation list and/or small score_adjustments (component "
+            "name -> signed delta, each clamped to "
+            f"+/-{config.mcp.max_component_adjustment:.0f} points) after doing "
+            "web research on a signal from get_signals. rationale (why) and "
+            "sources (list of URLs/citations) are required. Entry, stop, "
+            "targets and position size are ENGINE-OWNED and cannot be "
+            "submitted here at all -- there is no field for them; research "
+            "can re-rank a signal, never re-price or re-size one. Thesis and "
+            "invalidation text are guardrailed against introducing an "
+            "unrecognised price level or a directive phrase (e.g. 'widen the "
+            "stop'). Returns accepted=false with a reason on any rejection "
+            "(including when research writes are disabled for this "
+            "installation) rather than raising. " + DISCLAIMER
+        ),
+    )
+    async def _submit_research_revision(
+        signal_id: str,
+        thesis: str | None = None,
+        invalidation: list[str] | None = None,
+        score_adjustments: dict[str, float] | None = None,
+        rationale: str = "",
+        sources: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return await _call_bounded(
+            "submit_research_revision",
+            config.mcp.tool_timeout_seconds,
+            lambda: submit_research_revision(
+                pipeline,
+                config,
+                signal_id,
+                thesis,
+                invalidation,
+                score_adjustments,
+                rationale,
+                sources or [],
+            ),
+        )
+
+    @server.tool(
+        name="get_research_revisions",
+        description=(
+            "Read-only. Full research-revision history for one signal "
+            "(everything previously submitted via submit_research_revision), "
+            "oldest first -- the audit trail behind its current "
+            "effective_score/has_research."
+        ),
+    )
+    async def _get_research_revisions(signal_id: str) -> dict[str, Any]:
+        return await _call_bounded(
+            "get_research_revisions",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_research_revisions(pipeline, signal_id),
+        )
+
+    @server.tool(
         name="get_backtest_report",
         description=(
             "Read-only. The most recently generated backtest report (see `claudetrade "
@@ -1106,6 +1315,7 @@ __all__ = [
     "get_backtest_report",
     "get_market_status",
     "get_refresh_status",
+    "get_research_revisions",
     "get_rising_sentiment",
     "get_sentiment",
     "get_sentiment_history",
@@ -1113,5 +1323,6 @@ __all__ = [
     "get_trending",
     "run_scan",
     "run_stdio",
+    "submit_research_revision",
     "trigger_refresh",
 ]

@@ -267,6 +267,48 @@ def _m008_add_sentiment_prior_column(session: Session) -> None:
     session.execute(text("ALTER TABLE social_posts ADD COLUMN sentiment_prior VARCHAR(10)"))
 
 
+def _m009_signal_research_revisions(session: Session) -> None:
+    """Create ``signal_research_revisions`` plus its append-only triggers.
+
+    Same fresh-vs-migrated shape as ``_m006_symbol_fetch_health``: a
+    brand-new database already gets the table from ``_m001_create_schema``
+    (the ORM model exists now), so ``checkfirst=True`` makes the table
+    creation a no-op there. The triggers are always (re-)installed with
+    ``IF NOT EXISTS``, exactly like ``_m002_immutability_triggers`` -- a
+    fresh database created via ``create_all`` gets the table but not the
+    trigger, since triggers are not part of the SQLAlchemy schema.
+    """
+    from claudetrade.db.models import SignalResearchRevisionRow
+
+    bind = session.get_bind()
+    SignalResearchRevisionRow.__table__.create(bind, checkfirst=True)
+
+    if bind.dialect.name != "sqlite":
+        log.info(
+            "immutability triggers skipped on %s; see docs/architecture.md", bind.dialect.name
+        )
+        return
+
+    statements = [
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_signal_research_revisions_no_update
+        BEFORE UPDATE ON signal_research_revisions
+        BEGIN
+            SELECT RAISE(ABORT, 'research revisions are append-only');
+        END;
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_signal_research_revisions_no_delete
+        BEFORE DELETE ON signal_research_revisions
+        BEGIN
+            SELECT RAISE(ABORT, 'research revisions are append-only');
+        END;
+        """,
+    ]
+    for stmt in statements:
+        session.execute(text(stmt))
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_schema", _m001_create_schema, "Initial tables, indexes and constraints"),
     Migration(2, "immutability_triggers", _m002_immutability_triggers, "Append-only ledger guards"),
@@ -290,6 +332,12 @@ MIGRATIONS: tuple[Migration, ...] = (
         "add_sentiment_prior_column",
         _m008_add_sentiment_prior_column,
         "Nullable social_posts.sentiment_prior column (author's own bull/bear tag)",
+    ),
+    Migration(
+        9,
+        "signal_research_revisions",
+        _m009_signal_research_revisions,
+        "Append-only MCP research revisions (thesis/invalidation/score adjustments) + guards",
     ),
 )
 

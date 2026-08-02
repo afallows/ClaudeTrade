@@ -572,6 +572,59 @@ class SignalRevisionRow(Base):
     signal: Mapped[SignalRow] = relationship(back_populates="revisions")
 
 
+class SignalResearchRevisionRow(Base):
+    """Append-only web-research finding attached to a signal.
+
+    Distinct from ``SignalRevisionRow`` (status history, e.g. triggered/
+    expired): this table carries what an MCP client's own web research
+    contributed after the signal was generated -- an updated thesis, updated
+    invalidation conditions, and small, bounded adjustments to the
+    already-computed component scores. It never carries a status and never
+    touches ``SignalRow.plan`` -- entry, stop, targets and size are
+    engine-owned and structurally unreachable from this table's columns.
+
+    Written exclusively through ``claudetrade.signals.research.ResearchLedger
+    .append_research_revision``, which validates the target signal exists,
+    runs the same rewrite guardrails as ``signals.thesis`` (no unrecognised
+    price level, no directive phrase) against the signal's own plan levels,
+    clamps every adjustment to ``McpConfig.max_component_adjustment`` and
+    rejects unknown component names. A SQLite trigger (installed by the
+    migration that creates this table) rejects ``UPDATE`` and ``DELETE``, the
+    same append-only guard ``signals``/``signal_revisions`` get from
+    migration 002.
+    """
+
+    __tablename__ = "signal_research_revisions"
+    __table_args__ = (
+        UniqueConstraint("signal_id", "revision", name="uq_signal_research_revision"),
+        Index("ix_research_revision_signal", "signal_id", "revision"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_id: Mapped[str] = mapped_column(ForeignKey("signals.signal_id"), index=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    actor: Mapped[str] = mapped_column(String(60), default="mcp")
+    #: NULL means "unchanged" -- the client submitted no thesis rewrite.
+    thesis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: NULL means "unchanged"; a list of strings when the client submitted one.
+    invalidation: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    #: Component name -> signed delta, already clamped to
+    #: ``McpConfig.max_component_adjustment`` at write time. Unknown
+    #: component names never reach storage -- rejected before the insert.
+    score_adjustments: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    #: Required, non-empty: why the research changes what it changes.
+    rationale: Mapped[str] = mapped_column(Text)
+    #: Required, non-empty list of URLs/citations backing the research.
+    sources: Mapped[list[Any]] = mapped_column(JSON)
+    #: Provider/model/tool metadata about how this revision was produced.
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    #: Digest over (signal_id, revision, thesis, invalidation,
+    #: score_adjustments, rationale, sources), verified on read -- see
+    #: ``signals.research.research_integrity_payload``.
+    integrity_hash: Mapped[str] = mapped_column(String(64), default="")
+
+
 class DataSnapshotRow(Base):
     """Manifest describing exactly which inputs produced a signal or run.
 

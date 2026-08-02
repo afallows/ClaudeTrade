@@ -605,6 +605,84 @@ def apply_hard_gates(
 
 
 # --------------------------------------------------------------------------
+# Research-revision effective score
+# --------------------------------------------------------------------------
+
+
+def adjusted_overall(
+    components: dict[str, float],
+    overall_score: float,
+    adjustments: dict[str, float],
+    config: AppConfig,
+) -> float:
+    """The signal's overall score after append-only research adjustments.
+
+    Read-time only: never stored, never mutates ``SignalRow.overall_score``.
+    ``signals.research.ResearchLedger`` calls this to report the "effective
+    score" for a signal that has one or more research revisions, and
+    ``mcp_server.get_signals`` calls it to re-rank the screener.
+
+    **Why a difference, not a rebuild.** The obvious alternative -- add the
+    adjustments to ``components`` and re-run this module's own weighted-mean
+    blend from scratch -- cannot be trusted to reproduce ``overall_score``.
+    ``score_candidate`` weights each component by its EFFECTIVE weight, not
+    its configured one: a sentiment axis with no evidence contributes zero
+    weight and is renormalised away (see ``_polarity_axis``), and only the
+    original scoring call -- which had ``ctx``, not just the persisted 0-100
+    numbers -- knew which components were actually evidenced. Recomputing the
+    base here would silently diverge from the audited ``overall_score``
+    precisely for the candidates where that renormalisation mattered most,
+    which defeats the whole point of ``overall_score`` being an audited,
+    reproducible number.
+
+    So this applies a *weighted delta* to the existing, already-correct
+    score instead: only the CHANGE the research introduced needs a weighting
+    scheme, and using the nominal configured weights -- renormalised over
+    whichever components the stored dict actually has, weight 0 for any
+    that are missing -- for that small delta is a reasonable, auditable
+    approximation. It can never itself produce a base mismatch, because it
+    never recomputes the base; at worst an unusual weighting of the delta.
+
+    Args:
+        components: the signal's stored ``ComponentScores.as_dict()``
+            (0-100 per component, as recorded on ``SignalRow.components``).
+        overall_score: the signal's stored, audited overall score.
+        adjustments: component name -> already-clamped signed delta (see
+            ``McpConfig.max_component_adjustment`` and
+            ``signals.research.ResearchLedger.append_research_revision``,
+            which is also where an unknown component name is rejected
+            outright). A name here that is not a key of ``components`` is
+            silently ignored rather than raising -- consistent with that
+            rejection happening upstream, not a second, looser policy at
+            this layer.
+        config: supplies ``SignalConfig.component_weights``.
+
+    Returns:
+        ``overall_score`` plus the weighted mean of the deltas, clamped to
+        [0, 100]. Unchanged (aside from the clamp) when ``adjustments`` is
+        empty or none of its keys are present in ``components``.
+    """
+    if not adjustments:
+        return _clamp(overall_score)
+
+    weights = config.signals.component_weights
+    total_weight = sum(weights.get(name, 0.0) for name in components)
+    if total_weight <= 0:
+        return _clamp(overall_score)
+
+    weighted_delta = (
+        sum(
+            weights.get(name, 0.0) * float(delta)
+            for name, delta in adjustments.items()
+            if name in components
+        )
+        / total_weight
+    )
+
+    return _clamp(overall_score + weighted_delta)
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 

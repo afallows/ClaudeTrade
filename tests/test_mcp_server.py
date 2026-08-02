@@ -28,6 +28,7 @@ from claudetrade.db.session import Database
 from claudetrade.domain import Direction, MarketRegime, Signal
 from claudetrade.pipeline import Pipeline, PipelineResult
 from claudetrade.signals.ledger import SignalLedger
+from claudetrade.signals.research import ResearchLedger
 from claudetrade.utils.timeutils import current_trading_session, utc_now
 from claudetrade.version import DISCLAIMER
 from claudetrade.webapi.refresh_state import RefreshState
@@ -197,6 +198,225 @@ def test_get_signals_ties_break_deterministically(
     first = [r["symbol"] for r in mcp_server.get_signals(pipeline)["signals"]]
     second = [r["symbol"] for r in mcp_server.get_signals(pipeline)["signals"]]
     assert first == second
+
+
+# --------------------------------------------------------------------------
+# get_signals: effective_score / has_research
+# --------------------------------------------------------------------------
+
+
+def test_get_signals_reports_overall_score_as_effective_when_no_research(
+    pipeline: Pipeline, tmp_db: Database, make_signal
+) -> None:
+    _record(tmp_db, make_signal(symbol="AAA", overall_score=70.0))
+    row = mcp_server.get_signals(pipeline)["signals"][0]
+    assert row["effective_score"] == row["overall_score"] == 70.0
+    assert row["has_research"] is False
+
+
+def test_get_signals_reorders_by_effective_score_when_research_exists(
+    pipeline: Pipeline, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+) -> None:
+    """A research revision's clamped score adjustment can re-rank the page
+    it landed on -- the whole point of ``adjusted_overall``. A close-enough
+    starting gap (3 points) so the default ``technical_setup`` weight (0.20)
+    applied to the cap (20.0) -- a +4.0 effective-score move -- is enough to
+    flip the order, deterministically rather than conditionally."""
+    high = make_signal(symbol="HIGH", overall_score=63.0)
+    low = make_signal(symbol="LOW", overall_score=60.0)
+    _record(tmp_db, high)
+    _record(tmp_db, low)
+
+    ResearchLedger(tmp_db).append_research_revision(
+        low.signal_id,
+        thesis=None,
+        invalidation=None,
+        score_adjustments={"technical_setup": 20.0},
+        rationale="Strong new catalyst confirmed by two independent sources.",
+        sources=["https://example.com/a", "https://example.com/b"],
+        config=tmp_app_config,
+    )
+
+    result = mcp_server.get_signals(pipeline, tmp_app_config)
+    symbols = [r["symbol"] for r in result["signals"]]
+    low_row = next(r for r in result["signals"] if r["symbol"] == "LOW")
+    high_row = next(r for r in result["signals"] if r["symbol"] == "HIGH")
+
+    assert low_row["has_research"] is True
+    assert low_row["overall_score"] == 60.0
+    assert low_row["effective_score"] == pytest.approx(64.0)
+    assert high_row["has_research"] is False
+    assert high_row["overall_score"] == high_row["effective_score"] == 63.0
+    # LOW's effective score (64.0) now beats HIGH's (63.0) -- the page must
+    # reflect that, not the raw overall_score order the SQL query used.
+    assert symbols.index("LOW") < symbols.index("HIGH")
+
+
+def test_get_signals_effective_score_uses_the_batched_read_not_n_plus_one(
+    pipeline: Pipeline, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+) -> None:
+    """Same F26 discipline as ``recent_with_status``: fetching research per
+    row instead of in one batched query is the exact class of regression
+    that produced the original production stall."""
+    from sqlalchemy import event
+
+    signals = [make_signal(symbol=f"SYM{i}", overall_score=50.0 + i) for i in range(10)]
+    for sig in signals:
+        _record(tmp_db, sig)
+    for sig in signals[:4]:
+        ResearchLedger(tmp_db).append_research_revision(
+            sig.signal_id,
+            thesis=None,
+            invalidation=None,
+            score_adjustments={"technical_setup": 1.0},
+            rationale="minor confirmation",
+            sources=["https://example.com"],
+            config=tmp_app_config,
+        )
+
+    statements: list[str] = []
+
+    def _record_stmt(conn, cursor, statement, params, context, executemany):
+        statements.append(statement)
+
+    event.listen(tmp_db.engine, "before_cursor_execute", _record_stmt)
+    try:
+        result = mcp_server.get_signals(pipeline, tmp_app_config, limit=10)
+    finally:
+        event.remove(tmp_db.engine, "before_cursor_execute", _record_stmt)
+
+    selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+    assert result["count"] == 10
+    # list_with_status issues two SELECTs (a count, then the joined page);
+    # research adds exactly one more batched query -- never one per row,
+    # which would have been 10+ additional SELECTs here.
+    assert len(selects) == 3, f"expected 3 SELECTs, got {len(selects)}: {selects}"
+
+
+# --------------------------------------------------------------------------
+# submit_research_revision / get_research_revisions
+# --------------------------------------------------------------------------
+
+
+def test_submit_research_revision_happy_path(
+    pipeline: Pipeline, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+) -> None:
+    sig = make_signal(symbol="AAPL", overall_score=65.0)
+    _record(tmp_db, sig)
+
+    result = mcp_server.submit_research_revision(
+        pipeline,
+        tmp_app_config,
+        sig.signal_id,
+        None,
+        None,
+        {"technical_setup": 5.0},
+        "Confirmed the setup with a fresh earnings call transcript.",
+        ["https://example.com/transcript"],
+    )
+
+    assert result["accepted"] is True
+    assert result["disclaimer"] == DISCLAIMER
+    assert result["signal_id"] == sig.signal_id
+    assert result["revision"] == 1
+    assert result["original_score"] == 65.0
+    # technical_setup's default weight (0.20) applied to an unclamped +5.0
+    # delta over the full 1.00 total weight -- a deterministic +1.0 move.
+    assert result["effective_score"] == pytest.approx(66.0)
+    assert result["clamped"] == {}
+
+
+def test_submit_research_revision_disabled_by_config(
+    pipeline: Pipeline, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+) -> None:
+    tmp_app_config.mcp.research_writes_enabled = False
+    sig = make_signal(symbol="AAPL")
+    _record(tmp_db, sig)
+
+    result = mcp_server.submit_research_revision(
+        pipeline, tmp_app_config, sig.signal_id, None, None, None, "reason", ["https://x.com"]
+    )
+
+    assert result["accepted"] is False
+    assert "disabled" in result["reason"]
+    # Nothing was written.
+    assert ResearchLedger(tmp_db).research_history(sig.signal_id) == []
+
+
+def test_submit_research_revision_rejection_payload_shape(
+    pipeline: Pipeline, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+) -> None:
+    """A guardrail rejection returns a structured payload, never raises."""
+    sig = make_signal(symbol="AAPL")
+    _record(tmp_db, sig)
+
+    result = mcp_server.submit_research_revision(
+        pipeline,
+        tmp_app_config,
+        sig.signal_id,
+        None,
+        None,
+        {"not_a_real_component": 5.0},
+        "reason",
+        ["https://x.com"],
+    )
+
+    assert set(result) == {"accepted", "reason"}
+    assert result["accepted"] is False
+    assert "unknown component" in result["reason"]
+
+
+def test_submit_research_revision_missing_rationale_is_rejected(
+    pipeline: Pipeline, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+) -> None:
+    sig = make_signal(symbol="AAPL")
+    _record(tmp_db, sig)
+
+    result = mcp_server.submit_research_revision(
+        pipeline, tmp_app_config, sig.signal_id, None, None, None, "", ["https://x.com"]
+    )
+    assert result["accepted"] is False
+
+
+def test_submit_research_revision_cannot_touch_the_trade_plan(
+    pipeline: Pipeline, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+) -> None:
+    """No signature parameter accepts entry/stop/targets/size/direction --
+    the bare function itself is the enforcement, not a runtime check."""
+    import inspect
+
+    params = set(inspect.signature(mcp_server.submit_research_revision).parameters)
+    assert params.isdisjoint({"entry_low", "entry_high", "stop_loss", "targets", "shares",
+                               "size", "direction", "plan"})
+
+
+def test_get_research_revisions_returns_full_history(
+    pipeline: Pipeline, tmp_db: Database, tmp_app_config: AppConfig, make_signal
+) -> None:
+    sig = make_signal(symbol="AAPL")
+    _record(tmp_db, sig)
+    mcp_server.submit_research_revision(
+        pipeline, tmp_app_config, sig.signal_id, None, None, None, "first", ["https://x.com/1"]
+    )
+    mcp_server.submit_research_revision(
+        pipeline, tmp_app_config, sig.signal_id, None, None, None, "second", ["https://x.com/2"]
+    )
+
+    result = mcp_server.get_research_revisions(pipeline, sig.signal_id)
+    assert result["signal_id"] == sig.signal_id
+    assert result["count"] == 2
+    assert [r["rationale"] for r in result["revisions"]] == ["first", "second"]
+    assert isinstance(result["revisions"][0]["created_at"], str)  # JSON-serialisable
+
+
+def test_get_research_revisions_empty_for_unresearched_signal(
+    pipeline: Pipeline, tmp_db: Database, make_signal
+) -> None:
+    sig = make_signal(symbol="AAPL")
+    _record(tmp_db, sig)
+    result = mcp_server.get_research_revisions(pipeline, sig.signal_id)
+    assert result["count"] == 0
+    assert result["revisions"] == []
 
 
 # --------------------------------------------------------------------------
@@ -920,6 +1140,8 @@ EXPECTED_TOOL_NAMES = {
     "trigger_refresh",
     "get_refresh_status",
     "get_backtest_report",
+    "submit_research_revision",
+    "get_research_revisions",
 }
 
 
@@ -954,6 +1176,10 @@ def test_build_server_tool_schemas_match_the_documented_signatures(
     assert properties("trigger_refresh") == set()
     assert properties("get_refresh_status") == set()
     assert properties("get_backtest_report") == set()
+    assert properties("submit_research_revision") == {
+        "signal_id", "thesis", "invalidation", "score_adjustments", "rationale", "sources",
+    }
+    assert properties("get_research_revisions") == {"signal_id"}
 
 
 def test_write_tools_are_named_and_described_as_writes(
@@ -964,10 +1190,11 @@ def test_write_tools_are_named_and_described_as_writes(
     server = mcp_server.build_server(pipeline, tmp_app_config)
     tools = {t.name: t for t in server._tool_manager.list_tools()}
 
-    for name in ("run_scan", "trigger_refresh"):
+    write_tools = {"run_scan", "trigger_refresh", "submit_research_revision"}
+    for name in write_tools:
         assert "WRITE" in tools[name].description
 
-    read_only = EXPECTED_TOOL_NAMES - {"run_scan", "trigger_refresh"}
+    read_only = EXPECTED_TOOL_NAMES - write_tools
     for name in read_only:
         assert "WRITE" not in tools[name].description
 

@@ -1502,12 +1502,32 @@ class McpConfig(BaseModel):
     #: is a legitimate multi-minute compute-and-write job, and killing it at
     #: the read deadline would make the tool useless on a real installation.
     scan_timeout_seconds: float = 300.0
+    #: Master switch for ``submit_research_revision``. False makes the tool
+    #: refuse with a structured ``{"accepted": false, ...}`` payload rather
+    #: than raise -- an operator who wants this installation strictly
+    #: read-only from MCP (no append to the research ledger at all) can say
+    #: so without disabling every other tool.
+    research_writes_enabled: bool = True
+    #: Hard cap on the magnitude of any single component-score adjustment an
+    #: MCP research revision may apply, in the same 0-100 units the
+    #: component itself is scored in. Bounded so that "web research nudges
+    #: the ranking" cannot become "web research repaints the score" --
+    #: ``signals.research.ResearchLedger.append_research_revision`` clamps
+    #: every submitted delta to +/- this value before it is stored.
+    max_component_adjustment: float = 20.0
 
     @field_validator("tool_timeout_seconds", "scan_timeout_seconds")
     @classmethod
     def _positive_timeout(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("timeout must be positive")
+        return v
+
+    @field_validator("max_component_adjustment")
+    @classmethod
+    def _bounded_adjustment_cap(cls, v: float) -> float:
+        if not (0 < v <= 50):
+            raise ValueError("max_component_adjustment must be > 0 and <= 50")
         return v
 
 
