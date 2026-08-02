@@ -191,6 +191,9 @@ collected on a timer rather than fetched on demand.
   stored: `warming_up` (< 20 sessions), `provisional` (20+), `partial` (60+), `ready`
   (120+). The tier is advisory — nothing is blocked at any tier — and it also appears
   on `GET /api/system/refresh/status` and in the MCP `get_market_status` tool.
+- On Windows, `claudetrade schedule install` registers Task Scheduler tasks that keep
+  collecting even when the app is closed — see
+  [docs/scheduled-collection.md](docs/scheduled-collection.md).
 
 ## Configuration
 

@@ -278,6 +278,26 @@ class TestCollectCommand:
 
         result = runner.invoke(app, ["sentiment", "collect"])
 
-        assert result.exit_code == 1
+        # Exit 0: a lock-contention skip is the single-flight lock working as
+        # intended, not a failure -- Task Scheduler and other unattended
+        # callers must not record it as a run failure. The JSON payload still
+        # says "skipped" for anyone who wants to tell it apart from "collected".
+        assert result.exit_code == 0
+        assert '"status": "skipped"' in result.output
         assert "webapi" in result.output
         assert called["n"] == 0
+
+    def test_a_genuine_failure_still_exits_nonzero(self, cli_env, monkeypatch) -> None:
+        """Unlike a benign skip, an actual collection failure must still exit 1 --
+        this is the case an unattended scheduler DOES need to see as a failure."""
+
+        def fake_collect(self, *, lookback_hours, progress_callback=None):
+            raise RuntimeError("provider exploded")
+
+        monkeypatch.setattr(Pipeline, "collect_social", fake_collect)
+
+        result = runner.invoke(app, ["sentiment", "collect"])
+
+        assert result.exit_code == 1
+        assert '"status": "failed"' in result.output
+        assert "provider exploded" in result.output

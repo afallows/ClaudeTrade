@@ -27,6 +27,7 @@ from claudetrade.cli import (
     config_app,
     db_app,
     paper_app,
+    schedule_app,
     secrets_app,
     sentiment_app,
     verify_app,
@@ -78,6 +79,7 @@ def _real_command_surface() -> set[tuple[str, str | None]]:
         "backtest": backtest_app,
         "sentiment": sentiment_app,
         "config": config_app,
+        "schedule": schedule_app,
     }
     # Every group actually mounted on `app` (via add_typer) must be one of the
     # ones this test knows about -- catches a new group being added to cli.py
@@ -171,6 +173,7 @@ def test_real_cli_surface_is_nonempty() -> None:
     assert ("verify", "ledger") in REAL_SURFACE
     assert ("backtest", "report") in REAL_SURFACE
     assert ("sentiment", "collect") in REAL_SURFACE
+    assert ("schedule", "install") in REAL_SURFACE
 
 
 def test_documented_app_dir_matches_config_default() -> None:

@@ -33,6 +33,7 @@ import typer
 
 from claudetrade.config import AppConfig, get_config
 from claudetrade.logging_setup import setup_logging
+from claudetrade.taskscheduler import schedule_app
 from claudetrade.utils.timeutils import current_trading_session, utc_now
 from claudetrade.version import CODE_VERSION, DISCLAIMER, __version__
 
@@ -78,6 +79,7 @@ app.add_typer(sentiment_app, name="sentiment")
 app.add_typer(verify_app, name="verify")
 app.add_typer(config_app, name="config")
 app.add_typer(backtest_app, name="backtest")
+app.add_typer(schedule_app, name="schedule")
 
 ConfigOption = Annotated[
     Path | None, typer.Option("--config", "-c", help="Path to config.toml.")
@@ -1664,6 +1666,12 @@ def sentiment_collect(
     than racing) while a refresh is running anywhere -- and is recorded under
     the ``cli`` entry point, distinguishing "I asked for this" from the
     server's automatic ``scheduler`` runs.
+
+    Exit code: 0 for both ``collected`` and ``skipped`` (a skip means the
+    single-flight lock did its job, not that anything failed -- an unattended
+    scheduler must not record a benign skip as a task failure); 1 only for
+    ``failed``. The JSON payload's ``status`` field still distinguishes all
+    three regardless of exit code.
     """
     cfg = _load(config)
     from claudetrade.pipeline import Pipeline
@@ -1682,7 +1690,11 @@ def sentiment_collect(
             "Nothing was collected: " + str(outcome["reason"]) + ". Retry once it finishes.",
             fg=typer.colors.YELLOW,
         )
-        raise typer.Exit(code=1)
+        # Exit 0: a skip is the single-flight lock working as intended, not a
+        # failure -- Task Scheduler (and any other unattended caller) must not
+        # record a benign skip as a run failure. The JSON payload above still
+        # says "skipped" for anyone who wants to distinguish it from "collected".
+        return
     if outcome["status"] == "failed":
         typer.secho(f"Collection failed: {outcome['error']}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
@@ -1828,6 +1840,26 @@ def verify_ledger(config: ConfigOption = None) -> None:
         )
         raise typer.Exit(1)
     typer.secho("all signals verified: none have been modified since they were written", fg=typer.colors.GREEN)
+
+
+@verify_app.command("research")
+def verify_research(config: ConfigOption = None) -> None:
+    """Check every stored MCP research revision against its integrity hash."""
+    cfg = _load(config)
+    from claudetrade.db.session import get_database
+    from claudetrade.signals.research import ResearchLedger
+
+    failures = ResearchLedger(get_database(cfg)).verify_all_research()
+    if failures:
+        typer.secho(
+            f"{len(failures)} research revisions failed their integrity check: {failures[:5]}",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+    typer.secho(
+        "all research revisions verified: none have been modified since they were written",
+        fg=typer.colors.GREEN,
+    )
 
 
 @verify_app.command("survivorship")
