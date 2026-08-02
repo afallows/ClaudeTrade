@@ -114,9 +114,11 @@ these tools. All of them return plain JSON — no charts, no pandas objects.
 
 | Tool | Reads/Writes | What it returns |
 | --- | --- | --- |
-| `get_signals(min_score, limit)` | read-only | Current ledger signals: symbol, strategy, direction, score, confidence, entry/stop/targets, days to earnings. |
+| `get_signals(min_score, limit, sort)` | read-only | Current ledger signals, **best-scoring first** (so `limit=N` means the N best, matching the web Screener); `sort='created_at'` gives newest-first for audit. Includes `total_matching`/`truncated` so a page is distinguishable from the whole answer. Fields: symbol, strategy, direction, score, confidence, entry/stop/targets, days to earnings. |
 | `get_sentiment(symbol, days)` | read-only | Daily sentiment/mention rows for one symbol over the last N days. |
-| `get_trending(limit)` | read-only | Symbols ranked by recent mention volume. |
+| `get_trending(limit, source)` | read-only | Symbols ranked by recent mention *volume*, most-mentioned first. `source='auto'` prefers ApeWisdom's Reddit/4chan counts when present (broader corpus, pre-resolved tickers) and falls back to locally-resolved posts. Absolute volume, so it returns the same large caps most days -- for what is *changing*, use `get_rising_sentiment`. |
+| `get_rising_sentiment(limit, recent_sessions, baseline_sessions, min_recent_mentions)` | read-only | Symbols whose mention rate is accelerating against their **own** recent baseline, so a quiet name waking up ranks above a permanently-loud one. Each row carries mention change, recent vs baseline rate, and sentiment change where polarity was actually measured. Includes a coverage block stating how much stored history backs the ranking. |
+| `get_sentiment_history(symbol, days)` | read-only | One symbol's daily mention/sentiment series, gap-filled across trading sessions so it can be charted or differenced directly. `observed` marks a real stored row, distinguishing a measured zero from absent data. |
 | `get_market_status()` | read-only | Regime, current Eastern time, whether the market is pre-market/open/after-hours/closed, last refresh time, symbol coverage, provider health, and `sentiment_readiness` — how many sessions of social history this installation has actually accumulated, as a tier. |
 | `run_scan()` | **write** | Runs a full scan for today's session and records new signals to the immutable ledger (same as `claudetrade scan`). |
 | `trigger_refresh()` | **write, background** | Starts a data refresh (market data, earnings, sentiment) on a background thread; can take several minutes on a large universe. Refuses (naming the holder) while a refresh started from *any* entry point is running. |
