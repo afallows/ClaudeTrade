@@ -1095,6 +1095,116 @@ def db_rebuild_sentiment(
     )
 
 
+def _backfill_via_market_chain(
+    cfg: AppConfig,
+    db,
+    targets: list[str],
+    start_date: dt.date,
+    end_date: dt.date,
+    *,
+    force: bool,
+) -> dict[str, int]:
+    """Keyless historical backfill through the configured provider cascade.
+
+    The grouped-daily path below is faster per call, but it needs a Polygon
+    key, and requiring a signup to escape ``insufficient_history`` would put
+    the fix to this application's most serious defect behind a paywall-shaped
+    door. It does not need to be: Yahoo's chart endpoint (already in the
+    default ``market_data.fallbacks``) returns *years* of daily bars for a
+    symbol in a single call, and ``get_daily_bars`` already fans symbols out
+    across ``MarketDataConfig.max_workers``. One call per symbol for the whole
+    window is a completely reasonable one-time cost -- and unlike the grouped
+    path it also covers TSX names, which Polygon's ``locale=us`` grouped
+    endpoint never returns.
+
+    Symbol-keyed rather than date-keyed, which inverts the resume behaviour:
+    progress is committed per symbol chunk, so an interrupted run leaves
+    whole symbols complete rather than whole dates. Re-running skips sessions
+    already stored for that symbol.
+    """
+    from sqlalchemy import select
+
+    from claudetrade.db.models import PriceBar
+    from claudetrade.providers.base import ProviderError
+    from claudetrade.providers.registry import get_market_provider
+
+    market = get_market_provider(cfg)
+    chunk_size = max(1, min(cfg.market_data.max_symbols_per_request, 100))
+    stats = {"bars_written": 0, "symbols_covered": 0, "symbols_failed": 0}
+
+    typer.echo(
+        f"no Polygon key configured -- backfilling through the market provider chain "
+        f"({getattr(market, 'name', 'market')}: "
+        f"{cfg.market_data.provider} -> {', '.join(cfg.market_data.fallbacks)}), "
+        f"one call per symbol for the whole window, "
+        f"{cfg.market_data.max_workers} in parallel"
+    )
+
+    chunks = [targets[i : i + chunk_size] for i in range(0, len(targets), chunk_size)]
+    for index, chunk in enumerate(chunks, start=1):
+        try:
+            fetched = market.get_daily_bars(chunk, start_date, end_date)
+        except ProviderError as exc:
+            stats["symbols_failed"] += len(chunk)
+            typer.secho(f"  chunk {index}/{len(chunks)} failed: {exc}", fg=typer.colors.YELLOW)
+            continue
+
+        # One short transaction per chunk -- never a long one, matching the
+        # write-scope posture the rest of this codebase now holds.
+        with db.session() as session:
+            for symbol, bars in fetched.items():
+                if not bars:
+                    stats["symbols_failed"] += 1
+                    continue
+                existing = {
+                    row.session: row
+                    for row in session.execute(
+                        select(PriceBar).where(
+                            PriceBar.symbol == symbol,
+                            PriceBar.session >= start_date,
+                            PriceBar.session <= end_date,
+                        )
+                    ).scalars()
+                }
+                wrote = 0
+                for bar in bars:
+                    row = existing.get(bar.session)
+                    if row is not None and not force:
+                        continue  # already stored; resume cheaply
+                    if row is not None:
+                        row.open, row.high, row.low, row.close = (
+                            bar.open, bar.high, bar.low, bar.close,
+                        )
+                        row.adj_close = bar.adj_close
+                        row.volume = bar.volume
+                        row.source = bar.source or "backfill"
+                        row.ingested_at = utc_now()
+                    else:
+                        session.add(
+                            PriceBar(
+                                symbol=symbol,
+                                session=bar.session,
+                                open=bar.open,
+                                high=bar.high,
+                                low=bar.low,
+                                close=bar.close,
+                                adj_close=bar.adj_close,
+                                volume=bar.volume,
+                                source=bar.source or "backfill",
+                            )
+                        )
+                    wrote += 1
+                if wrote:
+                    stats["bars_written"] += wrote
+                    stats["symbols_covered"] += 1
+
+        typer.echo(
+            f"  {index}/{len(chunks)} chunks | {stats['symbols_covered']} symbols | "
+            f"{stats['bars_written']} bars written"
+        )
+    return stats
+
+
 @db_app.command("backfill")
 def db_backfill(
     config: ConfigOption = None,
@@ -1108,17 +1218,39 @@ def db_backfill(
     force: Annotated[
         bool, typer.Option(help="Re-fetch and replace dates that already have stored bars.")
     ] = False,
+    only_if_missing: Annotated[
+        bool,
+        typer.Option(
+            help="Exit quietly (status 0) when enough history is already stored. "
+            "For unattended callers like the setup script."
+        ),
+    ] = False,
+    min_sessions: Annotated[
+        int,
+        typer.Option(
+            help="With --only-if-missing, how many stored sessions count as 'enough'."
+        ),
+    ] = 150,
 ) -> None:
-    """One-time historical price backfill via Polygon.io grouped-daily bars.
+    """One-time historical price backfill. No API key required.
 
-    QA handoff v3 F23: the scanner gates on 60 sessions of price history, but
+    QA handoff v3 F23: the scanner gates on 60+ sessions of price history, but
     a fresh install's refresh only ever adds ~1 real session per day -- so
     without a backfill the scanner rejects the whole universe with
-    ``insufficient_history`` for weeks. This walks trading dates NEWEST ->
-    OLDEST (the scanner becomes useful as soon as the most recent ~60
-    sessions land, long before the full range finishes), fetching each
-    date's ENTIRE US market in one grouped call and persisting the
-    universe's symbols with source tag ``polygon_grouped``.
+    ``insufficient_history`` for weeks.
+
+    Two paths, chosen automatically:
+
+    * **No Polygon key (the default).** Fetches each symbol's full window
+      through the configured market-provider chain -- Yahoo's chart endpoint
+      returns years of daily bars per symbol in one call, and symbols fan out
+      across ``max_workers`` in parallel. Keyless, and it covers TSX names
+      too. This is the path the setup script uses.
+    * **Polygon key present.** Walks trading dates NEWEST -> OLDEST (the
+      scanner becomes useful as soon as the most recent ~60 sessions land),
+      fetching each date's ENTIRE US market in one grouped call. Fewer calls,
+      but free-tier pacing (~5/min) makes ~2 years roughly 500 calls, about
+      1.7 hours; the progress line's ETA accounts for it.
 
     Safe to Ctrl-C and re-run: every date commits in its own short
     transaction (no long transaction is ever held -- deliberate, see the
@@ -1128,9 +1260,6 @@ def db_backfill(
     re-fetches covered dates and replaces those symbols' rows in place --
     scoped to symbols Polygon actually returned, so e.g. TSX bars sourced
     from the tipranks/yahoo cascade are never destroyed by a force pass.
-
-    Free-tier pacing (~5 calls/min) means ~2 years is roughly 500 calls,
-    about 1.7 hours; the progress line's ETA accounts for it.
     """
     cfg = _load(config)
     import time as _time
@@ -1147,9 +1276,11 @@ def db_backfill(
 
     provider = PolygonProvider(config=cfg.polygon, cache_dir=cfg.paths.resolve("cache_dir"))
     status = provider.status()
-    if not status.configured:
-        typer.secho(f"polygon is {status.message}", fg=typer.colors.RED)
-        raise typer.Exit(1)
+    # An absent Polygon key selects the keyless path -- it is NOT an error.
+    # This used to exit(1) here, which put the only fix for the scanner's
+    # insufficient_history blocker behind an API signup and made the setup
+    # script fail outright on a clean install.
+    use_grouped = status.configured
 
     end_date = _parse_date(end, current_trading_session())
     start_date = _parse_date(start, end_date - dt.timedelta(days=round(years * 365.25)))
@@ -1185,6 +1316,32 @@ def db_backfill(
                     .distinct()
                 ).scalars()
             )
+
+    if only_if_missing and len(covered) >= min_sessions:
+        typer.secho(
+            f"backfill not needed: {len(covered)} session(s) already stored between "
+            f"{start_date} and {end_date} (>= --min-sessions {min_sessions}).",
+            fg=typer.colors.GREEN,
+        )
+        return
+
+    if not use_grouped:
+        stats = _backfill_via_market_chain(
+            cfg, db, targets, start_date, end_date, force=force
+        )
+        _echo_json({**stats, "path": "market_chain", "sessions_already_stored": len(covered)})
+        typer.secho(
+            f"Backfill complete: {stats['bars_written']} bars across "
+            f"{stats['symbols_covered']} symbols"
+            + (
+                f" ({stats['symbols_failed']} symbol(s) returned nothing)"
+                if stats["symbols_failed"]
+                else ""
+            )
+            + ". Run 'claudetrade scan' -- the strategies need ~60 sessions of history.",
+            fg=typer.colors.GREEN,
+        )
+        return
 
     rate = max(1, cfg.polygon.rate_limit_per_minute)
     source_tag = "polygon_grouped"

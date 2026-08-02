@@ -410,6 +410,32 @@ if ($LASTEXITCODE -ne 0) {
 Write-Ok "Database ready."
 
 # ---------------------------------------------------------------------------
+# Step c2: two years of price history, if the database doesn't already have it
+#
+# The scanner gates every strategy on 60-100 sessions of price history, and an
+# ordinary refresh only ever adds ~1 session per day -- so without this a fresh
+# install rejects the entire universe with `insufficient_history` for weeks
+# (QA handoff v3, F23). Backfilling here is what makes the app useful on the
+# day it is installed rather than in September.
+#
+# No API key is required: with no Polygon key configured the command fetches
+# each symbol's whole window through the normal provider chain (Yahoo returns
+# years of daily bars per symbol in one call, fanned out in parallel).
+#
+# `--only-if-missing` makes this a cheap no-op on every re-run, and a failure
+# here is deliberately NON-FATAL: an incomplete backfill is a degraded
+# scanner, not a broken install, and it can be re-run at any time.
+# ---------------------------------------------------------------------------
+
+Write-Step "Backfilling two years of price history (first run only; no API key needed)"
+& $venvClaudetrade db backfill --years 2 --only-if-missing
+if ($LASTEXITCODE -ne 0) {
+    Write-Warn "Price-history backfill did not complete (exit code $LASTEXITCODE). Setup will continue -- the app works, but the scanner will report 'insufficient_history' until you re-run 'claudetrade db backfill --years 2'."
+} else {
+    Write-Ok "Price history ready."
+}
+
+# ---------------------------------------------------------------------------
 # Step d: launch the UI, then trigger the first data load
 #
 # UI-FIRST STARTUP: the previous version of this script ran `claudetrade

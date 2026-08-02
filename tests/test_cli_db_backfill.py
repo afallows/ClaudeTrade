@@ -28,6 +28,7 @@ from claudetrade.cli import app
 from claudetrade.config import reset_config_cache
 from claudetrade.db.models import PriceBar, Security
 from claudetrade.db.session import get_database, reset_database_cache
+from claudetrade.domain import Bar
 
 runner = CliRunner()
 
@@ -124,11 +125,112 @@ def _bars() -> list[PriceBar]:
 # --------------------------------------------------------------------------
 
 
-def test_backfill_refuses_cleanly_when_polygon_is_unconfigured(unconfigured_cli_env):
-    result = runner.invoke(app, ["db", "backfill", "--start", "2026-07-29", "--end", "2026-07-30"])
-    assert result.exit_code == 1
-    assert "POLYGON_API_KEY" in result.output
-    assert _bars() == []
+class _ChainStub:
+    """Stands in for the tipranks/yahoo/csv cascade: whole-window bars per
+    symbol, which is what makes a keyless backfill viable."""
+
+    name = "fallback"
+
+    def __init__(self) -> None:
+        self.requested: list[list[str]] = []
+
+    def get_daily_bars(self, symbols, start, end, *, adjusted=True):
+        self.requested.append(list(symbols))
+        out = {}
+        for symbol in symbols:
+            bars, day = [], start
+            while day <= end:
+                if day.weekday() < 5:
+                    bars.append(
+                        Bar(
+                            symbol=symbol, session=day, open=10.0, high=11.0, low=9.0,
+                            close=10.5, volume=1000.0, source="yahoo",
+                        )
+                    )
+                day += dt.timedelta(days=1)
+            out[symbol] = bars
+        return out
+
+
+def test_backfill_without_a_key_uses_the_provider_chain_instead_of_refusing(
+    unconfigured_cli_env, monkeypatch
+):
+    """The whole point of F23's fix is escaping ``insufficient_history``.
+    Requiring an API signup to do that put the only remedy for this app's
+    most serious defect behind a door the operator never agreed to open --
+    and made the Windows setup script fail outright on a clean install.
+    A missing key selects the keyless path; it is not an error.
+    """
+    chain = _ChainStub()
+    monkeypatch.setattr(
+        "claudetrade.providers.registry.get_market_provider", lambda _cfg: chain
+    )
+
+    result = runner.invoke(app, ["db", "backfill", "--start", "2026-07-27", "--end", "2026-07-31"])
+
+    assert result.exit_code == 0
+    assert chain.requested, "the provider chain was never consulted"
+    bars = _bars()
+    assert bars, "no history was written"
+    assert {b.source for b in bars} == {"yahoo"}
+    # One call per symbol covering the WHOLE window -- not one call per date.
+    requested_symbols = {s for batch in chain.requested for s in batch}
+    assert len({b.symbol for b in bars}) == len(requested_symbols)
+
+
+def test_backfill_without_a_key_is_resumable_and_does_not_duplicate(
+    unconfigured_cli_env, monkeypatch
+):
+    monkeypatch.setattr(
+        "claudetrade.providers.registry.get_market_provider", lambda _cfg: _ChainStub()
+    )
+    args = ["db", "backfill", "--start", "2026-07-27", "--end", "2026-07-31"]
+
+    assert runner.invoke(app, args).exit_code == 0
+    first = len(_bars())
+    assert runner.invoke(app, args).exit_code == 0
+
+    assert len(_bars()) == first  # already-stored sessions are skipped
+
+
+def test_only_if_missing_is_a_cheap_no_op_once_history_exists(
+    unconfigured_cli_env, monkeypatch
+):
+    """What the setup script relies on: safe to run on every install without
+    re-fetching, and never a failure."""
+    chain = _ChainStub()
+    monkeypatch.setattr(
+        "claudetrade.providers.registry.get_market_provider", lambda _cfg: chain
+    )
+    runner.invoke(app, ["db", "backfill", "--start", "2026-07-01", "--end", "2026-07-31"])
+    calls_after_first = len(chain.requested)
+
+    result = runner.invoke(
+        app,
+        ["db", "backfill", "--start", "2026-07-01", "--end", "2026-07-31",
+         "--only-if-missing", "--min-sessions", "5"],
+    )
+
+    assert result.exit_code == 0
+    assert "not needed" in result.output
+    assert len(chain.requested) == calls_after_first  # nothing re-fetched
+
+
+def test_only_if_missing_still_backfills_an_empty_database(
+    unconfigured_cli_env, monkeypatch
+):
+    chain = _ChainStub()
+    monkeypatch.setattr(
+        "claudetrade.providers.registry.get_market_provider", lambda _cfg: chain
+    )
+    result = runner.invoke(
+        app,
+        ["db", "backfill", "--start", "2026-07-27", "--end", "2026-07-31",
+         "--only-if-missing", "--min-sessions", "150"],
+    )
+
+    assert result.exit_code == 0
+    assert chain.requested and _bars()
 
 
 # --------------------------------------------------------------------------

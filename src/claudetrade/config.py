@@ -349,6 +349,14 @@ class PolygonConfig(BaseModel):
     #: Credential-store name (``claudetrade.secrets``) checked after the
     #: plain ``POLYGON_API_KEY`` env var and before ``api_key`` above.
     api_key_credential: str = "polygon_api_key"
+    #: API origin, overridable without a code change. The vendor has been
+    #: reported rebranding (polygon.io -> massive.com); vendors normally keep
+    #: an existing API hostname working across a rebrand, but this package
+    #: cannot verify that from an egress-blocked build, and a hard-coded host
+    #: would make a domain move a code change for every operator. Point this
+    #: at whatever origin the current documentation gives if the default ever
+    #: stops resolving. Path shape is assumed unchanged.
+    base_url: str = "https://api.polygon.io"
     #: The documented free tier is ~5 requests/minute; the provider paces
     #: itself under this and honours a 429's Retry-After regardless. A paid
     #: tier lifts this -- raise to match your plan.

@@ -56,6 +56,12 @@ def _credential_catalog(config: AppConfig) -> list[tuple[str, str, str]]:
         (config.ai.anthropic_api_key_credential, "Anthropic (Claude) API key", "sentiment"),
         (config.ai.openai_api_key_credential, "OpenAI (ChatGPT) API key", "sentiment"),
     ]
+    # Polygon is OPTIONAL -- bars degrade to the tipranks/yahoo cascade and
+    # `db backfill` has a keyless path -- but it was previously unreachable
+    # from this screen entirely, so an operator who had a key had nowhere to
+    # put it and no way to tell that was the reason nothing changed. Listed
+    # unconditionally, like the AI keys above and for the same reason.
+    items.append((config.polygon.api_key_credential, "Polygon.io API key (optional)", "stock_price"))
     if config.market_data.credential:
         items.append((config.market_data.credential, "Market data API key", "stock_price"))
     if config.earnings.credential:

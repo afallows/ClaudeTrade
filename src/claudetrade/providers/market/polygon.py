@@ -132,7 +132,13 @@ from claudetrade.utils.timeutils import (
 
 log = logging.getLogger(__name__)
 
-GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
+#: Path appended to ``PolygonConfig.base_url``. Split from the origin so a
+#: vendor domain change (polygon.io -> massive.com has been reported) is a
+#: config edit rather than a code change -- see ``PolygonConfig.base_url``.
+GROUPED_PATH = "/v2/aggs/grouped/locale/us/market/stocks/{date}"
+
+#: Kept for the default origin; prefer ``self._grouped_url(date)``.
+GROUPED_URL = "https://api.polygon.io" + GROUPED_PATH
 
 #: Plain environment variable checked FIRST -- the name every Polygon client
 #: library documents, so a key exported for any other Polygon tool just works.
@@ -427,7 +433,8 @@ class PolygonProvider(MarketDataProvider):
         with self._lock:
             self._calls += 1
 
-        url = GROUPED_URL.format(date=date.isoformat())
+        origin = (getattr(self._config, "base_url", "") or "https://api.polygon.io").rstrip("/")
+        url = origin + GROUPED_PATH.format(date=date.isoformat())
         params = {"adjusted": "true" if adjusted else "false", "apiKey": self._api_key}
         try:
             with httpx.Client(timeout=self._config.request_timeout_s, verify=True) as client:
