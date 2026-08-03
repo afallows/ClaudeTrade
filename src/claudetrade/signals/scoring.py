@@ -1,6 +1,6 @@
 """Component scoring and confidence.
 
-Every candidate is scored on thirteen components, each mapped to 0-100 where
+Every candidate is scored on sixteen components, each mapped to 0-100 where
 higher is always better. Risk-shaped components (earnings proximity,
 manipulation risk) are inverted at the point of scoring so the weighted sum
 needs no special cases and cannot be read backwards.
@@ -23,14 +23,40 @@ Two properties are enforced here rather than left to strategy authors:
   (ApeWisdom) feed the attention axis and nothing else -- never a polarity
   component, never manipulation risk, never data confidence. See
   ``_attention_score``.
+
+**ADR-0009 (score promotion, shadow mode).** ``analyst_sentiment``/
+``institutional_sentiment``/``cross_source_attention`` are three additional
+components, computed unconditionally (``score_candidate`` always returns
+them on ``ComponentScores``) but weighted only under
+``SignalConfig.promoted_component_weights`` -- a SECOND, independent weight
+table from ``component_weights``. ``score_candidate`` therefore returns TWO
+overall scores on ``ScoreBreakdown``: ``overall`` (the pre-existing baseline,
+computed EXACTLY as before this ADR -- ``component_weights`` has no entries
+for the three new components, so their effective weight there is always
+zero) and ``promoted_overall`` (the same weighted-mean machinery run again
+against ``promoted_component_weights``). Computing ``promoted_overall`` is
+unconditional too -- it is cheap and deterministic -- but what
+``signals.engine.SignalEngine`` does with it depends on
+``SignalConfig.promoted_scoring_mode`` (``"off"``/``"shadow"``/``"live"``): only
+the RANKING policy differs by mode, not what gets computed. This split is
+deliberate -- see ``docs/decisions/ADR-0009-score-promotion-weighting.md``'s
+"Implementation notes" for the two-table rationale and
+:func:`_promoted_overall`/:func:`_analyst_sentiment_score`/
+:func:`_institutional_sentiment_score`/:func:`_cross_source_attention_score`
+below for direction-awareness and evidence-absence handling per component.
 """
 
 from __future__ import annotations
 
+import datetime as dt
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from claudetrade.config import AppConfig
+from claudetrade.data.analyst import analyst_delta
 from claudetrade.domain import (
+    AnalystRatingAction,
     ComponentScores,
     Direction,
     RegimeState,
@@ -43,6 +69,7 @@ from claudetrade.strategies.base import (
     is_attention_only,
 )
 from claudetrade.strategies.scoring_utils import percentile_rank
+from claudetrade.utils.timeutils import previous_trading_day, trading_days_between
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -75,10 +102,19 @@ class GateFailure:
 
 @dataclass(slots=True)
 class ScoreBreakdown:
-    """Scoring result plus the reasons a candidate was gated out, if it was."""
+    """Scoring result plus the reasons a candidate was gated out, if it was.
+
+    ``promoted_overall`` (ADR-0009) is the SAME components, blended a second
+    time against ``SignalConfig.promoted_component_weights`` instead of
+    ``component_weights`` -- always computed (cheap, deterministic), never
+    itself deciding rank. ``signals.engine.SignalEngine`` is what turns it
+    into a stored divergence note (mode ``"shadow"``) or an actual ranking
+    key (mode ``"live"``); see ``SignalConfig.promoted_scoring_mode``.
+    """
 
     components: ComponentScores
     overall: float
+    promoted_overall: float
     confidence: float
     gate_failures: list[GateFailure] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -380,6 +416,277 @@ def _manipulation_score(sentiment: SymbolSentiment | None, invert_for_short: boo
     if invert_for_short:
         return _clamp(40.0 + 60.0 * risk)
     return _clamp(100.0 * (1.0 - risk))
+
+
+# --------------------------------------------------------------------------
+# ADR-0009: promoted-scoring components (analyst / institutional / cross-
+# source attention). Each returns ``(score_0_to_100, has_evidence)`` --
+# ``has_evidence`` is what the caller uses to zero the component's weight
+# when absent (mirroring ``_polarity_axis``/``_attention_score`` above,
+# never a weighted neutral 50).
+# --------------------------------------------------------------------------
+
+#: A snapshot older than this many trading sessions is treated as stale (no
+#: evidence) rather than acted on -- an analyst picture five sessions old is
+#: not "current coverage" for a swing-trading composite.
+ANALYST_STALE_SESSIONS = 5
+#: Trailing trading-session window for the rating-action tilt sub-blend.
+RATING_TILT_WINDOW_SESSIONS = 10
+#: Divisor for the star-weighted rating-tilt sum before ``tanh`` squashing --
+#: calibrated so a single 5-star reiterated buy already registers a strong
+#: (but not saturated) tilt, and several corroborating actions saturate it.
+RATING_TILT_SCALE = 3.0
+#: Divisor for the coverage-change kicker before ``tanh`` squashing -- a
+#: change of a few analysts is already a meaningful shift in a name's
+#: covered-analyst count.
+COVERAGE_CHANGE_SCALE = 3.0
+#: Adanos feeds observed in this codebase (X, Reddit, News, Polymarket) --
+#: used only as the corroboration sub-component's upper scale bound, an
+#: honestly-approximate proxy (see ``_cross_source_attention_score``), not a
+#: vendor-documented constant.
+ADANOS_KNOWN_PLATFORMS = 4
+
+
+def _sub_blend(parts: Sequence[tuple[float | None, float]]) -> float:
+    """Weighted mean over ``(value, weight)`` pairs, skipping ``None`` values
+    and renormalising the remaining weights.
+
+    The same evidence-absent renormalisation ``_polarity_axis``/
+    ``score_candidate`` apply at the top-level component, mirrored here one
+    level down: an unavailable SUB-signal (no stored price target, no
+    previous snapshot to diff a coverage change against, fewer than 7 points
+    of Adanos trend history) contributes no weight rather than a neutral 50
+    dragging the parent component toward the middle. Falls back to a neutral
+    50.0 only when EVERY part in the blend is unavailable.
+    """
+    present = [(v, w) for v, w in parts if v is not None]
+    total = sum(w for _, w in present)
+    if total <= 0:
+        return 50.0
+    return sum(v * w for v, w in present) / total
+
+
+def _rating_action_tilt(
+    actions: Sequence[AnalystRatingAction], session: dt.date, sign: int
+) -> float | None:
+    """10-trading-session, star-weighted, sign-squashed rating tilt.
+
+    **Rating-tilt substitute (coordinator-approved deviation from ADR-0009's
+    literal wording).** The ADR asks for "star-weighted upgrades and
+    initiations minus downgrades" -- unavailable as stated:
+    ``domain.AnalystRatingAction.action_id``/``action_label`` are CONFIRMED
+    only for ``action_id=3`` ("upgrade") and ``action_id=5`` ("reiterate");
+    downgrades and initiations have no confirmed ``action_id`` mapping in
+    this codebase (see that field's own docstring, and ADR-0008 Decision 1:
+    never fabricate meaning for an unconfirmed field). Substituted instead:
+    each action's CONFIRMED ``rating_label`` ("buy"/"sell"; "hold" and
+    unrated actions carry no directional tilt and are excluded), star-
+    weighted by ``analyst_stars`` (defaulting to 1.0 when the vendor did not
+    report a star rating) and summed over the trailing
+    ``RATING_TILT_WINDOW_SESSIONS`` trading sessions, then ``tanh``-squashed
+    -- "recent rating tilt weighted by analyst quality" rather than literal
+    upgrade/downgrade counting. SIGNED: this sub-blend is polarity-shaped
+    (a buy-rating tilt is bullish, a sell-rating tilt is bearish), so it
+    mirrors ``_sentiment_score``'s direction flip for shorts.
+
+    Returns ``None`` (excluded from the parent blend, not scored 50) when no
+    rating action with a directional label falls inside the window.
+    """
+    window_start = previous_trading_day(session, skip=RATING_TILT_WINDOW_SESSIONS)
+    numerator = 0.0
+    weight_total = 0.0
+    for action in actions:
+        if not (window_start <= action.date <= session):
+            continue
+        if action.rating_label == "buy":
+            rating_sign = 1.0
+        elif action.rating_label == "sell":
+            rating_sign = -1.0
+        else:
+            continue  # "hold", unrated, or unmapped: no directional tilt
+        stars = action.analyst_stars if action.analyst_stars and action.analyst_stars > 0 else 1.0
+        numerator += rating_sign * stars
+        weight_total += stars
+    if weight_total <= 0:
+        return None
+    squashed = math.tanh(numerator / RATING_TILT_SCALE)
+    return _scale(sign * squashed, -1.0, 1.0)
+
+
+def _analyst_sentiment_score(
+    ctx: StrategyContext, direction: Direction
+) -> tuple[float, bool]:
+    """ADR-0009: TipRanks analyst-consensus blend.
+
+    Four sub-blends (``_sub_blend``, renormalising over whichever are
+    available for this snapshot):
+
+    * **Consensus tilt** (0.40, SIGNED): ``(buy - sell) / (buy + hold +
+      sell)``, mapped to 0-100. Polarity-shaped -- mirrors
+      ``_sentiment_score``'s sign flip for shorts.
+    * **Price-target upside** (0.30, SIGNED): ``price_target_mean / price -
+      1``, clamped to +/-30% before mapping. Polarity-shaped, same flip.
+    * **Rating-action tilt** (0.20, SIGNED): see
+      :func:`_rating_action_tilt` for the rating-tilt substitute this
+      codebase uses in place of the ADR's unconfirmable upgrade/downgrade
+      counting.
+    * **Coverage-change kicker** (0.10, **UNSIGNED**): ``data.analyst
+      .analyst_delta``'s ``coverage_change`` (analyst count added/dropped
+      since the previous stored snapshot), ``tanh``-squashed. Deliberately
+      NOT sign-flipped for shorts -- more analysts picking up coverage is a
+      change in ATTENTION on the name, not a bullish or bearish opinion,
+      the same "a crowd gathering is neither bullish nor bearish" reasoning
+      ``_attention_score`` documents for mention counts. This is a
+      coordinator-approved deviation from the ADR's flat "mirror
+      reddit_sentiment" instruction, not an oversight -- see
+      ``docs/decisions/ADR-0009-score-promotion-weighting.md``'s
+      "Implementation notes".
+
+    Evidence-absent (returns ``(50.0, False)``) when the symbol has no
+    stored analyst snapshot, when the latest snapshot's ``analyst_count`` is
+    0, or when the latest snapshot is older than ``ANALYST_STALE_SESSIONS``
+    trading sessions (stale-snapshot guard).
+    """
+    history = ctx.analyst_history
+    if not history:
+        return 50.0, False
+    latest = history[-1]
+    if latest.analyst_count <= 0:
+        return 50.0, False
+    if trading_days_between(latest.as_of_session, ctx.session) > ANALYST_STALE_SESSIONS:
+        return 50.0, False
+
+    previous = history[-2] if len(history) >= 2 else None
+    delta = analyst_delta(latest, previous)
+    sign = direction.sign or 1
+
+    total = latest.buy_count + latest.hold_count + latest.sell_count
+    consensus_component = (
+        _scale(sign * (latest.buy_count - latest.sell_count) / total, -1.0, 1.0)
+        if total > 0
+        else None
+    )
+
+    pt_component: float | None = None
+    if latest.price_target_mean is not None and ctx.price > 0:
+        upside = max(-0.30, min(0.30, latest.price_target_mean / ctx.price - 1.0))
+        pt_component = _scale(sign * upside, -0.30, 0.30)
+
+    rating_component = _rating_action_tilt(latest.recent_rating_actions, ctx.session, sign)
+
+    coverage_component: float | None = None
+    if delta.has_previous and delta.coverage_change is not None:
+        coverage_component = _scale(
+            math.tanh(delta.coverage_change / COVERAGE_CHANGE_SCALE), -1.0, 1.0
+        )
+
+    blended = _sub_blend(
+        [
+            (consensus_component, 0.40),
+            (pt_component, 0.30),
+            (rating_component, 0.20),
+            (coverage_component, 0.10),
+        ]
+    )
+    return blended, True
+
+
+def _institutional_sentiment_score(
+    ctx: StrategyContext, direction: Direction
+) -> tuple[float, bool]:
+    """ADR-0009: direct map of the stored institutional score.
+
+    ``InstitutionalScorePoint.score`` is already the blended, staleness-
+    discounted [-1, +1] figure ``tipranks_institutional.institutional_score``
+    computed at INGEST time (see that function and ``data.institutional
+    .load_history``) -- it is read straight off the row here, never
+    recomputed, and staleness is already inside it, so no second discount is
+    applied. SIGNED: this score is polarity-carrying (net insider/hedge-fund
+    bullishness vs. bearishness), so it mirrors ``_sentiment_score``'s sign
+    flip for shorts, per ADR-0009 Decision 3's instruction to mirror the
+    existing direction-awareness precedent for polarity-shaped evidence.
+
+    Evidence-absent (returns ``(50.0, False)``) when the symbol has no
+    stored institutional snapshot, or the latest one's ``score`` is
+    ``None`` (both axes absent/fully stale -- see
+    ``InstitutionalScoreResult.score``'s own docstring).
+    """
+    history = ctx.institutional_history
+    if not history:
+        return 50.0, False
+    latest = history[-1]
+    if latest.score is None:
+        return 50.0, False
+    sign = direction.sign or 1
+    return _clamp((sign * latest.score + 1.0) * 50.0), True
+
+
+def _cross_source_attention_score(
+    ctx: StrategyContext, direction: Direction
+) -> tuple[float, bool]:
+    """ADR-0009: Adanos cross-platform buzz/polarity/corroboration blend.
+
+    Three sub-blends (``_sub_blend``) over the symbol's latest stored
+    ``AttentionAggregate`` (``ctx.adanos_history[-1]``):
+
+    * **Buzz percentile** (0.40, **UNSIGNED**): today's ``buzz_score``
+      ranked (``strategies.scoring_utils.percentile_rank``) against the
+      aggregate's OWN embedded ``trend_history`` (the vendor's 7-point
+      trailing buzz series) -- "how loud is this, relative to its own
+      recent normal", which carries no bullish/bearish direction.
+    * **Bullish-minus-bearish spread** (0.40, SIGNED): ``bullish_pct -
+      bearish_pct``, mapped from [-100, 100]. This is the one
+      polarity-shaped sub-component, so it alone mirrors
+      ``_sentiment_score``'s sign flip for shorts.
+    * **Corroboration bonus** (0.20, **UNSIGNED**): the number of platforms
+      reporting on the symbol this session, scaled against
+      ``ADANOS_KNOWN_PLATFORMS``. An honest approximation -- Adanos does not
+      expose a per-platform trend-AGREEMENT count, only the already-folded
+      dominant ``trend`` -- documented as such rather than presented as a
+      precise "platforms agreeing" tally.
+
+    **Direction-awareness split (coordinator-approved deviation from the
+    ADR's flat "mirror reddit_sentiment" instruction).** Buzz percentile and
+    the corroboration bonus are ATTENTION-shaped ("how much" and "how many
+    sources"), not polarity-shaped, so -- per the same "a crowd gathering is
+    neither bullish nor bearish" reasoning ``_attention_score`` documents --
+    they are never sign-flipped for shorts; only the bull/bear spread is.
+    See ``docs/decisions/ADR-0009-score-promotion-weighting.md``'s
+    "Implementation notes" for the full rationale.
+
+    Evidence-absent (returns ``(50.0, False)``) when the symbol has no
+    stored Adanos snapshot at all.
+    """
+    history = ctx.adanos_history
+    if not history:
+        return 50.0, False
+    latest = history[-1]
+    sign = direction.sign or 1
+
+    buzz_component: float | None = None
+    if latest.trend_history:
+        pct = percentile_rank(latest.trend_history, latest.buzz_score)
+        buzz_component = _scale(pct, 0.0, 1.0)  # unsigned: attention-shaped
+
+    spread_component: float | None = None
+    if latest.bullish_pct is not None and latest.bearish_pct is not None:
+        spread = latest.bullish_pct - latest.bearish_pct
+        spread_component = _scale(sign * spread, -100.0, 100.0)  # signed: polarity-shaped
+
+    corroboration_component: float | None = None
+    if latest.platforms:
+        corroboration_component = _scale(
+            float(len(latest.platforms)), 1.0, float(ADANOS_KNOWN_PLATFORMS)
+        )  # unsigned: attention-shaped
+
+    blended = _sub_blend(
+        [
+            (buzz_component, 0.40),
+            (spread_component, 0.40),
+            (corroboration_component, 0.20),
+        ]
+    )
+    return blended, True
 
 
 def _data_confidence_score(
@@ -710,6 +1017,18 @@ def score_candidate(
     weights = config.signals.component_weights
     polarity = _polarity_axis(ctx, direction, weights)
     attention = _attention_score(ctx, config)
+    # ADR-0009: computed unconditionally, exactly like every other component
+    # -- ``has_evidence`` feeds the PROMOTED composite's renormalisation
+    # below; it never touches the baseline ``overall`` computation, which
+    # remains byte-identical to pre-ADR-0009 behaviour (``component_weights``
+    # simply has no entries for these three names).
+    analyst_score, analyst_evidence = _analyst_sentiment_score(ctx, direction)
+    institutional_score, institutional_evidence = _institutional_sentiment_score(
+        ctx, direction
+    )
+    cross_source_score, cross_source_evidence = _cross_source_attention_score(
+        ctx, direction
+    )
 
     components = ComponentScores(
         technical_setup=_technical_score(proposal),
@@ -727,6 +1046,9 @@ def score_candidate(
         # aggregator attention tally reports no authors and no text, so it
         # has nothing to say about coordinated promotion or data quality.
         manipulation_risk=_manipulation_score(sentiment, invert_for_short=is_hype_short),
+        analyst_sentiment=analyst_score,
+        institutional_sentiment=institutional_score,
+        cross_source_attention=cross_source_score,
         data_confidence=_data_confidence_score(ctx, sentiment, config),
     )
 
@@ -737,6 +1059,13 @@ def score_candidate(
     # weighting a placeholder 50, which is an active vote for indecision and
     # pulls every candidate toward the middle in proportion to how quiet its
     # social coverage happens to be.
+    #
+    # NOTE (ADR-0009): this block is UNCHANGED from pre-ADR-0009 code, on
+    # purpose -- ``weights`` is ``component_weights`` (the baseline table),
+    # which has no entries for ``analyst_sentiment``/``institutional_
+    # sentiment``/``cross_source_attention``, so ``weights.get(name, 0.0)``
+    # already zeroes them out here with no extra code. This is exactly what
+    # keeps shadow-mode's baseline ranking byte-identical to today's.
     effective = {k: weights.get(k, 0.0) for k in scored if k != "data_confidence"}
     effective["reddit_sentiment"] = polarity.reddit_weight
     effective["x_sentiment"] = polarity.x_weight
@@ -750,6 +1079,36 @@ def score_candidate(
     # The regime raises or lowers the bar rather than the score, so a hostile
     # environment shrinks the candidate list instead of silently re-ranking it.
     overall = _clamp(overall)
+
+    # ADR-0009: the PROMOTED composite -- same ``scored`` components, blended
+    # a second time against ``promoted_component_weights`` (an entirely
+    # independent table; see that field's docstring for the two-table
+    # rationale), with the SAME evidence-conditional weighting the baseline
+    # above uses for reddit/x/attention, extended to the three new
+    # components via the ``has_evidence`` flags computed above.  A dedicated
+    # dict, never touching ``effective`` above, so this cannot alter the
+    # baseline by construction.
+    promoted_weights = config.signals.promoted_component_weights
+    promoted_effective = {k: promoted_weights.get(k, 0.0) for k in scored if k != "data_confidence"}
+    promoted_effective["reddit_sentiment"] *= 1.0 if "reddit" in polarity.measured else (
+        0.5 if polarity.combined_fallback else 0.0
+    )
+    promoted_effective["x_sentiment"] *= 1.0 if "x" in polarity.measured else (
+        0.5 if polarity.combined_fallback else 0.0
+    )
+    promoted_effective["attention_acceleration"] *= 1.0 if attention.weight > 0 else 0.0
+    promoted_effective["analyst_sentiment"] *= 1.0 if analyst_evidence else 0.0
+    promoted_effective["institutional_sentiment"] *= 1.0 if institutional_evidence else 0.0
+    promoted_effective["cross_source_attention"] *= 1.0 if cross_source_evidence else 0.0
+    promoted_total_weight = sum(promoted_effective.values())
+    if promoted_total_weight <= 0:
+        promoted_overall = 50.0
+    else:
+        promoted_overall = (
+            sum(scored[k] * promoted_effective[k] for k in promoted_effective)
+            / promoted_total_weight
+        )
+    promoted_overall = _clamp(promoted_overall)
 
     # Confidence blends data quality with sample adequacy and agreement.
     confidence = components.data_confidence / 100.0
@@ -808,6 +1167,7 @@ def score_candidate(
     return ScoreBreakdown(
         components=components,
         overall=round(overall, 2),
+        promoted_overall=round(promoted_overall, 2),
         confidence=round(confidence, 4),
         gate_failures=gate_failures,
         notes=notes,

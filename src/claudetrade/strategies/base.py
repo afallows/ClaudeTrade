@@ -22,17 +22,29 @@ from __future__ import annotations
 import datetime as dt
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from claudetrade.config import AppConfig
 from claudetrade.domain import (
+    AnalystSnapshot,
     Bar,
     Direction,
     EarningsEvent,
+    InstitutionalScorePoint,
     RegimeState,
     SecurityInfo,
     SymbolSentiment,
 )
+
+if TYPE_CHECKING:
+    # Deferred: importing ``data.adanos_read`` at module scope would make the
+    # `data` package depend on `strategies` (already true, see
+    # ``data.context``) AND `strategies` depend on `data` -- harmless given
+    # Python's submodule-import semantics (neither module's import touches
+    # the other's still-executing ``__init__``), but ``from __future__
+    # import annotations`` above means this type is never evaluated at
+    # runtime anyway, so there is no reason to pay for the real import.
+    from claudetrade.data.adanos_read import AttentionAggregate
 
 
 class LookaheadError(AssertionError):
@@ -105,6 +117,23 @@ class StrategyContext:
             excluded: strategies percentile-rank today's combined snapshot
             against this series, and interleaving rows from other sources
             would rank a value against a distribution it does not belong to.
+        analyst_history: Stored TipRanks ``AnalystSnapshot`` rows, ascending,
+            ending at ``session`` (ADR-0009). Feeds
+            ``signals.scoring._analyst_sentiment_score``; the last element is
+            "current", the one before it (if any) is "previous" for
+            ``data.analyst.analyst_delta``'s coverage-change kicker.
+        institutional_history: Stored ``InstitutionalScorePoint`` rows
+            (snapshot + its ingest-time ``score``), ascending, ending at
+            ``session`` (ADR-0009). Feeds
+            ``signals.scoring._institutional_sentiment_score``, which reads
+            the last element's ``score`` straight off the row rather than
+            recomputing it.
+        adanos_history: Stored cross-platform Adanos ``AttentionAggregate``
+            rows (``data.adanos_read``), ascending, ending at ``session``
+            (ADR-0009). Feeds ``signals.scoring
+            ._cross_source_attention_score``, which reads the last
+            element's own ``trend_history`` for the buzz-percentile
+            sub-component rather than needing several sessions of this list.
         earnings: Known earnings events, past and scheduled.
         security: Reference data.
         regime: Market environment on ``session``.
@@ -124,6 +153,9 @@ class StrategyContext:
     attention_by_source: dict[str, SymbolSentiment] = field(default_factory=dict)
     attention_history: dict[str, list[SymbolSentiment]] = field(default_factory=dict)
     sentiment_history: list[SymbolSentiment] = field(default_factory=list)
+    analyst_history: list[AnalystSnapshot] = field(default_factory=list)
+    institutional_history: list[InstitutionalScorePoint] = field(default_factory=list)
+    adanos_history: list[AttentionAggregate] = field(default_factory=list)
     earnings: list[EarningsEvent] = field(default_factory=list)
     benchmark_features: dict[str, float] = field(default_factory=dict)
     sector_features: dict[str, float] = field(default_factory=dict)
@@ -146,6 +178,22 @@ class StrategyContext:
                 source: [s for s in series if s.session <= self.session]
                 for source, series in self.attention_history.items()
             }
+        # ADR-0009: the three new histories get the identical truncate-
+        # silently treatment as sentiment_history/attention_history above --
+        # over-supplying a full history and having it clipped here is the
+        # same safe, normal calling pattern, not an error.
+        if self.analyst_history:
+            self.analyst_history = [
+                a for a in self.analyst_history if a.as_of_session <= self.session
+            ]
+        if self.institutional_history:
+            self.institutional_history = [
+                p for p in self.institutional_history if p.session <= self.session
+            ]
+        if self.adanos_history:
+            self.adanos_history = [
+                a for a in self.adanos_history if a.session <= self.session
+            ]
         # Everything that cannot be safely clipped -- a single sentiment
         # snapshot, an earnings row's knowledge date, the regime -- is validated
         # here, at construction. Leaving that to an explicit
@@ -275,6 +323,26 @@ class StrategyContext:
                         f"{self.symbol}: {source} attention history dated "
                         f"{snapshot.session} exceeds session {self.session}"
                     )
+        # ADR-0009: the three new histories get the identical belt-and-braces
+        # check as sentiment_history/attention_history above.
+        for snapshot in self.analyst_history:
+            if snapshot.as_of_session > self.session:
+                raise LookaheadError(
+                    f"{self.symbol}: analyst history dated {snapshot.as_of_session} "
+                    f"exceeds session {self.session}"
+                )
+        for point in self.institutional_history:
+            if point.session > self.session:
+                raise LookaheadError(
+                    f"{self.symbol}: institutional history dated {point.session} "
+                    f"exceeds session {self.session}"
+                )
+        for aggregate in self.adanos_history:
+            if aggregate.session > self.session:
+                raise LookaheadError(
+                    f"{self.symbol}: adanos history dated {aggregate.session} "
+                    f"exceeds session {self.session}"
+                )
         # The regime may legitimately be absent (unclassified session); only a
         # regime dated in the future is a leak.
         if self.regime is not None and self.regime.session > self.session:

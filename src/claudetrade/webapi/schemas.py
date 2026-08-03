@@ -41,6 +41,12 @@ class ComponentScoresOut(BaseModel):
     market_regime: float
     manipulation_risk: float
     data_confidence: float
+    # ADR-0009 promotion-candidate components. Defaults mirror the domain
+    # dataclass so signals recorded before 2026-08-03 (whose stored JSON
+    # lacks these keys) still serialize.
+    analyst_sentiment: float = 50.0
+    institutional_sentiment: float = 50.0
+    cross_source_attention: float = 50.0
 
 
 class TradePlanOut(BaseModel):

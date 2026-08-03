@@ -669,9 +669,15 @@ def get_institutional_sentiment(pipeline: Pipeline, symbol: str) -> dict[str, An
     it has not been refreshed yet, or TipRanks has no institutional content
     for it at all (common for small/illiquid names) -- never an error.
 
-    **Not fed into ``signals.scoring.ComponentScores`` or any strategy** --
-    see ``domain.InstitutionalSnapshot``'s own docstring. This is a
-    read-only research overlay.
+    **Fed into ``signals.scoring.ComponentScores.institutional_sentiment`` as
+    of ADR-0009** (2026-08-03) -- see ``domain.InstitutionalSnapshot``'s own
+    docstring. This tool remains a separate, read-only research overlay: it
+    RECOMPUTES ``institutional_score`` fresh (see above) so the reported
+    figure always reflects the current scoring formula, whereas the scoring
+    path reads the score already computed and stored at ingest time straight
+    off the row (``data.institutional.InstitutionalScorePoint``) -- the two
+    can therefore differ slightly if the scoring formula has changed since
+    the row was ingested, which is expected and not a bug.
     """
     from claudetrade.data.institutional import institutional_delta, latest_and_previous_snapshots
     from claudetrade.providers.market.tipranks_institutional import institutional_score

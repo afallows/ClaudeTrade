@@ -1434,6 +1434,86 @@ class SignalConfig(BaseModel):
     #: prevent. Under-covered sources are simply absent from the axis.
     attention_min_history_sessions: int = 10
 
+    #: ADR-0009 Decision 5: ``"off"`` computes ``analyst_sentiment``/
+    #: ``institutional_sentiment``/``cross_source_attention`` (they always
+    #: appear in ``Signal.components``) but they carry no weight, because
+    #: ``component_weights`` below has no entries for them -- ranking is
+    #: byte-identical to pre-ADR-0009 behaviour. ``"shadow"`` (the default)
+    #: additionally computes the PROMOTED composite from
+    #: ``promoted_component_weights`` and stores it, the baseline/promoted
+    #: ranks and a divergence note in ``Signal.extras["promoted_scoring"]``
+    #: -- the composite that actually ranks signals is still the baseline
+    #: one, so recommendations do not change. ``"live"`` ranks by the
+    #: promoted composite instead. See ``signals.engine.SignalEngine.scan``
+    #: for where the mode is consumed.
+    #:
+    #: **Named ``promoted_scoring_mode``, NOT ``promoted_scoring`` as
+    #: HANDOFF.md's plan originally specified** -- a deviation discovered
+    #: (not merely assumed) while running ``tests/test_webapi_system.py``
+    #: unedited, as this task's brief requires: ``webapi.schemas
+    #: .SignalWeightsOut.promoted_scoring`` already exists, typed
+    #: ``dict[str, float] | None``, as a placeholder for an eventually-
+    #: surfaced WEIGHTS table (see that field's own docstring: "a
+    #: placeholder for an upcoming score-promotion config field"). Naming
+    #: this field ``promoted_scoring`` -- a plain string -- would make
+    #: ``webapi/routers/system.py``'s ``GET /api/system/weights`` 500
+    #: (pydantic rejects a ``str`` where the response model declares
+    #: ``dict[str, float] | None``) on every call, not merely fail one
+    #: assertion. Since ``webapi/`` is out of scope to edit for this
+    #: change, the only way to satisfy "the weights endpoint must pass
+    #: unedited" without shipping a live 500 is to avoid the name
+    #: collision here. ``getattr(config.signals, "promoted_scoring",
+    #: None)`` in ``system.py`` therefore still resolves to ``None`` (the
+    #: attribute genuinely does not exist under that name), which is
+    #: exactly what that endpoint's placeholder docstring already promises
+    #: and what ``test_webapi_system.py`` already asserts -- both stay
+    #: true and neither needed editing. See ``docs/decisions
+    #: /ADR-0009-score-promotion-weighting.md``'s "Implementation notes"
+    #: for the same note.
+    promoted_scoring_mode: Literal["off", "shadow", "live"] = "shadow"
+
+    #: ADR-0009 Decision 2's "New" weight column -- a SECOND, independent
+    #: table from ``component_weights`` above (which stays exactly as it was
+    #: pre-ADR-0009: the two-table split is deliberate, not an oversight --
+    #: see ``docs/decisions/ADR-0009-score-promotion-weighting.md``'s
+    #: "Implementation notes"). Sums to 1.00 (enforced by
+    #: ``_promoted_weights_sum_to_one`` below); normalised further at use by
+    #: the same evidence-absent renormalisation ``component_weights`` gets
+    #: (see ``signals.scoring``'s promoted-composite helpers). Reading the
+    #: CURRENT weights (``GET /api/system/weights``) still returns
+    #: ``component_weights`` only -- surfacing this table on that endpoint is
+    #: a follow-up, tracked separately, since ``webapi/`` is out of scope for
+    #: this change.
+    promoted_component_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "technical_setup": 0.18,
+            "price_momentum": 0.11,
+            "volume_confirmation": 0.09,
+            "reddit_sentiment": 0.07,
+            "x_sentiment": 0.03,
+            "sentiment_acceleration": 0.07,
+            "attention_acceleration": 0.04,
+            "catalyst_quality": 0.05,
+            "earnings_risk": 0.08,
+            "liquidity": 0.07,
+            "market_regime": 0.06,
+            "manipulation_risk": 0.04,
+            "analyst_sentiment": 0.05,
+            "institutional_sentiment": 0.03,
+            "cross_source_attention": 0.03,
+        }
+    )
+
+    @field_validator("promoted_component_weights")
+    @classmethod
+    def _promoted_weights_sum_to_one(cls, v: dict[str, float]) -> dict[str, float]:
+        total = sum(v.values())
+        if abs(total - 1.0) > 0.01:
+            raise ValueError(
+                f"promoted_component_weights must sum to 1.00 (ADR-0009 Decision 2); got {total:.4f}"
+            )
+        return v
+
 
 class StrategyCalibrationConfig(BaseModel):
     """Score-accumulation calibration for the five strategies (ADR-0007 Decision 2).

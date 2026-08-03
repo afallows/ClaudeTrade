@@ -544,7 +544,11 @@ class SignalEngine:
                 "will be permitted."
             )
 
-        candidates: list[tuple[Signal, float]] = []
+        # Third element is the ADR-0009 promoted composite (``ScoreBreakdown
+        # .promoted_overall``) -- carried alongside the baseline score so the
+        # post-loop ranking/divergence block below never needs to re-score a
+        # candidate to find it.
+        candidates: list[tuple[Signal, float, float]] = []
         symbols_with_sentiment = 0
         for ctx in contexts:
             result.evaluated_symbols += 1
@@ -563,7 +567,7 @@ class SignalEngine:
             ctx.config = ctx.config or self.config
 
             for strategy in self.strategies:
-                signal = self._evaluate_one(
+                evaluated = self._evaluate_one(
                     ctx=ctx,
                     strategy=strategy,
                     regime=regime,
@@ -574,8 +578,9 @@ class SignalEngine:
                     rejected=result.rejected,
                     funnel=result.funnel,
                 )
-                if signal is not None:
-                    candidates.append((signal, signal.overall_score))
+                if evaluated is not None:
+                    signal, promoted_overall = evaluated
+                    candidates.append((signal, signal.overall_score, promoted_overall))
 
         result.funnel.finalize()
         result.sentiment_coverage = {
@@ -589,15 +594,81 @@ class SignalEngine:
 
         # Rank best-first; ties broken by confidence then reward:risk, so a
         # better-evidenced idea outranks an equally-scored guess.
+        #
+        # ADR-0009: which SCORE ranks depends on ``promoted_scoring_mode``.
+        # ``"off"``/``"shadow"`` both rank by the baseline (index 1) --
+        # shadow mode's entire point is that today's ranking does not move
+        # while the promoted composite merely accumulates as observable
+        # evidence. ``"live"`` ranks by the promoted composite (index 2)
+        # instead. Either way ``Signal.overall_score`` itself is never
+        # touched -- it stays the baseline, audited figure every other
+        # reader (dedupe, ``adjusted_overall``, the ledger) already assumes.
+        rank_mode = self.config.signals.promoted_scoring_mode
+        rank_index = 2 if rank_mode == "live" else 1
         candidates.sort(
-            key=lambda pair: (
-                pair[1],
-                pair[0].confidence,
-                pair[0].plan.reward_risk_ratio,
+            key=lambda triple: (
+                triple[rank_index],
+                triple[0].confidence,
+                triple[0].plan.reward_risk_ratio,
             ),
             reverse=True,
         )
-        result.signals = [s for s, _ in candidates[: self.config.signals.max_candidates]]
+        result.signals = [s for s, _, _ in candidates[: self.config.signals.max_candidates]]
+
+        # ADR-0009: stamp the promoted-scoring divergence block into
+        # ``Signal.extras`` for every signal actually returned, in "shadow"
+        # and "live" modes only -- "off" leaves ``extras`` exactly as the
+        # strategy proposal supplied it, so behaviour there is byte-for-byte
+        # what it was before this feature existed. Baseline and promoted
+        # ranks are both recomputed from scratch over the FINAL
+        # ``result.signals`` set (not the pre-truncation candidate pool),
+        # since "rank #3" is only meaningful relative to what the operator
+        # actually sees.
+        if rank_mode != "off" and result.signals:
+            promoted_by_id = {c[0].signal_id: c[2] for c in candidates}
+            baseline_order = sorted(
+                result.signals,
+                key=lambda s: (s.overall_score, s.confidence, s.plan.reward_risk_ratio),
+                reverse=True,
+            )
+            promoted_order = sorted(
+                result.signals,
+                key=lambda s: (
+                    promoted_by_id[s.signal_id],
+                    s.confidence,
+                    s.plan.reward_risk_ratio,
+                ),
+                reverse=True,
+            )
+            baseline_rank = {s.signal_id: i + 1 for i, s in enumerate(baseline_order)}
+            promoted_rank = {s.signal_id: i + 1 for i, s in enumerate(promoted_order)}
+            reranked = 0
+            for sig in result.signals:
+                b_rank = baseline_rank[sig.signal_id]
+                p_rank = promoted_rank[sig.signal_id]
+                if p_rank < b_rank:
+                    note = f"promoted scoring would rank this #{p_rank} (+{b_rank - p_rank})"
+                elif p_rank > b_rank:
+                    note = f"promoted scoring would rank this #{p_rank} (-{p_rank - b_rank})"
+                else:
+                    note = "promoted scoring agrees with the baseline rank"
+                if p_rank != b_rank:
+                    reranked += 1
+                sig.extras["promoted_scoring"] = {
+                    "mode": rank_mode,
+                    "promoted_score": round(promoted_by_id[sig.signal_id], 2),
+                    "baseline_score": sig.overall_score,
+                    "baseline_rank": b_rank,
+                    "promoted_rank": p_rank,
+                    "rank_divergence_note": note,
+                }
+            log.info(
+                "promoted scoring (%s): %d/%d signals would re-rank under "
+                "promoted_component_weights",
+                rank_mode,
+                reranked,
+                len(result.signals),
+            )
 
         if not result.signals and result.evaluated_symbols:
             result.warnings.append(
@@ -651,7 +722,19 @@ class SignalEngine:
         generate_thesis: bool,
         rejected: list[RejectedCandidate],
         funnel: ScanFunnel,
-    ) -> Signal | None:
+    ) -> tuple[Signal, float] | None:
+        """Evaluate one (context, strategy) pair.
+
+        Returns:
+            ``None`` when the candidate did not become a signal (declined,
+            gated, undersized). Otherwise ``(signal, promoted_overall)`` --
+            the second element is ADR-0009's promoted composite
+            (``ScoreBreakdown.promoted_overall``), carried back to
+            :meth:`scan` for its post-loop ranking/divergence block. It is
+            NOT stored on ``signal`` itself at this point -- ``scan`` decides
+            whether/how to surface it depending on
+            ``SignalConfig.promoted_scoring_mode``.
+        """
         try:
             proposal = strategy.evaluate(ctx)
         except Exception as exc:  # one bad symbol must not abort the scan
@@ -870,7 +953,7 @@ class SignalEngine:
         if freshness > self.config.market_data.stale_after_hours:
             risks.append(f"Price data is {freshness:.0f} hours old")
 
-        return Signal(
+        signal = Signal(
             signal_id=signal_id,
             created_at=utc_now(),
             session=session,
@@ -906,6 +989,7 @@ class SignalEngine:
             ai_metadata=ai_metadata,
             extras=dict(proposal.extras),
         )
+        return signal, breakdown.promoted_overall
 
     def _build_plan(
         self,

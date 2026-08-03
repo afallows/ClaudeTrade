@@ -31,13 +31,19 @@ import pandas as pd
 from sqlalchemy import select
 
 from claudetrade.config import AppConfig
+from claudetrade.data.adanos_read import AttentionAggregate
+from claudetrade.data.adanos_read import load_history as load_adanos_history
+from claudetrade.data.analyst import load_history as load_analyst_history
+from claudetrade.data.institutional import load_history as load_institutional_history
 from claudetrade.data.quality import QualityReport
 from claudetrade.db.models import EarningsEventRow, PriceBar, Security, SymbolSentimentDaily
 from claudetrade.db.session import Database
 from claudetrade.domain import (
+    AnalystSnapshot,
     Bar,
     EarningsEvent,
     EarningsSession,
+    InstitutionalScorePoint,
     MarketRegime,
     RegimeState,
     SecurityInfo,
@@ -93,6 +99,13 @@ class SymbolData:
     bars: list[Bar] = field(default_factory=list)
     earnings: list[EarningsEvent] = field(default_factory=list)
     sentiment: list[SymbolSentiment] = field(default_factory=list)
+    #: ADR-0009: full stored history, ascending, already bounded by the
+    #: provider's own ``end`` at load time (see ``DatabaseContextProvider
+    #: ._load_analyst``/``_load_institutional``/``_load_adanos``) -- sliced
+    #: per-session by ``ContextBuilder`` exactly like ``sentiment`` above.
+    analyst_history: list[AnalystSnapshot] = field(default_factory=list)
+    institutional_history: list[InstitutionalScorePoint] = field(default_factory=list)
+    adanos_history: list[AttentionAggregate] = field(default_factory=list)
     features: pd.DataFrame | None = None
 
     def bars_through(self, session: dt.date) -> list[Bar]:
@@ -165,6 +178,13 @@ class ContextBuilder:
             sentiment_history=[
                 s for s in data.sentiment if s.session <= session and s.source == "all"
             ],
+            analyst_history=[
+                a for a in data.analyst_history if a.as_of_session <= session
+            ],
+            institutional_history=[
+                p for p in data.institutional_history if p.session <= session
+            ],
+            adanos_history=[a for a in data.adanos_history if a.session <= session],
             earnings=self._known_earnings(data, session),
             benchmark_features=dict(benchmark_features or {}),
             sector_features=dict(sector_features or {}),
@@ -352,6 +372,12 @@ class DatabaseContextProvider:
         bars_by_symbol = self._load_bars(wanted)
         earnings_by_symbol = self._load_earnings(wanted)
         sentiment_by_symbol = self._load_sentiment(wanted)
+        # ADR-0009: one batched query per table (F26), bounded by ``self.end``
+        # -- never a per-symbol loop, never "latest ever". Mirrors
+        # ``_load_sentiment`` above exactly, one table each.
+        analyst_by_symbol = load_analyst_history(self.db, wanted, end=self.end)
+        institutional_by_symbol = load_institutional_history(self.db, wanted, end=self.end)
+        adanos_by_symbol = load_adanos_history(self.db, wanted, end=self.end)
 
         benchmark_bars = bars_by_symbol.get(benchmark, [])
         if benchmark_bars:
@@ -369,6 +395,9 @@ class DatabaseContextProvider:
                 bars=bars,
                 earnings=earnings_by_symbol.get(symbol, []),
                 sentiment=sentiment_by_symbol.get(symbol, []),
+                analyst_history=analyst_by_symbol.get(symbol, []),
+                institutional_history=institutional_by_symbol.get(symbol, []),
+                adanos_history=adanos_by_symbol.get(symbol, []),
             )
             try:
                 data.features = self._builder.features.build(

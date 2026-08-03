@@ -144,6 +144,16 @@ def _render_current_signal(config, pipeline, symbol: str, signals) -> None:
         cols = st.columns(4)
         for i, (name, score) in enumerate(sig.components.as_dict().items()):
             cols[i % 4].metric(name.replace("_", " ").title(), f"{score:.0f}")
+        # ADR-0009 (shadow mode): the promoted-scoring divergence block, when
+        # present -- see ``signals.engine.SignalEngine.scan``. Absent
+        # (``None``) when ``SignalConfig.promoted_scoring_mode`` is "off".
+        promoted = sig.extras.get("promoted_scoring")
+        if promoted:
+            st.caption(
+                f"Promoted scoring ({promoted['mode']}): {promoted['rank_divergence_note']} "
+                f"(promoted score {promoted['promoted_score']:.0f} vs. baseline "
+                f"{promoted['baseline_score']:.0f})"
+            )
 
 
 def _render_research_revision(latest: dict) -> None:

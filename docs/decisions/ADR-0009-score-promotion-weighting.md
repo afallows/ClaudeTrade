@@ -172,3 +172,95 @@ conservative influence (11% combined), absence never penalises a symbol
 (renormalisation), and every step from here is reversible: `off` restores
 today's behaviour exactly; `shadow` costs one extra weighted-average per
 candidate and some detail-JSON bytes.
+
+## Implementation notes (2026-08-03, task #24)
+
+Implemented in shadow mode. Three deviations from this ADR's literal
+wording were identified during implementation, reviewed, and approved
+before landing; a fourth was discovered mid-implementation by running the
+existing test suite and is recorded here as well. All four are additive —
+none relax D4 (hard gates), and `off`/`shadow` remain byte-identical to
+pre-ADR-0009 ranking (proved in `tests/test_score_promotion.py`,
+`TestByteIdenticalBaseline`).
+
+**1. Two-table config, not one field replaced.** `SignalConfig` gained a
+SECOND, independent field, `promoted_component_weights` (this ADR's D2 "New"
+column, sums to 1.00 — enforced by a `field_validator`), alongside the
+existing `component_weights` (the "Old" column), which is untouched — not a
+single field whose values move under an existing name. This is what makes
+`overall` provably immune to `promoted_scoring_mode`: `component_weights` has
+no entries for `analyst_sentiment`/`institutional_sentiment`/
+`cross_source_attention`, so their effective weight there is zero with no
+extra code, in every mode. `GET /api/system/weights` still returns
+`component_weights` only; surfacing `promoted_component_weights` there is a
+`webapi/`-scope follow-up, deliberately left to the coordinator (see
+deviation 4).
+
+**2. Signed/unsigned direction-awareness split, not a flat mirror of
+`reddit_sentiment`.** D3 says to mirror whatever `reddit_sentiment` does for
+shorts. Implementation instead splits each new component's SUB-BLENDS by
+whether the sub-signal is polarity-shaped (bullish vs. bearish — flips sign
+for a short, exactly like `_sentiment_score`) or attention-shaped (how much/
+how many — never flips, exactly like `_attention_score`'s documented "a
+crowd gathering is neither bullish nor bearish"):
+
+- `analyst_sentiment`: consensus tilt, price-target upside and the
+  rating-action tilt are SIGNED; the coverage-change kicker (more/fewer
+  analysts covering the name) is UNSIGNED.
+- `institutional_sentiment`: the whole component is SIGNED (it is a single
+  polarity figure, no attention-shaped sub-part).
+- `cross_source_attention`: the bullish-minus-bearish spread is SIGNED; the
+  buzz-percentile and platform-corroboration sub-components are UNSIGNED.
+
+**3. Rating-tilt substitute for the unconfirmable upgrade/downgrade
+count.** D1 asks for "star-weighted upgrades and initiations minus
+downgrades". `AnalystRatingAction.action_id`/`action_label` are confirmed
+(against committed fixtures) ONLY for `action_id=3` ("upgrade") and
+`action_id=5` ("reiterate") — downgrades and initiations have no confirmed
+mapping, and ADR-0008 Decision 1 forbids fabricating one. Implemented
+instead: each rating action's CONFIRMED `rating_label` ("buy"/"sell"; "hold"
+and unmapped labels carry no tilt), star-weighted by `analyst_stars`
+(default 1.0 when unrated), summed over the trailing 10 trading sessions and
+`tanh`-squashed — "recent rating tilt weighted by analyst quality" rather
+than literal upgrade/downgrade counting. See
+`signals.scoring._rating_action_tilt`.
+
+**4. `promoted_scoring_mode`, not `promoted_scoring` (discovered, not
+planned).** The original implementation plan (HANDOFF.md) named this field
+`promoted_scoring`, inferred from `webapi/routers/system.py`'s
+`getattr(config.signals, "promoted_scoring", None)`. Running
+`tests/test_webapi_system.py` UNEDITED (required by this task's brief)
+surfaced a collision that grep alone had missed: `webapi/schemas.py`'s
+`SignalWeightsOut.promoted_scoring` is already typed `dict[str, float] |
+None` — a placeholder for an eventually-surfaced WEIGHTS table, not a mode
+string. Naming the new config field `promoted_scoring` would make
+`GET /api/system/weights` return HTTP 500 on every call (pydantic rejects a
+`str` where the response model declares `dict[str, float] | None`), not
+merely fail one assertion. Since `webapi/` is out of scope to edit, the
+field was named `promoted_scoring_mode` instead — `getattr(config.signals,
+"promoted_scoring", None)` still resolves to `None`, exactly what that
+endpoint's own docstring already promised and what
+`test_webapi_system.py` already asserted, so neither needed edits.
+Surfacing `promoted_component_weights`/`promoted_scoring_mode` on
+`GET /api/system/weights` (and the matching `ComponentScoresOut` schema,
+which similarly does not yet list the three new component names) is a
+`webapi/`-scope follow-up for the coordinator.
+
+**Extras JSON shape** (`Signal.extras["promoted_scoring"]`, stamped by
+`signals.engine.SignalEngine.scan` in "shadow" and "live" modes, absent in
+"off"):
+
+```json
+{
+  "mode": "shadow",
+  "promoted_score": 63.5,
+  "baseline_score": 58.0,
+  "baseline_rank": 4,
+  "promoted_rank": 2,
+  "rank_divergence_note": "promoted scoring would rank this #2 (+2)"
+}
+```
+
+Ranks are computed over the FINAL, already-truncated `ScanResult.signals`
+list (what the operator actually sees), not the full pre-`max_candidates`
+candidate pool.

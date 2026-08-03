@@ -87,11 +87,16 @@ read alongside the parser producing the values it operates on; it gets its
 own dedicated test file (``tests/test_institutional_score.py``) despite the
 shared module, exactly as the coordinator's build plan specified.
 
-**Not fed into ``signals.scoring.ComponentScores`` or any strategy.** This
-score (and the snapshot it is built from) is a read-only research overlay --
-the Streamlit ticker-detail "Institutional sentiment" block and the
-``get_institutional_sentiment`` MCP tool -- never a scan/backtest input. See
-``domain.InstitutionalSnapshot``'s own docstring for the same caveat.
+**Fed into ``signals.scoring.ComponentScores.institutional_sentiment`` as of
+ADR-0009** (2026-08-03), in addition to its pre-existing role as a read-only
+research overlay -- the Streamlit ticker-detail "Institutional sentiment"
+block and the ``get_institutional_sentiment`` MCP tool. The scoring path
+never re-invokes this function at read time: it reads the ``score`` this
+function computed and ``data.ingest`` already persisted onto
+``InstitutionalSnapshotRow.score``, via
+``data.institutional.InstitutionalScorePoint`` (see
+``signals.scoring._institutional_sentiment_score``). See
+``domain.InstitutionalSnapshot``'s own docstring for the same note.
 """
 
 from __future__ import annotations
@@ -678,8 +683,9 @@ def institutional_score(snapshot: InstitutionalSnapshot, as_of: dt.date) -> Inst
     per-axis breakdown this function always returns alongside the blended
     score.
 
-    **Not fed into ``signals.scoring.ComponentScores`` or any strategy** --
-    see the module docstring.
+    **Fed into ``signals.scoring.ComponentScores.institutional_sentiment`` as
+    of ADR-0009** -- see the module docstring for how the scoring layer reads
+    the ``score`` this function produces without re-invoking it.
     """
     insider_subscore, insider_age_days = _insider_axis(snapshot, as_of)
     hedge_fund_subscore, hedge_fund_age_days = _hedge_fund_axis(snapshot, as_of)

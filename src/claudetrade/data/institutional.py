@@ -30,6 +30,7 @@ from claudetrade.domain import (
     HedgeFundHoldingQuarter,
     InsiderTransaction,
     InsiderTransactionMonth,
+    InstitutionalScorePoint,
     InstitutionalSnapshot,
 )
 
@@ -304,6 +305,53 @@ def latest_and_previous_snapshots(
     return out
 
 
+def load_history(
+    db: Database, symbols: Sequence[str], *, end: dt.date
+) -> dict[str, list[InstitutionalScorePoint]]:
+    """Every stored ``InstitutionalScorePoint`` (snapshot + its ingest-time
+    ``score``) with ``session <= end`` for each of ``symbols``, ascending by
+    session -- ONE query for the whole batch (F26), mirroring
+    ``data.analyst.load_history`` one table over. ``score`` is read straight
+    off ``InstitutionalSnapshotRow.score`` -- ``institutional_score`` is
+    never re-invoked here (see ``InstitutionalScorePoint``'s own docstring).
+
+    Feeds ``StrategyContext.institutional_history`` via ``data.context
+    .DatabaseContextProvider._load``, bounded by ``end`` (the scan's own
+    range) so a context built for an earlier session can never see a
+    snapshot stored after it.
+
+    Returns every symbol in ``symbols`` as a key, mapped to ``[]`` when no
+    stored snapshot at or before ``end`` exists.
+    """
+    ids = list(dict.fromkeys(symbols))  # de-dup, preserve order
+    out: dict[str, list[InstitutionalScorePoint]] = {symbol: [] for symbol in ids}
+    if not ids:
+        return out
+
+    with db.read_session() as session:
+        rows = (
+            session.execute(
+                select(InstitutionalSnapshotRow)
+                .where(
+                    InstitutionalSnapshotRow.symbol.in_(ids),
+                    InstitutionalSnapshotRow.session <= end,
+                )
+                .order_by(InstitutionalSnapshotRow.symbol, InstitutionalSnapshotRow.session)
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            out.setdefault(row.symbol, []).append(
+                InstitutionalScorePoint(
+                    session=row.session,
+                    snapshot=_row_to_snapshot(row),
+                    score=row.score,
+                )
+            )
+    return out
+
+
 @dataclass(slots=True, frozen=True)
 class InstitutionalDelta:
     """What changed between two consecutive stored ``InstitutionalSnapshot``
@@ -399,5 +447,6 @@ __all__ = [
     "InstitutionalDelta",
     "institutional_delta",
     "latest_and_previous_snapshots",
+    "load_history",
     "snapshot_to_row_fields",
 ]

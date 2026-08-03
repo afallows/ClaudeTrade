@@ -552,10 +552,15 @@ class InstitutionalSnapshot:
     from ``tipranks_institutional.parse_institutional_snapshot`` rather than
     an all-``None`` instance of this class -- see that function's docstring.
 
-    **Not fed into ``signals.scoring.ComponentScores`` or any strategy.**
-    This is a read-only research overlay (Streamlit ticker-detail block, the
-    ``get_institutional_sentiment`` MCP tool) -- see ``institutional_score``'s
-    own docstring for the same caveat stated at the scoring-function level.
+    **Fed into ``signals.scoring.ComponentScores.institutional_sentiment``
+    as of ADR-0009** (2026-08-03), alongside its pre-existing role as a
+    read-only research overlay (Streamlit ticker-detail block, the
+    ``get_institutional_sentiment`` MCP tool). The scoring path never
+    recomputes ``institutional_score`` from this object -- it reads the
+    already-computed ``InstitutionalSnapshotRow.score`` straight off the
+    stored row (see ``data.institutional.InstitutionalScorePoint`` and
+    ``signals.scoring._institutional_sentiment_score``) -- so the two
+    surfaces are guaranteed to agree.
     """
 
     symbol: str
@@ -575,6 +580,31 @@ class InstitutionalSnapshot:
     notable_holder_moves: list[HedgeFundHolderMove] = field(default_factory=list)
     market_cap_usd: float | None = None
     fetched_at: dt.datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InstitutionalScorePoint:
+    """One stored session's ``InstitutionalSnapshot`` paired with its
+    already-computed ``score`` (ADR-0009).
+
+    ``InstitutionalSnapshot`` itself carries no score field -- the blended
+    [-1, +1] figure is computed by
+    ``providers.market.tipranks_institutional.institutional_score`` at
+    INGEST time and persisted only on ``db.models.InstitutionalSnapshotRow
+    .score``. This wrapper is what ``data.institutional.load_history`` (and,
+    through it, ``strategies.base.StrategyContext.institutional_history``)
+    hands to the scoring layer, so ``signals.scoring
+    ._institutional_sentiment_score`` reads ``score`` straight off the row
+    instead of re-invoking the scoring function -- the same "compute once at
+    ingest, read at score time" discipline
+    ``data.institutional.snapshot_to_row_fields`` already documents.
+    ``session`` mirrors ``snapshot.as_of_session`` and exists so callers can
+    filter/sort without reaching into the snapshot.
+    """
+
+    session: dt.date
+    snapshot: InstitutionalSnapshot
+    score: float | None
 
 
 # --------------------------------------------------------------------------
@@ -862,6 +892,17 @@ class ComponentScores:
     ``earnings_risk`` and ``manipulation_risk`` are *inverted* -- 100 means
     'no concern' -- so that every component points the same way and the
     weighted sum needs no special cases.
+
+    ``analyst_sentiment``/``institutional_sentiment``/``cross_source_attention``
+    (ADR-0009) are the three promotion-candidate components: computed and
+    displayed unconditionally (like every component here), but only WEIGHTED
+    under ``SignalConfig.promoted_component_weights`` -- the baseline
+    ``component_weights`` table has no entries for them, so they carry zero
+    weight in the ranking composite whenever ``SignalConfig.promoted_scoring_mode``
+    is ``"off"``, exactly as ADR-0009 Decision 5 specifies. See
+    ``signals.scoring`` for the scoring functions and
+    ``signals.engine.SignalEngine._evaluate_one`` for how the promoted
+    composite is surfaced (or not) depending on that mode.
     """
 
     technical_setup: float = 50.0
@@ -876,6 +917,19 @@ class ComponentScores:
     liquidity: float = 50.0
     market_regime: float = 50.0
     manipulation_risk: float = 100.0
+    #: ADR-0009: TipRanks consensus tilt, price-target upside, rating-action
+    #: tilt and coverage-change kicker (see ``signals.scoring
+    #: ._analyst_sentiment_score``). 50.0 (neutral display) when the symbol
+    #: has no usable analyst snapshot -- never scored, never weighted.
+    analyst_sentiment: float = 50.0
+    #: ADR-0009: direct map of ``InstitutionalSnapshotRow.score`` (read off
+    #: the stored row, never recomputed) onto 0-100. 50.0 when the score is
+    #: ``None`` (no institutional data yet).
+    institutional_sentiment: float = 50.0
+    #: ADR-0009: Adanos cross-platform buzz/polarity/corroboration blend (see
+    #: ``signals.scoring._cross_source_attention_score``). 50.0 when the
+    #: symbol has no stored Adanos snapshot at all.
+    cross_source_attention: float = 50.0
     data_confidence: float = 50.0
 
     def as_dict(self) -> dict[str, float]:
@@ -892,6 +946,9 @@ class ComponentScores:
             "liquidity": self.liquidity,
             "market_regime": self.market_regime,
             "manipulation_risk": self.manipulation_risk,
+            "analyst_sentiment": self.analyst_sentiment,
+            "institutional_sentiment": self.institutional_sentiment,
+            "cross_source_attention": self.cross_source_attention,
             "data_confidence": self.data_confidence,
         }
 

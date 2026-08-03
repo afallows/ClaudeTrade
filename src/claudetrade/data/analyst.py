@@ -213,6 +213,42 @@ def latest_and_previous_snapshots(
     return out
 
 
+def load_history(
+    db: Database, symbols: Sequence[str], *, end: dt.date
+) -> dict[str, list[AnalystSnapshot]]:
+    """Every stored ``AnalystSnapshot`` with ``session <= end`` for each of
+    ``symbols``, ascending by session -- ONE query for the whole batch (F26),
+    never a per-symbol loop. Feeds ``data.context.DatabaseContextProvider
+    ._load`` so ``StrategyContext.analyst_history`` can be truncated
+    per-session exactly like ``sentiment_history`` already is (see
+    ``data.context.ContextBuilder``'s module docstring): loading bounded by
+    ``end`` (the scan's own end-of-range date) rather than "latest ever" is
+    what keeps a backtest built for an earlier session from ever seeing a
+    snapshot stored after it.
+
+    Returns every symbol in ``symbols`` as a key, mapped to ``[]`` when no
+    stored snapshot at or before ``end`` exists.
+    """
+    ids = list(dict.fromkeys(symbols))  # de-dup, preserve order
+    out: dict[str, list[AnalystSnapshot]] = {symbol: [] for symbol in ids}
+    if not ids:
+        return out
+
+    with db.read_session() as session:
+        rows = (
+            session.execute(
+                select(AnalystSnapshotRow)
+                .where(AnalystSnapshotRow.symbol.in_(ids), AnalystSnapshotRow.session <= end)
+                .order_by(AnalystSnapshotRow.symbol, AnalystSnapshotRow.session)
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            out.setdefault(row.symbol, []).append(_row_to_snapshot(row))
+    return out
+
+
 @dataclass(slots=True, frozen=True)
 class AnalystDelta:
     """What changed between two consecutive stored ``AnalystSnapshot`` rows
@@ -303,5 +339,6 @@ __all__ = [
     "AnalystDelta",
     "analyst_delta",
     "latest_and_previous_snapshots",
+    "load_history",
     "snapshot_to_row_fields",
 ]

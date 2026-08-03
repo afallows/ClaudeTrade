@@ -606,8 +606,11 @@ class InstitutionalSnapshotRow(Base):
     ``consensus_over_time``/``recent_rating_actions`` columns for the same
     reasons (read-mostly, bounded-length, always read whole).
 
-    **Not fed into ``signals.scoring.ComponentScores`` or any strategy** --
-    see ``domain.InstitutionalSnapshot``'s own docstring.
+    **Fed into ``signals.scoring.ComponentScores.institutional_sentiment`` as
+    of ADR-0009** -- ``score`` below is read straight off this row by
+    ``data.institutional.load_history``/``InstitutionalScorePoint`` at scan
+    time, never recomputed. See ``domain.InstitutionalSnapshot``'s own
+    docstring.
     """
 
     __tablename__ = "institutional_snapshots"

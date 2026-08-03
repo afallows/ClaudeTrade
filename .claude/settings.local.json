@@ -1,5 +1,6 @@
 {
   "permissions": {
+    "defaultMode": "auto",
     "allow": [
       "mcp__claudetrade__get_market_status",
       "mcp__claudetrade__get_refresh_status",
