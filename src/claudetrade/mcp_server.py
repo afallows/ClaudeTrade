@@ -15,14 +15,21 @@ Design notes:
   running. SQLite is configured WAL-mode (see ``claudetrade.db.session``),
   so a second process reading concurrently is safe.
 * Every tool below except ``run_scan``/``trigger_refresh``/
-  ``submit_research_revision`` is read-only and side-effect-free: no writes,
-  no vendor requests, no recomputation of a score or filter rule the rest of
-  the app doesn't already own. Reads go through the exact same objects the
-  CLI and the web API use -- ``pipeline.ledger``, ``ui.data_access``,
-  ``pipeline.provider_status()`` -- never a second implementation of the same
-  query. ``submit_research_revision`` writes too, but only to the append-only
+  ``submit_research_revision`` is read-only and writes nothing: no
+  recomputation of a score or filter rule the rest of the app doesn't
+  already own. Reads go through the exact same objects the CLI and the web
+  API use -- ``pipeline.ledger``, ``ui.data_access``, ``pipeline
+  .provider_status()`` -- never a second implementation of the same query.
+  ``submit_research_revision`` writes too, but only to the append-only
   research ledger (``signals.research``) -- it can never touch a
   ``SignalRow`` or its trade plan; see that module for the guarantee.
+  **Two further exceptions make a real vendor request while staying
+  read-only from this app's own state:** ``get_adanos_detail`` and
+  ``get_adanos_explain`` call Adanos's on-demand official API directly
+  (``providers.social.adanos.AdanosProvider.fetch_stock_detail``/
+  ``fetch_explain``) and SPEND a metered request from its ~250/month free
+  tier each time -- see those tools' descriptions, which say so plainly.
+  ``get_adanos_budget`` is free (it only reads locally stored budget state).
 * ``mcp`` (the PyPI package providing the high-level ``FastMCP`` API used
   here) is an optional dependency (the ``claudetrade[mcp]`` extra). Nothing
   at import time of this module requires it to be installed; only
@@ -60,6 +67,7 @@ from claudetrade.db.models import Security, SymbolSentimentDaily
 from claudetrade.domain import Signal, SignalStatus
 from claudetrade.logging_setup import get_logger
 from claudetrade.pipeline import Pipeline
+from claudetrade.providers.base import ProviderError
 from claudetrade.signals import funnel_store
 from claudetrade.signals.research import ResearchGuardrailError, ResearchLedger
 from claudetrade.signals.scoring import adjusted_overall
@@ -77,6 +85,8 @@ from claudetrade.webapi.refresh_state import RefreshState
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
+
+    from claudetrade.providers.social.adanos import AdanosProvider
 
 log = get_logger(__name__)
 
@@ -1126,6 +1136,141 @@ def get_backtest_report(config: AppConfig) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Adanos hybrid mode -- on-demand official-API calls
+#
+# See providers.social.adanos's module docstring (Hybrid mode section) and
+# config.AdanosConfig for the full picture: bulk trending collection
+# (get_trending) never spends the official-API budget -- it stays keyless
+# (site mode) unless prefer_official_api is set. These three tools are the
+# SEPARATE, on-demand half: whenever an adanos_api_key credential resolves
+# at all, get_adanos_detail/get_adanos_explain spend one metered request
+# each (of the ~250/month free tier) for a single ticker's detail/AI
+# explanation, always budget-guarded. get_adanos_budget is free.
+# --------------------------------------------------------------------------
+
+
+def _adanos_provider(pipeline: Pipeline) -> AdanosProvider | None:
+    """The configured ``AdanosProvider`` instance, or ``None`` when Adanos
+    is disabled or has no feeds enabled on this installation.
+    ``pipeline.adanos`` is always a 0-or-1-element list (see
+    ``providers.registry.get_adanos_providers`` -- one instance covers all
+    four feeds)."""
+    return pipeline.adanos[0] if pipeline.adanos else None
+
+
+def get_adanos_budget(pipeline: Pipeline) -> dict[str, Any]:
+    """Read-only, FREE -- never spends the official-API quota.
+
+    Current Adanos on-demand official-API budget state (used/remaining/
+    reserve/month/resets_hint) and whether an ``adanos_api_key`` credential
+    resolves on this installation at all -- see ``AdanosProvider
+    .budget_status``. Bulk trending collection never spends this budget
+    either way (it stays keyless unless ``prefer_official_api`` is set);
+    only ``get_adanos_detail``/``get_adanos_explain`` do.
+    """
+    provider = _adanos_provider(pipeline)
+    if provider is None:
+        return {
+            "configured": False,
+            "key_resolved": False,
+            "note": (
+                "Adanos is disabled or has no feeds enabled on this installation -- "
+                "on-demand detail/explain calls have nothing to run against."
+            ),
+        }
+    return {"configured": True, **provider.budget_status()}
+
+
+def get_adanos_detail(pipeline: Pipeline, symbol: str, *, platform: str = "x") -> dict[str, Any]:
+    """SPENDS 1 official-API request (unless served from the same-session
+    top-candidate enrichment cache -- see below). One ticker's Adanos
+    detail via ``AdanosProvider.fetch_stock_detail``: daily trend,
+    sentiment breakdown, top mentions/authors, passed through from the
+    vendor without inventing schema, plus a normalized header block.
+
+    Checks ``AdanosProvider.cached_detail`` first: if this installation's
+    most recent scan already enriched ``symbol`` on ``platform`` THIS
+    trading session (``config.AdanosConfig.enrich_top_candidates``), that
+    cached result is returned with ``from_cache: true`` and NO quota is
+    spent. Otherwise makes a fresh on-demand call, which does spend one
+    request. Refuses with ``accepted: false`` (never raises) when Adanos is
+    not configured, no key resolves, or the monthly budget is at its
+    reserve floor; a genuine HTTP failure (401/403/429/404/5xx) is also
+    caught and reported the same structured way rather than propagating as
+    a bare exception. ``budget`` (used/remaining/reserve/month) is included
+    in every response, success or refusal.
+    """
+    symbol = symbol.strip().upper()
+    provider = _adanos_provider(pipeline)
+    if provider is None:
+        return {
+            "accepted": False,
+            "symbol": symbol,
+            "platform": platform,
+            "reason": "Adanos is disabled or has no feeds enabled on this installation",
+            "budget": None,
+        }
+
+    cached = provider.cached_detail(symbol, current_trading_session(), platform=platform)
+    if cached is not None:
+        payload = dict(cached)
+        payload["from_cache"] = True
+        payload["note"] = "cached from enrichment, no quota spent"
+        payload["budget"] = provider.budget_status()
+        return payload
+
+    try:
+        result = provider.fetch_stock_detail(symbol, platform=platform)
+    except ProviderError as exc:
+        return {
+            "accepted": False,
+            "symbol": symbol,
+            "platform": platform,
+            "reason": str(exc),
+            "budget": provider.budget_status(),
+        }
+    result.setdefault("from_cache", False)
+    return result
+
+
+def get_adanos_explain(pipeline: Pipeline, symbol: str, *, platform: str = "x") -> dict[str, Any]:
+    """SPENDS 1 official-API request of the ~250/month free tier, every
+    call -- unlike ``get_adanos_detail`` there is no enrichment cache for
+    this one. Adanos's own AI trend explanation
+    (``AdanosProvider.fetch_explain``, llama-3.1-8b) for one ticker. The
+    vendor itself caches the explanation text for 6h server-side: a repeat
+    call within that window still spends this installation's request here
+    (the vendor still counts it), but returns the same text -- ``cached``
+    and ``generated_at`` in the response say whether this particular answer
+    was freshly generated or served from the vendor's own cache. Refuses
+    with ``accepted: false`` (never raises) when Adanos is not configured,
+    no key resolves, or the monthly budget is at its reserve floor; other
+    HTTP failures are caught the same structured way. ``budget`` is
+    included in every response, success or refusal.
+    """
+    symbol = symbol.strip().upper()
+    provider = _adanos_provider(pipeline)
+    if provider is None:
+        return {
+            "accepted": False,
+            "symbol": symbol,
+            "platform": platform,
+            "reason": "Adanos is disabled or has no feeds enabled on this installation",
+            "budget": None,
+        }
+    try:
+        return provider.fetch_explain(symbol, platform=platform)
+    except ProviderError as exc:
+        return {
+            "accepted": False,
+            "symbol": symbol,
+            "platform": platform,
+            "reason": str(exc),
+            "budget": provider.budget_status(),
+        }
+
+
+# --------------------------------------------------------------------------
 # Research revisions
 # --------------------------------------------------------------------------
 
@@ -1634,6 +1779,68 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             lambda: get_backtest_report(config),
         )
 
+    @server.tool(
+        name="get_adanos_budget",
+        description=(
+            "Read-only, FREE -- never spends the official-API quota. Current Adanos "
+            "on-demand official-API budget state (used/remaining/reserve/month/"
+            "resets_hint) and whether an adanos_api_key credential resolves on this "
+            "installation at all. Bulk trending collection (get_trending) never spends "
+            "this budget -- it always prefers Adanos's keyless site endpoints for the "
+            "same trending data; only get_adanos_detail/get_adanos_explain spend it."
+        ),
+    )
+    async def _get_adanos_budget() -> dict[str, Any]:
+        return await _call_bounded(
+            "get_adanos_budget",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_adanos_budget(pipeline),
+        )
+
+    @server.tool(
+        name="get_adanos_detail",
+        description=(
+            "SPENDS 1 official-API request of the ~250/month free tier -- UNLESS this "
+            "ticker was already enriched by this session's scan (top-candidate "
+            "enrichment), in which case the cached result is returned free with "
+            "from_cache=true. One ticker's Adanos detail: daily trend, sentiment "
+            "breakdown, top mentions/authors, passed through from the vendor without "
+            "inventing schema, plus a normalized buzz_score/sentiment_score/"
+            "bullish_pct/bearish_pct/mentions header. Refuses with accepted=false "
+            "(never raises) when no adanos_api_key credential resolves on this "
+            "installation, or when the monthly budget is down to its reserve floor -- "
+            "the reason names the reset date. Remaining budget is included in every "
+            "response, success or refusal, under the budget key."
+        ),
+    )
+    async def _get_adanos_detail(symbol: str, platform: str = "x") -> dict[str, Any]:
+        return await _call_bounded(
+            "get_adanos_detail",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_adanos_detail(pipeline, symbol, platform=platform),
+        )
+
+    @server.tool(
+        name="get_adanos_explain",
+        description=(
+            "SPENDS 1 official-API request of the ~250/month free tier, on every call "
+            "(there is no enrichment cache for this one, unlike get_adanos_detail). "
+            "Adanos's own AI-generated trend explanation for one ticker "
+            "(llama-3.1-8b). The vendor caches the explanation text for 6h "
+            "server-side, so a repeat call within that window still spends a request "
+            "here but returns the same cached text -- cached and generated_at in the "
+            "response say which. Refuses with accepted=false (never raises) when no "
+            "adanos_api_key credential resolves, or when the monthly budget is down "
+            "to its reserve floor. Remaining budget is included in every response."
+        ),
+    )
+    async def _get_adanos_explain(symbol: str, platform: str = "x") -> dict[str, Any]:
+        return await _call_bounded(
+            "get_adanos_explain",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_adanos_explain(pipeline, symbol, platform=platform),
+        )
+
     return server
 
 
@@ -1665,6 +1872,9 @@ def run_stdio(config: AppConfig) -> None:
 
 __all__ = [
     "build_server",
+    "get_adanos_budget",
+    "get_adanos_detail",
+    "get_adanos_explain",
     "get_backtest_report",
     "get_market_status",
     "get_refresh_status",

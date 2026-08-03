@@ -1,0 +1,25 @@
+{
+  "ticker": "NVDA",
+  "company_name": "NVIDIA Corp",
+  "buzz_score": 87.5,
+  "sentiment_score": 0.42,
+  "bullish_pct": 68.0,
+  "bearish_pct": 32.0,
+  "mentions": 950,
+  "daily_trend": [
+    {"date": "2026-07-27", "buzz_score": 70.0, "mentions": 700},
+    {"date": "2026-07-28", "buzz_score": 75.0, "mentions": 720},
+    {"date": "2026-07-29", "buzz_score": 80.0, "mentions": 800},
+    {"date": "2026-07-30", "buzz_score": 82.0, "mentions": 830},
+    {"date": "2026-07-31", "buzz_score": 85.0, "mentions": 900},
+    {"date": "2026-08-01", "buzz_score": 86.0, "mentions": 930},
+    {"date": "2026-08-02", "buzz_score": 87.5, "mentions": 950}
+  ],
+  "sentiment_breakdown": {"bullish": 68.0, "bearish": 32.0, "neutral": 0.0},
+  "top_mentions": [
+    {"author_hash": "abc123", "text": "NVDA breaking out on volume", "engagement": 500}
+  ],
+  "top_authors": [
+    {"author_hash": "abc123", "mentions": 12}
+  ]
+}

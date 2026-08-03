@@ -68,6 +68,30 @@ resolves to a real key; it is gated by a persistent monthly budget (see
 rather than ever falling back to hammering the site proxy harder than its
 normal one-request-per-feed-per-cycle cadence.
 
+**Hybrid mode -- funding the free tier without burning it (owner's explicit
+requirement: "I want to utilize the free tier and then use the official api
+ALONG with the site mode").** Trending collection (``fetch_snapshots``)
+NEVER spends the official-API budget unless ``config.prefer_official_api``
+is true: the site endpoints serve the exact same trending rows keylessly, so
+there is no reason to ever pay for them. Separately, and regardless of
+``prefer_official_api``, whenever ``config.api_key_credential`` resolves to
+a real key this provider ALSO exposes two on-demand, per-ticker official
+calls that only make sense with a key at all --
+:meth:`AdanosProvider.fetch_stock_detail` (full per-ticker detail: daily
+trend, sentiment breakdown, top mentions/authors) and
+:meth:`AdanosProvider.fetch_explain` (the vendor's AI trend explanation,
+cached 6h server-side). Both are ALWAYS budget-guarded through the same
+``_MonthlyBudgetStore`` trending's official mode uses -- the free tier's
+~250 requests/month is meant to fund exactly this on-demand research use,
+not bulk collection the site proxy already covers for free, and both refuse
+with a structured, non-raising ``{"accepted": false, "reason": ...}`` payload
+(naming the reset date) rather than ever silently degrading to an
+unmetered call. See ``config.AdanosConfig.enrich_top_candidates`` /
+``enrich_enabled`` for the one automatic consumer of this budget (bounded
+top-candidate enrichment after a scan, wired in ``pipeline.Pipeline
+._enrich_adanos_top_candidates``) and :meth:`AdanosProvider.budget_status`
+for the read-only, free status surfaced by ``mcp_server.get_adanos_budget``.
+
 **Licensing** (adanos.org/terms, checked 2026-08-02): commercial use is
 permitted subject to the vendor's terms; raw API data may not be
 redistributed as a competing service, and rate limits may not be
@@ -140,6 +164,16 @@ _ENGAGEMENT_FIELD = {
 }
 
 
+def _stock_base(platform: str) -> str:
+    """The official per-platform base path for on-demand stock endpoints
+    (``{base}/stock/{ticker}``, ``.../stock/{ticker}/explain``), derived
+    from ``_OFFICIAL_PATHS`` by dropping its ``/trending`` suffix -- e.g.
+    ``x/stocks/v1/trending`` -> ``x/stocks/v1`` -- since the vendor shares
+    one base path across every endpoint in a platform's family (trending,
+    stock detail, explain; see ``docs/adanos-api-reference.md``)."""
+    return _OFFICIAL_PATHS[platform].rsplit("/trending", 1)[0]
+
+
 def _current_month(now: dt.datetime | None = None) -> str:
     current = now or utc_now()
     return f"{current.year:04d}-{current.month:02d}"
@@ -154,6 +188,22 @@ def _seconds_until_next_month(now: dt.datetime | None = None) -> float:
     else:
         nxt = current.replace(month=current.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
     return max(0.0, (nxt - current).total_seconds())
+
+
+def _next_month_reset_date(now: dt.datetime | None = None) -> str:
+    """ISO date of the 1st of next calendar month -- the reset date named in
+    an on-demand budget-exhausted refusal (see ``AdanosProvider
+    ._budget_refusal_reason``/``budget_status``'s ``resets_hint``). Note the
+    vendor's OWN quota window resets per account, not per calendar month
+    (``docs/adanos-api-reference.md``); this is an approximation consistent
+    with how ``_MonthlyBudgetStore`` already keys its local counter by
+    calendar month, not a claim about the vendor's actual reset instant."""
+    current = now or utc_now()
+    if current.month == 12:
+        nxt = current.replace(year=current.year + 1, month=1, day=1)
+    else:
+        nxt = current.replace(month=current.month + 1, day=1)
+    return nxt.date().isoformat()
 
 
 class _MonthlyBudgetStore:
@@ -250,12 +300,22 @@ class AdanosProvider:
         #: ``apewisdom``'s posture of holding no long-lived connection.
         self._client = client
         self._limiter = RateLimiter(config.calls_per_minute, name="adanos", max_wait_s=30.0)
-        #: Resolved once at construction (mirrors
+        #: Resolved once at construction, and now UNCONDITIONALLY (mirrors
         #: ``providers.market.polygon.PolygonProvider``): a provider instance
         #: lives for one run, so a credential change means a new process.
-        self._api_key = self._resolve_api_key() if config.prefer_official_api else None
+        #: Unlike before hybrid mode, this no longer depends on
+        #: ``config.prefer_official_api`` -- on-demand detail/explain calls
+        #: (see the module docstring's Hybrid mode section) are available
+        #: whenever a key resolves at all, independent of which mode
+        #: trending collection uses.
+        self._api_key = self._resolve_api_key()
         self.mode = "official" if (config.prefer_official_api and self._api_key) else "site"
-        budget_path = (Path(cache_dir) / "adanos" / "monthly_budget.json") if cache_dir else None
+        #: Root for this installation's on-disk caches (budget state below,
+        #: and the top-candidate detail-enrichment cache under
+        #: ``adanos/detail/`` -- see ``enrich_top_candidates``). ``None``
+        #: only in tests that construct a provider with no ``cache_dir``.
+        self._cache_dir = Path(cache_dir) if cache_dir else None
+        budget_path = (self._cache_dir / "adanos" / "monthly_budget.json") if self._cache_dir else None
         self._budget = _MonthlyBudgetStore(budget_path)
         self._lock = threading.Lock()
         self._calls = 0
@@ -504,6 +564,400 @@ class AdanosProvider:
         with self._lock:
             self._last_success = utc_now()
         return payload
+
+    # --- hybrid mode: on-demand official calls ------------------------------
+    #
+    # Independent of ``self.mode`` (the trending-collection selector above):
+    # these methods are available whenever ``self._api_key`` resolves at
+    # all, regardless of ``config.prefer_official_api``. See the module
+    # docstring's Hybrid mode section -- the owner's explicit requirement is
+    # that bulk trending never spends the free tier, while on-demand
+    # per-ticker research always can, budget permitting.
+
+    def budget_status(self) -> dict[str, Any]:
+        """Read-only, free -- calling this never counts against the budget.
+
+        Current official-API monthly budget state plus whether a key
+        resolves at all on this installation. Surfaced by
+        ``mcp_server.get_adanos_budget`` and folded into every
+        ``fetch_stock_detail``/``fetch_explain`` response (success or
+        refusal alike) so a caller always knows how much quota is left.
+        """
+        used, month = self._budget.snapshot()
+        return {
+            "key_resolved": self._api_key is not None,
+            "budget": self.config.monthly_budget,
+            "used": used,
+            "remaining": max(0, self.config.monthly_budget - used),
+            "reserve": self.config.monthly_reserve,
+            "month": month,
+            "resets_hint": _next_month_reset_date(),
+        }
+
+    def _budget_refusal_reason(self) -> str | None:
+        """``None`` when there is budget to spend one more on-demand call;
+        otherwise the refusal message naming the reset date -- the same
+        reserve-floor rule ``_enforce_budget_or_raise`` applies to trending's
+        official mode, applied here independent of ``self.mode``."""
+        used, month = self._budget.snapshot()
+        remaining = self.config.monthly_budget - used
+        if remaining <= self.config.monthly_reserve:
+            return (
+                f"adanos official-API monthly budget exhausted (used {used}/"
+                f"{self.config.monthly_budget}, reserve {self.config.monthly_reserve}) for "
+                f"{month}; resets {_next_month_reset_date()}"
+            )
+        return None
+
+    def _refusal(self, symbol: str, platform: str, reason: str) -> dict[str, Any]:
+        """The structured, ``accepted: false`` shape ``fetch_stock_detail``/
+        ``fetch_explain`` return (never raise) for the two EXPECTED refusal
+        cases -- no key, or budget at the reserve floor -- so a caller (an
+        MCP client, or ``enrich_top_candidates`` below) can branch on
+        ``accepted`` without a try/except. A genuine HTTP-level failure
+        (401/403/429/404/5xx) still raises a typed ``ProviderError``
+        subclass, same taxonomy as ``_get_json``/``fetch_snapshots``, since
+        that is unexpected rather than an ordinary, budget-aware refusal."""
+        return {
+            "accepted": False,
+            "symbol": symbol,
+            "platform": platform,
+            "reason": reason,
+            "budget": self.budget_status(),
+        }
+
+    def _detail_cache_path(self, symbol: str, session: dt.date) -> Path | None:
+        if self._cache_dir is None:
+            return None
+        return self._cache_dir / "adanos" / "detail" / f"{symbol}-{session.isoformat()}.json"
+
+    def cached_detail(
+        self, symbol: str, session: dt.date, *, platform: str | None = None
+    ) -> dict[str, Any] | None:
+        """A same-session top-candidate enrichment cache entry for
+        ``symbol``, or ``None`` when absent, unreadable, or written for a
+        different platform than requested. Reading this NEVER spends quota
+        -- it is what lets ``mcp_server.get_adanos_detail`` answer "cached
+        from enrichment, no quota spent" for a symbol ``Pipeline.scan``
+        already enriched this session (see ``enrich_top_candidates``
+        below)."""
+        path = self._detail_cache_path(symbol.strip().upper(), session)
+        if path is None or not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        if platform is not None and data.get("platform") != platform.strip().lower():
+            return None
+        return data
+
+    def _send_request(self, url: str, *, headers: dict[str, str]) -> httpx.Response:
+        """The network send shared by trending's ``_get_json`` and the
+        on-demand ``_ondemand_request`` below -- rate-limited, no retries,
+        wrapped into ``ProviderError`` on a transport failure. Everything
+        status-code-specific is left to the caller, since trending and
+        on-demand calls read different meanings into the same HTTP codes
+        (e.g. site-mode 401 is a block signal, official-mode 401 is a
+        credential error)."""
+        self._limiter.acquire()
+        try:
+            if self._client is not None:
+                return self._client.get(url, headers=headers, timeout=self.config.request_timeout_s)
+            with httpx.Client(
+                timeout=self.config.request_timeout_s, follow_redirects=True, headers=headers
+            ) as client:
+                return client.get(url)
+        except httpx.HTTPError as exc:
+            raise ProviderError(
+                f"adanos request failed: {exc}", provider=self.name, retryable=True
+            ) from exc
+
+    def _ondemand_request(
+        self, url: str, *, headers: dict[str, str], platform: str, ticker: str, kind: str
+    ) -> Any:
+        """One on-demand official call (stock detail / explain) -- ALWAYS
+        official regardless of ``self.mode``, since these endpoints have no
+        keyless site-proxy equivalent (only the four trending endpoints do
+        -- see ``docs/adanos-api-reference.md``). The caller must already
+        have confirmed there is budget to spend (``_budget_refusal_reason``)
+        -- this only sends the request, records it against the monthly
+        budget, and translates the response. No retries."""
+        try:
+            response = self._send_request(url, headers=headers)
+        except ProviderError:
+            self._last_error = f"network error for {kind} ({ticker}/{platform})"
+            raise
+
+        with self._lock:
+            self._calls += 1
+        self._record_official_call(response)
+
+        if response.status_code == 401:
+            self._last_error = f"HTTP 401 for {kind} ({ticker}/{platform})"
+            raise AuthenticationError(
+                f"adanos rejected the API key (HTTP 401) for {kind} of {ticker} -- check the "
+                f"{self.config.api_key_credential} credential",
+                provider=self.name,
+            )
+        if response.status_code == 403:
+            self._last_error = f"HTTP 403 for {kind} ({ticker}/{platform})"
+            raise ProviderError(
+                f"adanos refused {kind} for {ticker}: the requested history window exceeds "
+                "this account's tier depth (HTTP 403) -- request a shorter from/to range or "
+                "upgrade the tier",
+                provider=self.name,
+            )
+        if response.status_code == 429:
+            self._last_error = f"HTTP 429 for {kind} ({ticker}/{platform})"
+            raise RateLimitError(
+                f"adanos burst rate limit reached for {kind} of {ticker}",
+                provider=self.name,
+                retry_after_s=60.0,
+            )
+        if response.status_code == 404:
+            self._last_error = f"HTTP 404 for {kind} ({ticker}/{platform})"
+            raise ProviderError(
+                f"adanos has no {kind} for {ticker} on {platform} (HTTP 404) -- unsupported "
+                "or unknown ticker",
+                provider=self.name,
+            )
+        if response.status_code >= 500:
+            self._last_error = f"HTTP {response.status_code} for {kind} ({ticker}/{platform})"
+            raise ProviderError(
+                f"adanos returned HTTP {response.status_code} for {kind} of {ticker}",
+                provider=self.name,
+                retryable=True,
+            )
+        if response.status_code >= 400:
+            self._last_error = f"HTTP {response.status_code} for {kind} ({ticker}/{platform})"
+            raise ProviderError(
+                f"adanos returned HTTP {response.status_code} for {kind} of {ticker}",
+                provider=self.name,
+            )
+
+        try:
+            payload = response.json()
+        except Exception as exc:
+            self._last_error = f"non-JSON response for {kind} ({ticker}/{platform})"
+            raise SourceBlockedError(
+                f"adanos returned a non-JSON body for {kind} of {ticker} -- unexpected for a "
+                "documented JSON API, treated as a possible block/challenge response",
+                provider=self.name,
+            ) from exc
+
+        with self._lock:
+            self._last_success = utc_now()
+        return payload
+
+    def fetch_stock_detail(
+        self,
+        ticker: str,
+        platform: str = "x",
+        *,
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> dict[str, Any]:
+        """One ticker's full official-API detail: daily trend, sentiment
+        breakdown, top mentions/authors/subreddits/tweets -- whatever the
+        vendor's ``GET /stock/{ticker}`` returns for ``platform``, parsed
+        defensively (missing keys tolerated, nothing invented) and passed
+        through under ``raw``, alongside a normalized header block
+        (``buzz_score``/``sentiment_score``/``bullish_pct``/``bearish_pct``/
+        ``mentions``). **Spends one official-API request** -- always
+        budget-guarded (``_budget_refusal_reason``), regardless of
+        ``self.mode``: this is the on-demand half of hybrid mode, available
+        whenever ``self._api_key`` resolves at all (see the module
+        docstring). Returns a structured ``{"accepted": false, "reason":
+        ...}`` refusal (never raises) when no key resolves or the budget is
+        at its reserve floor; raises the usual ``ProviderError`` taxonomy
+        for a genuine HTTP failure (401/403/429/404/5xx).
+        """
+        symbol = ticker.strip().upper()
+        platform = platform.strip().lower()
+        if platform not in _OFFICIAL_PATHS:
+            return self._refusal(
+                symbol,
+                platform,
+                f"unsupported platform '{platform}' -- expected one of {sorted(_OFFICIAL_PATHS)}",
+            )
+        if self._api_key is None:
+            return self._refusal(
+                symbol,
+                platform,
+                "no adanos_api_key credential resolves on this installation -- on-demand "
+                "detail spends the official-API quota and requires a key even though bulk "
+                "trending collection never does",
+            )
+        reason = self._budget_refusal_reason()
+        if reason is not None:
+            return self._refusal(symbol, platform, reason)
+
+        params = []
+        if from_date:
+            params.append(f"from={from_date}")
+        if to_date:
+            params.append(f"to={to_date}")
+        query = ("?" + "&".join(params)) if params else ""
+        base = self.config.official_base_url.rstrip("/")
+        url = f"{base}/{_stock_base(platform)}/stock/{symbol}{query}"
+        headers = {
+            "X-API-Key": self._api_key,
+            "User-Agent": self.config.user_agent,
+            "Accept": "application/json",
+        }
+        payload = self._ondemand_request(
+            url, headers=headers, platform=platform, ticker=symbol, kind="stock detail"
+        )
+        data = payload if isinstance(payload, dict) else {}
+        return {
+            "accepted": True,
+            "symbol": symbol,
+            "platform": platform,
+            "fetched_at": utc_now().isoformat(),
+            "buzz_score": _as_float(data.get("buzz_score")),
+            "sentiment_score": _as_float(data.get("sentiment_score")),
+            "bullish_pct": _as_float(data.get("bullish_pct")),
+            "bearish_pct": _as_float(data.get("bearish_pct")),
+            "mentions": _as_int(data.get(_COUNT_FIELD.get(platform, "mentions"))),
+            "raw": data,
+            "budget": self.budget_status(),
+        }
+
+    def fetch_explain(self, ticker: str, platform: str = "x") -> dict[str, Any]:
+        """The vendor's AI trend explanation (llama-3.1-8b, cached
+        server-side for 6h) for one ticker. **Spends one official-API
+        request** -- even a cache hit on the VENDOR's side still spends
+        this installation's quota, since the vendor still counts the call;
+        the returned ``cached``/``generated_at`` fields say whether the text
+        was freshly generated or served from the vendor's own cache. Same
+        budget-guard/refusal/error-taxonomy contract as
+        ``fetch_stock_detail``.
+        """
+        symbol = ticker.strip().upper()
+        platform = platform.strip().lower()
+        if platform not in _OFFICIAL_PATHS:
+            return self._refusal(
+                symbol,
+                platform,
+                f"unsupported platform '{platform}' -- expected one of {sorted(_OFFICIAL_PATHS)}",
+            )
+        if self._api_key is None:
+            return self._refusal(
+                symbol,
+                platform,
+                "no adanos_api_key credential resolves on this installation -- on-demand "
+                "explain spends the official-API quota and requires a key even though bulk "
+                "trending collection never does",
+            )
+        reason = self._budget_refusal_reason()
+        if reason is not None:
+            return self._refusal(symbol, platform, reason)
+
+        base = self.config.official_base_url.rstrip("/")
+        url = f"{base}/{_stock_base(platform)}/stock/{symbol}/explain"
+        headers = {
+            "X-API-Key": self._api_key,
+            "User-Agent": self.config.user_agent,
+            "Accept": "application/json",
+        }
+        payload = self._ondemand_request(
+            url, headers=headers, platform=platform, ticker=symbol, kind="explain"
+        )
+        data = payload if isinstance(payload, dict) else {}
+        return {
+            "accepted": True,
+            "symbol": symbol,
+            "platform": platform,
+            "explanation": data.get("explanation"),
+            "cached": data.get("cached"),
+            "generated_at": data.get("generated_at"),
+            "budget": self.budget_status(),
+        }
+
+    def enrich_top_candidates(self, symbols: list[str], *, session: dt.date) -> int:
+        """Bounded, best-effort post-scan enrichment: up to
+        ``config.enrich_top_candidates`` of ``symbols`` (already ordered
+        best-first and de-duplicated by the caller -- see
+        ``pipeline.Pipeline._enrich_adanos_top_candidates``), ONE
+        ``fetch_stock_detail`` call each on ``config.detail_platform_default``,
+        cached to ``cache_dir/adanos/detail/{symbol}-{session}.json``.
+
+        Effective only when ``config.enrich_enabled`` and an
+        ``adanos_api_key`` credential resolves -- bulk trending collection is
+        never affected either way. Skips (INFO log, not an error) a symbol
+        already cached for this session -- the whole point of the cache is
+        that a re-scan of the same session, or a later
+        ``AdanosProvider.cached_detail``/``mcp_server.get_adanos_detail``
+        call for the same symbol, must not spend quota twice. Stops early,
+        rather than skipping one-by-one, once the budget guard refuses --
+        the remaining symbols are simply not enriched this session.
+
+        **Never raises.** A scan must never fail because enrichment
+        degraded; any per-symbol failure (network, vendor error, disk) is
+        logged and the loop continues to the next symbol. Returns the number
+        of NEW official calls actually made (i.e. quota actually spent), for
+        logging/tests.
+        """
+        if self._cache_dir is None:
+            log.info("adanos enrichment skipped: no cache_dir configured")
+            return 0
+        if self._api_key is None:
+            log.info("adanos enrichment skipped: no adanos_api_key credential resolves")
+            return 0
+        if not self.config.enrich_enabled or self.config.enrich_top_candidates <= 0:
+            return 0
+
+        platform = self.config.detail_platform_default
+        spent = 0
+        try:
+            for raw_symbol in symbols[: self.config.enrich_top_candidates]:
+                symbol = raw_symbol.strip().upper()
+                if not symbol:
+                    continue
+                path = self._detail_cache_path(symbol, session)
+                if path is None:
+                    continue
+                if path.exists():
+                    log.info(
+                        "adanos enrichment: %s already cached for session %s; skipping",
+                        symbol,
+                        session,
+                    )
+                    continue
+                reason = self._budget_refusal_reason()
+                if reason is not None:
+                    log.info("adanos enrichment: budget-guarded, stopping early (%s)", reason)
+                    break
+                try:
+                    result = self.fetch_stock_detail(symbol, platform=platform)
+                except ProviderError as exc:
+                    log.info("adanos enrichment: %s failed (%s); skipping", symbol, exc)
+                    continue
+                if not result.get("accepted", True):
+                    log.info(
+                        "adanos enrichment: %s refused (%s)", symbol, result.get("reason")
+                    )
+                    continue
+                result["enriched_at_session"] = session.isoformat()
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps(result), encoding="utf-8")
+                except OSError:
+                    log.debug(
+                        "adanos enrichment: failed to persist cache for %s",
+                        symbol,
+                        exc_info=True,
+                    )
+                    continue
+                spent += 1
+        except Exception:  # pragma: no cover - defensive, see docstring
+            log.warning(
+                "adanos enrichment raised unexpectedly; scan is unaffected", exc_info=True
+            )
+        return spent
 
 
 def _extract_rows(payload: Any) -> list | None:

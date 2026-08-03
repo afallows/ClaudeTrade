@@ -761,6 +761,16 @@ class AdanosConfig(BaseModel):
       falling back to hammering the site proxy harder than page-equivalent
       cadence -- see ``providers.social.adanos`` for the budget mechanism.
 
+    **Hybrid mode.** Independent of ``prefer_official_api``/the two modes
+    above: whenever ``api_key_credential`` resolves to a real key AT ALL,
+    ``AdanosProvider`` also exposes on-demand, per-ticker official calls
+    (``fetch_stock_detail``, ``fetch_explain``) that spend the same monthly
+    budget -- funding on-demand per-ticker research is the whole point of
+    keeping a free-tier key configured, while bulk trending collection stays
+    keyless (site mode) by default so it never touches that budget. See
+    ``detail_platform_default``/``enrich_top_candidates``/``enrich_enabled``
+    below for the one automatic consumer (bounded post-scan enrichment).
+
     Licensing (adanos.org/terms, checked 2026-08-02): commercial use is
     permitted subject to the vendor's terms; raw API data may not be
     redistributed as a competing service, and rate limits may not be
@@ -803,6 +813,56 @@ class AdanosConfig(BaseModel):
     limit: int = 100
     request_timeout_s: float = 20.0
     user_agent: str = "claudetrade/0.1 (research; contact configured by operator)"
+
+    # --- Hybrid mode: on-demand official calls, independent of the above ---
+    #
+    # ``prefer_official_api`` above governs ONLY bulk trending collection
+    # (``fetch_snapshots``) -- the owner's explicit requirement is that
+    # trending must NEVER spend the free tier, since the keyless site
+    # endpoints already serve the exact same rows. Separately, whenever
+    # ``api_key_credential`` resolves to a real key AT ALL (regardless of
+    # ``prefer_official_api``), ``AdanosProvider`` also exposes two
+    # on-demand, budget-guarded per-ticker calls -- ``fetch_stock_detail``
+    # and ``fetch_explain`` -- that only make sense with a key. These two
+    # settings tune the ONE automatic consumer of that on-demand budget:
+    # bounded enrichment of a scan's top-scoring candidates. See
+    # ``providers.social.adanos``'s module docstring (Hybrid mode section)
+    # and ``docs/api-providers.md``'s "Hybrid mode / spending the free tier"
+    # subsection for the full budget arithmetic.
+
+    #: Platform ``fetch_stock_detail``/``fetch_explain`` use when the caller
+    #: does not name one explicitly, and what post-scan enrichment always
+    #: uses (enrichment makes exactly one call per candidate, so it does not
+    #: pick a platform per call).
+    detail_platform_default: str = "x"
+    #: How many of a scan's top-scoring, distinct-by-symbol candidates get
+    #: ONE ``fetch_stock_detail`` call each after the scan completes. ``0``
+    #: disables enrichment entirely. Budget arithmetic at the default: 3
+    #: candidates/session x ~22 trading sessions/month =~ 66 official calls,
+    #: comfortably under ``monthly_budget - monthly_reserve`` (235 by
+    #: default) with headroom left for interactive ``get_adanos_detail``/
+    #: ``get_adanos_explain`` calls the same month.
+    enrich_top_candidates: int = 3
+    #: Master switch for post-scan enrichment. Effective only when
+    #: ``api_key_credential`` also resolves to a real key -- bulk trending
+    #: collection is unaffected either way, since enrichment is a purely
+    #: additive, budget-guarded extra rather than a fallback path for it.
+    enrich_enabled: bool = True
+
+    @field_validator("enrich_top_candidates")
+    @classmethod
+    def _bounded_enrich_top_candidates(cls, v: int) -> int:
+        if not 0 <= v <= 10:
+            raise ValueError("enrich_top_candidates must be within [0, 10]")
+        return v
+
+    @field_validator("detail_platform_default")
+    @classmethod
+    def _known_detail_platform(cls, v: str) -> str:
+        allowed = {"x", "reddit", "polymarket", "news"}
+        if v not in allowed:
+            raise ValueError(f"detail_platform_default must be one of {sorted(allowed)}")
+        return v
 
 
 class NewsConfig(BaseModel):

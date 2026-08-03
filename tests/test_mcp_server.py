@@ -1126,6 +1126,229 @@ def test_get_backtest_report_reads_back_the_latest_saved_report(tmp_app_config: 
 
 
 # --------------------------------------------------------------------------
+# Adanos hybrid mode: get_adanos_budget / get_adanos_detail / get_adanos_explain
+#
+# These exercise the MCP-layer wrapping (provider lookup, cache-hit
+# short-circuit, ProviderError -> structured refusal) against a minimal
+# stand-in for AdanosProvider -- the provider's OWN budget/no-key/error-
+# taxonomy mechanics are already covered end to end by
+# tests/test_adanos_provider.py, which is why this stub simply returns
+# whatever refusal/success shape a real AdanosProvider would have produced,
+# rather than re-deriving it.
+# --------------------------------------------------------------------------
+
+
+class _StubAdanosHybrid:
+    name = "adanos"
+
+    def __init__(
+        self,
+        *,
+        budget: dict | None = None,
+        detail: dict | None = None,
+        explain: dict | None = None,
+        cached: dict | None = None,
+        detail_error: Exception | None = None,
+        explain_error: Exception | None = None,
+    ) -> None:
+        self._budget = budget or {
+            "key_resolved": True,
+            "budget": 250,
+            "used": 15,
+            "remaining": 235,
+            "reserve": 15,
+            "month": "2026-08",
+            "resets_hint": "2026-09-01",
+        }
+        self._detail = detail
+        self._explain = explain
+        self._cached = cached
+        self._detail_error = detail_error
+        self._explain_error = explain_error
+
+    def budget_status(self) -> dict:
+        return dict(self._budget)
+
+    def cached_detail(self, symbol: str, session, *, platform: str | None = None) -> dict | None:
+        return self._cached
+
+    def fetch_stock_detail(self, symbol: str, platform: str = "x") -> dict:
+        if self._detail_error is not None:
+            raise self._detail_error
+        return self._detail
+
+    def fetch_explain(self, symbol: str, platform: str = "x") -> dict:
+        if self._explain_error is not None:
+            raise self._explain_error
+        return self._explain
+
+
+def test_get_adanos_budget_reports_not_configured_when_no_provider(pipeline: Pipeline) -> None:
+    pipeline.adanos = []
+    result = mcp_server.get_adanos_budget(pipeline)
+    assert result["configured"] is False
+    assert result["key_resolved"] is False
+
+
+def test_get_adanos_budget_reports_the_providers_current_state(pipeline: Pipeline) -> None:
+    pipeline.adanos = [_StubAdanosHybrid()]
+    result = mcp_server.get_adanos_budget(pipeline)
+    assert result["configured"] is True
+    assert result["key_resolved"] is True
+    assert result["remaining"] == 235
+    assert result["month"] == "2026-08"
+
+
+def test_get_adanos_detail_refuses_when_adanos_not_configured(pipeline: Pipeline) -> None:
+    pipeline.adanos = []
+    result = mcp_server.get_adanos_detail(pipeline, "NVDA")
+    assert result["accepted"] is False
+    assert result["budget"] is None
+
+
+def test_get_adanos_detail_happy_path_includes_budget(pipeline: Pipeline) -> None:
+    detail = {
+        "accepted": True,
+        "symbol": "NVDA",
+        "platform": "x",
+        "buzz_score": 80.0,
+        "raw": {},
+        "budget": {"remaining": 234},
+    }
+    pipeline.adanos = [_StubAdanosHybrid(detail=detail)]
+    result = mcp_server.get_adanos_detail(pipeline, "nvda")
+    assert result["accepted"] is True
+    assert result["symbol"] == "NVDA"
+    assert result["from_cache"] is False
+    assert result["budget"] == {"remaining": 234}
+
+
+def test_get_adanos_detail_no_key_refusal_shape(pipeline: Pipeline) -> None:
+    """The exact refusal an AdanosProvider with no resolvable key produces
+    (see tests/test_adanos_provider.py for the provider-level guarantee) is
+    passed straight through, budget included."""
+    refusal = {
+        "accepted": False,
+        "symbol": "NVDA",
+        "platform": "x",
+        "reason": "no adanos_api_key credential resolves on this installation -- ...",
+        "budget": {"key_resolved": False, "remaining": 0},
+    }
+    pipeline.adanos = [_StubAdanosHybrid(detail=refusal)]
+    result = mcp_server.get_adanos_detail(pipeline, "NVDA")
+    assert result["accepted"] is False
+    assert result["budget"]["key_resolved"] is False
+
+
+def test_get_adanos_detail_budget_refusal_shape_names_the_reset_date(pipeline: Pipeline) -> None:
+    refusal = {
+        "accepted": False,
+        "symbol": "NVDA",
+        "platform": "x",
+        "reason": (
+            "adanos official-API monthly budget exhausted (used 235/250, reserve 15) "
+            "for 2026-08; resets 2026-09-01"
+        ),
+        "budget": {"remaining": 0, "reserve": 15},
+    }
+    pipeline.adanos = [_StubAdanosHybrid(detail=refusal)]
+    result = mcp_server.get_adanos_detail(pipeline, "NVDA")
+    assert result["accepted"] is False
+    assert "resets 2026-09-01" in result["reason"]
+    assert result["budget"]["remaining"] == 0
+
+
+def test_get_adanos_detail_serves_the_enrichment_cache_without_spending_quota(
+    pipeline: Pipeline,
+) -> None:
+    cached_payload = {
+        "accepted": True,
+        "symbol": "NVDA",
+        "platform": "x",
+        "raw": {},
+        "budget": {"remaining": 232},
+        "enriched_at_session": "2026-08-01",
+    }
+    stub = _StubAdanosHybrid(
+        cached=cached_payload,
+        detail_error=AssertionError("fetch_stock_detail must not be called on a cache hit"),
+    )
+    pipeline.adanos = [stub]
+    result = mcp_server.get_adanos_detail(pipeline, "NVDA")
+    assert result["from_cache"] is True
+    assert result["note"] == "cached from enrichment, no quota spent"
+    # Budget is refreshed to the provider's CURRENT state (remaining=235),
+    # not the stale figure (232) baked into the cache entry when it was
+    # originally enriched.
+    assert result["budget"] == _StubAdanosHybrid().budget_status()
+    assert result["budget"]["remaining"] == 235
+
+
+def test_get_adanos_detail_catches_provider_errors_as_a_structured_refusal(
+    pipeline: Pipeline,
+) -> None:
+    from claudetrade.providers.base import RateLimitError
+
+    pipeline.adanos = [
+        _StubAdanosHybrid(detail_error=RateLimitError("burst limit reached", provider="adanos"))
+    ]
+    result = mcp_server.get_adanos_detail(pipeline, "NVDA")
+    assert result["accepted"] is False
+    assert "burst limit reached" in result["reason"]
+    assert "budget" in result
+
+
+def test_get_adanos_explain_happy_path(pipeline: Pipeline) -> None:
+    explain = {
+        "accepted": True,
+        "symbol": "NVDA",
+        "platform": "x",
+        "explanation": "NVDA buzz is rising on earnings anticipation.",
+        "cached": False,
+        "generated_at": "2026-08-02T00:00:00+00:00",
+        "budget": {"remaining": 234},
+    }
+    pipeline.adanos = [_StubAdanosHybrid(explain=explain)]
+    result = mcp_server.get_adanos_explain(pipeline, "nvda")
+    assert result["accepted"] is True
+    assert result["symbol"] == "NVDA"
+    assert result["cached"] is False
+    assert "budget" in result
+
+
+def test_get_adanos_explain_refuses_when_adanos_not_configured(pipeline: Pipeline) -> None:
+    pipeline.adanos = []
+    result = mcp_server.get_adanos_explain(pipeline, "NVDA")
+    assert result["accepted"] is False
+    assert result["budget"] is None
+
+
+def test_get_adanos_explain_catches_provider_errors_as_a_structured_refusal(
+    pipeline: Pipeline,
+) -> None:
+    from claudetrade.providers.base import AuthenticationError
+
+    pipeline.adanos = [
+        _StubAdanosHybrid(explain_error=AuthenticationError("bad key", provider="adanos"))
+    ]
+    result = mcp_server.get_adanos_explain(pipeline, "NVDA")
+    assert result["accepted"] is False
+    assert "bad key" in result["reason"]
+
+
+def test_get_adanos_tools_state_the_quota_spend_plainly_in_their_description(
+    pipeline: Pipeline, tmp_app_config: AppConfig
+) -> None:
+    server = mcp_server.build_server(pipeline, tmp_app_config)
+    tools = {t.name: t for t in server._tool_manager.list_tools()}
+    for name in ("get_adanos_detail", "get_adanos_explain"):
+        assert (
+            "SPENDS 1 official-API request of the ~250/month free tier" in tools[name].description
+        )
+    assert "FREE" in tools["get_adanos_budget"].description
+
+
+# --------------------------------------------------------------------------
 # FastMCP wiring
 # --------------------------------------------------------------------------
 
@@ -1144,6 +1367,9 @@ EXPECTED_TOOL_NAMES = {
     "get_backtest_report",
     "submit_research_revision",
     "get_research_revisions",
+    "get_adanos_budget",
+    "get_adanos_detail",
+    "get_adanos_explain",
 }
 
 
@@ -1182,6 +1408,9 @@ def test_build_server_tool_schemas_match_the_documented_signatures(
         "signal_id", "thesis", "invalidation", "score_adjustments", "rationale", "sources",
     }
     assert properties("get_research_revisions") == {"signal_id"}
+    assert properties("get_adanos_budget") == set()
+    assert properties("get_adanos_detail") == {"symbol", "platform"}
+    assert properties("get_adanos_explain") == {"symbol", "platform"}
 
 
 def test_write_tools_are_named_and_described_as_writes(

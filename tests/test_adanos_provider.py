@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from pathlib import Path
 
 import httpx
@@ -51,7 +52,9 @@ def _fixture(name: str) -> object:
     return json.loads((FIXTURES / f"{name}.json").read_text())
 
 
-def _client(routes: dict[str, object], *, status: int = 200, headers: dict | None = None) -> httpx.Client:
+def _client(
+    routes: dict[str, object], *, status: int = 200, headers: dict | None = None
+) -> httpx.Client:
     """A client serving ``{url_substring: payload}``, recording every request
     (URL and headers) so tests can assert on both."""
     calls: list[httpx.Request] = []
@@ -127,7 +130,9 @@ class TestParsingRedditFeed:
     def test_reads_reddit_specific_fields_via_the_shared_mentions_column(self) -> None:
         rows = {
             r.symbol: r
-            for r in _parse_feed_rows(_fixture("reddit_trending"), platform="reddit", observed_at=None)
+            for r in _parse_feed_rows(
+                _fixture("reddit_trending"), platform="reddit", observed_at=None
+            )
         }
         assert rows["GME"].mentions == 610
         assert rows["GME"].trend == "rising"
@@ -219,9 +224,7 @@ class TestParseDrift:
 
     def test_wrapped_results_envelope_is_still_accepted(self) -> None:
         """Tolerated in case a future response wraps the array."""
-        rows = _parse_feed_rows(
-            {"results": _fixture("x_trending")}, platform="x", observed_at=None
-        )
+        rows = _parse_feed_rows({"results": _fixture("x_trending")}, platform="x", observed_at=None)
         assert {r.symbol for r in rows} == {"NVDA", "MU"}
 
 
@@ -289,7 +292,9 @@ class TestFetchSiteMode:
 
     def test_no_api_key_header_sent_in_site_mode(self) -> None:
         client = _client({"proxy-x/trending": _fixture("x_trending")})
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
+        provider = AdanosProvider(
+            _config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client
+        )
         provider.fetch_snapshots()
         assert "X-API-Key" not in client.calls[0].headers  # type: ignore[attr-defined]
 
@@ -406,13 +411,17 @@ class TestFetchOfficialMode:
 class TestErrorTaxonomy:
     def test_429_raises_rate_limit_error(self) -> None:
         client = _client({"proxy-x/trending": {}}, status=429)
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
+        provider = AdanosProvider(
+            _config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client
+        )
         with pytest.raises(RateLimitError):
             provider._fetch_platform("x", None)
 
     def test_site_mode_401_is_source_blocked_not_authentication(self) -> None:
         client = _client({"proxy-x/trending": {}}, status=401)
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
+        provider = AdanosProvider(
+            _config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client
+        )
         with pytest.raises(SourceBlockedError):
             provider._fetch_platform("x", None)
 
@@ -425,28 +434,37 @@ class TestErrorTaxonomy:
         )
         client = _client({"x/stocks/v1/trending": {}}, status=403)
         provider = AdanosProvider(
-            _config(prefer_official_api=True, feed_reddit=False, feed_polymarket=False, feed_news=False), client=client
+            _config(
+                prefer_official_api=True, feed_reddit=False, feed_polymarket=False, feed_news=False
+            ),
+            client=client,
         )
         with pytest.raises(AuthenticationError):
             provider._fetch_platform("x", None)
 
     def test_5xx_is_retryable_provider_error(self) -> None:
         client = _client({"proxy-x/trending": {}}, status=503)
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
+        provider = AdanosProvider(
+            _config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client
+        )
         with pytest.raises(ProviderError) as exc_info:
             provider._fetch_platform("x", None)
         assert exc_info.value.retryable is True
 
     def test_non_json_body_is_source_blocked(self) -> None:
         client = _client({"proxy-x/trending": "<html>captcha</html>"})
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
+        provider = AdanosProvider(
+            _config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client
+        )
         with pytest.raises(SourceBlockedError):
             provider._fetch_platform("x", None)
 
     def test_no_retries_on_failure(self) -> None:
         """One failed request per feed per call -- never a retry loop."""
         client = _client({"proxy-x/trending": {}}, status=500)
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
+        provider = AdanosProvider(
+            _config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client
+        )
         rows = provider.fetch_snapshots()
         assert rows == []
         assert len(client.calls) == 1  # type: ignore[attr-defined]
@@ -597,7 +615,11 @@ class TestMonthlyBudget:
         )
         client = _client({"x/stocks/v1/trending": _fixture("x_trending")})
         cfg = _config(
-            prefer_official_api=True, feed_reddit=False, feed_polymarket=False, feed_news=False, monthly_budget=250
+            prefer_official_api=True,
+            feed_reddit=False,
+            feed_polymarket=False,
+            feed_news=False,
+            monthly_budget=250,
         )
         AdanosProvider(cfg, client=client, cache_dir=tmp_path).fetch_snapshots()
 
@@ -781,18 +803,14 @@ class TestMigration:
 
         init_database(memory_db)
         with memory_db.session() as session:
-            session.add(
-                AdanosSnapshotRow(symbol="NVDA", session=dt.date(2026, 8, 1), platform="x")
-            )
+            session.add(AdanosSnapshotRow(symbol="NVDA", session=dt.date(2026, 8, 1), platform="x"))
 
     def test_latest_version_covers_migration_010(self) -> None:
         from claudetrade.db.migrations import LATEST_VERSION
 
         assert LATEST_VERSION >= 10
 
-    def test_migrating_an_already_current_database_is_idempotent(
-        self, memory_db: Database
-    ) -> None:
+    def test_migrating_an_already_current_database_is_idempotent(self, memory_db: Database) -> None:
         from claudetrade.db.migrations import init_database, migrate
 
         init_database(memory_db)
@@ -874,3 +892,455 @@ class TestProbeHostList:
 
         row = next(row for row in LIVE_ENDPOINTS if row[1] == "api.adanos.org")
         assert row[3] is True  # needs_key
+
+
+# ---------------------------------------------------------------------------
+# Hybrid mode: on-demand official calls (fetch_stock_detail / fetch_explain)
+#
+# Independent of site-vs-official trending mode -- see the module docstring's
+# "Hybrid mode" section. These are ALWAYS official and ALWAYS budget-guarded
+# whenever a key resolves at all, regardless of ``prefer_official_api``.
+# ---------------------------------------------------------------------------
+
+
+def _hybrid_provider(
+    client, monkeypatch, *, cache_dir=None, key="sk_live_test", **overrides
+) -> AdanosProvider:
+    """A provider wired for on-demand calls: ``get_secret`` is monkeypatched
+    explicitly (never left to the real credential store -- this machine may
+    have a real key configured) to either resolve ``key`` or (``key=None``)
+    resolve nothing at all."""
+    import claudetrade.providers.social.adanos as adanos_module
+    from claudetrade.secrets import SecretValue
+
+    if key is None:
+        monkeypatch.setattr(adanos_module, "get_secret", lambda name: None)
+    else:
+        monkeypatch.setattr(
+            adanos_module, "get_secret", lambda name: SecretValue(name, key, "keyring")
+        )
+    return AdanosProvider(_config(**overrides), client=client, cache_dir=cache_dir)
+
+
+class TestHybridModeKeyResolution:
+    def test_key_resolves_regardless_of_prefer_official_api(self, monkeypatch) -> None:
+        """The whole point of hybrid mode: on-demand calls need a key even
+        when trending stays in its site-mode default."""
+        provider = _hybrid_provider(_client({}), monkeypatch)  # prefer_official_api defaults False
+        assert provider.mode == "site"  # trending mode is unaffected
+        assert provider.budget_status()["key_resolved"] is True  # on-demand calls ARE available
+
+    def test_no_key_means_on_demand_calls_are_unavailable(self, monkeypatch) -> None:
+        provider = _hybrid_provider(_client({}), monkeypatch, key=None)
+        assert provider.budget_status()["key_resolved"] is False
+
+
+class TestFetchStockDetailUrlConstruction:
+    def test_per_platform_url_and_auth_header(self, monkeypatch, tmp_path) -> None:
+        cases = {
+            "x": "x/stocks/v1/stock/NVDA",
+            "reddit": "reddit/stocks/v1/stock/NVDA",
+            "polymarket": "polymarket/stocks/v1/stock/NVDA",
+            "news": "news/stocks/v1/stock/NVDA",
+        }
+        for platform, expected_path in cases.items():
+            client = _client({expected_path: _fixture("x_stock_detail")})
+            provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+            result = provider.fetch_stock_detail("nvda", platform=platform)
+            assert result["accepted"] is True
+            url = str(client.calls[0].url)  # type: ignore[attr-defined]
+            assert url.startswith(f"https://api.adanos.org/{expected_path}")
+            assert client.calls[0].headers["x-api-key"] == "sk_live_test"  # type: ignore[attr-defined]
+
+    def test_from_to_params_are_passed_through(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        provider.fetch_stock_detail(
+            "NVDA", platform="x", from_date="2026-07-01", to_date="2026-08-01"
+        )
+        url = str(client.calls[0].url)  # type: ignore[attr-defined]
+        assert "from=2026-07-01" in url
+        assert "to=2026-08-01" in url
+
+    def test_unsupported_platform_is_a_refusal_not_a_request(self, monkeypatch, tmp_path) -> None:
+        client = _client({})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("NVDA", platform="bogus")
+        assert result["accepted"] is False
+        assert client.calls == []  # type: ignore[attr-defined]
+
+
+class TestFetchStockDetailParsing:
+    def test_normalized_header_and_raw_passthrough(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("NVDA")
+
+        assert result["symbol"] == "NVDA"
+        assert result["platform"] == "x"
+        assert result["buzz_score"] == pytest.approx(87.5)
+        assert result["sentiment_score"] == pytest.approx(0.42)
+        assert result["bullish_pct"] == pytest.approx(68.0)
+        assert result["bearish_pct"] == pytest.approx(32.0)
+        assert result["mentions"] == 950
+        # Nothing invented -- the vendor's own fields pass through untouched.
+        assert result["raw"]["daily_trend"][0]["date"] == "2026-07-27"
+        assert result["raw"]["sentiment_breakdown"]["bullish"] == 68.0
+        assert "budget" in result
+
+    def test_spends_exactly_one_official_call(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, monthly_budget=250)
+        provider.fetch_stock_detail("NVDA")
+        used, _ = provider._budget.snapshot()
+        assert used == 1
+
+
+class TestFetchStockDetailBudgetGuard:
+    def test_no_key_returns_a_structured_refusal_without_sending_a_request(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, key=None)
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is False
+        assert "no adanos_api_key" in result["reason"]
+        assert result["budget"]["key_resolved"] is False
+        assert client.calls == []  # type: ignore[attr-defined]
+
+    def test_fails_closed_at_the_reserve_floor_without_sending_a_request(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, monthly_budget=5, monthly_reserve=2
+        )
+        for _ in range(3):
+            provider.fetch_stock_detail("NVDA")  # used -> 3, remaining -> 2 (== reserve)
+        assert len(client.calls) == 3  # type: ignore[attr-defined]
+
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is False
+        assert "resets" in result["reason"]
+        assert len(client.calls) == 3  # type: ignore[attr-defined]  # no new request sent
+
+    def test_refusals_never_touch_the_budget_counter(self, monkeypatch, tmp_path) -> None:
+        client = _client({})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, key=None)
+        provider.fetch_stock_detail("NVDA")
+        used, _ = provider._budget.snapshot()
+        assert used == 0
+
+    def test_self_corrects_from_the_remaining_header(self, monkeypatch, tmp_path) -> None:
+        client = _client(
+            {"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")},
+            headers={"X-RateLimit-Remaining-Monthly": "1"},
+        )
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, monthly_budget=250)
+        provider.fetch_stock_detail("NVDA")
+        used, _ = provider._budget.snapshot()
+        assert used == 249  # max(local increment of 1, 250 - 1)
+
+
+class TestFetchStockDetailErrorTaxonomy:
+    def test_401_is_authentication_error(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": {}}, status=401)
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        with pytest.raises(AuthenticationError):
+            provider.fetch_stock_detail("NVDA")
+
+    def test_403_names_the_history_window(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": {}}, status=403)
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        with pytest.raises(ProviderError) as exc_info:
+            provider.fetch_stock_detail("NVDA")
+        assert "history window" in str(exc_info.value)
+
+    def test_429_is_rate_limit_error(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": {}}, status=429)
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        with pytest.raises(RateLimitError):
+            provider.fetch_stock_detail("NVDA")
+
+    def test_404_names_unsupported_ticker(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": {}}, status=404)
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        with pytest.raises(ProviderError) as exc_info:
+            provider.fetch_stock_detail("NVDA")
+        assert "unsupported" in str(exc_info.value).lower()
+
+    def test_5xx_is_retryable(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": {}}, status=503)
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        with pytest.raises(ProviderError) as exc_info:
+            provider.fetch_stock_detail("NVDA")
+        assert exc_info.value.retryable is True
+
+    def test_no_retries_on_failure(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": {}}, status=500)
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        with pytest.raises(ProviderError):
+            provider.fetch_stock_detail("NVDA")
+        assert len(client.calls) == 1  # type: ignore[attr-defined]
+
+    def test_a_failed_call_still_counts_against_the_budget(self, monkeypatch, tmp_path) -> None:
+        """The vendor served (and presumably counted) the request even
+        though it errored -- the local counter must reflect that."""
+        client = _client({"x/stocks/v1/stock/NVDA": {}}, status=500)
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        with pytest.raises(ProviderError):
+            provider.fetch_stock_detail("NVDA")
+        used, _ = provider._budget.snapshot()
+        assert used == 1
+
+
+class TestFetchExplain:
+    def test_url_construction(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA/explain": _fixture("x_stock_explain")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_explain("nvda")
+        assert result["accepted"] is True
+        url = str(client.calls[0].url)  # type: ignore[attr-defined]
+        assert url == "https://api.adanos.org/x/stocks/v1/stock/NVDA/explain"
+
+    def test_returns_explanation_cached_and_generated_at(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA/explain": _fixture("x_stock_explain")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_explain("NVDA")
+        assert "AI chip demand" in result["explanation"]
+        assert result["cached"] is False
+        assert result["generated_at"] == "2026-08-02T00:00:00+00:00"
+        assert "budget" in result
+
+    def test_no_key_is_a_structured_refusal(self, monkeypatch, tmp_path) -> None:
+        client = _client({})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, key=None)
+        result = provider.fetch_explain("NVDA")
+        assert result["accepted"] is False
+        assert client.calls == []  # type: ignore[attr-defined]
+
+    def test_budget_refusal_names_the_reset_date(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA/explain": _fixture("x_stock_explain")})
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, monthly_budget=1, monthly_reserve=0
+        )
+        provider.fetch_explain("NVDA")  # spends the one call -> remaining 0 == reserve
+        result = provider.fetch_explain("NVDA")
+        assert result["accepted"] is False
+        assert "resets" in result["reason"]
+
+    def test_401_is_authentication_error(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA/explain": {}}, status=401)
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        with pytest.raises(AuthenticationError):
+            provider.fetch_explain("NVDA")
+
+
+class TestBudgetStatus:
+    def test_shape_and_content(self, monkeypatch, tmp_path) -> None:
+        provider = _hybrid_provider(
+            _client({}), monkeypatch, cache_dir=tmp_path, monthly_budget=250, monthly_reserve=15
+        )
+        status = provider.budget_status()
+        assert status["key_resolved"] is True
+        assert status["budget"] == 250
+        assert status["used"] == 0
+        assert status["remaining"] == 250
+        assert status["reserve"] == 15
+        assert re.match(r"^\d{4}-\d{2}$", status["month"])
+        assert re.match(r"^\d{4}-\d{2}-\d{2}$", status["resets_hint"])
+
+    def test_never_spends_the_budget(self, monkeypatch, tmp_path) -> None:
+        provider = _hybrid_provider(_client({}), monkeypatch, cache_dir=tmp_path)
+        provider.budget_status()
+        provider.budget_status()
+        used, _ = provider._budget.snapshot()
+        assert used == 0
+
+    def test_key_resolved_false_when_no_key(self, monkeypatch, tmp_path) -> None:
+        provider = _hybrid_provider(_client({}), monkeypatch, cache_dir=tmp_path, key=None)
+        assert provider.budget_status()["key_resolved"] is False
+
+
+class TestCachedDetail:
+    SESSION = dt.date(2026, 8, 3)
+
+    def test_reads_back_a_written_cache_entry(self, tmp_path) -> None:
+        provider = AdanosProvider(_config(), cache_dir=tmp_path)
+        path = provider._detail_cache_path("NVDA", self.SESSION)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"symbol": "NVDA", "platform": "x", "buzz_score": 80.0}), encoding="utf-8"
+        )
+
+        cached = provider.cached_detail("nvda", self.SESSION)
+        assert cached["buzz_score"] == 80.0
+
+    def test_platform_mismatch_is_a_miss(self, tmp_path) -> None:
+        provider = AdanosProvider(_config(), cache_dir=tmp_path)
+        path = provider._detail_cache_path("NVDA", self.SESSION)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"symbol": "NVDA", "platform": "x"}), encoding="utf-8")
+
+        assert provider.cached_detail("NVDA", self.SESSION, platform="reddit") is None
+
+    def test_missing_entry_is_none(self, tmp_path) -> None:
+        provider = AdanosProvider(_config(), cache_dir=tmp_path)
+        assert provider.cached_detail("NVDA", self.SESSION) is None
+
+    def test_no_cache_dir_is_none(self) -> None:
+        provider = AdanosProvider(_config())
+        assert provider.cached_detail("NVDA", self.SESSION) is None
+
+
+class TestEnrichTopCandidates:
+    """``AdanosProvider.enrich_top_candidates`` -- the bounded, budget-guarded
+    post-scan enrichment ``pipeline.Pipeline._enrich_adanos_top_candidates``
+    calls with the session's top-scoring symbols."""
+
+    SESSION = dt.date(2026, 8, 3)
+
+    def test_one_call_per_symbol_up_to_the_configured_top_n(self, monkeypatch, tmp_path) -> None:
+        client = _client(
+            {
+                "x/stocks/v1/stock/AAA": _fixture("x_stock_detail"),
+                "x/stocks/v1/stock/BBB": _fixture("x_stock_detail"),
+                "x/stocks/v1/stock/CCC": _fixture("x_stock_detail"),
+            }
+        )
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=2
+        )
+        spent = provider.enrich_top_candidates(["AAA", "BBB", "CCC"], session=self.SESSION)
+        assert spent == 2
+        urls = {str(c.url).split("?")[0] for c in client.calls}  # type: ignore[attr-defined]
+        assert urls == {
+            "https://api.adanos.org/x/stocks/v1/stock/AAA",
+            "https://api.adanos.org/x/stocks/v1/stock/BBB",
+        }
+
+    def test_writes_a_cache_file_per_enriched_symbol(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=3
+        )
+        provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+
+        path = provider._detail_cache_path("AAA", self.SESSION)
+        assert path.exists()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["symbol"] == "AAA"
+        assert data["enriched_at_session"] == self.SESSION.isoformat()
+
+    def test_a_symbol_already_cached_this_session_is_not_spent_again(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The mechanism behind "no double spend same session": a re-scan of
+        the same trading session must not re-enrich (and re-spend for) a
+        symbol it already enriched."""
+        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=3
+        )
+
+        spent_first = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        spent_second = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+
+        assert spent_first == 1
+        assert spent_second == 0
+        assert len(client.calls) == 1  # type: ignore[attr-defined]
+
+    def test_disabled_makes_no_calls(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, enrich_enabled=False)
+        spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        assert spent == 0
+        assert client.calls == []  # type: ignore[attr-defined]
+
+    def test_zero_top_candidates_disables_enrichment(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=0
+        )
+        spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        assert spent == 0
+        assert client.calls == []  # type: ignore[attr-defined]
+
+    def test_no_key_skips_silently(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, key=None)
+        spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        assert spent == 0
+        assert client.calls == []  # type: ignore[attr-defined]
+
+    def test_no_cache_dir_skips_silently(self, monkeypatch) -> None:
+        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=None)
+        spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        assert spent == 0
+        assert client.calls == []  # type: ignore[attr-defined]
+
+    def test_one_symbols_failure_does_not_abort_the_rest(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/BBB": _fixture("x_stock_detail")})  # AAA 404s
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=2
+        )
+        spent = provider.enrich_top_candidates(["AAA", "BBB"], session=self.SESSION)
+        assert spent == 1
+        assert provider._detail_cache_path("BBB", self.SESSION).exists()
+        assert not provider._detail_cache_path("AAA", self.SESSION).exists()
+
+    def test_budget_guard_stops_early_rather_than_skipping_one_by_one(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        client = _client(
+            {
+                "x/stocks/v1/stock/AAA": _fixture("x_stock_detail"),
+                "x/stocks/v1/stock/BBB": _fixture("x_stock_detail"),
+            }
+        )
+        provider = _hybrid_provider(
+            client,
+            monkeypatch,
+            cache_dir=tmp_path,
+            enrich_top_candidates=3,
+            monthly_budget=1,
+            monthly_reserve=0,
+        )
+        spent = provider.enrich_top_candidates(["AAA", "BBB", "CCC"], session=self.SESSION)
+        assert spent == 1  # AAA spends the only unit of budget; BBB/CCC never attempted
+        assert len(client.calls) == 1  # type: ignore[attr-defined]
+
+    def test_never_raises_even_on_an_unexpected_exception(self, monkeypatch, tmp_path) -> None:
+        """Belt and suspenders: even a non-ProviderError raised from inside
+        the loop must not escape -- a scan's success can never hinge on this."""
+        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=1
+        )
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(provider, "fetch_stock_detail", _boom)
+        spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        assert spent == 0
+
+
+class TestConfigValidators:
+    def test_enrich_top_candidates_must_be_within_0_and_10(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            _config(enrich_top_candidates=11)
+        with pytest.raises(ValidationError):
+            _config(enrich_top_candidates=-1)
+        _config(enrich_top_candidates=0)
+        _config(enrich_top_candidates=10)
+
+    def test_detail_platform_default_must_be_a_known_platform(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            _config(detail_platform_default="bogus")
+        _config(detail_platform_default="reddit")

@@ -233,14 +233,25 @@ request_timeout_s = 20.0
 # instead of an engagement metric -- see providers.social.adanos for how
 # that's stored.
 #
-# Two access modes:
+# Two access modes for BULK TRENDING COLLECTION (fetch_snapshots):
 #   * Default keyless "site" mode hits adanos.org's own public-page proxy
 #     endpoints -- one request per enabled feed per collection cycle, no key
-#     required. This is what most operators use.
+#     required. This is what most operators use, and NEVER spends the
+#     official-API budget below.
 #   * "official" mode (prefer_official_api = true, with api_key_credential
 #     resolving to a real key) uses the keyed api.adanos.org API instead,
 #     gated by a persistent monthly budget that fails closed at the reserve
 #     floor rather than ever falling back to extra site-proxy calls.
+#
+# SEPARATELY -- hybrid mode -- whenever api_key_credential resolves to a
+# real key AT ALL (independent of prefer_official_api above), the provider
+# also exposes two ON-DEMAND, per-ticker official calls that spend the same
+# monthly budget: fetch_stock_detail and fetch_explain (surfaced as the MCP
+# tools get_adanos_detail/get_adanos_explain). enrich_top_candidates/
+# enrich_enabled below tune the one automatic consumer of that budget: a
+# bounded detail call for each of a scan's top-scoring candidates. See
+# docs/api-providers.md's "Hybrid mode / spending the free tier" subsection
+# for the budget arithmetic.
 #
 # Licensing (adanos.org/terms): commercial use permitted subject to the
 # vendor's terms; raw API data may not be redistributed as a competing
@@ -255,13 +266,16 @@ feed_polymarket = true                    # Polymarket feed
 feed_news = true                          # Financial news feed (source_count instead of engagement)
 site_base_url = "https://adanos.org/api"
 official_base_url = "https://api.adanos.org"
-prefer_official_api = false               # true = use official_base_url + X-API-Key when the credential resolves
+prefer_official_api = false               # true = use official_base_url + X-API-Key for BULK TRENDING when the credential resolves
 api_key_credential = "adanos_api_key"     # Environment variable or keyring lookup name (optional)
 calls_per_minute = 10
-monthly_budget = 250                      # Free-tier monthly cap on official-mode requests
-monthly_reserve = 15                      # Official mode fails closed for the rest of the month at this floor
+monthly_budget = 250                      # Free-tier monthly cap on official-mode requests (trending + on-demand combined)
+monthly_reserve = 15                      # Official calls fail closed for the rest of the month at this floor
 limit = 100                               # Rows requested per feed per cycle
 request_timeout_s = 20.0
+detail_platform_default = "x"             # Platform get_adanos_detail/get_adanos_explain/enrichment use by default
+enrich_top_candidates = 3                 # Post-scan: ONE fetch_stock_detail call for each of the top N scoring symbols (0 disables)
+enrich_enabled = true                     # Master switch for post-scan enrichment (effective only when the key resolves)
 
 [ai]
 # Optional LLM-assisted sentiment classification -- an ensemble ADJUNCT,

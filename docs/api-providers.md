@@ -1967,15 +1967,74 @@ feed_x = true
 feed_reddit = true
 feed_polymarket = true
 feed_news = true
-prefer_official_api = false        # true = use the keyed API when api_key_credential resolves
+prefer_official_api = false        # true = use the keyed API for BULK TRENDING when api_key_credential resolves
 api_key_credential = "adanos_api_key"
 monthly_budget = 250
 monthly_reserve = 15
+detail_platform_default = "x"      # platform on-demand detail/explain/enrichment use by default
+enrich_top_candidates = 3          # 0 disables post-scan enrichment
+enrich_enabled = true
 ```
 
 **Credentials**: none required for the default site mode.
 `claudetrade secrets set adanos_api_key` (optional) enables official mode
-once `prefer_official_api = true` is also set.
+once `prefer_official_api = true` is also set. **A key also unlocks hybrid
+mode's on-demand calls (below) regardless of `prefer_official_api`** -- see
+the next subsection.
+
+#### Hybrid mode / spending the free tier
+
+The owner's requirement this feature exists to satisfy, verbatim: *"I want
+to utilize the free tier and then use the official api ALONG with the site
+mode. I'm using the free tier API which would get used up quickly."* Two
+rules follow from that, and the code enforces both:
+
+1. **Bulk trending collection never spends the free tier unless you ask it
+   to.** `fetch_snapshots` (what a data refresh calls) stays on the keyless
+   site endpoints -- which serve the exact same trending rows -- unless
+   `prefer_official_api = true` is explicitly set. There is no reason to pay
+   for data the site proxy already gives away for free.
+2. **On-demand, per-ticker calls are what the free tier is FOR.** The moment
+   `api_key_credential` resolves to a real key -- independent of
+   `prefer_official_api` -- `AdanosProvider` exposes two additional calls
+   that only make sense with a key:
+   - `fetch_stock_detail(ticker, platform)` -- full per-ticker detail (daily
+     trend, sentiment breakdown, top mentions/authors), surfaced as the MCP
+     tool `get_adanos_detail`.
+   - `fetch_explain(ticker, platform)` -- the vendor's AI trend explanation
+     (cached 6h server-side), surfaced as `get_adanos_explain`.
+
+   Both spend one request from the same `monthly_budget`/`monthly_reserve`
+   pool trending's official mode uses, and both are ALWAYS budget-guarded --
+   they return a structured `{"accepted": false, "reason": ...}` refusal
+   (never an unmetered fallback) once remaining budget reaches
+   `monthly_reserve`, naming the reset date. `AdanosProvider.budget_status()`
+   (surfaced free, read-only, via the `get_adanos_budget` MCP tool) reports
+   used/remaining/reserve/month at any time.
+
+**The one automatic consumer of this budget: bounded top-candidate
+enrichment.** After a scan completes, if `enrich_enabled` is true and a key
+resolves, the pipeline fetches ONE `fetch_stock_detail` call (on
+`detail_platform_default`) for each of the session's top
+`enrich_top_candidates` distinct, best-scoring symbols
+(`pipeline.Pipeline._enrich_adanos_top_candidates` ->
+`AdanosProvider.enrich_top_candidates`). Results are cached to
+`cache_dir/adanos/detail/{symbol}-{session}.json` -- a re-scan of the same
+session, or a later `get_adanos_detail` call for the same symbol, is served
+from that cache with `from_cache: true` and spends nothing. Enrichment is
+wrapped end to end and can never fail a scan: a per-symbol error (network,
+vendor, disk) is logged at INFO and skipped, and the budget guard stops
+early (not one-by-one) once the reserve floor is hit.
+
+**Budget arithmetic at the defaults** (`monthly_budget = 250`,
+`monthly_reserve = 15`, `enrich_top_candidates = 3`): 3 candidates/session x
+~22 trading sessions/month =~ 66 official calls/month for enrichment alone,
+comfortably under `monthly_budget - monthly_reserve` = 235, leaving roughly
+169 requests/month of headroom for interactive `get_adanos_detail`/
+`get_adanos_explain` calls (e.g. via an MCP client) in the same month.
+Raise/lower `enrich_top_candidates` (0-10) to trade automatic coverage
+against that headroom; set `enrich_enabled = false` to keep the key for
+purely interactive use.
 
 **Surfacing**: not currently wired into `get_trending`'s `source` option --
 that function's query is built directly against `symbol_sentiment_daily`'s

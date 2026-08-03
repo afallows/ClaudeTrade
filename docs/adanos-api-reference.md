@@ -67,8 +67,8 @@ endpoints since v1.32.0 — cache-validate to save quota.
 | Endpoint | Notes |
 |---|---|
 | `GET /trending` | Ranked by buzz score. Params: `from`, `to` (YYYY-MM-DD, UTC, inclusive), `limit` (1-100, default 20), `offset`, `type` (stock/etf/all). `days` is deprecated. |
-| `GET /stock/{ticker}` | Detail: daily trend array, sentiment breakdown, top mentions/authors/subreddits/tweets (platform-appropriate). Polymarket adds a `pulse` mood block. |
-| `GET /stock/{ticker}/explain` | AI trend explanation (llama-3.1-8b-instant), cached 6h, served with `cached` flag + `generated_at`. |
+| `GET /stock/{ticker}` | Detail: daily trend array, sentiment breakdown, top mentions/authors/subreddits/tweets (platform-appropriate). Polymarket adds a `pulse` mood block. Wired as `AdanosProvider.fetch_stock_detail` / MCP `get_adanos_detail` -- see `docs/api-providers.md`'s "Hybrid mode / spending the free tier" for how this stays budget-guarded and separate from bulk trending collection. |
+| `GET /stock/{ticker}/explain` | AI trend explanation (llama-3.1-8b-instant), cached 6h, served with `cached` flag + `generated_at`. Wired as `AdanosProvider.fetch_explain` / MCP `get_adanos_explain`; same hybrid-mode budget guard. |
 | `GET /stock/{ticker}/mentions` | **Professional tier only.** Raw post/tweet/market rows, `limit` 1-100, `offset`, `include_inherited` (Reddit). |
 | `GET /trending/sectors` | Sector aggregation, top 5 tickers each, has `trend_history`. |
 | `GET /trending/countries` | Country aggregation, same shape. |

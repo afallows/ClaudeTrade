@@ -761,9 +761,47 @@ class Pipeline:
             # a stale idea cannot be resurrected at a convenient price later.
             self.ledger.expire_stale(session)
 
+            # Bounded, budget-guarded Adanos top-candidate enrichment (see
+            # AdanosConfig.enrich_top_candidates/enrich_enabled and
+            # providers.social.adanos.AdanosProvider.enrich_top_candidates
+            # for the mechanics). Gated on `record` -- a preview/dry-run scan
+            # (`claudetrade scan --no-record`) must not spend the official-
+            # API quota for candidates that are never even written down.
+            if scan_result.signals:
+                self._enrich_adanos_top_candidates(scan_result, session)
+
         result.finished_at = utc_now()
         log.info("scan complete for %s: %s", session, result.summary())
         return result
+
+    def _enrich_adanos_top_candidates(self, scan_result: ScanResult, session: dt.date) -> None:
+        """Fund one bounded, budget-guarded Adanos detail call per top-scoring
+        candidate from this scan, if Adanos is configured and an
+        ``adanos_api_key`` credential resolves.
+
+        Best-effort and NEVER allowed to fail a scan: everything here is
+        wrapped, and any exception is logged rather than raised, even though
+        ``AdanosProvider.enrich_top_candidates`` already documents itself as
+        never raising -- belt and suspenders, since a scan succeeding is far
+        more important than one more research artifact landing.
+        """
+        try:
+            provider = self.adanos[0] if self.adanos else None
+            if provider is None:
+                return
+            seen: set[str] = set()
+            ordered_symbols: list[str] = []
+            for signal in sorted(scan_result.signals, key=lambda s: s.overall_score, reverse=True):
+                if signal.symbol in seen:
+                    continue
+                seen.add(signal.symbol)
+                ordered_symbols.append(signal.symbol)
+            provider.enrich_top_candidates(ordered_symbols, session=session)
+        except Exception:
+            log.warning(
+                "adanos top-candidate enrichment raised unexpectedly; scan is unaffected",
+                exc_info=True,
+            )
 
     def _latest_bar_session(self, *, upto: dt.date) -> dt.date | None:
         """Most recent session at or before ``upto`` with stored price bars."""
