@@ -776,9 +776,14 @@ class AdanosConfig(BaseModel):
     all, and normal operation (site healthy) spends zero official-API
     quota -- the free tier is now purely a durability reserve for when the
     site proxy is down or rate-limited. See ``detail_platform_default``/
-    ``enrich_top_candidates``/``enrich_enabled`` below for the one automatic
-    consumer (bounded post-scan enrichment, which inherits this same
-    site-first behaviour).
+    ``enrich_scope``/``enrich_top_candidates``/``enrich_enabled`` below for
+    the one automatic consumer (bounded post-scan enrichment, which inherits
+    this same site-first behaviour) -- as of the enrichment-breadth revision,
+    ``enrich_scope = "all"`` (the default) enriches every distinct signal
+    symbol from a scan, best-scoring first, capped by
+    ``enrich_max_symbols_per_scan`` and paced by ``enrich_delay_seconds``
+    between actual network calls; ``enrich_top_candidates`` now only bounds
+    the count when ``enrich_scope = "top_n"``.
 
     Licensing (adanos.org/terms, checked 2026-08-02): commercial use is
     permitted subject to the vendor's terms; raw API data may not be
@@ -844,27 +849,73 @@ class AdanosConfig(BaseModel):
     #: uses (enrichment makes exactly one call per candidate, so it does not
     #: pick a platform per call).
     detail_platform_default: str = "x"
+    #: Breadth of post-scan enrichment (see
+    #: ``providers.social.adanos.AdanosProvider.enrich_candidates``):
+    #:
+    #: * ``"all"`` (default) -- every distinct signal symbol from the scan,
+    #:   ordered best-scoring first, capped by
+    #:   ``enrich_max_symbols_per_scan`` (dropped symbols are logged, never
+    #:   silently truncated). Since ``fetch_stock_detail`` runs the
+    #:   site-first ladder, this ordinarily spends ZERO official-API quota
+    #:   regardless of breadth -- see ``docs/api-providers.md``'s "Hybrid
+    #:   mode / spending the free tier".
+    #: * ``"top_n"`` -- the previous behaviour: only the top
+    #:   ``enrich_top_candidates`` distinct, best-scoring symbols.
+    #: * ``"off"`` -- post-scan enrichment disabled entirely (equivalent to
+    #:   ``enrich_enabled = False``).
+    enrich_scope: str = "all"
     #: How many of a scan's top-scoring, distinct-by-symbol candidates get
-    #: ONE ``fetch_stock_detail`` call each after the scan completes. ``0``
-    #: disables enrichment entirely. Since ``fetch_stock_detail`` runs the
-    #: site-first ladder, this ordinarily spends ZERO official-API quota --
-    #: see ``docs/api-providers.md``'s "Hybrid mode / spending the free
-    #: tier" for the revised budget arithmetic (the free tier is now a
-    #: fallback reserve, not the primary path).
+    #: ONE ``fetch_stock_detail`` call each after the scan completes. Only
+    #: consulted when ``enrich_scope == "top_n"`` -- ``"all"`` scope enriches
+    #: every distinct symbol instead (subject to
+    #: ``enrich_max_symbols_per_scan``). ``0`` disables ``top_n`` enrichment.
     enrich_top_candidates: int = 3
+    #: Safety valve for ``enrich_scope == "all"``: the maximum number of
+    #: distinct signal symbols enriched in one scan, best-scoring first.
+    #: Symbols beyond this cap are logged (never silently dropped) rather
+    #: than enriched. Irrelevant in ``top_n``/``off`` scope.
+    enrich_max_symbols_per_scan: int = 60
+    #: Courtesy pause between successive site-proxy detail calls during
+    #: post-scan enrichment -- only applied between actual network calls
+    #: (never for a same-session cache hit or a memoised-unsupported skip).
+    #: ``0`` is allowed (e.g. for tests) to disable pacing entirely.
+    enrich_delay_seconds: float = 1.0
     #: Master switch for post-scan enrichment. Effective regardless of
     #: whether ``api_key_credential`` resolves -- ``fetch_stock_detail``
     #: works keylessly via the site rung by default (see
     #: ``providers.social.adanos``'s Hybrid mode section); a resolved key
     #: only matters as a per-symbol fallback when that symbol's site lookup
-    #: fails. Bulk trending collection is unaffected either way.
+    #: fails. Bulk trending collection is unaffected either way. Equivalent
+    #: to ``enrich_scope = "off"`` when ``False``.
     enrich_enabled: bool = True
+
+    @field_validator("enrich_scope")
+    @classmethod
+    def _known_enrich_scope(cls, v: str) -> str:
+        allowed = {"all", "top_n", "off"}
+        if v not in allowed:
+            raise ValueError(f"enrich_scope must be one of {sorted(allowed)}")
+        return v
 
     @field_validator("enrich_top_candidates")
     @classmethod
     def _bounded_enrich_top_candidates(cls, v: int) -> int:
         if not 0 <= v <= 10:
             raise ValueError("enrich_top_candidates must be within [0, 10]")
+        return v
+
+    @field_validator("enrich_max_symbols_per_scan")
+    @classmethod
+    def _bounded_enrich_max_symbols_per_scan(cls, v: int) -> int:
+        if not 1 <= v <= 200:
+            raise ValueError("enrich_max_symbols_per_scan must be within [1, 200]")
+        return v
+
+    @field_validator("enrich_delay_seconds")
+    @classmethod
+    def _non_negative_enrich_delay_seconds(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("enrich_delay_seconds must be >= 0")
         return v
 
     @field_validator("detail_platform_default")

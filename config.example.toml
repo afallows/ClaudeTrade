@@ -253,13 +253,19 @@ request_timeout_s = 20.0
 # official rung -- budget-guarded, same monthly_budget/monthly_reserve pool
 # as above -- is tried only as a fallback when the site rung fails and a key
 # resolves with budget to spend. No key is required for on-demand calls to
-# work at all anymore. enrich_top_candidates/enrich_enabled below tune the
-# one automatic consumer (bounded detail calls for a scan's top-scoring
-# candidates), which inherits this same site-first behaviour and therefore
-# spends ZERO official-API quota in ordinary operation -- the free tier is
-# now a durability reserve, not the primary path. See docs/api-providers.md's
-# "Hybrid mode / spending the free tier" subsection for the revised budget
-# arithmetic.
+# work at all anymore. enrich_scope/enrich_top_candidates/
+# enrich_max_symbols_per_scan/enrich_delay_seconds/enrich_enabled below tune
+# the one automatic consumer (bounded detail calls after each scan) -- by
+# default (enrich_scope = "all") EVERY distinct signal symbol from the scan
+# is enriched, best-scoring first, capped by enrich_max_symbols_per_scan and
+# paced by enrich_delay_seconds between actual network calls; set
+# enrich_scope = "top_n" to restore the old top-N-only behaviour. Inherits
+# the site-first ladder either way, so ordinary enrichment spends ZERO
+# official-API quota in ordinary operation -- the free tier is now a
+# durability reserve, not the primary path. A ticker the vendor definitively
+# refuses as unsupported is remembered for ~30 trading days so a scan never
+# re-asks about it daily. See docs/api-providers.md's "Hybrid mode /
+# spending the free tier" subsection for the revised budget arithmetic.
 #
 # Licensing (adanos.org/terms): commercial use permitted subject to the
 # vendor's terms; raw API data may not be redistributed as a competing
@@ -282,8 +288,11 @@ monthly_reserve = 15                      # Official calls fail closed for the r
 limit = 100                               # Rows requested per feed per cycle
 request_timeout_s = 20.0
 detail_platform_default = "x"             # Platform get_adanos_detail/get_adanos_explain/enrichment use by default
-enrich_top_candidates = 3                 # Post-scan: ONE fetch_stock_detail call for each of the top N scoring symbols (0 disables)
-enrich_enabled = true                     # Master switch for post-scan enrichment (works keylessly via the site rung by default)
+enrich_scope = "all"                      # "all" (every distinct signal symbol) | "top_n" (legacy top-N) | "off"
+enrich_top_candidates = 3                 # Only used when enrich_scope = "top_n": ONE fetch_stock_detail call per top N scoring symbols (0 disables)
+enrich_max_symbols_per_scan = 60          # Safety valve for enrich_scope = "all" -- symbols beyond this cap are logged, not silently dropped
+enrich_delay_seconds = 1.0                # Courtesy pause between successive site detail calls (0 disables pacing, e.g. for tests)
+enrich_enabled = true                     # Master switch for post-scan enrichment (works keylessly via the site rung by default); equivalent to enrich_scope = "off" when false
 
 [ai]
 # Optional LLM-assisted sentiment classification -- an ensemble ADJUNCT,

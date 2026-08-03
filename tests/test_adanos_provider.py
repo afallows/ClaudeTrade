@@ -1174,6 +1174,7 @@ class TestFetchStockDetailStructuredAnswers:
         assert "found: false" in result["reason"]
         assert result["mode"] == "site"
         assert result["quota_spent"] is False
+        assert result["unsupported_ticker"] is False
         assert len(client.calls) == 1  # type: ignore[attr-defined]  # official never tried
 
     def test_unsupported_ticker_error_code_is_a_distinct_structured_refusal(
@@ -1188,6 +1189,7 @@ class TestFetchStockDetailStructuredAnswers:
         assert "unsupported ticker" in result["reason"].lower()
         assert "ZZZZFAKE" in result["reason"]
         assert result["mode"] == "site"
+        assert result["unsupported_ticker"] is True
         assert len(client.calls) == 1  # type: ignore[attr-defined]  # official never tried
 
     def test_endpoint_absent_error_body_is_a_site_failure_not_data(
@@ -1540,10 +1542,13 @@ class TestCachedDetail:
         assert provider.cached_detail("NVDA", self.SESSION) is None
 
 
-class TestEnrichTopCandidates:
-    """``AdanosProvider.enrich_top_candidates`` -- the bounded, budget-guarded
-    post-scan enrichment ``pipeline.Pipeline._enrich_adanos_top_candidates``
-    calls with the session's top-scoring symbols."""
+class TestEnrichCandidatesTopNScope:
+    """``AdanosProvider.enrich_candidates`` under ``enrich_scope = "top_n"``
+    -- the pre-generalisation top-N-only behaviour, still available
+    explicitly. ``pipeline.Pipeline._enrich_adanos_candidates`` calls this
+    with the session's symbols, best-scoring first; the provider applies
+    scope/cap itself (see ``TestEnrichCandidatesAllScope`` for the new
+    default)."""
 
     SESSION = dt.date(2026, 8, 3)
 
@@ -1556,9 +1561,14 @@ class TestEnrichTopCandidates:
             }
         )
         provider = _hybrid_provider(
-            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=2
+            client,
+            monkeypatch,
+            cache_dir=tmp_path,
+            enrich_scope="top_n",
+            enrich_top_candidates=2,
+            enrich_delay_seconds=0,
         )
-        spent = provider.enrich_top_candidates(["AAA", "BBB", "CCC"], session=self.SESSION)
+        spent = provider.enrich_candidates(["AAA", "BBB", "CCC"], session=self.SESSION)
         assert spent == 2
         urls = {str(c.url).split("?")[0] for c in client.calls}  # type: ignore[attr-defined]
         assert urls == {
@@ -1571,9 +1581,13 @@ class TestEnrichTopCandidates:
     def test_writes_a_cache_file_per_enriched_symbol(self, monkeypatch, tmp_path) -> None:
         client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(
-            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=3
+            client,
+            monkeypatch,
+            cache_dir=tmp_path,
+            enrich_scope="top_n",
+            enrich_top_candidates=3,
         )
-        provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        provider.enrich_candidates(["AAA"], session=self.SESSION)
 
         path = provider._detail_cache_path("AAA", self.SESSION)
         assert path.exists()
@@ -1591,11 +1605,15 @@ class TestEnrichTopCandidates:
         symbol it already enriched."""
         client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(
-            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=3
+            client,
+            monkeypatch,
+            cache_dir=tmp_path,
+            enrich_scope="top_n",
+            enrich_top_candidates=3,
         )
 
-        spent_first = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
-        spent_second = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        spent_first = provider.enrich_candidates(["AAA"], session=self.SESSION)
+        spent_second = provider.enrich_candidates(["AAA"], session=self.SESSION)
 
         assert spent_first == 1
         assert spent_second == 0
@@ -1604,16 +1622,29 @@ class TestEnrichTopCandidates:
     def test_disabled_makes_no_calls(self, monkeypatch, tmp_path) -> None:
         client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, enrich_enabled=False)
-        spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        spent = provider.enrich_candidates(["AAA"], session=self.SESSION)
+        assert spent == 0
+        assert client.calls == []  # type: ignore[attr-defined]
+
+    def test_scope_off_disables_enrichment_regardless_of_enrich_enabled(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, enrich_scope="off")
+        spent = provider.enrich_candidates(["AAA"], session=self.SESSION)
         assert spent == 0
         assert client.calls == []  # type: ignore[attr-defined]
 
     def test_zero_top_candidates_disables_enrichment(self, monkeypatch, tmp_path) -> None:
         client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(
-            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=0
+            client,
+            monkeypatch,
+            cache_dir=tmp_path,
+            enrich_scope="top_n",
+            enrich_top_candidates=0,
         )
-        spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        spent = provider.enrich_candidates(["AAA"], session=self.SESSION)
         assert spent == 0
         assert client.calls == []  # type: ignore[attr-defined]
 
@@ -1623,14 +1654,14 @@ class TestEnrichTopCandidates:
         keylessly via the free site rung."""
         client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, key=None)
-        spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        spent = provider.enrich_candidates(["AAA"], session=self.SESSION)
         assert spent == 1
         assert len(client.calls) == 1  # type: ignore[attr-defined]
 
     def test_no_cache_dir_skips_silently(self, monkeypatch) -> None:
         client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(client, monkeypatch, cache_dir=None)
-        spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        spent = provider.enrich_candidates(["AAA"], session=self.SESSION)
         assert spent == 0
         assert client.calls == []  # type: ignore[attr-defined]
 
@@ -1638,9 +1669,14 @@ class TestEnrichTopCandidates:
         # AAA: both rungs fail (neither route registered). BBB: site succeeds.
         client = _client({"proxy-x/stock/BBB": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(
-            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=2
+            client,
+            monkeypatch,
+            cache_dir=tmp_path,
+            enrich_scope="top_n",
+            enrich_top_candidates=2,
+            enrich_delay_seconds=0,
         )
-        spent = provider.enrich_top_candidates(["AAA", "BBB"], session=self.SESSION)
+        spent = provider.enrich_candidates(["AAA", "BBB"], session=self.SESSION)
         assert spent == 1
         assert provider._detail_cache_path("BBB", self.SESSION).exists()
         assert not provider._detail_cache_path("AAA", self.SESSION).exists()
@@ -1664,11 +1700,13 @@ class TestEnrichTopCandidates:
             client,
             monkeypatch,
             cache_dir=tmp_path,
+            enrich_scope="top_n",
             enrich_top_candidates=3,
+            enrich_delay_seconds=0,
             monthly_budget=1,
             monthly_reserve=1,  # official rung starts already at its reserve floor
         )
-        spent = provider.enrich_top_candidates(["AAA", "BBB", "CCC"], session=self.SESSION)
+        spent = provider.enrich_candidates(["AAA", "BBB", "CCC"], session=self.SESSION)
         assert spent == 1
         assert provider._detail_cache_path("AAA", self.SESSION).exists()
         assert not provider._detail_cache_path("BBB", self.SESSION).exists()
@@ -1681,15 +1719,300 @@ class TestEnrichTopCandidates:
         the loop must not escape -- a scan's success can never hinge on this."""
         client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(
-            client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=1
+            client,
+            monkeypatch,
+            cache_dir=tmp_path,
+            enrich_scope="top_n",
+            enrich_top_candidates=1,
         )
 
         def _boom(*_a, **_kw):
             raise RuntimeError("boom")
 
         monkeypatch.setattr(provider, "fetch_stock_detail", _boom)
-        spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
+        spent = provider.enrich_candidates(["AAA"], session=self.SESSION)
         assert spent == 0
+
+
+class TestEnrichCandidatesAllScope:
+    """``enrich_scope = "all"`` -- the new default: every distinct signal
+    symbol, best-scoring first, capped by ``enrich_max_symbols_per_scan``."""
+
+    SESSION = dt.date(2026, 8, 3)
+
+    def test_default_scope_is_all(self) -> None:
+        assert _config().enrich_scope == "all"
+
+    def test_enriches_every_distinct_symbol_by_default(self, monkeypatch, tmp_path) -> None:
+        client = _client(
+            {
+                "proxy-x/stock/AAA": _fixture("x_stock_detail_site"),
+                "proxy-x/stock/BBB": _fixture("x_stock_detail_site"),
+                "proxy-x/stock/CCC": _fixture("x_stock_detail_site"),
+            }
+        )
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, enrich_delay_seconds=0
+        )
+        spent = provider.enrich_candidates(["AAA", "BBB", "CCC"], session=self.SESSION)
+        assert spent == 3
+
+    def test_caps_at_enrich_max_symbols_per_scan_and_logs_the_dropped_symbols(
+        self, monkeypatch, tmp_path, caplog
+    ) -> None:
+        symbols = [f"SYM{i}" for i in range(5)]
+        routes = {f"proxy-x/stock/{s}": _fixture("x_stock_detail_site") for s in symbols[:3]}
+        client = _client(routes)
+        provider = _hybrid_provider(
+            client,
+            monkeypatch,
+            cache_dir=tmp_path,
+            enrich_max_symbols_per_scan=3,
+            enrich_delay_seconds=0,
+        )
+        with caplog.at_level("INFO"):
+            spent = provider.enrich_candidates(symbols, session=self.SESSION)
+        assert spent == 3
+        for kept in symbols[:3]:
+            assert provider._detail_cache_path(kept, self.SESSION).exists()
+        for dropped in symbols[3:]:
+            assert not provider._detail_cache_path(dropped, self.SESSION).exists()
+        assert any("SYM3" in r.message and "SYM4" in r.message for r in caplog.records)
+
+    def test_never_touches_enrich_top_candidates_in_all_scope(self, monkeypatch, tmp_path) -> None:
+        """``enrich_top_candidates`` is a ``"top_n"``-only knob -- a low
+        value must not silently cap ``"all"`` scope."""
+        client = _client(
+            {
+                "proxy-x/stock/AAA": _fixture("x_stock_detail_site"),
+                "proxy-x/stock/BBB": _fixture("x_stock_detail_site"),
+            }
+        )
+        provider = _hybrid_provider(
+            client,
+            monkeypatch,
+            cache_dir=tmp_path,
+            enrich_top_candidates=1,  # would cap top_n scope at 1
+            enrich_delay_seconds=0,
+        )
+        spent = provider.enrich_candidates(["AAA", "BBB"], session=self.SESSION)
+        assert spent == 2
+
+
+class TestEnrichCandidatesDelay:
+    """``enrich_delay_seconds`` -- paced between successive ACTUAL network
+    calls only; never before the first call, and never for a cache/memo
+    hit."""
+
+    SESSION = dt.date(2026, 8, 3)
+
+    #: ``RateLimiter.acquire`` (``providers.base``) also calls ``time.sleep``
+    #: for its own token-bucket pacing -- and since these tests' patched
+    #: ``time.sleep`` records instead of actually blocking, real wall-clock
+    #: time never advances, so the rate limiter's own (sub-second, given
+    #: ``calls_per_minute=6000`` in ``_config``) waits show up in the
+    #: recording too. Filtering to sleeps at or above 1 second isolates
+    #: THIS test's own ``enrich_delay_seconds`` pacing from that unrelated
+    #: noise without needing to fake ``time.monotonic`` as well.
+    _NOISE_FLOOR = 1.0
+
+    def test_sleeps_between_calls_but_not_before_the_first(self, monkeypatch, tmp_path) -> None:
+        import claudetrade.providers.social.adanos as adanos_module
+
+        client = _client(
+            {
+                "proxy-x/stock/AAA": _fixture("x_stock_detail_site"),
+                "proxy-x/stock/BBB": _fixture("x_stock_detail_site"),
+                "proxy-x/stock/CCC": _fixture("x_stock_detail_site"),
+            }
+        )
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, enrich_delay_seconds=2.5
+        )
+        sleeps: list[float] = []
+        monkeypatch.setattr(adanos_module.time, "sleep", sleeps.append)
+
+        provider.enrich_candidates(["AAA", "BBB", "CCC"], session=self.SESSION)
+        assert [s for s in sleeps if s >= self._NOISE_FLOOR] == [2.5, 2.5]
+
+    def test_zero_delay_never_sleeps(self, monkeypatch, tmp_path) -> None:
+        import claudetrade.providers.social.adanos as adanos_module
+
+        client = _client(
+            {
+                "proxy-x/stock/AAA": _fixture("x_stock_detail_site"),
+                "proxy-x/stock/BBB": _fixture("x_stock_detail_site"),
+            }
+        )
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, enrich_delay_seconds=0
+        )
+        sleeps: list[float] = []
+        monkeypatch.setattr(adanos_module.time, "sleep", sleeps.append)
+
+        provider.enrich_candidates(["AAA", "BBB"], session=self.SESSION)
+        assert [s for s in sleeps if s >= self._NOISE_FLOOR] == []
+
+    def test_cache_hits_do_not_count_toward_pacing(self, monkeypatch, tmp_path) -> None:
+        """AAA is already cached (no network call); BBB is the first REAL
+        network attempt this run and must not be delayed."""
+        import claudetrade.providers.social.adanos as adanos_module
+
+        client = _client({"proxy-x/stock/BBB": _fixture("x_stock_detail_site")})
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, enrich_delay_seconds=5.0
+        )
+        path = provider._detail_cache_path("AAA", self.SESSION)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"symbol": "AAA", "platform": "x"}), encoding="utf-8")
+
+        sleeps: list[float] = []
+        monkeypatch.setattr(adanos_module.time, "sleep", sleeps.append)
+
+        provider.enrich_candidates(["AAA", "BBB"], session=self.SESSION)
+        # Only one real network attempt (BBB) -- nothing to pace between.
+        assert [s for s in sleeps if s >= self._NOISE_FLOOR] == []
+
+
+class TestEnrichCandidatesUnsupportedTickerMemo:
+    """Vendor-definitive ``unsupported_ticker`` refusals are memoised so a
+    scan never re-asks about the same symbol every day; the quieter
+    ``{"found": false}`` refusal is deliberately NOT memoised."""
+
+    SESSION = dt.date(2026, 8, 3)
+
+    def test_unsupported_ticker_refusal_is_memoized_and_skips_a_later_call_with_no_request(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        client = _client(
+            {"proxy-x/stock/ZZZZFAKE": _fixture("stock_detail_unsupported_ticker")}, status=404
+        )
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+
+        spent_first = provider.enrich_candidates(["ZZZZFAKE"], session=self.SESSION)
+        assert spent_first == 0
+        calls_after_first = len(client.calls)  # type: ignore[attr-defined]
+        assert calls_after_first >= 1
+
+        spent_second = provider.enrich_candidates(["ZZZZFAKE"], session=self.SESSION)
+        assert spent_second == 0
+        assert len(client.calls) == calls_after_first  # type: ignore[attr-defined]  # no new request
+
+    def test_found_false_quiet_refusal_is_not_memoized(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/ZZZZ": _fixture("stock_detail_not_found")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+
+        provider.enrich_candidates(["ZZZZ"], session=self.SESSION)
+        first_calls = len(client.calls)  # type: ignore[attr-defined]
+
+        provider.enrich_candidates(["ZZZZ"], session=self.SESSION)
+        # Tried again -- NOT memoised, unlike the unsupported-ticker case.
+        assert len(client.calls) > first_calls  # type: ignore[attr-defined]
+
+    def test_memo_persists_across_provider_instances(self, monkeypatch, tmp_path) -> None:
+        client = _client(
+            {"proxy-x/stock/ZZZZFAKE": _fixture("stock_detail_unsupported_ticker")}, status=404
+        )
+        first = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        first.enrich_candidates(["ZZZZFAKE"], session=self.SESSION)
+        calls_after_first = len(client.calls)  # type: ignore[attr-defined]
+
+        second = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        second.enrich_candidates(["ZZZZFAKE"], session=self.SESSION)
+        assert len(client.calls) == calls_after_first  # type: ignore[attr-defined]
+
+    def test_memo_expires_after_the_30_trading_day_horizon(self, monkeypatch, tmp_path) -> None:
+        from claudetrade.utils.timeutils import next_trading_day
+
+        client = _client(
+            {"proxy-x/stock/ZZZZFAKE": _fixture("stock_detail_unsupported_ticker")}, status=404
+        )
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        provider.enrich_candidates(["ZZZZFAKE"], session=self.SESSION)
+        calls_after_first = len(client.calls)  # type: ignore[attr-defined]
+
+        still_memoized_session = next_trading_day(self.SESSION, skip=29)
+        provider.enrich_candidates(["ZZZZFAKE"], session=still_memoized_session)
+        assert len(client.calls) == calls_after_first  # type: ignore[attr-defined]  # still memoised
+
+        expired_session = next_trading_day(self.SESSION, skip=31)
+        provider.enrich_candidates(["ZZZZFAKE"], session=expired_session)
+        assert len(client.calls) > calls_after_first  # type: ignore[attr-defined]  # re-probed
+
+
+class TestEnrichCandidatesOnSnapshot:
+    """The ``on_snapshot`` callback -- how ``pipeline.Pipeline`` feeds
+    ``db.models.AdanosSnapshotRow`` from a successful enrichment (see
+    ``tests/test_pipeline_adanos_enrichment.py`` for the pipeline-side
+    storage wiring this feeds)."""
+
+    SESSION = dt.date(2026, 8, 3)
+
+    def test_called_once_per_successful_enrichment_with_the_normalized_header(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        snapshots = []
+
+        spent = provider.enrich_candidates(
+            ["AAA"], session=self.SESSION, on_snapshot=snapshots.append
+        )
+
+        assert spent == 1
+        assert len(snapshots) == 1
+        snap = snapshots[0]
+        assert snap.symbol == "AAA"
+        assert snap.platform == "x"
+        assert snap.buzz_score == pytest.approx(87.5)
+        assert snap.sentiment_score == pytest.approx(0.42)
+        assert snap.bullish_pct == pytest.approx(68.0)
+        assert snap.bearish_pct == pytest.approx(32.0)
+        assert snap.mentions == 950
+        assert snap.trend == "rising"
+        assert snap.company_name == "NVIDIA Corp"
+        # The per-ticker detail response carries no trend_history field
+        # (that's a trending/market-sentiment shape) -- honestly empty.
+        assert snap.trend_history == []
+
+    def test_not_called_for_a_refused_symbol(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/ZZZZ": _fixture("stock_detail_not_found")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        snapshots = []
+
+        provider.enrich_candidates(["ZZZZ"], session=self.SESSION, on_snapshot=snapshots.append)
+
+        assert snapshots == []
+
+    def test_callback_exception_does_not_abort_enrichment(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+
+        def _boom(_snapshot) -> None:
+            raise RuntimeError("storage boom")
+
+        spent = provider.enrich_candidates(["AAA"], session=self.SESSION, on_snapshot=_boom)
+        assert spent == 1  # the cache write still counted
+        assert provider._detail_cache_path("AAA", self.SESSION).exists()
+
+    def test_polymarket_engagement_uses_total_liquidity(self, monkeypatch, tmp_path) -> None:
+        from claudetrade.providers.social.adanos import _snapshot_from_detail
+
+        client = _client({"proxy-polymarket/stock/TSLA": _fixture("polymarket_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        envelope = provider.fetch_stock_detail("TSLA", platform="polymarket")
+        snap = _snapshot_from_detail("TSLA", "polymarket", envelope)
+        assert snap.mentions == 1200  # trade_count
+        assert snap.engagement == pytest.approx(250000.5)  # total_liquidity
+
+    def test_news_engagement_uses_source_count(self, monkeypatch, tmp_path) -> None:
+        from claudetrade.providers.social.adanos import _snapshot_from_detail
+
+        client = _client({"proxy-news/stock/NVDA": _fixture("news_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        envelope = provider.fetch_stock_detail("NVDA", platform="news")
+        snap = _snapshot_from_detail("NVDA", "news", envelope)
+        assert snap.engagement == pytest.approx(12.0)  # source_count
 
 
 class TestConfigValidators:
@@ -1702,6 +2025,33 @@ class TestConfigValidators:
             _config(enrich_top_candidates=-1)
         _config(enrich_top_candidates=0)
         _config(enrich_top_candidates=10)
+
+    def test_enrich_scope_must_be_a_known_value(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            _config(enrich_scope="bogus")
+        _config(enrich_scope="all")
+        _config(enrich_scope="top_n")
+        _config(enrich_scope="off")
+
+    def test_enrich_max_symbols_per_scan_must_be_within_1_and_200(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            _config(enrich_max_symbols_per_scan=0)
+        with pytest.raises(ValidationError):
+            _config(enrich_max_symbols_per_scan=201)
+        _config(enrich_max_symbols_per_scan=1)
+        _config(enrich_max_symbols_per_scan=200)
+
+    def test_enrich_delay_seconds_must_be_non_negative(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            _config(enrich_delay_seconds=-0.1)
+        _config(enrich_delay_seconds=0.0)
+        _config(enrich_delay_seconds=30.0)
 
     def test_detail_platform_default_must_be_a_known_platform(self) -> None:
         from pydantic import ValidationError

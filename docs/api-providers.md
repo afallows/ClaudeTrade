@@ -1972,7 +1972,10 @@ api_key_credential = "adanos_api_key"
 monthly_budget = 250
 monthly_reserve = 15
 detail_platform_default = "x"      # platform on-demand detail/explain/enrichment use by default
-enrich_top_candidates = 3          # 0 disables post-scan enrichment
+enrich_scope = "all"               # "all" | "top_n" | "off" -- see the subsection below
+enrich_top_candidates = 3          # only used when enrich_scope = "top_n"
+enrich_max_symbols_per_scan = 60   # safety valve for enrich_scope = "all"
+enrich_delay_seconds = 1.0         # courtesy pause between actual network calls (0 for tests)
 enrich_enabled = true
 ```
 
@@ -2035,43 +2038,77 @@ enforces all three:
    time; in ordinary operation (site proxy healthy) that counter simply
    never moves for on-demand calls.
 
-**The one automatic consumer of this ladder: bounded top-candidate
-enrichment.** After a scan completes, if `enrich_enabled` is true (no key
-required), the pipeline fetches ONE `fetch_stock_detail` call (on
-`detail_platform_default`) for each of the session's top
-`enrich_top_candidates` distinct, best-scoring symbols
-(`pipeline.Pipeline._enrich_adanos_top_candidates` ->
-`AdanosProvider.enrich_top_candidates`), inheriting the same site-first
-ladder. Results are cached to `cache_dir/adanos/detail/{symbol}-{session}.json`
--- a re-scan of the same session, or a later `get_adanos_detail` call for
-the same symbol, is served from that cache and spends nothing. Enrichment is
-wrapped end to end and can never fail a scan: a per-symbol failure (either
-rung failed, or a genuine vendor "no") is logged at INFO and skipped; there
-is no more "stop early once the budget guard refuses" special case, since
-most symbols now succeed for free regardless of the official budget's state
--- each symbol is judged independently.
+**The one automatic consumer of this ladder: bounded post-scan
+enrichment.** After a scan completes, if `enrich_enabled` is true and
+`enrich_scope != "off"` (no key required either way), the pipeline fetches
+ONE `fetch_stock_detail` call (on `detail_platform_default`) for each
+candidate symbol, breadth governed by `enrich_scope`
+(`pipeline.Pipeline._enrich_adanos_candidates` ->
+`AdanosProvider.enrich_candidates`), inheriting the same site-first ladder:
+
+* `enrich_scope = "all"` (default) -- every distinct signal symbol from the
+  scan, ordered best-scoring first, capped by `enrich_max_symbols_per_scan`
+  (symbols beyond the cap are logged by name, never silently dropped).
+* `enrich_scope = "top_n"` -- only the top `enrich_top_candidates` distinct,
+  best-scoring symbols (the pre-generalisation behaviour).
+
+`enrich_delay_seconds` is slept between successive *actual* network calls
+only -- never before the first call, and never for a same-session cache hit
+or a memoised-unsupported skip (see below). Results are cached to
+`cache_dir/adanos/detail/{symbol}-{session}.json` -- a re-scan of the same
+session, or a later `get_adanos_detail` call for the same symbol, is served
+from that cache and spends nothing. Enrichment is wrapped end to end and can
+never fail a scan: a per-symbol failure (either rung failed, or a genuine
+vendor "no") is logged at INFO and skipped; there is no "stop early once the
+budget guard refuses" special case, since most symbols now succeed for free
+regardless of the official budget's state -- each symbol is judged
+independently.
+
+**Unsupported-ticker memo.** A ticker the vendor definitively refuses as
+unsupported (`{"detail": {"error_code": "unsupported_ticker", ...}}` --
+never the quieter `{"found": false}` "tracked but no data right now"
+answer, which can flip hourly and is deliberately not memoised) is recorded
+in `cache_dir/adanos/unsupported.json` with a 30-*trading*-day re-probe
+horizon, so a scan does not re-ask the vendor about the same unsupported
+symbol every single day; the vendor occasionally gains coverage, so the memo
+expires rather than being permanent.
+
+**Feeding the Screener.** Each successfully enriched symbol also produces an
+`AdanosSnapshotRow` -- the SAME `(session, platform, symbol)` upsert path
+`ingest_adanos` uses for trending, not a second storage contract -- via
+`pipeline.Pipeline._store_adanos_enrichment_snapshot`. This is what lets the
+Screener's Buzz/Mentions/Sentiment/Trend columns
+(`webapi.attention.latest_attention`) fill in for a symbol outside the
+top-100 trending feeds; `trend_history` is stored empty when the per-ticker
+detail response does not carry one (it's a trending/market-sentiment field,
+not a per-ticker detail one), never fabricated.
 
 **Budget arithmetic, revised.** Because ordinary enrichment (site proxy
-healthy) spends zero official-API quota, `monthly_budget - monthly_reserve`
-(235 at the defaults: `monthly_budget = 250`, `monthly_reserve = 15`) is no
-longer split between automatic enrichment and interactive headroom -- it is
-now effectively THE WHOLE interactive/fallback headroom available for the
-month, there to absorb `get_adanos_detail`/`get_adanos_explain`/
-`get_adanos_market_sentiment` calls whenever the site proxy is down,
-rate-limited, or changes shape, plus any explicit `prefer_official_api =
-true` usage. Raise/lower `enrich_top_candidates` (0-10) still trades
-automatic coverage against that reserve in the degraded case where the site
-proxy is unavailable; set `enrich_enabled = false` to disable automatic
+healthy) spends zero official-API quota regardless of `enrich_scope`,
+`monthly_budget - monthly_reserve` (235 at the defaults: `monthly_budget =
+250`, `monthly_reserve = 15`) is no longer split between automatic
+enrichment and interactive headroom -- it is now effectively THE WHOLE
+interactive/fallback headroom available for the month, there to absorb
+`get_adanos_detail`/`get_adanos_explain`/`get_adanos_market_sentiment` calls
+whenever the site proxy is down, rate-limited, or changes shape, plus any
+explicit `prefer_official_api = true` usage. `enrich_max_symbols_per_scan`
+(in `"all"` scope) or `enrich_top_candidates` (0-10, in `"top_n"` scope)
+still trade automatic coverage against that reserve in the degraded case
+where the site proxy is unavailable; set `enrich_enabled = false` (or
+`enrich_scope = "off"`) to disable automatic
 enrichment entirely if even the free site-mode traffic is unwanted.
 
 **Surfacing**: not currently wired into `get_trending`'s `source` option --
 that function's query is built directly against `symbol_sentiment_daily`'s
 columns (`post_count`, `bull_bear_ratio`), which `adanos_snapshots`'
 per-platform shape does not share. Adanos data is visible today through
-`claudetrade probe`, provider status, and direct queries against
-`adanos_snapshots`; ranking it alongside ApeWisdom/local mentions in
-`get_trending` (and any deeper fusion into scoring) is a later, deliberate
-change, not a side effect of adding the provider.
+`claudetrade probe`, provider status, direct queries against
+`adanos_snapshots`, and -- since post-scan enrichment also writes
+`adanos_snapshots` rows (see "Feeding the Screener" above) -- the Screener
+grid's Buzz/Mentions/Sentiment/Trend columns (`webapi.attention`) for any
+enriched symbol, trending or not. Ranking Adanos alongside ApeWisdom/local
+mentions in `get_trending` itself (and any deeper fusion into scoring) is a
+later, deliberate change, not a side effect of adding the provider.
 
 ### News RSS/Atom (Default, Live, No Credentials)
 

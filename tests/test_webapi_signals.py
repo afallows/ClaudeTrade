@@ -345,6 +345,48 @@ def test_list_signals_attention_issues_one_batched_query_not_one_per_row(
     assert len(selects) == 1, f"expected one SELECT, got {len(selects)}"
 
 
+def test_list_signals_attention_picks_up_a_snapshot_stored_via_adanos_enrichment(
+    client: TestClient, tmp_app_config: AppConfig, tmp_db: Database, make_signal
+):
+    """The Screener's attention column must fill in for a symbol Adanos
+    enrichment reached even when that symbol never appeared in a top-100
+    trending feed -- see ``pipeline.Pipeline._store_adanos_enrichment_snapshot``
+    (called from ``AdanosProvider.enrich_candidates``'s ``on_snapshot``
+    callback), which reuses this exact same ``adanos_snapshots`` storage
+    contract rather than a second one. Written through the real pipeline
+    method (not the ``_add_snapshot`` test helper other attention tests use
+    above) to prove that code path, specifically, produces a row the API
+    surfaces."""
+    from claudetrade.domain import AdanosSnapshot
+
+    sig = make_signal(symbol="OUTSIDER", overall_score=50.0, session=dt.date(2026, 8, 1))
+    _record(tmp_db, sig)
+
+    pipeline = Pipeline(tmp_app_config, tmp_db)
+    pipeline._store_adanos_enrichment_snapshot(
+        AdanosSnapshot(
+            symbol="OUTSIDER",
+            platform="x",
+            buzz_score=33.0,
+            mentions=7,
+            trend="rising",
+            sentiment_score=0.1,
+            bullish_pct=55.0,
+            bearish_pct=45.0,
+        ),
+        dt.date(2026, 8, 1),
+    )
+
+    resp = client.get("/api/signals")
+    row = next(r for r in resp.json()["signals"] if r["symbol"] == "OUTSIDER")
+    attention = row["attention"]
+    assert attention is not None
+    assert attention["platforms"] == ["x"]
+    assert attention["total_mentions"] == 7
+    assert attention["buzz_score"] == pytest.approx(33.0)
+    assert attention["trend"] == "rising"
+
+
 # --- GET /api/signals: distinct (read-time de-duplication) ------------------
 
 

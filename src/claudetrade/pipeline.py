@@ -36,6 +36,7 @@ from claudetrade.db.migrations import init_database
 from claudetrade.db.models import SymbolSentimentDaily
 from claudetrade.db.session import Database
 from claudetrade.domain import (
+    AdanosSnapshot,
     Bar,
     MarketRegime,
     RegimeState,
@@ -761,27 +762,35 @@ class Pipeline:
             # a stale idea cannot be resurrected at a convenient price later.
             self.ledger.expire_stale(session)
 
-            # Bounded, budget-guarded Adanos top-candidate enrichment (see
-            # AdanosConfig.enrich_top_candidates/enrich_enabled and
-            # providers.social.adanos.AdanosProvider.enrich_top_candidates
+            # Bounded, best-effort Adanos enrichment (see
+            # AdanosConfig.enrich_scope/enrich_top_candidates/
+            # enrich_max_symbols_per_scan/enrich_delay_seconds/enrich_enabled
+            # and providers.social.adanos.AdanosProvider.enrich_candidates
             # for the mechanics). Gated on `record` -- a preview/dry-run scan
             # (`claudetrade scan --no-record`) must not spend the official-
             # API quota for candidates that are never even written down.
             if scan_result.signals:
-                self._enrich_adanos_top_candidates(scan_result, session)
+                self._enrich_adanos_candidates(scan_result, session)
 
         result.finished_at = utc_now()
         log.info("scan complete for %s: %s", session, result.summary())
         return result
 
-    def _enrich_adanos_top_candidates(self, scan_result: ScanResult, session: dt.date) -> None:
-        """Fund one bounded, budget-guarded Adanos detail call per top-scoring
-        candidate from this scan, if Adanos is configured and an
-        ``adanos_api_key`` credential resolves.
+    def _enrich_adanos_candidates(self, scan_result: ScanResult, session: dt.date) -> None:
+        """Fund bounded, best-effort Adanos detail calls for this scan's
+        signal symbols (breadth governed by ``AdanosConfig.enrich_scope`` --
+        every distinct symbol by default, or only the top-scoring N in
+        ``"top_n"`` scope), if Adanos is configured.
+
+        Hands the provider every distinct signal symbol, best-scoring first
+        -- the provider itself applies ``enrich_scope``'s breadth/cap, not
+        this method (see ``AdanosProvider.enrich_candidates``'s docstring for
+        why: the cap/log-what's-dropped policy is a provider-config concern,
+        not something this wiring method should duplicate).
 
         Best-effort and NEVER allowed to fail a scan: everything here is
         wrapped, and any exception is logged rather than raised, even though
-        ``AdanosProvider.enrich_top_candidates`` already documents itself as
+        ``AdanosProvider.enrich_candidates`` already documents itself as
         never raising -- belt and suspenders, since a scan succeeding is far
         more important than one more research artifact landing.
         """
@@ -796,10 +805,73 @@ class Pipeline:
                     continue
                 seen.add(signal.symbol)
                 ordered_symbols.append(signal.symbol)
-            provider.enrich_top_candidates(ordered_symbols, session=session)
+            provider.enrich_candidates(
+                ordered_symbols,
+                session=session,
+                on_snapshot=lambda snapshot: self._store_adanos_enrichment_snapshot(
+                    snapshot, session
+                ),
+            )
         except Exception:
             log.warning(
-                "adanos top-candidate enrichment raised unexpectedly; scan is unaffected",
+                "adanos enrichment raised unexpectedly; scan is unaffected",
+                exc_info=True,
+            )
+
+    def _store_adanos_enrichment_snapshot(self, snapshot: AdanosSnapshot, session: dt.date) -> None:
+        """Persist one enrichment-derived Adanos reading into
+        ``db.models.AdanosSnapshotRow`` -- the SAME table, and the SAME
+        ``(session, platform, symbol)`` upsert/dedupe key, that
+        ``data.ingest.DataIngestor.ingest_adanos`` already uses for trending
+        rows (see that method's docstring). Deliberately not a second
+        storage contract: a symbol that later appears in both trending and
+        enrichment on the same session simply has its row updated, matching
+        ``ingest_adanos``'s own re-ingest-updates-not-duplicates posture.
+
+        This is what makes ``webapi.attention.latest_attention`` (the
+        Screener grid's Buzz/Mentions/Sentiment/Trend columns) pick up a
+        symbol enriched by ``AdanosProvider.enrich_candidates`` even when
+        that symbol never appeared in the top-100 trending feeds.
+
+        No ``securities`` membership check (unlike ``ingest_adanos``): every
+        symbol reaching this callback came from a signal this scan already
+        generated for a tracked security, so the guard ``ingest_adanos``
+        needs for vendor-supplied trending tickers is redundant here.
+
+        Best-effort: any failure (DB error, disk) is logged and swallowed --
+        ``AdanosProvider.enrich_candidates`` already catches whatever this
+        raises, but this also guards itself so a caller invoking it directly
+        gets the same never-fails guarantee.
+        """
+        from claudetrade.db.models import AdanosSnapshotRow
+
+        try:
+            with self.db.session() as db_session:
+                existing = (
+                    db_session.query(AdanosSnapshotRow)
+                    .filter_by(symbol=snapshot.symbol, session=session, platform=snapshot.platform)
+                    .one_or_none()
+                )
+                row = existing or AdanosSnapshotRow(
+                    symbol=snapshot.symbol, session=session, platform=snapshot.platform
+                )
+                row.company_name = snapshot.company_name
+                row.buzz_score = snapshot.buzz_score
+                row.mentions = snapshot.mentions
+                row.trend = snapshot.trend
+                row.sentiment_score = snapshot.sentiment_score
+                row.bullish_pct = snapshot.bullish_pct
+                row.bearish_pct = snapshot.bearish_pct
+                row.engagement = snapshot.engagement
+                row.trend_history = list(snapshot.trend_history)
+                row.fetched_at = utc_now()
+                if existing is None:
+                    db_session.add(row)
+        except Exception:
+            log.warning(
+                "adanos enrichment: failed to store snapshot for %s; enrichment cache entry "
+                "was still written",
+                snapshot.symbol,
                 exc_info=True,
             )
 

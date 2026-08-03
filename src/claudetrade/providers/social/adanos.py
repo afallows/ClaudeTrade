@@ -181,10 +181,24 @@ calls either.** The free tier's ~250 requests/month is now purely a
 fallback/durability reserve for when the site proxy is down or rate-limited,
 not the primary path -- see ``docs/api-providers.md``'s "Hybrid mode /
 spending the free tier" for the revised budget arithmetic. See
-``config.AdanosConfig.enrich_top_candidates`` / ``enrich_enabled`` for the
-one automatic consumer of this ladder (bounded top-candidate enrichment
-after a scan, wired in ``pipeline.Pipeline._enrich_adanos_top_candidates`` --
-this, too, now runs keylessly via the site rung by default) and
+``config.AdanosConfig.enrich_scope`` / ``enrich_top_candidates`` /
+``enrich_max_symbols_per_scan`` / ``enrich_delay_seconds`` / ``enrich_enabled``
+for the one automatic consumer of this ladder --
+:meth:`AdanosProvider.enrich_candidates`, wired in
+``pipeline.Pipeline._enrich_adanos_candidates`` after every scan. Default
+scope (``"all"``) enriches every distinct signal symbol, best-scoring first,
+capped by ``enrich_max_symbols_per_scan`` and paced by
+``enrich_delay_seconds`` between actual network calls; ``"top_n"`` restores
+the previous top-N-only behaviour. A symbol the vendor definitively refuses
+as unsupported (``error_code: "unsupported_ticker"``, never the quieter
+``{"found": false}``) is memoised for a 30-trading-day re-probe horizon (see
+``_UnsupportedTickerStore``) so a scan never re-asks about it every day.
+This, too, now runs keylessly via the site rung by default, and each
+successful enrichment also feeds ``db.models.AdanosSnapshotRow`` (via the
+``on_snapshot`` callback the pipeline supplies), reusing the exact same
+``(session, platform, symbol)`` upsert path ``data.ingest.DataIngestor
+.ingest_adanos`` uses for trending -- so a symbol outside the top-100
+trending feeds still shows up in the Screener's attention columns. See
 :meth:`AdanosProvider.budget_status` for the read-only, free status surfaced
 by ``mcp_server.get_adanos_budget``.
 
@@ -207,10 +221,12 @@ is preferred whenever one is configured.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -229,7 +245,7 @@ from claudetrade.providers.base import (
 )
 from claudetrade.secrets import get_secret
 from claudetrade.utils.text import sanitize_social_text
-from claudetrade.utils.timeutils import utc_now
+from claudetrade.utils.timeutils import next_trading_day, utc_now
 
 log = logging.getLogger(__name__)
 
@@ -476,6 +492,74 @@ class _MonthlyBudgetStore:
             return used
 
 
+class _UnsupportedTickerStore:
+    """Persists symbols the vendor has told us, DEFINITIVELY, it does not
+    track at all -- an ``unsupported_ticker`` refusal (see
+    ``_structured_answer_reason``), never the quieter ``{"found": false}``
+    "tracked but no data right now" answer, which can flip hourly and is
+    deliberately NOT memoised here (see ``AdanosProvider.enrich_candidates``).
+
+    Same persistence posture as ``_MonthlyBudgetStore`` immediately above: one
+    small JSON file under ``cache_dir/adanos/unsupported.json``, falling back
+    to an in-process dict when no ``cache_dir`` is configured. Exists purely
+    so post-scan enrichment never re-asks about the same unsupported symbol
+    every day -- reading/writing it is cheap and local, never a network call.
+
+    Each memoised symbol carries a re-probe horizon of 30 TRADING days (not
+    calendar days, via ``utils.timeutils.next_trading_day`` -- vendors
+    occasionally gain coverage for a previously-unsupported ticker, so the
+    memo is a durable skip, not a permanent one.
+    """
+
+    def __init__(self, path: Path | None):
+        self._path = path
+        self._lock = threading.Lock()
+        self._mem_state: dict[str, str] = {}
+
+    def _load(self) -> dict[str, str]:
+        if self._path is None:
+            return dict(self._mem_state)
+        if not self._path.exists():
+            return {}
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save(self, state: dict[str, str]) -> None:
+        if self._path is None:
+            self._mem_state = dict(state)
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(state), encoding="utf-8")
+        except OSError:
+            log.debug("failed to persist adanos unsupported-ticker memo", exc_info=True)
+
+    def is_memoized(self, symbol: str, *, today: dt.date) -> bool:
+        """``True`` when ``symbol`` was memoised as unsupported and the
+        30-trading-day re-probe horizon has not elapsed as of ``today`` --
+        callers should skip the network call entirely in that case."""
+        state = self._load()
+        expiry = state.get(symbol)
+        if expiry is None:
+            return False
+        try:
+            expiry_date = dt.date.fromisoformat(expiry)
+        except ValueError:
+            return False
+        return today < expiry_date
+
+    def memoize(self, symbol: str, *, today: dt.date) -> None:
+        """Record ``symbol`` as unsupported as of ``today``, re-probable
+        after the 30-trading-day horizon."""
+        with self._lock:
+            state = self._load()
+            state[symbol] = next_trading_day(today, skip=30).isoformat()
+            self._save(state)
+
+
 class AdanosProvider:
     """Reads pre-aggregated per-ticker buzz/sentiment from Adanos."""
 
@@ -506,14 +590,22 @@ class AdanosProvider:
         self._api_key = self._resolve_api_key()
         self.mode = "official" if (config.prefer_official_api and self._api_key) else "site"
         #: Root for this installation's on-disk caches (budget state below,
-        #: and the top-candidate detail-enrichment cache under
-        #: ``adanos/detail/`` -- see ``enrich_top_candidates``). ``None``
-        #: only in tests that construct a provider with no ``cache_dir``.
+        #: the candidate detail-enrichment cache under ``adanos/detail/``,
+        #: and the unsupported-ticker memo below -- see
+        #: ``enrich_candidates``). ``None`` only in tests that construct a
+        #: provider with no ``cache_dir``.
         self._cache_dir = Path(cache_dir) if cache_dir else None
         budget_path = (
             (self._cache_dir / "adanos" / "monthly_budget.json") if self._cache_dir else None
         )
         self._budget = _MonthlyBudgetStore(budget_path)
+        unsupported_path = (
+            (self._cache_dir / "adanos" / "unsupported.json") if self._cache_dir else None
+        )
+        #: See ``_UnsupportedTickerStore`` -- consulted/updated only by
+        #: ``enrich_candidates``, never by ``fetch_stock_detail`` itself (an
+        #: interactive/on-demand caller always gets a live answer).
+        self._unsupported = _UnsupportedTickerStore(unsupported_path)
         self._lock = threading.Lock()
         self._calls = 0
         self._last_error: str | None = None
@@ -818,16 +910,24 @@ class AdanosProvider:
         *,
         mode: str | None = None,
         quota_spent: bool = False,
+        unsupported_ticker: bool = False,
     ) -> dict[str, Any]:
         """The structured, ``accepted: false`` envelope every on-demand
         refusal shares -- preflight (unsupported platform), both-rungs-failed
         (see ``_ladder_refusal``), and unknown-ticker (``_unknown_ticker_
         refusal``) alike -- so a caller (an MCP client, or
-        ``enrich_top_candidates`` below) can branch on ``accepted`` without a
+        ``enrich_candidates`` below) can branch on ``accepted`` without a
         try/except and always finds ``mode``/``quota_spent``/``budget`` keys
         present regardless of which refusal shape it got. ``mode``/
         ``quota_spent`` stay at their defaults (``None``/``False``) for a
-        preflight refusal, since no rung was ever attempted."""
+        preflight refusal, since no rung was ever attempted.
+
+        ``unsupported_ticker`` is ``True`` only for the specific vendor "no"
+        naming an ``unsupported_ticker`` error code (see
+        ``_structured_answer_reason``) -- the one refusal shape
+        ``enrich_candidates`` memoises via ``_UnsupportedTickerStore``,
+        distinct from every other refusal (including the quieter
+        ``{"found": false}`` answer), which is never memoised."""
         return {
             "accepted": False,
             "symbol": symbol,
@@ -835,6 +935,7 @@ class AdanosProvider:
             "reason": reason,
             "mode": mode,
             "quota_spent": quota_spent,
+            "unsupported_ticker": unsupported_ticker,
             "budget": self.budget_status(),
         }
 
@@ -933,38 +1034,56 @@ class AdanosProvider:
 
     def _structured_answer_reason(
         self, data: dict[str, Any], symbol: str, platform: str
-    ) -> str | None:
-        """``None`` when ``data`` is real data; otherwise the human-readable
-        refusal reason for whichever structured "no" it is (see
+    ) -> tuple[str, bool] | None:
+        """``None`` when ``data`` is real data; otherwise ``(reason,
+        unsupported)`` for whichever structured "no" it is (see
         ``_is_structured_vendor_answer``) -- distinguishing "unsupported
         ticker" (the vendor does not track this symbol at all, observed as
-        ``{"detail": {"error_code": "unsupported_ticker", ...}}``) from
-        "found: false" (a tracked ticker with no data in the requested
-        window), since those are different situations worth reporting
-        differently even though both stop the ladder the same way."""
+        ``{"detail": {"error_code": "unsupported_ticker", ...}}``,
+        ``unsupported`` ``True``) from "found: false" (a tracked ticker with
+        no data in the requested window, ``unsupported`` ``False``), since
+        those are different situations worth reporting differently -- and,
+        for ``enrich_candidates``, worth treating differently for memoisation
+        purposes -- even though both stop the ladder the same way."""
         detail = data.get("detail")
         if isinstance(detail, dict) and detail.get("error_code") == "unsupported_ticker":
             message = (
                 detail.get("message") or f"{symbol} is not a ticker adanos tracks on {platform}"
             )
-            return f"adanos: unsupported ticker -- {message}"
+            return f"adanos: unsupported ticker -- {message}", True
         if data.get("found") is False:
             return (
-                f"adanos has no {platform} data for {symbol} in the requested window (found: false)"
+                f"adanos has no {platform} data for {symbol} in the requested window (found: false)",
+                False,
             )
         return None
 
     def _vendor_answer_refusal(
-        self, symbol: str, platform: str, reason: str, *, mode: str, quota_spent: bool
+        self,
+        symbol: str,
+        platform: str,
+        reason: str,
+        *,
+        mode: str,
+        quota_spent: bool,
+        unsupported: bool = False,
     ) -> dict[str, Any]:
         """The vendor gave a definitive, structured "no" rather than failing
         -- either ``{"found": false}`` (a ticker it tracks, no data in the
         requested window) or a ``{"detail": {"error_code":
         "unsupported_ticker", ...}}`` body (a ticker it does not track at
-        all) -- see ``_is_structured_vendor_answer``/the module docstring.
-        Either way this is a normal result, not an exception, and NOT a
-        reason to try the other rung: the vendor has already answered."""
-        return self._refusal(symbol, platform, reason, mode=mode, quota_spent=quota_spent)
+        all, ``unsupported=True``) -- see ``_is_structured_vendor_answer``/
+        the module docstring. Either way this is a normal result, not an
+        exception, and NOT a reason to try the other rung: the vendor has
+        already answered."""
+        return self._refusal(
+            symbol,
+            platform,
+            reason,
+            mode=mode,
+            quota_spent=quota_spent,
+            unsupported_ticker=unsupported,
+        )
 
     def _site_get(self, url: str, *, platform: str, kind: str) -> Any:
         """One keyless site-proxy on-demand request (stock detail / explain
@@ -1069,13 +1188,12 @@ class AdanosProvider:
     def cached_detail(
         self, symbol: str, session: dt.date, *, platform: str | None = None
     ) -> dict[str, Any] | None:
-        """A same-session top-candidate enrichment cache entry for
-        ``symbol``, or ``None`` when absent, unreadable, or written for a
-        different platform than requested. Reading this NEVER spends quota
-        -- it is what lets ``mcp_server.get_adanos_detail`` answer "cached
-        from enrichment, no quota spent" for a symbol ``Pipeline.scan``
-        already enriched this session (see ``enrich_top_candidates``
-        below)."""
+        """A same-session enrichment cache entry for ``symbol``, or ``None``
+        when absent, unreadable, or written for a different platform than
+        requested. Reading this NEVER spends quota -- it is what lets
+        ``mcp_server.get_adanos_detail`` answer "cached from enrichment, no
+        quota spent" for a symbol ``Pipeline.scan`` already enriched this
+        session (see ``enrich_candidates`` below)."""
         path = self._detail_cache_path(symbol.strip().upper(), session)
         if path is None or not path.exists():
             return None
@@ -1385,10 +1503,11 @@ class AdanosProvider:
         if mode is None:
             return self._ladder_refusal(symbol, platform, failures, quota_spent=quota_spent)
         data = payload if isinstance(payload, dict) else {}
-        reason = self._structured_answer_reason(data, symbol, platform)
-        if reason is not None:
+        answer = self._structured_answer_reason(data, symbol, platform)
+        if answer is not None:
+            reason, unsupported = answer
             return self._vendor_answer_refusal(
-                symbol, platform, reason, mode=mode, quota_spent=quota_spent
+                symbol, platform, reason, mode=mode, quota_spent=quota_spent, unsupported=unsupported
             )
         return self._detail_success_envelope(
             symbol, platform, data, mode=mode, quota_spent=quota_spent
@@ -1422,10 +1541,11 @@ class AdanosProvider:
         if mode is None:
             return self._ladder_refusal(symbol, platform, failures, quota_spent=quota_spent)
         data = payload if isinstance(payload, dict) else {}
-        reason = self._structured_answer_reason(data, symbol, platform)
-        if reason is not None:
+        answer = self._structured_answer_reason(data, symbol, platform)
+        if answer is not None:
+            reason, unsupported = answer
             return self._vendor_answer_refusal(
-                symbol, platform, reason, mode=mode, quota_spent=quota_spent
+                symbol, platform, reason, mode=mode, quota_spent=quota_spent, unsupported=unsupported
             )
         return self._explain_success_envelope(
             symbol, platform, data, mode=mode, quota_spent=quota_spent
@@ -1474,13 +1594,39 @@ class AdanosProvider:
             platform, data, mode=mode, quota_spent=quota_spent
         )
 
-    def enrich_top_candidates(self, symbols: list[str], *, session: dt.date) -> int:
-        """Bounded, best-effort post-scan enrichment: up to
-        ``config.enrich_top_candidates`` of ``symbols`` (already ordered
-        best-first and de-duplicated by the caller -- see
-        ``pipeline.Pipeline._enrich_adanos_top_candidates``), ONE
-        ``fetch_stock_detail`` call each on ``config.detail_platform_default``,
-        cached to ``cache_dir/adanos/detail/{symbol}-{session}.json``.
+    def enrich_candidates(
+        self,
+        symbols: list[str],
+        *,
+        session: dt.date,
+        on_snapshot: Callable[[AdanosSnapshot], None] | None = None,
+    ) -> int:
+        """Bounded, best-effort post-scan enrichment: one ``fetch_stock_detail``
+        call each (on ``config.detail_platform_default``) for a breadth of
+        ``symbols`` (already ordered best-first and de-duplicated by the
+        caller -- see ``pipeline.Pipeline._enrich_adanos_candidates``)
+        governed by ``config.enrich_scope``:
+
+        * ``"all"`` (default) -- every distinct symbol, capped by
+          ``config.enrich_max_symbols_per_scan``. Symbols beyond the cap are
+          logged by name (INFO), never silently dropped.
+        * ``"top_n"`` -- only the first ``config.enrich_top_candidates``
+          symbols (the previous, pre-generalisation behaviour).
+        * ``"off"`` -- no-op, same as ``config.enrich_enabled = False``.
+
+        Each attempted symbol's result is cached to
+        ``cache_dir/adanos/detail/{symbol}-{session}.json``; a symbol already
+        cached for this session is skipped (INFO log, not an error, no
+        network call) -- the whole point of the cache is that a re-scan of
+        the same session, or a later ``AdanosProvider.cached_detail``/
+        ``mcp_server.get_adanos_detail`` call for the same symbol, must not
+        re-fetch it. A symbol memoised as vendor-unsupported (see
+        ``_UnsupportedTickerStore``) within its 30-trading-day re-probe
+        horizon is skipped the same way, also with no network call.
+
+        ``config.enrich_delay_seconds`` is slept BETWEEN successive actual
+        network attempts only -- never before the first attempt, and never
+        for a cache/memo hit (which makes no network call at all).
 
         Effective whenever ``config.enrich_enabled`` -- unlike before the
         site-first ladder existed, this no longer requires
@@ -1488,18 +1634,32 @@ class AdanosProvider:
         keylessly via the site rung by default, so ordinary enrichment spends
         ZERO official-API quota (see the module docstring's Hybrid mode
         section). A resolved key only matters as a per-symbol fallback when
-        that symbol's site lookup fails. Skips (INFO log, not an error) a
-        symbol already cached for this session -- the whole point of the
-        cache is that a re-scan of the same session, or a later
-        ``AdanosProvider.cached_detail``/``mcp_server.get_adanos_detail``
-        call for the same symbol, must not re-fetch it.
+        that symbol's site lookup fails.
 
         Each symbol's ``fetch_stock_detail`` result is judged independently:
-        there is no more "stop early once the budget guard refuses" special
-        case (that assumed every call spent the shared official budget,
-        which is no longer true in site mode) -- a refusal for one symbol
-        (every rung failed, or a genuine ``{"found": false}``) is simply
-        skipped, same as any other per-symbol failure, and the loop moves on.
+        there is no "stop early once the budget guard refuses" special case
+        (that assumed every call spent the shared official budget, which is
+        no longer true in site mode) -- a refusal for one symbol (every rung
+        failed, or a genuine vendor "no") is simply skipped, same as any
+        other per-symbol failure, and the loop moves on. A definitive
+        ``unsupported_ticker`` refusal is additionally memoised so future
+        scans skip it without a network call until the re-probe horizon;
+        the quieter ``{"found": false}`` "tracked but no data right now"
+        refusal is deliberately NOT memoised (it can change hourly).
+
+        ``on_snapshot``, when given, is called once per SUCCESSFUL
+        enrichment with an ``AdanosSnapshot`` built from that symbol's
+        detail header (buzz/sentiment/bullish/bearish/mentions, plus
+        whatever ``trend``/platform-engagement field the detail payload
+        carries -- ``trend_history`` is honestly empty when the detail
+        response does not include one, never fabricated). This is how
+        ``pipeline.Pipeline`` feeds ``db.models.AdanosSnapshotRow`` for a
+        symbol outside the top-100 trending feeds, reusing the exact same
+        ``(session, platform, symbol)`` storage contract
+        ``data.ingest.DataIngestor.ingest_adanos`` writes for trending (see
+        ``pipeline.Pipeline._store_adanos_enrichment_snapshot``). Any
+        exception the callback raises is caught and logged here -- a
+        secondary storage failure must never abort enrichment or a scan.
 
         **Never raises.** A scan must never fail because enrichment
         degraded; any per-symbol failure (network, vendor error, disk) is
@@ -1512,15 +1672,26 @@ class AdanosProvider:
         if self._cache_dir is None:
             log.info("adanos enrichment skipped: no cache_dir configured")
             return 0
-        if not self.config.enrich_enabled or self.config.enrich_top_candidates <= 0:
+        if not self.config.enrich_enabled or self.config.enrich_scope == "off":
+            return 0
+        if self.config.enrich_scope == "top_n" and self.config.enrich_top_candidates <= 0:
             return 0
 
+        candidates = self._enrichment_candidates(symbols)
         platform = self.config.detail_platform_default
         spent = 0
+        attempted = 0
         try:
-            for raw_symbol in symbols[: self.config.enrich_top_candidates]:
+            for raw_symbol in candidates:
                 symbol = raw_symbol.strip().upper()
                 if not symbol:
+                    continue
+                if self._unsupported.is_memoized(symbol, today=session):
+                    log.info(
+                        "adanos enrichment: %s memoised as unsupported (re-probe horizon not "
+                        "yet reached); skipping",
+                        symbol,
+                    )
                     continue
                 path = self._detail_cache_path(symbol, session)
                 if path is None:
@@ -1532,6 +1703,10 @@ class AdanosProvider:
                         session,
                     )
                     continue
+
+                if attempted > 0 and self.config.enrich_delay_seconds > 0:
+                    time.sleep(self.config.enrich_delay_seconds)
+                attempted += 1
                 try:
                     result = self.fetch_stock_detail(symbol, platform=platform)
                 except Exception as exc:  # pragma: no cover - fetch_stock_detail no longer raises
@@ -1539,6 +1714,8 @@ class AdanosProvider:
                     continue
                 if not result.get("accepted", True):
                     log.info("adanos enrichment: %s refused (%s)", symbol, result.get("reason"))
+                    if result.get("unsupported_ticker"):
+                        self._unsupported.memoize(symbol, today=session)
                     continue
                 result["enriched_at_session"] = session.isoformat()
                 try:
@@ -1551,10 +1728,81 @@ class AdanosProvider:
                         exc_info=True,
                     )
                     continue
+                if on_snapshot is not None:
+                    try:
+                        on_snapshot(_snapshot_from_detail(symbol, platform, result))
+                    except Exception:
+                        log.warning(
+                            "adanos enrichment: on_snapshot callback failed for %s; the cached "
+                            "detail was still written",
+                            symbol,
+                            exc_info=True,
+                        )
                 spent += 1
         except Exception:  # pragma: no cover - defensive, see docstring
             log.warning("adanos enrichment raised unexpectedly; scan is unaffected", exc_info=True)
         return spent
+
+    def _enrichment_candidates(self, symbols: list[str]) -> list[str]:
+        """``symbols`` narrowed to ``config.enrich_scope``'s breadth -- the
+        cap/log-what's-dropped policy for ``"all"`` scope, or the top-N slice
+        for ``"top_n"`` scope. Assumes the caller (``enrich_candidates``) has
+        already ruled out ``"off"``/disabled."""
+        if self.config.enrich_scope == "top_n":
+            return symbols[: self.config.enrich_top_candidates]
+        cap = self.config.enrich_max_symbols_per_scan
+        if len(symbols) > cap:
+            dropped = symbols[cap:]
+            log.info(
+                "adanos enrichment: capped at %d of %d distinct signal symbol(s) this scan; "
+                "dropped %s",
+                cap,
+                len(symbols),
+                ", ".join(dropped),
+            )
+        return symbols[:cap]
+
+
+def _snapshot_from_detail(symbol: str, platform: str, envelope: dict[str, Any]) -> AdanosSnapshot:
+    """Build an ``AdanosSnapshot`` from a successful ``fetch_stock_detail``
+    envelope (``envelope["accepted"] is True``) -- what
+    ``AdanosProvider.enrich_candidates`` hands to its ``on_snapshot``
+    callback so a symbol enriched outside the top-100 trending feeds still
+    feeds ``db.models.AdanosSnapshotRow``/``webapi.attention``.
+
+    Reads the SAME normalized header fields ``_detail_success_envelope``
+    already computed (``buzz_score``/``sentiment_score``/``bullish_pct``/
+    ``bearish_pct``/``mentions``) plus two fields only present under
+    ``raw`` (the vendor's own per-ticker detail payload, already sanitised):
+    ``company_name`` and ``trend``. ``trend_history`` is a 7-point series
+    Adanos's *trending*/*market-sentiment* endpoints carry but the
+    per-ticker ``/stock/{ticker}`` detail response does not (see the module
+    docstring's verified-shape notes) -- stored honestly as an empty list
+    here rather than fabricated from ``daily_trend``, which is a different,
+    differently-shaped series.
+    """
+    raw = envelope.get("raw")
+    raw = raw if isinstance(raw, dict) else {}
+    observed_at = utc_now()
+    fetched_at = envelope.get("fetched_at")
+    if isinstance(fetched_at, str):
+        with contextlib.suppress(ValueError):
+            observed_at = dt.datetime.fromisoformat(fetched_at)
+    engagement_field = _ENGAGEMENT_FIELD.get(platform, "total_upvotes")
+    return AdanosSnapshot(
+        symbol=symbol,
+        platform=platform,
+        company_name=str(raw.get("company_name") or ""),
+        buzz_score=envelope.get("buzz_score") or 0.0,
+        mentions=envelope.get("mentions") or 0,
+        trend=str(raw.get("trend") or ""),
+        sentiment_score=envelope.get("sentiment_score"),
+        bullish_pct=envelope.get("bullish_pct"),
+        bearish_pct=envelope.get("bearish_pct"),
+        engagement=_as_float(raw.get(engagement_field)) or 0.0,
+        trend_history=_as_float_list(raw.get("trend_history")),
+        observed_at=observed_at,
+    )
 
 
 def _extract_rows(payload: Any) -> list | None:
