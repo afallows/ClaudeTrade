@@ -17,6 +17,7 @@ from claudetrade.pipeline import Pipeline
 from claudetrade.signals.research import ResearchLedger
 from claudetrade.signals.scoring import adjusted_overall
 from claudetrade.utils.timeutils import current_trading_session, utc_now
+from claudetrade.webapi.attention import latest_attention
 from claudetrade.webapi.deps import get_config, get_last_scan, get_pipeline, set_last_scan
 from claudetrade.webapi.schemas import (
     NearMissOut,
@@ -63,7 +64,10 @@ def list_signals(
     and ``has_research``, fetched with ONE extra batched query keyed to
     exactly the signal ids on this page (``ResearchLedger
     .latest_research_revisions``) -- never a per-row lookup, mirroring
-    ``mcp_server.get_signals``'s discipline. The response itself stays in
+    ``mcp_server.get_signals``'s discipline. ``attention`` (cross-platform
+    Adanos buzz/sentiment) is fetched the same way, with a second batched
+    query keyed to exactly the symbols on this page
+    (``webapi.attention.latest_attention``). The response itself stays in
     ledger (recency) order for client-side sorting/filtering (the Screener
     grid sorts by whichever column -- including ``effective_score`` -- the
     user picks); it is not re-sorted here.
@@ -92,6 +96,7 @@ def list_signals(
     research = ResearchLedger(pipeline.db).latest_research_revisions(
         [sig.signal_id for sig, _ in matched]
     )
+    attention = latest_attention(pipeline.db, [sig.symbol for sig, _ in matched])
 
     rows = []
     for sig, status in matched:
@@ -107,7 +112,13 @@ def list_signals(
         else:
             effective = sig.overall_score
         rows.append(
-            signal_to_row(sig, status, effective_score=effective, has_research=has_research)
+            signal_to_row(
+                sig,
+                status,
+                effective_score=effective,
+                has_research=has_research,
+                attention=attention.get(sig.symbol),
+            )
         )
 
     return SignalListOut(signals=rows, total=len(rows))
@@ -181,6 +192,8 @@ def get_signal(
     (the same append-only store ``mcp_server.submit_research_revision``
     writes to); ``effective_score``/``has_research`` are derived from the
     latest revision the same way ``list_signals`` derives them for the grid.
+    ``attention`` comes from the same ``webapi.attention.latest_attention``
+    helper the grid uses, keyed to this one symbol.
     """
     sig = pipeline.ledger.get(signal_id)
     if sig is None:
@@ -198,6 +211,8 @@ def get_signal(
     else:
         effective = sig.overall_score
 
+    attention = latest_attention(pipeline.db, [sig.symbol]).get(sig.symbol)
+
     return signal_to_detail(
         sig,
         status,
@@ -205,6 +220,7 @@ def get_signal(
         has_research=has_research,
         research=latest,
         research_history=history,
+        attention=attention,
     )
 
 

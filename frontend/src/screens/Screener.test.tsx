@@ -96,6 +96,7 @@ const SIGNAL: SignalRow = {
   days_to_earnings: 20,
   session: '2024-06-28',
   created_at: '2024-06-28T15:00:00Z',
+  attention: null,
 };
 
 describe('Screener row click navigation', () => {

@@ -38,6 +38,26 @@ export interface TradePlan {
   expected_holding_days: number;
 }
 
+/** Cross-platform Adanos buzz/sentiment aggregate for one symbol's latest
+ * session -- see `webapi.attention.latest_attention` (Python) for how each
+ * field is derived (mention-weighted means, "best supported" buzz score,
+ * dominant trend). `null` on the parent row when no Adanos snapshot exists
+ * for the symbol at all. */
+export interface Attention {
+  session: string;
+  platforms: string[];
+  total_mentions: number;
+  source_count: number | null;
+  buzz_score: number;
+  bullish_pct: number | null;
+  bearish_pct: number | null;
+  /** "rising" | "falling" | "stable" | "" (no platform reported one). */
+  trend: string;
+  /** Mention-weighted elementwise mean of each contributing platform's
+   * 7-point buzz history, oldest first. Empty when no platform qualifies. */
+  trend_history: number[];
+}
+
 export interface SignalRow {
   signal_id: string;
   symbol: string;
@@ -60,6 +80,9 @@ export interface SignalRow {
   days_to_earnings: number | null;
   session: string;
   created_at: string;
+  /** Cross-platform Adanos attention for this symbol's latest session --
+   * null when no Adanos snapshot exists for it yet. */
+  attention: Attention | null;
 }
 
 /** One research-ledger entry (latest or history). thesis/invalidation of

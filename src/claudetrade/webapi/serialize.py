@@ -21,7 +21,9 @@ import pandas as pd
 
 from claudetrade.domain import Bar, Signal, SignalStatus
 from claudetrade.features.indicators import bollinger_bands, rsi, sma
+from claudetrade.webapi.attention import AttentionAggregate
 from claudetrade.webapi.schemas import (
+    AttentionOut,
     ComponentScoresOut,
     IndicatorsOut,
     ResearchRevisionOut,
@@ -81,12 +83,27 @@ def _research_out(entry: dict[str, object]) -> ResearchRevisionOut:
     )
 
 
+def _attention_out(agg: AttentionAggregate) -> AttentionOut:
+    return AttentionOut(
+        session=agg.session,
+        platforms=list(agg.platforms),
+        total_mentions=agg.total_mentions,
+        source_count=agg.source_count,
+        buzz_score=agg.buzz_score,
+        bullish_pct=agg.bullish_pct,
+        bearish_pct=agg.bearish_pct,
+        trend=agg.trend,
+        trend_history=list(agg.trend_history),
+    )
+
+
 def signal_to_row(
     sig: Signal,
     status: SignalStatus | None,
     *,
     effective_score: float | None = None,
     has_research: bool = False,
+    attention: AttentionAggregate | None = None,
 ) -> SignalRowOut:
     """One flat Screener/candidate-table row for ``sig``.
 
@@ -95,6 +112,9 @@ def signal_to_row(
     ``adjusted_overall`` call) -- this stays a pure translation function with
     no DB access. Omitting ``effective_score`` defaults it to
     ``sig.overall_score``, matching "no research" (``has_research=False``).
+    ``attention`` is likewise supplied by the caller (which owns the batched
+    ``webapi.attention.latest_attention`` lookup); ``None`` means no Adanos
+    snapshot exists for this symbol yet.
     """
     return SignalRowOut(
         signal_id=sig.signal_id,
@@ -115,6 +135,7 @@ def signal_to_row(
         days_to_earnings=sig.days_to_earnings,
         session=sig.session,
         created_at=sig.created_at,
+        attention=_attention_out(attention) if attention is not None else None,
     )
 
 
@@ -126,14 +147,23 @@ def signal_to_detail(
     has_research: bool = False,
     research: dict[str, object] | None = None,
     research_history: list[dict[str, object]] | None = None,
+    attention: AttentionAggregate | None = None,
 ) -> SignalDetailOut:
     """Full ticker-detail/thesis view of ``sig``.
 
     ``research``/``research_history`` are the raw dicts
     ``ResearchLedger.latest_research_revisions``/``research_history`` return
     (the router fetches them); ``None``/empty means no research exists.
+    ``attention`` is the same optional ``AttentionAggregate`` ``signal_to_row``
+    takes.
     """
-    row = signal_to_row(sig, status, effective_score=effective_score, has_research=has_research)
+    row = signal_to_row(
+        sig,
+        status,
+        effective_score=effective_score,
+        has_research=has_research,
+        attention=attention,
+    )
     return SignalDetailOut(
         **row.model_dump(),
         components=_components_out(sig),

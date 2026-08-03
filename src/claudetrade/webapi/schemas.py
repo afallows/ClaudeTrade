@@ -57,6 +57,25 @@ class TradePlanOut(BaseModel):
     expected_holding_days: int
 
 
+class AttentionOut(BaseModel):
+    """Cross-platform Adanos buzz/sentiment aggregate for one symbol's latest
+    session -- see ``webapi.attention.latest_attention`` for how each field
+    is derived and why (mention-weighted means, "best supported" buzz score,
+    dominant trend). Omitted (``None``) on the parent row when no Adanos
+    snapshot exists for the symbol at all.
+    """
+
+    session: dt.date
+    platforms: list[str]
+    total_mentions: int
+    source_count: int | None
+    buzz_score: float
+    bullish_pct: float | None
+    bearish_pct: float | None
+    trend: str
+    trend_history: list[float]
+
+
 class SignalRowOut(BaseModel):
     """One Screener grid row -- deliberately flat for AG Grid column binding."""
 
@@ -83,6 +102,10 @@ class SignalRowOut(BaseModel):
     days_to_earnings: int | None
     session: dt.date
     created_at: dt.datetime
+    #: Cross-platform Adanos buzz/sentiment attention for this symbol's
+    #: latest session -- ``None`` when no Adanos snapshot exists for it yet
+    #: (feed disabled, not yet collected, or an unrecognised symbol).
+    attention: AttentionOut | None = None
 
 
 class ResearchRevisionOut(BaseModel):
@@ -432,6 +455,7 @@ class PaperOpenResponse(BaseModel):
 __all__ = [
     "AIConfigOut",
     "AIConfigUpdate",
+    "AttentionOut",
     "BarOut",
     "ClosedTradeOut",
     "ComponentScoresOut",

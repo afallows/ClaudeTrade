@@ -15,6 +15,7 @@ import { StatusChip } from '../components/StatusChip';
 import { ScoreBar, ConfidenceBar } from '../components/ScoreBar';
 import { ResearchBadge } from '../components/ResearchBadge';
 import { RejectionFunnelPanel } from '../components/RejectionFunnelPanel';
+import { BuzzCell, MentionsCell, SentimentBar, TrendSparkline } from '../components/AttentionCells';
 import { formatPrice, formatRatio, daysToEarningsLabel } from '../lib/format';
 
 const columnDefs: ColDef<SignalRow>[] = [
@@ -87,6 +88,45 @@ const columnDefs: ColDef<SignalRow>[] = [
     width: 130,
     sortable: true,
     valueFormatter: (p) => daysToEarningsLabel(p.value),
+  },
+  {
+    headerName: 'Buzz',
+    width: 100,
+    sortable: true,
+    // Nulls (no Adanos data) sort below every real reading in both directions.
+    valueGetter: (p) => p.data?.attention?.buzz_score ?? -1,
+    cellRenderer: (p: ICellRendererParams<SignalRow>) => <BuzzCell attention={p.data?.attention ?? null} />,
+  },
+  {
+    headerName: 'Mentions',
+    width: 140,
+    sortable: true,
+    valueGetter: (p) => p.data?.attention?.total_mentions ?? -1,
+    cellRenderer: (p: ICellRendererParams<SignalRow>) => (
+      <MentionsCell attention={p.data?.attention ?? null} />
+    ),
+  },
+  {
+    headerName: 'Sentiment',
+    width: 140,
+    sortable: true,
+    valueGetter: (p) => p.data?.attention?.bullish_pct ?? -1,
+    cellRenderer: (p: ICellRendererParams<SignalRow>) => (
+      <SentimentBar attention={p.data?.attention ?? null} />
+    ),
+  },
+  {
+    headerName: 'Trend',
+    width: 100,
+    sortable: true,
+    // Sorts by the most recent point in the combined buzz history.
+    valueGetter: (p) => {
+      const history = p.data?.attention?.trend_history;
+      return history && history.length === 7 ? history[6] : -1;
+    },
+    cellRenderer: (p: ICellRendererParams<SignalRow>) => (
+      <TrendSparkline attention={p.data?.attention ?? null} />
+    ),
   },
   {
     field: 'status',

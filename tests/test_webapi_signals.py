@@ -12,8 +12,10 @@ import datetime as dt
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
 from claudetrade.config import AppConfig
+from claudetrade.db.models import AdanosSnapshotRow
 from claudetrade.db.session import Database
 from claudetrade.domain import Direction, Signal
 from claudetrade.pipeline import Pipeline
@@ -31,6 +33,63 @@ def client(tmp_app_config: AppConfig, tmp_db: Database) -> TestClient:
 
 def _record(db: Database, sig: Signal) -> None:
     SignalLedger(db).record(sig)
+
+
+def _add_snapshot(
+    db: Database,
+    *,
+    symbol: str,
+    platform: str,
+    session: dt.date = dt.date(2026, 8, 1),
+    buzz_score: float = 50.0,
+    mentions: int = 10,
+    trend: str = "stable",
+    sentiment_score: float | None = 0.0,
+    bullish_pct: float | None = 50.0,
+    bearish_pct: float | None = 50.0,
+    engagement: float = 0.0,
+    trend_history: list[float] | None = None,
+) -> None:
+    """Insert one ``AdanosSnapshotRow`` directly, bypassing the provider --
+    these tests only need the stored shape ``webapi.attention`` reads, not a
+    real Adanos fetch."""
+    with db.session() as db_session:
+        db_session.add(
+            AdanosSnapshotRow(
+                symbol=symbol,
+                session=session,
+                platform=platform,
+                company_name="",
+                buzz_score=buzz_score,
+                mentions=mentions,
+                trend=trend,
+                sentiment_score=sentiment_score,
+                bullish_pct=bullish_pct,
+                bearish_pct=bearish_pct,
+                engagement=engagement,
+                trend_history=trend_history or [],
+            )
+        )
+
+
+def _count_selects(db: Database, fn):
+    """Run ``fn`` and return its result plus the SELECTs it issued.
+
+    Same helper as ``tests/test_research_revisions.py``'s -- duplicated
+    locally rather than imported so this module has no cross-test-module
+    dependency.
+    """
+    statements: list[str] = []
+
+    def _record_stmt(conn, cursor, statement, params, context, executemany):
+        statements.append(statement)
+
+    event.listen(db.engine, "before_cursor_execute", _record_stmt)
+    try:
+        result = fn()
+    finally:
+        event.remove(db.engine, "before_cursor_execute", _record_stmt)
+    return result, [s for s in statements if s.lstrip().upper().startswith("SELECT")]
 
 
 # --- GET /api/signals --------------------------------------------------------
@@ -172,6 +231,119 @@ def test_list_signals_sorted_by_effective_score_orders_research_adjusted_rows_fi
     assert [r["symbol"] for r in ranked] == ["LOW", "HIGH"]
 
 
+# --- GET /api/signals: attention (Adanos cross-platform aggregate) ---------
+
+
+def test_list_signals_attention_is_null_when_no_snapshots(client: TestClient, tmp_db, make_signal):
+    _record(tmp_db, make_signal(symbol="NOATT", overall_score=50.0))
+
+    resp = client.get("/api/signals")
+    row = resp.json()["signals"][0]
+    assert row["attention"] is None
+
+
+def test_list_signals_attention_aggregates_across_two_platforms(
+    client: TestClient, tmp_db: Database, make_signal
+):
+    """Two platform rows on the same (latest) session fold into one
+    mention-weighted aggregate -- see ``webapi.attention._aggregate``."""
+    _record(tmp_db, make_signal(symbol="AAA", overall_score=50.0))
+    _add_snapshot(
+        tmp_db,
+        symbol="AAA",
+        platform="x",
+        buzz_score=80.0,
+        mentions=30,
+        trend="rising",
+        bullish_pct=70.0,
+        bearish_pct=30.0,
+        trend_history=[10, 20, 30, 40, 50, 60, 70],
+    )
+    _add_snapshot(
+        tmp_db,
+        symbol="AAA",
+        platform="reddit",
+        buzz_score=20.0,
+        mentions=10,
+        trend="falling",
+        bullish_pct=30.0,
+        bearish_pct=70.0,
+        trend_history=[70, 60, 50, 40, 30, 20, 10],
+    )
+
+    resp = client.get("/api/signals")
+    row = resp.json()["signals"][0]
+    attention = row["attention"]
+    assert attention is not None
+    assert attention["platforms"] == ["reddit", "x"]
+    assert attention["total_mentions"] == 40
+    assert attention["source_count"] is None  # no "news" row this session
+    # Mention-weighted mean: (80*30 + 20*10) / 40 = 65.0
+    assert attention["buzz_score"] == pytest.approx(65.0)
+    assert attention["bullish_pct"] == pytest.approx((70 * 30 + 30 * 10) / 40)
+    assert attention["bearish_pct"] == pytest.approx((30 * 30 + 70 * 10) / 40)
+    # x (weight 30) dominates reddit (weight 10) -- dominant trend is "rising".
+    assert attention["trend"] == "rising"
+    # Elementwise mention-weighted mean of the two 7-point histories.
+    expected_point0 = (10 * 30 + 70 * 10) / 40
+    assert attention["trend_history"][0] == pytest.approx(expected_point0)
+    assert len(attention["trend_history"]) == 7
+
+
+def test_list_signals_attention_reads_news_source_count_from_engagement_column(
+    client: TestClient, tmp_db: Database, make_signal
+):
+    """News rows carry ``source_count`` through the shared ``engagement``
+    column (no dedicated column) -- see ``providers.social.adanos``'s
+    ``_ENGAGEMENT_FIELD`` and ``webapi.attention._source_count``."""
+    _record(tmp_db, make_signal(symbol="BBB", overall_score=50.0))
+    _add_snapshot(tmp_db, symbol="BBB", platform="news", mentions=5, engagement=12.0)
+
+    resp = client.get("/api/signals")
+    attention = resp.json()["signals"][0]["attention"]
+    assert attention["source_count"] == 12
+    assert attention["platforms"] == ["news"]
+
+
+def test_list_signals_attention_uses_only_the_latest_session(
+    client: TestClient, tmp_db: Database, make_signal
+):
+    """A stale earlier-session row for the same symbol must not leak into the
+    aggregate once a newer session exists."""
+    _record(tmp_db, make_signal(symbol="CCC", overall_score=50.0))
+    _add_snapshot(
+        tmp_db, symbol="CCC", platform="x", session=dt.date(2026, 7, 1), buzz_score=1.0, mentions=1
+    )
+    _add_snapshot(
+        tmp_db, symbol="CCC", platform="x", session=dt.date(2026, 8, 1), buzz_score=99.0, mentions=99
+    )
+
+    resp = client.get("/api/signals")
+    attention = resp.json()["signals"][0]["attention"]
+    assert attention["session"] == "2026-08-01"
+    assert attention["total_mentions"] == 99
+    assert attention["buzz_score"] == pytest.approx(99.0)
+
+
+def test_list_signals_attention_issues_one_batched_query_not_one_per_row(
+    client: TestClient, tmp_db: Database, make_signal
+):
+    """Same F26 discipline as ``latest_research_revisions`` -- one extra
+    query for the whole page's attention data, never a per-symbol loop."""
+    from claudetrade.webapi.attention import latest_attention
+
+    symbols = [f"SYM{i}" for i in range(8)]
+    for symbol in symbols:
+        _record(tmp_db, make_signal(symbol=symbol, overall_score=50.0))
+        _add_snapshot(tmp_db, symbol=symbol, platform="x", mentions=5)
+        _add_snapshot(tmp_db, symbol=symbol, platform="reddit", mentions=5)
+
+    result, selects = _count_selects(tmp_db, lambda: latest_attention(tmp_db, symbols))
+
+    assert len(result) == len(symbols)
+    assert len(selects) == 1, f"expected one SELECT, got {len(selects)}"
+
+
 # --- GET /api/signals/{id} ---------------------------------------------------
 
 
@@ -190,6 +362,18 @@ def test_get_signal_detail(client: TestClient, tmp_db, make_signal):
     assert body["has_research"] is False
     assert body["research"] is None
     assert body["research_history"] == []
+
+
+def test_get_signal_detail_includes_attention(client: TestClient, tmp_db: Database, make_signal):
+    sig = make_signal(symbol="DETAILATT", overall_score=55.0)
+    _record(tmp_db, sig)
+    _add_snapshot(tmp_db, symbol="DETAILATT", platform="x", mentions=5, buzz_score=40.0)
+
+    resp = client.get(f"/api/signals/{sig.signal_id}")
+    body = resp.json()
+    assert body["attention"] is not None
+    assert body["attention"]["platforms"] == ["x"]
+    assert body["attention"]["total_mentions"] == 5
 
 
 def test_get_signal_detail_404_for_unknown_id(client: TestClient):

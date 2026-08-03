@@ -473,6 +473,7 @@ def _test_adanos_connectivity(config: AppConfig) -> dict[str, object]:
             ("x", adanos.feed_x),
             ("reddit", adanos.feed_reddit),
             ("polymarket", adanos.feed_polymarket),
+            ("news", adanos.feed_news),
         )
         if on
     ]
@@ -607,6 +608,7 @@ def _adanos_pipeline(config: AppConfig) -> dict[str, object]:
             ("x", adanos.feed_x),
             ("reddit", adanos.feed_reddit),
             ("polymarket", adanos.feed_polymarket),
+            ("news", adanos.feed_news),
         )
         if on
     ]
