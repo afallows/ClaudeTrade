@@ -1,8 +1,8 @@
 # ADR-0009: Promoting analyst, institutional and cross-source sentiment into the composite score
 
-**Status: PROPOSED** — awaiting owner review. Nothing in this document is
-implemented; the three data layers it promotes are collected and surfaced
-today but deliberately excluded from ranking (stated in their docstrings).
+**Status: ACCEPTED** (owner, 2026-08-03 — "I like the weightings you've
+chosen ... to start"). Implementation follows the phased rollout below:
+shadow mode first, live only after the owner reviews shadow divergence.
 
 ## Context
 

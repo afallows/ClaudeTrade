@@ -1216,16 +1216,16 @@ def get_backtest_report(config: AppConfig) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# Adanos hybrid mode -- on-demand official-API calls
+# Adanos hybrid mode -- on-demand calls (site-first, official fallback)
 #
 # See providers.social.adanos's module docstring (Hybrid mode section) and
-# config.AdanosConfig for the full picture: bulk trending collection
-# (get_trending) never spends the official-API budget -- it stays keyless
-# (site mode) unless prefer_official_api is set. These three tools are the
-# SEPARATE, on-demand half: whenever an adanos_api_key credential resolves
-# at all, get_adanos_detail/get_adanos_explain spend one metered request
-# each (of the ~250/month free tier) for a single ticker's detail/AI
-# explanation, always budget-guarded. get_adanos_budget is free.
+# config.AdanosConfig for the full picture. Every on-demand call runs a
+# two-rung ladder: the keyless site proxy FIRST (free -- no quota), falling
+# back to the budget-guarded official API only when the site rung fails AND
+# an adanos_api_key resolves (prefer_official_api reverses the rungs). So
+# in normal operation these tools spend nothing; the ~250/month free tier
+# is a durability reserve. Every envelope reports mode ("site"|"official")
+# and quota_spent so the caller always knows which rung answered.
 # --------------------------------------------------------------------------
 
 
@@ -1262,23 +1262,21 @@ def get_adanos_budget(pipeline: Pipeline) -> dict[str, Any]:
 
 
 def get_adanos_detail(pipeline: Pipeline, symbol: str, *, platform: str = "x") -> dict[str, Any]:
-    """SPENDS 1 official-API request (unless served from the same-session
-    top-candidate enrichment cache -- see below). One ticker's Adanos
-    detail via ``AdanosProvider.fetch_stock_detail``: daily trend,
-    sentiment breakdown, top mentions/authors, passed through from the
-    vendor without inventing schema, plus a normalized header block.
+    """Usually FREE. One ticker's Adanos detail via the site-first ladder
+    (``AdanosProvider.fetch_stock_detail``): daily trend, sentiment
+    breakdown, top mentions/authors, passed through from the vendor
+    without inventing schema, plus a normalized header block. The keyless
+    site proxy answers in normal operation (``mode: "site"``,
+    ``quota_spent: false``); the metered official API is only the
+    fallback when the site rung fails and a key resolves.
 
     Checks ``AdanosProvider.cached_detail`` first: if this installation's
     most recent scan already enriched ``symbol`` on ``platform`` THIS
-    trading session (``config.AdanosConfig.enrich_top_candidates``), that
-    cached result is returned with ``from_cache: true`` and NO quota is
-    spent. Otherwise makes a fresh on-demand call, which does spend one
-    request. Refuses with ``accepted: false`` (never raises) when Adanos is
-    not configured, no key resolves, or the monthly budget is at its
-    reserve floor; a genuine HTTP failure (401/403/429/404/5xx) is also
-    caught and reported the same structured way rather than propagating as
-    a bare exception. ``budget`` (used/remaining/reserve/month) is included
-    in every response, success or refusal.
+    trading session, that cached result is returned with
+    ``from_cache: true`` and no request is made at all. Refuses with
+    ``accepted: false`` (never raises) when Adanos is disabled, the
+    ticker is unsupported/quiet (the vendor's two distinct "no" answers),
+    or both rungs failed; ``budget`` is included in every response.
     """
     symbol = symbol.strip().upper()
     provider = _adanos_provider(pipeline)
@@ -1314,19 +1312,18 @@ def get_adanos_detail(pipeline: Pipeline, symbol: str, *, platform: str = "x") -
 
 
 def get_adanos_explain(pipeline: Pipeline, symbol: str, *, platform: str = "x") -> dict[str, Any]:
-    """SPENDS 1 official-API request of the ~250/month free tier, every
-    call -- unlike ``get_adanos_detail`` there is no enrichment cache for
-    this one. Adanos's own AI trend explanation
-    (``AdanosProvider.fetch_explain``, llama-3.1-8b) for one ticker. The
-    vendor itself caches the explanation text for 6h server-side: a repeat
-    call within that window still spends this installation's request here
-    (the vendor still counts it), but returns the same text -- ``cached``
-    and ``generated_at`` in the response say whether this particular answer
-    was freshly generated or served from the vendor's own cache. Refuses
-    with ``accepted: false`` (never raises) when Adanos is not configured,
-    no key resolves, or the monthly budget is at its reserve floor; other
-    HTTP failures are caught the same structured way. ``budget`` is
-    included in every response, success or refusal.
+    """Usually FREE. Adanos's own AI trend explanation
+    (``AdanosProvider.fetch_explain``, llama-3.1-8b) for one ticker via
+    the site-first ladder -- the keyless site proxy answers in normal
+    operation (``mode: "site"``, ``quota_spent: false``); the metered
+    official API only on fallback. Polymarket has no explain endpoint at
+    all (confirmed absent on the site proxy; the provider goes straight
+    to official for that platform, which requires a key). The vendor
+    caches the explanation text ~6h server-side; ``cached`` and
+    ``generated_at`` say whether this answer was freshly generated.
+    Refuses with ``accepted: false`` (never raises) on the vendor's
+    structured "no" answers or when both rungs failed; ``budget`` is
+    included in every response.
     """
     symbol = symbol.strip().upper()
     provider = _adanos_provider(pipeline)
@@ -1344,6 +1341,39 @@ def get_adanos_explain(pipeline: Pipeline, symbol: str, *, platform: str = "x") 
         return {
             "accepted": False,
             "symbol": symbol,
+            "platform": platform,
+            "reason": str(exc),
+            "budget": provider.budget_status(),
+        }
+
+
+def get_adanos_market_sentiment(
+    pipeline: Pipeline, *, platform: str = "x"
+) -> dict[str, Any]:
+    """Usually FREE. Adanos's market-WIDE sentiment snapshot for one
+    platform (x/reddit/news/polymarket) via the site-first ladder
+    (``AdanosProvider.fetch_market_sentiment``): overall buzz and trend,
+    active-ticker count, sentiment split, 7-point trend history, and the
+    top ``drivers`` (the handful of tickers moving the market's mood).
+    The natural first call of a morning-briefing flow, before
+    ``get_market_status``'s regime read and ``get_signals``. Same
+    envelope conventions as the other Adanos on-demand tools: ``mode``,
+    ``quota_spent``, structured ``accepted: false`` refusals, ``budget``
+    always present.
+    """
+    provider = _adanos_provider(pipeline)
+    if provider is None:
+        return {
+            "accepted": False,
+            "platform": platform,
+            "reason": "Adanos is disabled or has no feeds enabled on this installation",
+            "budget": None,
+        }
+    try:
+        return provider.fetch_market_sentiment(platform=platform)
+    except ProviderError as exc:
+        return {
+            "accepted": False,
             "platform": platform,
             "reason": str(exc),
             "budget": provider.budget_status(),
@@ -1870,9 +1900,11 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "Read-only, FREE -- never spends the official-API quota. Current Adanos "
             "on-demand official-API budget state (used/remaining/reserve/month/"
             "resets_hint) and whether an adanos_api_key credential resolves on this "
-            "installation at all. Bulk trending collection (get_trending) never spends "
-            "this budget -- it always prefers Adanos's keyless site endpoints for the "
-            "same trending data; only get_adanos_detail/get_adanos_explain spend it."
+            "installation at all. In normal operation NOTHING spends this budget: "
+            "trending collection and the on-demand detail/explain/market-sentiment "
+            "tools all answer from Adanos's keyless site endpoints first; the metered "
+            "official API is only their fallback rung, so the ~250/month free tier "
+            "is a durability reserve."
         ),
     )
     async def _get_adanos_budget() -> dict[str, Any]:
@@ -1885,17 +1917,17 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
     @server.tool(
         name="get_adanos_detail",
         description=(
-            "SPENDS 1 official-API request of the ~250/month free tier -- UNLESS this "
-            "ticker was already enriched by this session's scan (top-candidate "
-            "enrichment), in which case the cached result is returned free with "
-            "from_cache=true. One ticker's Adanos detail: daily trend, sentiment "
-            "breakdown, top mentions/authors, passed through from the vendor without "
-            "inventing schema, plus a normalized buzz_score/sentiment_score/"
-            "bullish_pct/bearish_pct/mentions header. Refuses with accepted=false "
-            "(never raises) when no adanos_api_key credential resolves on this "
-            "installation, or when the monthly budget is down to its reserve floor -- "
-            "the reason names the reset date. Remaining budget is included in every "
-            "response, success or refusal, under the budget key."
+            "Usually FREE (site-first ladder). One ticker's Adanos detail for a "
+            "platform (x/reddit/news/polymarket): daily trend, sentiment breakdown, "
+            "top mentions/authors, passed through from the vendor without inventing "
+            "schema, plus a normalized buzz_score/sentiment_score/bullish_pct/"
+            "bearish_pct/mentions header. The keyless site proxy answers in normal "
+            "operation (mode='site', quota_spent=false); the metered official API "
+            "(~250/month free tier) is only the fallback when the site rung fails "
+            "and a key resolves. Same-session enrichment cache hits return "
+            "from_cache=true with no request at all. Refuses with accepted=false "
+            "(never raises) for unsupported or quiet tickers (two distinct vendor "
+            "answers) or when both rungs failed; budget is in every response."
         ),
     )
     async def _get_adanos_detail(symbol: str, platform: str = "x") -> dict[str, Any]:
@@ -1908,15 +1940,15 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
     @server.tool(
         name="get_adanos_explain",
         description=(
-            "SPENDS 1 official-API request of the ~250/month free tier, on every call "
-            "(there is no enrichment cache for this one, unlike get_adanos_detail). "
-            "Adanos's own AI-generated trend explanation for one ticker "
-            "(llama-3.1-8b). The vendor caches the explanation text for 6h "
-            "server-side, so a repeat call within that window still spends a request "
-            "here but returns the same cached text -- cached and generated_at in the "
-            "response say which. Refuses with accepted=false (never raises) when no "
-            "adanos_api_key credential resolves, or when the monthly budget is down "
-            "to its reserve floor. Remaining budget is included in every response."
+            "Usually FREE (site-first ladder). Adanos's own AI-generated trend "
+            "explanation for one ticker (llama-3.1-8b), answered by the keyless "
+            "site proxy in normal operation (mode='site', quota_spent=false) with "
+            "the metered official API only as fallback. Polymarket has no explain "
+            "endpoint on the site proxy at all -- that platform goes straight to "
+            "official and needs a key. The vendor caches explanation text ~6h "
+            "server-side; cached and generated_at say whether this answer was "
+            "freshly generated. Refuses with accepted=false (never raises); budget "
+            "is in every response."
         ),
     )
     async def _get_adanos_explain(symbol: str, platform: str = "x") -> dict[str, Any]:
@@ -1924,6 +1956,26 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "get_adanos_explain",
             config.mcp.tool_timeout_seconds,
             lambda: get_adanos_explain(pipeline, symbol, platform=platform),
+        )
+
+    @server.tool(
+        name="get_adanos_market_sentiment",
+        description=(
+            "Usually FREE (site-first ladder). Adanos's market-WIDE sentiment "
+            "snapshot for one platform (x/reddit/news/polymarket): overall buzz "
+            "and trend, active-ticker count, bullish/bearish split, 7-point trend "
+            "history, and the top drivers -- the handful of tickers moving the "
+            "market's mood. A good first call of a morning-briefing flow, "
+            "alongside get_market_status's regime read. Same envelope as the "
+            "other Adanos tools: mode, quota_spent, structured accepted=false "
+            "refusals, budget always present."
+        ),
+    )
+    async def _get_adanos_market_sentiment(platform: str = "x") -> dict[str, Any]:
+        return await _call_bounded(
+            "get_adanos_market_sentiment",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_adanos_market_sentiment(pipeline, platform=platform),
         )
 
     return server
@@ -1960,6 +2012,7 @@ __all__ = [
     "get_adanos_budget",
     "get_adanos_detail",
     "get_adanos_explain",
+    "get_adanos_market_sentiment",
     "get_backtest_report",
     "get_market_status",
     "get_refresh_status",

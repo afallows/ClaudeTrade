@@ -1312,6 +1312,36 @@ def test_get_adanos_detail_refuses_when_adanos_not_configured(pipeline: Pipeline
     assert result["budget"] is None
 
 
+def test_get_adanos_market_sentiment_refuses_when_not_configured(pipeline: Pipeline) -> None:
+    pipeline.adanos = []
+    result = mcp_server.get_adanos_market_sentiment(pipeline)
+    assert result["accepted"] is False
+    assert result["budget"] is None
+
+
+def test_get_adanos_market_sentiment_passes_through_the_provider_envelope(
+    pipeline: Pipeline,
+) -> None:
+    envelope = {
+        "accepted": True,
+        "platform": "x",
+        "mode": "site",
+        "quota_spent": False,
+        "buzz_score": 16.7,
+        "drivers": [{"ticker": "TSLA", "buzz_score": 73.2, "sentiment_score": 0.057}],
+        "budget": {"remaining": 235},
+    }
+
+    class _Stub(_StubAdanosHybrid):
+        def fetch_market_sentiment(self, *, platform: str = "x"):
+            assert platform == "reddit"
+            return envelope
+
+    pipeline.adanos = [_Stub()]
+    result = mcp_server.get_adanos_market_sentiment(pipeline, platform="reddit")
+    assert result is envelope
+
+
 def test_get_adanos_detail_happy_path_includes_budget(pipeline: Pipeline) -> None:
     detail = {
         "accepted": True,
@@ -1442,16 +1472,22 @@ def test_get_adanos_explain_catches_provider_errors_as_a_structured_refusal(
     assert "bad key" in result["reason"]
 
 
-def test_get_adanos_tools_state_the_quota_spend_plainly_in_their_description(
+def test_get_adanos_tools_state_the_cost_posture_plainly_in_their_description(
     pipeline: Pipeline, tmp_app_config: AppConfig
 ) -> None:
+    """Since the site-first ladder (2026-08-03), the honest posture is
+    "usually free, official API only as fallback" -- the descriptions must
+    say so and must name the mode/quota_spent envelope fields the caller
+    should check."""
     server = mcp_server.build_server(pipeline, tmp_app_config)
     tools = {t.name: t for t in server._tool_manager.list_tools()}
-    for name in ("get_adanos_detail", "get_adanos_explain"):
-        assert (
-            "SPENDS 1 official-API request of the ~250/month free tier" in tools[name].description
-        )
+    for name in ("get_adanos_detail", "get_adanos_explain", "get_adanos_market_sentiment"):
+        description = tools[name].description
+        assert "Usually FREE" in description
+        assert "site" in description.lower()
+    assert "quota_spent" in tools["get_adanos_detail"].description
     assert "FREE" in tools["get_adanos_budget"].description
+    assert "durability reserve" in tools["get_adanos_budget"].description
 
 
 # --------------------------------------------------------------------------
@@ -1476,6 +1512,7 @@ EXPECTED_TOOL_NAMES = {
     "get_adanos_budget",
     "get_adanos_detail",
     "get_adanos_explain",
+    "get_adanos_market_sentiment",
 }
 
 
