@@ -18,7 +18,7 @@ import { RejectionFunnelPanel } from '../components/RejectionFunnelPanel';
 import { BuzzCell, MentionsCell, SentimentBar, TrendSparkline } from '../components/AttentionCells';
 import { formatPrice, formatRatio, daysToEarningsLabel } from '../lib/format';
 
-const columnDefs: ColDef<SignalRow>[] = [
+export const columnDefs: ColDef<SignalRow>[] = [
   {
     field: 'symbol',
     headerName: 'Symbol',
@@ -35,7 +35,32 @@ const columnDefs: ColDef<SignalRow>[] = [
       );
     },
   },
-  { field: 'strategy', headerName: 'Strategy', width: 170, sortable: true },
+  {
+    field: 'strategy',
+    headerName: 'Strategy',
+    width: 190,
+    sortable: true,
+    // corroborating_strategies (other strategies that independently agree
+    // on the same symbol+direction -- see signals.dedupe, Python) shows as
+    // a small muted "+other_strategy" annotation, mirroring how the Score
+    // column already annotates research-adjusted rows with ResearchBadge.
+    cellRenderer: (p: ICellRendererParams<SignalRow>) => {
+      const corroborating = p.data?.corroborating_strategies ?? [];
+      return (
+        <div className="flex h-full flex-col justify-center leading-tight">
+          <span className="text-ink">{p.data?.strategy}</span>
+          {corroborating.length > 0 && (
+            <span
+              className="truncate text-[10px] text-ink-muted"
+              title={`Also flagged by: ${corroborating.join(', ')}`}
+            >
+              {corroborating.map((s) => `+${s}`).join(', ')}
+            </span>
+          )}
+        </div>
+      );
+    },
+  },
   {
     field: 'direction',
     headerName: 'Direction',

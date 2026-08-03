@@ -73,6 +73,25 @@ def test_signals_dataframe_research_column_blank_without_a_revision(make_signal)
     assert df.iloc[0]["Research"] == ""
 
 
+def test_signals_dataframe_without_corroborating_matches_prior_shape(make_signal):
+    """Backward-compat guard: omitting ``corroborating`` (every existing
+    caller before dedup) keeps the exact same column set as before."""
+    df = signals_dataframe([make_signal()])
+    assert "Corroborating" not in df.columns
+
+
+def test_signals_dataframe_corroborating_column_lists_other_strategies(make_signal):
+    sig = make_signal(strategy="volume_breakout")
+    df = signals_dataframe([sig], corroborating={sig.signal_id: ["sentiment_pullback"]})
+    assert df.iloc[0]["Corroborating"] == "+sentiment_pullback"
+
+
+def test_signals_dataframe_corroborating_column_blank_when_no_siblings(make_signal):
+    sig = make_signal(strategy="volume_breakout")
+    df = signals_dataframe([sig], corroborating={sig.signal_id: []})
+    assert df.iloc[0]["Corroborating"] == ""
+
+
 def test_signals_column_config_covers_progress_and_price_columns():
     config = signals_column_config()
     assert "Score" in config

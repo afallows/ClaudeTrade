@@ -83,6 +83,19 @@ export interface SignalRow {
   /** Cross-platform Adanos attention for this symbol's latest session --
    * null when no Adanos snapshot exists for it yet. */
   attention: Attention | null;
+  /** Names of the OTHER strategies whose signal collapsed into this same
+   * (symbol, direction) recommendation at read time (see
+   * `signals.dedupe.collapse_recommendations`, Python). Empty when
+   * distinct=false was requested, or no other strategy corroborates this
+   * symbol+direction on the representative session. */
+  corroborating_strategies: string[];
+  /** corroborating_strategies.length -- a group with 1+ is genuinely
+   * stronger evidence (2+ independently-reasoned strategies agree). */
+  corroborating_count: number;
+  /** How many exact re-scan duplicates (same symbol+strategy+session,
+   * different signal_id from a code/config change) were folded into this
+   * row at read time. */
+  duplicates_collapsed: number;
 }
 
 /** One research-ledger entry (latest or history). thesis/invalidation of
@@ -342,6 +355,9 @@ export interface SignalFilters {
   strategy?: string[];
   max_days_to_earnings?: number;
   limit?: number;
+  /** Collapse read-time duplicates (see `SignalRow.corroborating_strategies`).
+   * Defaults to true server-side when omitted. */
+  distinct?: boolean;
 }
 
 export interface CredentialStatus {

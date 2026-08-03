@@ -22,7 +22,7 @@ from claudetrade.ui.components.tables import (
     signals_column_config,
     signals_dataframe,
 )
-from claudetrade.ui.data_access import research_overlay
+from claudetrade.ui.data_access import collapse_signals, research_overlay
 from claudetrade.ui.formatting import format_date, format_datetime, format_price
 from claudetrade.ui.state import (
     get_config,
@@ -153,21 +153,32 @@ def _render_filters_and_table(config, pipeline, recent):
         max_days_to_earnings=max_days_to_earnings or None,
     )
 
-    st.subheader(f"Candidates ({len(filtered)})")
     if not filtered:
+        st.subheader("Candidates (0)")
         empty_state("No signals match the selected filters. Loosen a filter above to see candidates.")
         return []
 
-    status_by_id = {
-        s.signal_id: (pipeline.ledger.current_status(s.signal_id) or None) for s in filtered
-    }
-    status_by_id = {k: (v.value if v else None) for k, v in status_by_id.items()}
+    status_by_signal_id = {s.signal_id: pipeline.ledger.current_status(s.signal_id) for s in filtered}
     # ONE batched research lookup for the whole filtered page -- never a
     # per-row query (same F26 discipline as webapi.routers.signals and
     # mcp_server.get_signals). Score shows the research-adjusted effective
     # score; the Research column names the original engine score.
     overlay = research_overlay(pipeline.db, filtered, config)
-    df = signals_dataframe(filtered, status_by_id, research=overlay)
+
+    # Read-time de-duplication (same default as mcp_server.get_signals /
+    # webapi.routers.signals.list_signals's distinct=True): collapses exact
+    # re-scan duplicates and folds cross-strategy overlap into one row per
+    # (symbol, direction), with corroborating strategy names surfaced in
+    # their own column rather than hidden or shown as extra rows.
+    groups = collapse_signals(filtered, status_by_signal_id, overlay)
+    representative_signals = [g.signal for g in groups]
+    status_by_id = {g.signal.signal_id: (g.status.value if g.status else None) for g in groups}
+    corroborating_by_id = {g.signal.signal_id: g.corroborating_strategies for g in groups}
+
+    st.subheader(f"Candidates ({len(representative_signals)})")
+    df = signals_dataframe(
+        representative_signals, status_by_id, research=overlay, corroborating=corroborating_by_id
+    )
 
     event = st.dataframe(
         df,
@@ -183,7 +194,7 @@ def _render_filters_and_table(config, pipeline, recent):
     st.session_state["scanner_selected_signal_ids"] = [
         df.iloc[i]["Signal ID"] for i in selected_rows if i < len(df)
     ]
-    return filtered
+    return representative_signals
 
 
 def _render_rejected_expander() -> None:

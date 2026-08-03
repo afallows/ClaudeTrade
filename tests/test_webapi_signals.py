@@ -8,6 +8,7 @@ providers, no Streamlit.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 
 import pytest
@@ -342,6 +343,94 @@ def test_list_signals_attention_issues_one_batched_query_not_one_per_row(
 
     assert len(result) == len(symbols)
     assert len(selects) == 1, f"expected one SELECT, got {len(selects)}"
+
+
+# --- GET /api/signals: distinct (read-time de-duplication) ------------------
+
+
+def test_list_signals_distinct_defaults_to_true_and_collapses_duplicates(
+    client: TestClient, tmp_db: Database, make_signal
+):
+    """End-to-end reproduction of the reported bug: two identical-content
+    re-scans of the same session (different signal_id from a code/config
+    change) plus one cross-strategy sibling collapse into ONE row by
+    default, with corroborating/duplicates summary fields set."""
+    session = dt.date(2026, 7, 31)
+    dup_early = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="volume_breakout", session=session, overall_score=60.0),
+        signal_id="dup-early",
+        created_at=dt.datetime(2026, 7, 31, 5, 39, tzinfo=dt.UTC),
+    )
+    dup_late = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="volume_breakout", session=session, overall_score=61.0),
+        signal_id="dup-late",
+        created_at=dt.datetime(2026, 7, 31, 12, 0, tzinfo=dt.UTC),
+    )
+    sibling = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="sentiment_pullback", session=session, overall_score=90.0),
+        signal_id="sibling",
+        created_at=dt.datetime(2026, 7, 31, 12, 0, tzinfo=dt.UTC),
+    )
+    for sig in (dup_early, dup_late, sibling):
+        _record(tmp_db, sig)
+
+    resp = client.get("/api/signals")
+    body = resp.json()
+
+    assert body["total"] == 1
+    row = body["signals"][0]
+    assert row["signal_id"] == "sibling"
+    assert row["duplicates_collapsed"] == 1
+    assert row["corroborating_strategies"] == ["volume_breakout"]
+    assert row["corroborating_count"] == 1
+
+
+def test_list_signals_distinct_false_returns_raw_per_strategy_rows(
+    client: TestClient, tmp_db: Database, make_signal
+):
+    session = dt.date(2026, 7, 31)
+    dup_early = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="volume_breakout", session=session, overall_score=60.0),
+        signal_id="dup-early",
+        created_at=dt.datetime(2026, 7, 31, 5, 39, tzinfo=dt.UTC),
+    )
+    dup_late = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="volume_breakout", session=session, overall_score=61.0),
+        signal_id="dup-late",
+        created_at=dt.datetime(2026, 7, 31, 12, 0, tzinfo=dt.UTC),
+    )
+    sibling = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="sentiment_pullback", session=session, overall_score=90.0),
+        signal_id="sibling",
+        created_at=dt.datetime(2026, 7, 31, 12, 0, tzinfo=dt.UTC),
+    )
+    for sig in (dup_early, dup_late, sibling):
+        _record(tmp_db, sig)
+
+    resp = client.get("/api/signals", params={"distinct": False})
+    body = resp.json()
+
+    assert body["total"] == 3
+    ids = {row["signal_id"] for row in body["signals"]}
+    assert ids == {"dup-early", "dup-late", "sibling"}
+    for row in body["signals"]:
+        assert row["corroborating_strategies"] == []
+        assert row["corroborating_count"] == 0
+        assert row["duplicates_collapsed"] == 0
+
+
+def test_list_signals_distinct_keeps_long_and_short_separate(
+    client: TestClient, tmp_db: Database, make_signal
+):
+    _record(tmp_db, make_signal(symbol="TSLA", direction=Direction.LONG, overall_score=70.0))
+    _record(tmp_db, make_signal(symbol="TSLA", direction=Direction.SHORT, overall_score=65.0))
+
+    resp = client.get("/api/signals")
+    body = resp.json()
+
+    assert body["total"] == 2
+    directions = {row["direction"] for row in body["signals"]}
+    assert directions == {"long", "short"}
 
 
 # --- GET /api/signals/{id} ---------------------------------------------------

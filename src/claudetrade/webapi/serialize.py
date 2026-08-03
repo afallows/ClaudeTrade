@@ -104,6 +104,8 @@ def signal_to_row(
     effective_score: float | None = None,
     has_research: bool = False,
     attention: AttentionAggregate | None = None,
+    corroborating_strategies: list[str] | None = None,
+    duplicates_collapsed: int = 0,
 ) -> SignalRowOut:
     """One flat Screener/candidate-table row for ``sig``.
 
@@ -115,6 +117,13 @@ def signal_to_row(
     ``attention`` is likewise supplied by the caller (which owns the batched
     ``webapi.attention.latest_attention`` lookup); ``None`` means no Adanos
     snapshot exists for this symbol yet.
+
+    ``corroborating_strategies``/``duplicates_collapsed`` mirror the same
+    -named fields on ``signals.dedupe.RecommendationGroup`` -- the caller
+    (``routers.signals.list_signals``) owns the ``collapse_recommendations``
+    call and passes the representative group's own summary through
+    unchanged; omitting them (the default) means "no dedup was applied to
+    this row", matching ``distinct=False``.
     """
     return SignalRowOut(
         signal_id=sig.signal_id,
@@ -136,6 +145,9 @@ def signal_to_row(
         session=sig.session,
         created_at=sig.created_at,
         attention=_attention_out(attention) if attention is not None else None,
+        corroborating_strategies=list(corroborating_strategies or []),
+        corroborating_count=len(corroborating_strategies or []),
+        duplicates_collapsed=duplicates_collapsed,
     )
 
 

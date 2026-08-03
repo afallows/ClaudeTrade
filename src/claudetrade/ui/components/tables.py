@@ -51,6 +51,7 @@ def signals_dataframe(
     signals: list[Signal],
     status_by_id: dict[str, str] | None = None,
     research: dict[str, ResearchOverlay] | None = None,
+    corroborating: dict[str, list[str]] | None = None,
 ) -> pd.DataFrame:
     """Flatten signals into a display-ready DataFrame.
 
@@ -67,6 +68,15 @@ def signals_dataframe(
     score for any row a revision adjusted -- mirrors ``webapi``/MCP's
     ``effective_score``/``has_research`` contract without changing this
     function's output shape for callers that don't opt in.
+
+    ``corroborating`` is likewise optional -- a signal id -> list of OTHER
+    strategy names map, e.g. from
+    ``RecommendationGroup.corroborating_strategies`` (see
+    ``ui.data_access.collapse_signals``). When passed, a muted
+    ``Corroborating`` column names those strategies (``""`` when the id has
+    none), mirroring the web API/MCP's ``corroborating_strategies`` field so
+    all three surfaces agree on what "more than one strategy agrees" looks
+    like (a past incident, F26, came from surfaces disagreeing).
     """
     status_by_id = status_by_id or {}
     rows = []
@@ -95,10 +105,15 @@ def signals_dataframe(
                 if overlay is not None and overlay.has_research
                 else ""
             )
+        if corroborating is not None:
+            names = corroborating.get(sig.signal_id) or []
+            row["Corroborating"] = ", ".join(f"+{name}" for name in names)
         rows.append(row)
     columns = [*CANDIDATE_COLUMN_ORDER, "Signal ID"]
     if research is not None:
         columns = [*columns, "Research"]
+    if corroborating is not None:
+        columns = [*columns, "Corroborating"]
     return pd.DataFrame(rows, columns=columns)
 
 
@@ -121,6 +136,11 @@ def signals_column_config() -> dict[str, object]:
             "Research",
             help="Set when an accepted research revision adjusted this signal's score; "
             "names the original, unadjusted engine score.",
+        ),
+        "Corroborating": st.column_config.TextColumn(
+            "Corroborating",
+            help="Other strategies that independently flagged this same symbol+direction "
+            "on the same session -- more than one is stronger evidence.",
         ),
         "Confidence %": st.column_config.ProgressColumn(
             "Confidence", help="Model confidence in this signal.", min_value=0, max_value=100, format="%.0f%%"

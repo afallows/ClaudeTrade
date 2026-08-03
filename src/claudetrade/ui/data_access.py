@@ -26,11 +26,12 @@ from claudetrade.data.institutional import (
 )
 from claudetrade.db.models import EarningsEventRow, PriceBar, SymbolSentimentDaily
 from claudetrade.db.session import Database
-from claudetrade.domain import AnalystSnapshot, Bar, InstitutionalSnapshot, Signal
+from claudetrade.domain import AnalystSnapshot, Bar, InstitutionalSnapshot, Signal, SignalStatus
 from claudetrade.providers.market.tipranks_institutional import (
     InstitutionalScoreResult,
     institutional_score,
 )
+from claudetrade.signals.dedupe import RecommendationGroup, collapse_recommendations
 from claudetrade.signals.research import ResearchLedger
 from claudetrade.signals.scoring import adjusted_overall
 
@@ -206,6 +207,38 @@ def research_overlay(
     return overlay
 
 
+def collapse_signals(
+    signals: list[Signal],
+    status_by_id: dict[str, SignalStatus | None],
+    research: dict[str, ResearchOverlay],
+) -> list[RecommendationGroup]:
+    """Read-time de-duplication for the Scanner table.
+
+    Matches ``mcp_server.get_signals``/``webapi.routers.signals
+    .list_signals``'s default (``distinct=True``) behaviour -- see
+    ``signals.dedupe`` for exactly what "duplicate" means here (same
+    -session re-scans after a code/config change, and cross-strategy
+    overlap on one symbol+direction). A past incident (F26) came from
+    surfaces disagreeing about ordering because each reimplemented its own
+    rules, so this composes the Scanner's own already-fetched
+    ``status_by_id``/:func:`research_overlay` output with the shared
+    ``signals.dedupe.collapse_recommendations`` helper rather than adding a
+    fourth implementation.
+
+    Args:
+        signals: The already-filtered candidate list -- the Scanner's own
+            filter widgets (``apply_candidate_filters``) apply first,
+            exactly as before dedup existed.
+        status_by_id: ``signal_id -> SignalStatus | None``, e.g. from a
+            ``pipeline.ledger.current_status`` lookup per signal.
+        research: ``signal_id -> ResearchOverlay``, from
+            :func:`research_overlay` -- supplies ``effective_score``.
+    """
+    effective_scores = {sid: overlay.effective_score for sid, overlay in research.items()}
+    signals_with_status = [(sig, status_by_id.get(sig.signal_id)) for sig in signals]
+    return collapse_recommendations(signals_with_status, effective_scores)
+
+
 @dataclass(slots=True, frozen=True)
 class AnalystOverlay:
     """Read-time analyst-sentiment picture for one symbol
@@ -322,6 +355,7 @@ __all__ = [
     "ResearchOverlay",
     "SentimentPoint",
     "analyst_sentiment",
+    "collapse_signals",
     "data_freshness",
     "earnings_dates",
     "institutional_sentiment",

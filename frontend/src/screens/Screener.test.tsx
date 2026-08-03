@@ -17,6 +17,7 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider, useParams } from 'react-router-dom';
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import type { ICellRendererParams } from 'ag-grid-community';
 import type { SignalRow } from '../api/types';
 
 vi.mock('ag-grid-react', () => ({
@@ -58,7 +59,7 @@ vi.mock('../api/client', () => ({
 }));
 
 // Imported after the mocks above so Screener picks up the mocked client.
-const { Screener } = await import('./Screener');
+const { Screener, columnDefs } = await import('./Screener');
 
 function TickerDetailStub() {
   const { symbol } = useParams<{ symbol: string }>();
@@ -97,7 +98,30 @@ const SIGNAL: SignalRow = {
   session: '2024-06-28',
   created_at: '2024-06-28T15:00:00Z',
   attention: null,
+  corroborating_strategies: [],
+  corroborating_count: 0,
+  duplicates_collapsed: 0,
 };
+
+describe('Screener strategy column corroborating annotation', () => {
+  function renderStrategyCell(row: SignalRow) {
+    const strategyColumn = columnDefs.find((c) => c.field === 'strategy');
+    const rendered = strategyColumn!.cellRenderer!({
+      data: row,
+    } as ICellRendererParams<SignalRow>);
+    render(<>{rendered}</>);
+  }
+
+  it('shows a muted "+strategy" annotation when a corroborating strategy exists', () => {
+    renderStrategyCell({ ...SIGNAL, strategy: 'volume_breakout', corroborating_strategies: ['sentiment_pullback'] });
+    expect(screen.getByText('+sentiment_pullback')).toBeInTheDocument();
+  });
+
+  it('shows no annotation when there is no corroborating strategy', () => {
+    renderStrategyCell({ ...SIGNAL, strategy: 'volume_breakout', corroborating_strategies: [] });
+    expect(screen.queryByText(/^\+/)).not.toBeInTheDocument();
+  });
+});
 
 describe('Screener row click navigation', () => {
   afterEach(() => {

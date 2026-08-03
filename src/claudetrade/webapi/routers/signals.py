@@ -14,6 +14,7 @@ import datetime as dt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from claudetrade.pipeline import Pipeline
+from claudetrade.signals.dedupe import collapse_recommendations
 from claudetrade.signals.research import ResearchLedger
 from claudetrade.signals.scoring import adjusted_overall
 from claudetrade.utils.timeutils import current_trading_session, utc_now
@@ -46,6 +47,14 @@ def list_signals(
     strategy: list[str] | None = Query(default=None),
     max_days_to_earnings: int | None = Query(default=None, ge=0),
     limit: int = Query(default=500, ge=1, le=5000),
+    distinct: bool = Query(
+        default=True,
+        description=(
+            "Collapse read-time duplicates (same-session re-scans after a code/config "
+            "change, and cross-strategy overlap on one symbol+direction) into one row "
+            "per recommendation. False returns the raw, uncollapsed per-strategy rows."
+        ),
+    ),
 ) -> SignalListOut:
     """The candidate universe for the Screener grid, most-recent-first.
 
@@ -67,10 +76,20 @@ def list_signals(
     ``mcp_server.get_signals``'s discipline. ``attention`` (cross-platform
     Adanos buzz/sentiment) is fetched the same way, with a second batched
     query keyed to exactly the symbols on this page
-    (``webapi.attention.latest_attention``). The response itself stays in
-    ledger (recency) order for client-side sorting/filtering (the Screener
-    grid sorts by whichever column -- including ``effective_score`` -- the
-    user picks); it is not re-sorted here.
+    (``webapi.attention.latest_attention``).
+
+    ``distinct`` (default ``True``) collapses read-time duplicates via
+    ``signals.dedupe.collapse_recommendations`` -- the same pure helper
+    ``mcp_server.get_signals``/the Streamlit Scanner use, so all three
+    surfaces agree (a past incident, F26, came from surfaces disagreeing).
+    Each collapsed row carries ``corroborating_strategies``/
+    ``corroborating_count``/``duplicates_collapsed`` (see ``SignalRowOut``).
+    When ``distinct=True`` the response is ordered by representative
+    ``effective_score`` descending (``collapse_recommendations``'s own
+    contract) rather than ledger recency; ``distinct=False`` keeps the
+    original ledger (recency) order for client-side sorting/filtering (the
+    Screener grid sorts by whichever column -- including
+    ``effective_score`` -- the user picks either way).
     """
     recent = pipeline.ledger.recent_with_status(limit=limit)
     directions = {d.lower() for d in direction} if direction else None
@@ -98,8 +117,9 @@ def list_signals(
     )
     attention = latest_attention(pipeline.db, [sig.symbol for sig, _ in matched])
 
-    rows = []
-    for sig, status in matched:
+    effective_scores: dict[str, float] = {}
+    has_research_by_id: dict[str, bool] = {}
+    for sig, _status in matched:
         revision = research.get(sig.signal_id)
         has_research = revision is not None
         if revision is not None:
@@ -111,15 +131,34 @@ def list_signals(
             )
         else:
             effective = sig.overall_score
-        rows.append(
+        effective_scores[sig.signal_id] = effective
+        has_research_by_id[sig.signal_id] = has_research
+
+    if distinct:
+        groups = collapse_recommendations(matched, effective_scores)
+        rows = [
+            signal_to_row(
+                group.signal,
+                group.status,
+                effective_score=group.effective_score,
+                has_research=has_research_by_id.get(group.signal.signal_id, False),
+                attention=attention.get(group.signal.symbol),
+                corroborating_strategies=group.corroborating_strategies,
+                duplicates_collapsed=group.duplicates_collapsed,
+            )
+            for group in groups
+        ]
+    else:
+        rows = [
             signal_to_row(
                 sig,
                 status,
-                effective_score=effective,
-                has_research=has_research,
+                effective_score=effective_scores[sig.signal_id],
+                has_research=has_research_by_id[sig.signal_id],
                 attention=attention.get(sig.symbol),
             )
-        )
+            for sig, status in matched
+        ]
 
     return SignalListOut(signals=rows, total=len(rows))
 

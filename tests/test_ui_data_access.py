@@ -12,6 +12,8 @@ from claudetrade.db.session import Database
 from claudetrade.signals.ledger import SignalLedger
 from claudetrade.signals.research import ResearchLedger
 from claudetrade.ui.data_access import (
+    ResearchOverlay,
+    collapse_signals,
     data_freshness,
     earnings_dates,
     known_symbols,
@@ -171,3 +173,69 @@ def test_research_overlay_uses_one_batched_query_for_multiple_signals(
     selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
     assert len(overlay) == 5
     assert len(selects) == 1
+
+
+# --- collapse_signals (Scanner read-time de-duplication) ---------------------
+
+
+def test_collapse_signals_folds_cross_strategy_overlap_using_research_overlay(
+    tmp_db: Database, tmp_app_config: AppConfig, make_signal
+):
+    """``collapse_signals`` composes the Scanner's own status/research
+    lookups with ``signals.dedupe.collapse_recommendations`` -- this checks
+    the composition, not the dedup rules themselves (covered in depth by
+    ``tests/test_signals_dedupe.py``)."""
+    from claudetrade.domain import SignalStatus
+
+    sig = make_signal(symbol="LPLA", strategy="volume_breakout", overall_score=75.0)
+    sibling = make_signal(symbol="LPLA", strategy="sentiment_pullback", overall_score=60.0)
+    _record(tmp_db, sig)
+    _record(tmp_db, sibling)
+
+    ResearchLedger(tmp_db).append_research_revision(
+        sibling.signal_id,
+        thesis=None,
+        invalidation=None,
+        score_adjustments={"technical_setup": 20.0},
+        rationale="Strong new catalyst confirmed by two independent sources.",
+        sources=["https://example.com/a", "https://example.com/b"],
+        config=tmp_app_config,
+    )
+
+    signals = [sig, sibling]
+    status_by_id = {s.signal_id: SignalStatus.ACTIONABLE for s in signals}
+    overlay = research_overlay(tmp_db, signals, tmp_app_config)
+
+    groups = collapse_signals(signals, status_by_id, overlay)
+
+    assert len(groups) == 1
+    group = groups[0]
+    # sibling's research-adjusted effective_score (60.0 + 4.0 = 64.0) is
+    # still below sig's raw 75.0, so sig stays the representative.
+    assert group.signal.signal_id == sig.signal_id
+    assert group.corroborating_strategies == ["sentiment_pullback"]
+    [corroborator] = group.corroborating
+    assert corroborator.effective_score == pytest.approx(64.0)
+
+
+def test_collapse_signals_with_no_overlap_returns_one_group_per_signal(
+    tmp_db: Database, tmp_app_config: AppConfig, make_signal
+):
+    from claudetrade.domain import SignalStatus
+
+    signals = [make_signal(symbol=f"SYM{i}", overall_score=50.0 + i) for i in range(3)]
+    for sig in signals:
+        _record(tmp_db, sig)
+
+    status_by_id = {s.signal_id: SignalStatus.ACTIONABLE for s in signals}
+    overlay = {
+        s.signal_id: ResearchOverlay(effective_score=s.overall_score, has_research=False, latest=None)
+        for s in signals
+    }
+
+    groups = collapse_signals(signals, status_by_id, overlay)
+
+    assert len(groups) == 3
+    for group in groups:
+        assert group.corroborating == ()
+        assert group.duplicates_collapsed == 0

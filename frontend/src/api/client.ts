@@ -60,7 +60,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return resp.json() as Promise<T>;
 }
 
-function query(params: Record<string, string | number | string[] | undefined>): string {
+function query(params: Record<string, string | number | boolean | string[] | undefined>): string {
   const usp = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === null) continue;
@@ -108,6 +108,7 @@ export const api = {
         strategy: filters.strategy,
         max_days_to_earnings: filters.max_days_to_earnings,
         limit: filters.limit,
+        distinct: filters.distinct,
       })}`,
     ),
 

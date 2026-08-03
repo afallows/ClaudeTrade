@@ -294,6 +294,112 @@ def test_get_signals_effective_score_uses_the_batched_read_not_n_plus_one(
 
 
 # --------------------------------------------------------------------------
+# get_signals: distinct (read-time de-duplication -- signals.dedupe)
+# --------------------------------------------------------------------------
+
+
+def test_get_signals_distinct_defaults_to_true_and_collapses_duplicates(
+    pipeline: Pipeline, tmp_db: Database, make_signal
+) -> None:
+    """The reported bug, reproduced end-to-end: two identical-content
+    re-scans of the same session (different signal_id from a code/config
+    change) plus one cross-strategy sibling collapse into ONE row by
+    default, with corroborating_strategies and duplicates_collapsed set."""
+    import dataclasses
+
+    session = dt.date(2026, 7, 31)
+    dup_early = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="volume_breakout", session=session, overall_score=60.0),
+        signal_id="dup-early",
+        created_at=dt.datetime(2026, 7, 31, 5, 39, tzinfo=dt.UTC),
+    )
+    dup_late = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="volume_breakout", session=session, overall_score=61.0),
+        signal_id="dup-late",
+        created_at=dt.datetime(2026, 7, 31, 12, 0, tzinfo=dt.UTC),
+    )
+    sibling = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="sentiment_pullback", session=session, overall_score=90.0),
+        signal_id="sibling",
+        created_at=dt.datetime(2026, 7, 31, 12, 0, tzinfo=dt.UTC),
+    )
+    for sig in (dup_early, dup_late, sibling):
+        _record(tmp_db, sig)
+
+    result = mcp_server.get_signals(pipeline)  # distinct defaults to True
+
+    assert result["distinct"] is True
+    assert result["count"] == 1
+    row = result["signals"][0]
+    assert row["signal_id"] == "sibling"  # highest score wins representative
+    assert row["duplicates_collapsed"] == 1
+    assert row["corroborating_strategies"] == [
+        {
+            "signal_id": "dup-late",
+            "strategy": "volume_breakout",
+            "overall_score": 61.0,
+            "effective_score": 61.0,
+        }
+    ]
+    assert result["total_matching"] == 1  # one GROUP, not three raw rows
+    assert result["truncated"] is False
+
+
+def test_get_signals_distinct_false_returns_raw_per_strategy_rows(
+    pipeline: Pipeline, tmp_db: Database, make_signal
+) -> None:
+    import dataclasses
+
+    session = dt.date(2026, 7, 31)
+    dup_early = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="volume_breakout", session=session, overall_score=60.0),
+        signal_id="dup-early",
+        created_at=dt.datetime(2026, 7, 31, 5, 39, tzinfo=dt.UTC),
+    )
+    dup_late = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="volume_breakout", session=session, overall_score=61.0),
+        signal_id="dup-late",
+        created_at=dt.datetime(2026, 7, 31, 12, 0, tzinfo=dt.UTC),
+    )
+    sibling = dataclasses.replace(
+        make_signal(symbol="SPSC", strategy="sentiment_pullback", session=session, overall_score=90.0),
+        signal_id="sibling",
+        created_at=dt.datetime(2026, 7, 31, 12, 0, tzinfo=dt.UTC),
+    )
+    for sig in (dup_early, dup_late, sibling):
+        _record(tmp_db, sig)
+
+    result = mcp_server.get_signals(pipeline, distinct=False)
+
+    assert result["distinct"] is False
+    assert result["count"] == 3
+    ids = {row["signal_id"] for row in result["signals"]}
+    assert ids == {"dup-early", "dup-late", "sibling"}
+    for row in result["signals"]:
+        assert "corroborating_strategies" not in row
+        assert "duplicates_collapsed" not in row
+    assert result["total_matching"] == 3
+
+
+def test_get_signals_distinct_keeps_long_and_short_separate(
+    pipeline: Pipeline, tmp_db: Database, make_signal
+) -> None:
+    from claudetrade.domain import Direction
+
+    _record(tmp_db, make_signal(symbol="TSLA", direction=Direction.LONG, overall_score=70.0))
+    _record(tmp_db, make_signal(symbol="TSLA", direction=Direction.SHORT, overall_score=65.0))
+
+    result = mcp_server.get_signals(pipeline)
+
+    assert result["count"] == 2
+    directions = {row["direction"] for row in result["signals"]}
+    assert directions == {"long", "short"}
+    for row in result["signals"]:
+        assert row["corroborating_strategies"] == []
+        assert row["duplicates_collapsed"] == 0
+
+
+# --------------------------------------------------------------------------
 # submit_research_revision / get_research_revisions
 # --------------------------------------------------------------------------
 
@@ -1396,7 +1502,7 @@ def test_build_server_tool_schemas_match_the_documented_signatures(
     def properties(name: str) -> set[str]:
         return set(tools[name].parameters.get("properties", {}))
 
-    assert properties("get_signals") == {"min_score", "limit", "sort"}
+    assert properties("get_signals") == {"min_score", "limit", "sort", "distinct"}
     assert properties("get_sentiment") == {"symbol", "days"}
     assert properties("get_trending") == {"limit", "source"}
     assert properties("get_market_status") == set()

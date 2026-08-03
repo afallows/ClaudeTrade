@@ -69,6 +69,7 @@ from claudetrade.logging_setup import get_logger
 from claudetrade.pipeline import Pipeline
 from claudetrade.providers.base import ProviderError
 from claudetrade.signals import funnel_store
+from claudetrade.signals.dedupe import collapse_recommendations
 from claudetrade.signals.research import ResearchGuardrailError, ResearchLedger
 from claudetrade.signals.scoring import adjusted_overall
 from claudetrade.ui.data_access import data_freshness, sentiment_timeline
@@ -173,6 +174,7 @@ def get_signals(
     min_score: float = 0.0,
     limit: int = 20,
     sort: str = "score",
+    distinct: bool = True,
 ) -> dict[str, Any]:
     """Read-only. Current signals from the immutable ledger, best-scoring first.
 
@@ -196,7 +198,12 @@ def get_signals(
         sort: ``"score"`` (default, best first -- matches the UI screener) or
             ``"created_at"`` (newest first). Chronological order is a real
             need for audit and ledger inspection, so it stays available; it
-            is simply the wrong default for "show me the candidates".
+            is simply the wrong default for "show me the candidates". When
+            ``distinct=True`` it still governs which rows get *scanned* (see
+            below), and it also re-sorts the final, already-collapsed rows
+            by the representative's ``created_at`` -- otherwise the
+            collapsed rows stay in their natural (representative
+            ``effective_score`` descending) order.
         config: When given and there are no matching signals, a
             ``why_no_signals`` block is added from the most recent scan's
             persisted rejection funnel (see :func:`_why_no_signals`) -- "why
@@ -206,20 +213,38 @@ def get_signals(
             back to the unadjusted ``overall_score``. Optional only so
             callers that genuinely do not have a config on hand still get a
             valid result; :func:`build_server` always passes one.
+        distinct: Default ``True``. Collapses read-time duplicates via
+            ``signals.dedupe.collapse_recommendations`` before applying
+            ``limit`` -- see that module's docstring for exactly what
+            "duplicate" means here (same-session re-scans after a code/
+            config change, and cross-strategy overlap on the same symbol
+            +direction). ``distinct=False`` returns the raw, uncollapsed
+            per-strategy ledger rows -- today's original behaviour --
+            unchanged. Each collapsed row gains ``corroborating_strategies``
+            (the OTHER strategies that agree, with their own scores) and
+            ``duplicates_collapsed`` (how many exact re-scan duplicates were
+            folded into this one row). ``total_matching``/``truncated`` count
+            GROUPS, not raw ledger rows, when ``distinct=True`` -- a caller
+            asking "how many recommendations are there" gets an honest
+            answer in either mode, but the unit changes.
 
     Each row carries ``effective_score`` (``overall_score`` re-ranked by any
     accepted MCP research revisions -- see ``submit_research_revision`` --
     via ``signals.scoring.adjusted_overall``) and ``has_research`` (whether
-    any revision exists at all). When ``sort="score"`` and at least one
-    returned row has research, the page is re-sorted by ``effective_score``
-    instead of the raw ``overall_score`` the SQL query used to select and
-    order it -- a revision's clamped adjustment can only ever move a score by
-    a bounded amount (``McpConfig.max_component_adjustment``), so it can
-    reorder rows already on the page, but it cannot pull in a row that did
-    not qualify for the page on ``overall_score`` in the first place. Research
+    any revision exists at all). When ``distinct=False`` and ``sort="score"``
+    and at least one returned row has research, the page is re-sorted by
+    ``effective_score`` instead of the raw ``overall_score`` the SQL query
+    used to select and order it -- a revision's clamped adjustment can only
+    ever move a score by a bounded amount
+    (``McpConfig.max_component_adjustment``), so it can reorder rows already
+    on the page, but it cannot pull in a row that did not qualify for the
+    page on ``overall_score`` in the first place. When ``distinct=True`` the
+    collapsed groups are already ordered by representative
+    ``effective_score`` (see :func:`~claudetrade.signals.dedupe
+    .collapse_recommendations`), so no extra re-sort is needed. Research
     revisions are fetched with ONE extra batched query, keyed to exactly the
-    signal ids on this page (see ``ResearchLedger.latest_research_revisions``)
-    -- never a per-row lookup.
+    signal ids scanned (see ``ResearchLedger.latest_research_revisions``) --
+    never a per-row lookup.
     """
     limit = max(1, min(int(limit), 200))
     order = "created_at" if str(sort).lower() == "created_at" else "score"
@@ -230,16 +255,24 @@ def get_signals(
     # sequential queries and never broke early when fewer than ``limit`` rows
     # cleared the filter -- that aggregate, on the MCP event loop, is what QA
     # observed as a hung-then-dead server (F26).
+    #
+    # ``distinct=True`` scans up to SIGNAL_SCAN_LIMIT raw rows (rather than
+    # exactly ``limit``) BEFORE collapsing: collapsing can only ever shrink a
+    # page (duplicates/siblings fold together), so scanning only ``limit``
+    # raw rows first would silently under-fill a ``limit``-sized page of
+    # GROUPS whenever any collapsing happened on the page.
+    scan_limit = SIGNAL_SCAN_LIMIT if distinct else limit
     matches, total = pipeline.ledger.list_with_status(
-        min_score=min_score, limit=limit, order=order
+        min_score=min_score, limit=scan_limit, order=order
     )
 
     # Batched, not per-row (same F26 discipline as the query above).
     research = ResearchLedger(pipeline.db).latest_research_revisions(
         [sig.signal_id for sig, _ in matches]
     )
-    rows: list[dict[str, Any]] = []
-    for sig, status in matches:
+    effective_scores: dict[str, float] = {}
+    has_research_by_id: dict[str, bool] = {}
+    for sig, _status in matches:
         revision = research.get(sig.signal_id)
         has_research = revision is not None
         if revision is not None and config is not None:
@@ -251,18 +284,65 @@ def get_signals(
             )
         else:
             effective = sig.overall_score
-        rows.append(_signal_summary(sig, status, effective_score=effective, has_research=has_research))
+        effective_scores[sig.signal_id] = effective
+        has_research_by_id[sig.signal_id] = has_research
 
-    if order == "score" and any(row["has_research"] for row in rows):
-        rows.sort(key=lambda row: row["effective_score"], reverse=True)
+    if distinct:
+        groups = collapse_recommendations(matches, effective_scores)
+        if order == "created_at":
+            # Groups come back sorted by representative effective_score
+            # descending (collapse_recommendations' own contract); honour
+            # the caller's explicit chronological request on the final,
+            # already-collapsed list instead.
+            groups.sort(key=lambda g: g.signal.created_at, reverse=True)
+        page = groups[:limit]
+        rows = []
+        for group in page:
+            sig = group.signal
+            row = _signal_summary(
+                sig,
+                group.status,
+                effective_score=group.effective_score,
+                has_research=has_research_by_id.get(sig.signal_id, False),
+            )
+            row["corroborating_strategies"] = [
+                {
+                    "signal_id": c.signal_id,
+                    "strategy": c.strategy,
+                    "overall_score": c.overall_score,
+                    "effective_score": c.effective_score,
+                }
+                for c in group.corroborating
+            ]
+            row["duplicates_collapsed"] = group.duplicates_collapsed
+            rows.append(row)
+        total_matching = len(groups)
+        truncated = total_matching > len(page) or total > len(matches)
+    else:
+        rows = [
+            _signal_summary(
+                sig,
+                status,
+                effective_score=effective_scores[sig.signal_id],
+                has_research=has_research_by_id[sig.signal_id],
+            )
+            for sig, status in matches
+        ]
+        if order == "score" and any(row["has_research"] for row in rows):
+            rows.sort(key=lambda row: row["effective_score"], reverse=True)
+        total_matching = total
+        truncated = total > len(rows)
 
     result: dict[str, Any] = {
         "disclaimer": DISCLAIMER,
         "count": len(rows),
         # Callers could not previously tell a complete answer from a slice.
-        "total_matching": total,
-        "truncated": total > len(rows),
+        # Counts GROUPS, not raw ledger rows, when distinct=True -- see the
+        # ``distinct`` arg's docstring.
+        "total_matching": total_matching,
+        "truncated": truncated,
         "sorted_by": order,
+        "distinct": distinct,
         "signals": rows,
     }
     if not rows and config is not None:
@@ -1464,21 +1544,26 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "direction, score, confidence, entry/stop/targets and days_to_earnings, "
             "plus total_matching and truncated so you can tell a complete answer "
             "from a page. sort='created_at' gives newest-first instead, for audit or "
-            "ledger inspection. Includes the standing research-only disclaimer once, "
-            "not per row. When there are no matching signals, includes a "
-            "why_no_signals block: the rejection funnel (reasons and counts) and "
-            "closest near-misses from the most recent scan on this installation, so "
-            "'why no picks today?' has a real answer."
+            "ledger inspection. distinct=True (default) collapses read-time "
+            "duplicates -- same-session re-scans after a code/config change, and "
+            "cross-strategy overlap on one symbol+direction -- into one row per "
+            "recommendation, with corroborating_strategies (the other strategies "
+            "that agree) and duplicates_collapsed on each row; pass distinct=False "
+            "for the raw, uncollapsed per-strategy rows. Includes the standing "
+            "research-only disclaimer once, not per row. When there are no matching "
+            "signals, includes a why_no_signals block: the rejection funnel (reasons "
+            "and counts) and closest near-misses from the most recent scan on this "
+            "installation, so 'why no picks today?' has a real answer."
         ),
     )
     async def _get_signals(
-        min_score: float = 0.0, limit: int = 20, sort: str = "score"
+        min_score: float = 0.0, limit: int = 20, sort: str = "score", distinct: bool = True
     ) -> dict[str, Any]:
         return await _call_bounded(
             "get_signals",
             config.mcp.tool_timeout_seconds,
             lambda: get_signals(
-                pipeline, config, min_score=min_score, limit=limit, sort=sort
+                pipeline, config, min_score=min_score, limit=limit, sort=sort, distinct=distinct
             ),
         )
 

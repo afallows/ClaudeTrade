@@ -106,6 +106,19 @@ class SignalRowOut(BaseModel):
     #: latest session -- ``None`` when no Adanos snapshot exists for it yet
     #: (feed disabled, not yet collected, or an unrecognised symbol).
     attention: AttentionOut | None = None
+    #: Names of the OTHER strategies whose signal collapsed into this same
+    #: (symbol, direction) recommendation at read time -- see
+    #: ``signals.dedupe.collapse_recommendations``. Empty when
+    #: ``distinct=False`` was requested, or no other strategy corroborates
+    #: this symbol+direction on the representative session.
+    corroborating_strategies: list[str] = Field(default_factory=list)
+    #: ``len(corroborating_strategies)`` -- a group with 1+ is genuinely
+    #: stronger evidence (2+ independently-reasoned strategies agree).
+    corroborating_count: int = 0
+    #: How many exact re-scan duplicates (same symbol+strategy+session,
+    #: different signal_id from a code/config change) were folded into this
+    #: row at read time.
+    duplicates_collapsed: int = 0
 
 
 class ResearchRevisionOut(BaseModel):
