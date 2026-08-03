@@ -25,6 +25,8 @@ import type {
   SignalDetail,
   SignalFilters,
   SignalList,
+  SignalWeights,
+  SignalWeightsUpdateResult,
   TickerDetail,
 } from './types';
 
@@ -93,6 +95,13 @@ export const api = {
     request<AIConfigUpdateResult>('/api/system/ai-config', {
       method: 'PUT',
       body: JSON.stringify({ provider, model }),
+    }),
+
+  weights: () => request<SignalWeights>('/api/system/weights'),
+  updateWeights: (weights: Record<string, number>) =>
+    request<SignalWeightsUpdateResult>('/api/system/weights', {
+      method: 'PUT',
+      body: JSON.stringify({ weights }),
     }),
 
   refreshStatus: () => request<RefreshStatus>('/api/system/refresh/status'),

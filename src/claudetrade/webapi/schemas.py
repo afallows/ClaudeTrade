@@ -345,6 +345,37 @@ class AIConfigUpdate(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Signal weightings (Configuration screen's "Signal Weightings" section)
+# --------------------------------------------------------------------------
+
+
+class SignalWeightsOut(BaseModel):
+    """Current ``config.signals.component_weights`` for the Configuration
+    screen's "Signal Weightings" section, plus the normalised (sum-to-1)
+    view actually used at scoring time -- see
+    ``signals.scoring``/``SignalConfig.component_weights``'s docstring:
+    weights are normalised at use, so their raw sum need not be 1.0, but the
+    UI shows both so an operator can see when it has drifted far from 1.0.
+
+    ``promoted_scoring`` is a placeholder for an upcoming score-promotion
+    config field (not yet present on ``SignalConfig``) -- ``None`` until
+    that field exists, never an error.
+    """
+
+    weights: dict[str, float]
+    normalised: dict[str, float]
+    promoted_scoring: dict[str, float] | None = None
+
+
+class SignalWeightsUpdate(BaseModel):
+    #: Component name -> weight. May be a subset of the known components --
+    #: unspecified components keep their current value (see
+    #: ``PUT /api/system/weights``'s docstring for the full merge/validation
+    #: contract).
+    weights: dict[str, float]
+
+
+# --------------------------------------------------------------------------
 # Dashboard
 # --------------------------------------------------------------------------
 
@@ -496,6 +527,8 @@ __all__ = [
     "SignalDetailOut",
     "SignalListOut",
     "SignalRowOut",
+    "SignalWeightsOut",
+    "SignalWeightsUpdate",
     "StatusRibbonOut",
     "TickerDetailOut",
     "TradePlanOut",

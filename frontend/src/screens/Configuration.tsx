@@ -1,7 +1,90 @@
 import { useEffect, useState } from 'react';
-import { KeyRound, Trash2 } from 'lucide-react';
+import { Activity, KeyRound, Trash2 } from 'lucide-react';
 import { api } from '../api/client';
-import type { AIConfig, CredentialStatus } from '../api/types';
+import type { AIConfig, CredentialStatus, SignalWeights } from '../api/types';
+
+/** How far the raw weight sum may drift from 1.00 before the caption warns.
+ * Weights are normalised at use (see the section's own caption), so a small
+ * drift is harmless -- this only flags a sum far enough off to suggest a
+ * mistake (e.g. a component left at 0 or fat-fingered). */
+const WEIGHT_SUM_DRIFT_WARNING = 0.15;
+
+/** "Signal Weightings" section: one numeric input per scoring component
+ * (`config.signals.component_weights`), a live sum readout, and a Save
+ * button against `PUT /api/system/weights`. Rendered first on this screen,
+ * before any credential -- weights shape every score the app produces, so
+ * they lead. See `webapi.routers.system.update_signal_weights` (Python) for
+ * the honest-persistence contract this section's note text quotes. */
+function SignalWeightingsSection() {
+  const [data, setData] = useState<SignalWeights | null>(null);
+  const [weights, setWeights] = useState<Record<string, number>>({});
+  const [message, setMessage] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    void api.weights().then((d) => { setData(d); setWeights(d.weights); });
+  }, []);
+
+  if (!data) return null;
+
+  const componentNames = Object.keys(weights).sort();
+  const sum = Object.values(weights).reduce((total, value) => total + (Number.isFinite(value) ? value : 0), 0);
+  const sumDrifted = Math.abs(sum - 1) > WEIGHT_SUM_DRIFT_WARNING;
+
+  async function save() {
+    setSaving(true);
+    setMessage('');
+    try {
+      const result = await api.updateWeights(weights);
+      setWeights(result.weights);
+      setMessage(result.note);
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : 'Unable to update signal weightings.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <section className="rounded-xl border border-gridline bg-surface p-4">
+    <div className="mb-3"><h2 className="font-medium text-ink">Signal Weightings</h2>
+      <p className="text-xs text-ink-secondary">
+        Relative contribution of each scoring component to a signal&rsquo;s overall score. Weights are
+        normalised at use, so the sum need not be exactly 1.00 -- but a sum far from 1.00 usually means a
+        component was set by mistake.
+      </p>
+    </div>
+
+    <div className="grid gap-2 sm:grid-cols-2">
+      {componentNames.map((name) => (
+        <label key={name} htmlFor={`weight-${name}`} className="flex items-center justify-between gap-3 text-sm text-ink">
+          <span className="text-ink-secondary">{name.replace(/_/g, ' ')}</span>
+          <input
+            id={`weight-${name}`}
+            type="number"
+            step={0.01}
+            min={0}
+            max={1}
+            value={weights[name]}
+            onChange={(e) => setWeights((w) => ({ ...w, [name]: Number.isNaN(e.target.valueAsNumber) ? 0 : e.target.valueAsNumber }))}
+            className="w-24 rounded-lg border border-gridline bg-background px-2 py-1 text-right text-sm text-ink"
+          />
+        </label>
+      ))}
+    </div>
+
+    <div className="mt-3 flex items-center justify-between gap-3">
+      <p className={`text-xs ${sumDrifted ? 'text-warning' : 'text-ink-secondary'}`}>
+        Sum: {sum.toFixed(2)}{sumDrifted ? ' -- far from 1.00' : ''}
+      </p>
+      <button onClick={() => void save()} disabled={saving}
+        className="rounded-lg bg-accent px-3 py-2 text-sm font-medium text-white disabled:opacity-40">
+        {saving ? 'Saving…' : 'Save'}
+      </button>
+    </div>
+
+    {message && <div role="status" className="mt-3 rounded-lg border border-gridline px-3 py-2 text-sm text-ink">{message}</div>}
+  </section>;
+}
 
 /** "AI Analysis" section: provider dropdown, model field, and per-provider
  * setup instructions -- see docs/ai-setup.md for the full walkthrough this
@@ -99,6 +182,50 @@ function AIAnalysisSection({ onChanged }: { onChanged: () => void }) {
   </section>;
 }
 
+/** One credential card, styled to match Diagnostics.tsx's pipeline rows:
+ * an icon + name header, a status pill in the same colours Diagnostics
+ * uses for "configured" states, and a muted detail line -- see
+ * Diagnostics.tsx's pipeline `<section>` for the layout this mirrors. */
+function CredentialCard({ item, value, onChange, onSave, onRemove }: {
+  item: CredentialStatus;
+  value: string;
+  onChange: (value: string) => void;
+  onSave: () => void;
+  onRemove: () => void;
+}) {
+  return <section className="rounded-xl border border-gridline bg-surface p-4">
+    <div className="flex items-start justify-between gap-2">
+      <div className="flex items-center gap-2"><KeyRound className="h-4 w-4 text-accent shrink-0" /><h2 className="font-medium text-ink">{item.label}</h2></div>
+      <span className={`shrink-0 rounded-full px-2 py-1 text-xs font-medium ${item.configured ? 'bg-good/15 text-good' : 'bg-surface-2 text-ink-secondary'}`}>
+        {item.configured ? 'Configured' : 'Not configured'}
+      </span>
+    </div>
+    <p className="mt-1 text-xs text-ink-secondary">{item.pipeline.replace('_', ' ')} pipeline</p>
+    <p className="mt-3 text-xs text-ink-secondary">
+      {item.configured ? `${item.masked} via ${item.source}` : 'No value stored yet.'}
+    </p>
+    <div className="mt-3 flex gap-2">
+      <input aria-label={`${item.label} value`} type="password" autoComplete="new-password" value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={item.configured ? 'Enter replacement value' : 'Enter credential'}
+        className="min-w-0 flex-1 rounded-lg border border-gridline bg-background px-3 py-2 text-sm text-ink" />
+      <button onClick={onSave} disabled={!value}
+        className="rounded-lg bg-accent px-3 py-2 text-sm font-medium text-white disabled:opacity-40">
+        Save
+      </button>
+      {item.configured && <button aria-label={`Remove ${item.label}`} onClick={onRemove}
+        className="rounded-lg border border-gridline p-2 text-critical">
+        <Trash2 className="h-4 w-4" />
+      </button>}
+    </div>
+  </section>;
+}
+
+const PIPELINE_GROUPS: { key: CredentialStatus['pipeline']; heading: string }[] = [
+  { key: 'sentiment', heading: 'Sentiment sources' },
+  { key: 'stock_price', heading: 'Stock price sources' },
+];
+
 export function Configuration() {
   const [items, setItems] = useState<CredentialStatus[]>([]);
   const [values, setValues] = useState<Record<string, string>>({});
@@ -123,13 +250,27 @@ export function Configuration() {
     <div className="rounded-xl border border-gridline bg-surface p-4 text-sm text-ink-secondary"><KeyRound className="mr-2 inline h-4 w-4 text-accent" />Secrets are written to your operating system credential store. Existing values are never returned to this page.</div>
     {message && <div role="status" className="rounded-lg border border-gridline px-3 py-2 text-sm text-ink">{message}</div>}
 
+    <SignalWeightingsSection />
+
     <AIAnalysisSection onChanged={load} />
 
-    {loading ? <p className="text-sm text-ink-secondary">Loading credentials…</p> : <div className="grid gap-3">
-      {items.map((item) => <section key={item.name} className="rounded-xl border border-gridline bg-surface p-4">
-        <div className="mb-3 flex items-start justify-between"><div><h2 className="font-medium text-ink">{item.label}</h2><p className="text-xs text-ink-secondary">{item.pipeline.replace('_', ' ')} pipeline · {item.configured ? `${item.masked} via ${item.source}` : 'Not configured'}</p></div><span className={`rounded-full px-2 py-1 text-xs ${item.configured ? 'bg-good/15 text-good' : 'bg-surface-2 text-ink-secondary'}`}>{item.configured ? 'Configured' : 'Not configured'}</span></div>
-        <div className="flex gap-2"><input aria-label={`${item.label} value`} type="password" autoComplete="new-password" value={values[item.name] ?? ''} onChange={(e) => setValues((v) => ({...v, [item.name]: e.target.value}))} placeholder={item.configured ? 'Enter replacement value' : 'Enter credential'} className="min-w-0 flex-1 rounded-lg border border-gridline bg-background px-3 py-2 text-sm text-ink"/><button onClick={() => void save(item)} disabled={!values[item.name]} className="rounded-lg bg-accent px-3 py-2 text-sm font-medium text-white disabled:opacity-40">Save</button>{item.configured && <button aria-label={`Remove ${item.label}`} onClick={() => void remove(item)} className="rounded-lg border border-gridline p-2 text-critical"><Trash2 className="h-4 w-4" /></button>}</div>
-      </section>)}
+    {loading ? <p className="text-sm text-ink-secondary">Loading credentials…</p> : <div className="flex flex-col gap-4">
+      {PIPELINE_GROUPS.map(({ key, heading }) => {
+        const group = items.filter((item) => item.pipeline === key);
+        if (group.length === 0) return null;
+        return <div key={key} className="flex flex-col gap-3">
+          <h3 className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-ink-secondary">
+            <Activity className="h-3.5 w-3.5" />{heading}
+          </h3>
+          <div className="grid gap-3 md:grid-cols-2">
+            {group.map((item) => <CredentialCard key={item.name} item={item}
+              value={values[item.name] ?? ''}
+              onChange={(value) => setValues((v) => ({ ...v, [item.name]: value }))}
+              onSave={() => void save(item)}
+              onRemove={() => void remove(item)} />)}
+          </div>
+        </div>;
+      })}
     </div>}
   </div>;
 }

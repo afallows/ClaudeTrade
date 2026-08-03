@@ -404,6 +404,22 @@ export interface AIConfigUpdateResult {
   note: string;
 }
 
+/** `config.signals.component_weights` -- see `webapi.schemas.SignalWeightsOut`
+ * (Python). `normalised` is the sum-to-1 view actually used at scan time;
+ * `promoted_scoring` is a placeholder for an upcoming score-promotion field
+ * and is `null` until that field exists. */
+export interface SignalWeights {
+  weights: Record<string, number>;
+  normalised: Record<string, number>;
+  promoted_scoring: Record<string, number> | null;
+}
+export interface SignalWeightsUpdateResult {
+  weights: Record<string, number>;
+  normalised: Record<string, number>;
+  persisted: boolean;
+  note: string;
+}
+
 export interface RefreshStatus {
   running: boolean;
   phase: string;

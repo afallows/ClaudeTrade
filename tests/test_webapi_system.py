@@ -175,6 +175,59 @@ class TestAIConfigEndpoint:
         assert response.status_code == 422
 
 
+class TestSignalWeightsEndpoint:
+    """``GET``/``PUT /api/system/weights`` -- the Configuration screen's
+    "Signal Weightings" section, mirroring ``TestAIConfigEndpoint``'s
+    honest-persistence contract."""
+
+    def test_get_reflects_defaults(self, client, tmp_app_config) -> None:
+        body = client.get("/api/system/weights").json()
+        assert len(body["weights"]) == 12
+        assert body["weights"] == tmp_app_config.signals.component_weights
+        assert pytest.approx(sum(body["weights"].values()), abs=1e-9) == 1.0
+        assert pytest.approx(sum(body["normalised"].values()), abs=1e-9) == 1.0
+        assert body["promoted_scoring"] is None
+
+    def test_put_applies_immediately_and_reports_unpersisted(self, client, tmp_app_config) -> None:
+        response = client.put(
+            "/api/system/weights", json={"weights": {"technical_setup": 0.5}}
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["weights"]["technical_setup"] == 0.5
+        # Untouched components carry forward unchanged.
+        assert body["weights"]["price_momentum"] == pytest.approx(0.12)
+        assert body["persisted"] is False
+        assert "config.toml" in body["note"]
+        assert tmp_app_config.signals.component_weights["technical_setup"] == 0.5
+
+        # Visible immediately on a subsequent GET.
+        assert client.get("/api/system/weights").json()["weights"]["technical_setup"] == 0.5
+
+    def test_put_rejects_unknown_component(self, client) -> None:
+        response = client.put(
+            "/api/system/weights", json={"weights": {"not_a_real_component": 0.5}}
+        )
+        assert response.status_code == 422
+        assert "not_a_real_component" in response.json()["detail"]
+
+    def test_put_rejects_out_of_range_value(self, client) -> None:
+        response = client.put(
+            "/api/system/weights", json={"weights": {"technical_setup": 1.5}}
+        )
+        assert response.status_code == 422
+
+        response = client.put(
+            "/api/system/weights", json={"weights": {"technical_setup": -0.1}}
+        )
+        assert response.status_code == 422
+
+    def test_put_rejects_all_zero(self, client, tmp_app_config) -> None:
+        all_zero = dict.fromkeys(tmp_app_config.signals.component_weights, 0.0)
+        response = client.put("/api/system/weights", json={"weights": all_zero})
+        assert response.status_code == 422
+
+
 class TestXConnectivityTest:
     """``POST /api/system/credentials/x/test`` -- mirrors
     ``TestRedditConnectivityTest`` exactly; the transport is always mocked.

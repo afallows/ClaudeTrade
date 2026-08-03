@@ -30,7 +30,12 @@ from claudetrade.secrets import credential_catalog, delete_secret, get_secret, s
 from claudetrade.utils.timeutils import utc_now
 from claudetrade.webapi.deps import get_config, get_pipeline
 from claudetrade.webapi.refresh_state import RefreshState
-from claudetrade.webapi.schemas import AIConfigOut, AIConfigUpdate
+from claudetrade.webapi.schemas import (
+    AIConfigOut,
+    AIConfigUpdate,
+    SignalWeightsOut,
+    SignalWeightsUpdate,
+)
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 log = logging.getLogger(__name__)
@@ -139,6 +144,87 @@ def update_ai_config(
             "Applied immediately for this running session. To make it "
             "permanent across restarts, add it to config.toml's [ai] table "
             "or set CLAUDETRADE_AI__PROVIDER / CLAUDETRADE_AI__MODEL."
+        ),
+    }
+
+
+def _normalised(weights: dict[str, float]) -> dict[str, float]:
+    total = sum(weights.values())
+    return {name: (value / total if total else 0.0) for name, value in weights.items()}
+
+
+@router.get("/weights")
+def signal_weights(config: AppConfig = Depends(get_config)) -> SignalWeightsOut:
+    """Current scoring-component weights for the Configuration screen's
+    "Signal Weightings" section, plus the normalised view actually applied
+    at scan time (see ``SignalConfig.component_weights``'s docstring --
+    weights are normalised at use, so the raw sum need not be 1.0).
+    """
+    weights = dict(config.signals.component_weights)
+    return SignalWeightsOut(
+        weights=weights,
+        normalised=_normalised(weights),
+        # A future score-promotion field, not yet on SignalConfig -- absence
+        # is expected right now, not an error.
+        promoted_scoring=getattr(config.signals, "promoted_scoring", None),
+    )
+
+
+@router.put("/weights")
+def update_signal_weights(
+    body: SignalWeightsUpdate, config: AppConfig = Depends(get_config)
+) -> dict[str, object]:
+    """Update scoring-component weights on the running config.
+
+    **Scoped, honest persistence**: exactly like ``PUT /api/system/ai-config``
+    (see that endpoint's docstring), this updates the running server's
+    in-memory ``AppConfig.signals.component_weights`` immediately -- the
+    next scan in *this* process uses the new weights. It does NOT rewrite
+    ``config.toml`` on disk. The response's ``persisted: false`` and
+    ``note`` fields say this plainly. To make a change permanent across
+    restarts, add it to ``config.toml``'s ``[signals]`` table or set
+    ``CLAUDETRADE_SIGNALS__COMPONENT_WEIGHTS``.
+
+    Validation: every submitted key must already be a known component (the
+    keys currently present on ``config.signals.component_weights`` -- this
+    is intentionally read from the live config rather than hardcoded, since
+    a future score-promotion change will add components); every value must
+    be within ``0..1``; and the resulting weight set (after merging the
+    submission over the current weights -- a partial submission leaves
+    untouched components at their current value) must have at least one
+    positive weight, or scoring would have nothing to rank on.
+    """
+    current = dict(config.signals.component_weights)
+    unknown = sorted(set(body.weights) - set(current))
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown weighting component(s): {', '.join(unknown)}",
+        )
+    if not body.weights:
+        raise HTTPException(status_code=422, detail="at least one component weight must be provided")
+    out_of_range = sorted(name for name, value in body.weights.items() if not (0.0 <= value <= 1.0))
+    if out_of_range:
+        raise HTTPException(
+            status_code=422,
+            detail=f"weight(s) out of range 0..1: {', '.join(out_of_range)}",
+        )
+
+    merged = {**current, **body.weights}
+    if not any(value > 0 for value in merged.values()):
+        raise HTTPException(
+            status_code=422, detail="at least one component weight must be greater than 0"
+        )
+
+    config.signals.component_weights = merged
+    return {
+        "weights": merged,
+        "normalised": _normalised(merged),
+        "persisted": False,
+        "note": (
+            "Applied immediately for this running session. To make it "
+            "permanent across restarts, add it to config.toml's [signals] "
+            "table or set CLAUDETRADE_SIGNALS__COMPONENT_WEIGHTS."
         ),
     }
 
