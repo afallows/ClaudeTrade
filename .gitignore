@@ -42,3 +42,4 @@ desktop.ini
 
 # PyInstaller
 *.spec.bak
+scripts/setup-log-*.txt
