@@ -509,7 +509,8 @@ def _test_adanos_connectivity(config: AppConfig) -> dict[str, object]:
 
 
 def _pipeline(name: str, kind: Literal["sentiment", "stock_price"], provider: str,
-              enabled: bool, needs_credential: bool, credential: str | None = None) -> dict[str, object]:
+              enabled: bool, needs_credential: bool, credential: str | None = None,
+              test_source: str | None = None) -> dict[str, object]:
     configured = enabled and (not needs_credential or bool(credential and get_secret(credential)))
     # This endpoint deliberately performs no vendor requests. "reachable" means
     # the selected adapter can be invoked locally; runtime vendor reachability
@@ -523,6 +524,14 @@ def _pipeline(name: str, kind: Literal["sentiment", "stock_price"], provider: st
             "Configured; network reachability is checked during refresh" if configured else
             ("Credential required" if enabled else "Disabled in configuration")
         ),
+        # The {source} string ``POST /api/system/credentials/{source}/test``
+        # accepts for this connector, or None when no live test exists (e.g.
+        # local/synthetic providers, or a connector -- Stocktwits, News RSS --
+        # that has no probe implemented yet). Diagnostics is the single home
+        # for connection tests, so the frontend renders a "Test connection"
+        # button purely off this field rather than hardcoding which sources
+        # are testable.
+        "test_source": test_source,
     }
 
 
@@ -583,6 +592,7 @@ def _reddit_pipeline(config: AppConfig) -> dict[str, object]:
         "status": "not_configured" if not configured else "configured",
         "configured": configured, "reachable": None,
         "detail": detail,
+        "test_source": "reddit",
     }
 
 
@@ -621,33 +631,37 @@ def _adanos_pipeline(config: AppConfig) -> dict[str, object]:
         "status": "not_configured" if not configured else "configured",
         "configured": configured, "reachable": None,
         "detail": detail,
+        "test_source": "adanos",
     }
 
 
 @router.get("/diagnostics")
 def diagnostics(config: AppConfig = Depends(get_config)) -> dict[str, object]:
     pipelines = [
+        # No live test implemented for the local/CSV market-data provider.
         _pipeline("Market prices", "stock_price", config.market_data.provider, True,
                   bool(config.market_data.credential), config.market_data.credential),
         # Enabled-by-key: the provider is always willing, so "Credential
         # required" (no key) vs "Configured" (key resolves) is the honest
         # pair of states -- mirrors PolygonConfig's own contract.
         _pipeline("Polygon bars", "stock_price", "polygon", True,
-                  True, config.polygon.api_key_credential),
+                  True, config.polygon.api_key_credential, test_source="polygon"),
         _reddit_pipeline(config),
         _pipeline("X", "sentiment", config.x.provider, config.x.enabled,
-                  config.x.provider != "synthetic", config.x.bearer_credential),
+                  config.x.provider != "synthetic", config.x.bearer_credential,
+                  test_source="x"),
+        # No live test implemented for Stocktwits or News RSS yet.
         _pipeline("Stocktwits", "sentiment", config.stocktwits.provider,
                   config.stocktwits.enabled, False),
         _pipeline("News RSS", "sentiment", config.news.provider,
                   config.news.enabled, config.news.hosted_enabled,
                   config.news.hosted_credential),
         _pipeline("ApeWisdom", "sentiment", config.apewisdom.provider,
-                  config.apewisdom.enabled, False),
+                  config.apewisdom.enabled, False, test_source="apewisdom"),
         _adanos_pipeline(config),
         _pipeline("AI classifier", "sentiment", config.ai.provider,
                   config.ai.provider != "none", config.ai.provider != "none",
-                  config.ai.api_key_credential),
+                  config.ai.api_key_credential, test_source="ai"),
     ]
     return {"pipelines": pipelines, "probe_note": "Network providers are tested during refresh; no secret-bearing request is made by this page."}
 

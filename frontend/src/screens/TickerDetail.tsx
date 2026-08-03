@@ -108,7 +108,7 @@ export function TickerDetailScreen() {
 
       {!error && detail && (
         <>
-          <Card title={`Current Signal: ${detail.symbol}`}>
+          <Card title={`Current Signal: ${detail.symbol}`} subtitle={sig?.company_name}>
             {!sig && (
               <EmptyState message={`No signals recorded for ${detail.symbol} yet.`} command="claudetrade scan" />
             )}

@@ -338,6 +338,9 @@ export interface PipelineDiagnostic {
   configured: boolean;
   reachable: boolean | null;
   detail: string;
+  /** The {source} string POST /api/system/credentials/{source}/test accepts
+   * for this connector, or null when no live connectivity test exists. */
+  test_source: string | null;
 }
 export interface DiagnosticsResponse { pipelines: PipelineDiagnostic[]; probe_note: string; }
 

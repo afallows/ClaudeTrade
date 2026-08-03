@@ -811,3 +811,33 @@ class TestDiagnosticsCoversEveryConnector:
             "Market prices", "Polygon bars", "Reddit", "X", "Stocktwits",
             "News RSS", "ApeWisdom", "Adanos", "AI classifier",
         } <= names
+
+    def test_test_source_matches_every_implemented_connectivity_test(self, client, tmp_app_config) -> None:
+        """Diagnostics is now the single home for connection tests (the
+        Configuration screen's per-source ``ConnectivityTest`` widgets moved
+        here): each row's ``test_source`` must be the exact ``{source}``
+        string ``POST /api/system/credentials/{source}/test`` accepts, or
+        ``None`` where no live probe is implemented -- Market prices,
+        Stocktwits, and News RSS have none.
+
+        Reddit is pinned to the live adapter here: ``tmp_app_config`` pins it
+        to ``synthetic`` for deterministic refreshes elsewhere in the suite
+        (see conftest), which correctly reports ``test_source: None`` (a
+        local/synthetic row has no live probe to offer, mirroring every other
+        local provider) -- that is not what this test is checking.
+        """
+        tmp_app_config.reddit.provider = "reddit"
+        response = client.get("/api/system/diagnostics")
+        assert response.status_code == 200
+        test_sources = {row["name"]: row["test_source"] for row in response.json()["pipelines"]}
+        assert test_sources == {
+            "Market prices": None,
+            "Polygon bars": "polygon",
+            "Reddit": "reddit",
+            "X": "x",
+            "Stocktwits": None,
+            "News RSS": None,
+            "ApeWisdom": "apewisdom",
+            "Adanos": "adanos",
+            "AI classifier": "ai",
+        }

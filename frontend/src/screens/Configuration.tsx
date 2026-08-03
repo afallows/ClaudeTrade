@@ -1,35 +1,12 @@
 import { useEffect, useState } from 'react';
-import { CheckCircle2, KeyRound, Trash2, XCircle } from 'lucide-react';
+import { KeyRound, Trash2 } from 'lucide-react';
 import { api } from '../api/client';
-import type { AIConfig, CredentialStatus, CredentialTestResult } from '../api/types';
+import type { AIConfig, CredentialStatus } from '../api/types';
 
-/** Generic "test this source" widget: mirrors the Reddit connectivity
- * probe's exact shape so Reddit/X/AI all read and behave identically. */
-function ConnectivityTest({ source, label, caption }: { source: string; label: string; caption: string }) {
-  const [result, setResult] = useState<CredentialTestResult | null>(null);
-  const [testing, setTesting] = useState(false);
-  async function run() {
-    setTesting(true);
-    setResult(null);
-    try { setResult(await api.testCredential(source)); }
-    catch (e) { setResult({ ok: false, mode: null, status_detail: e instanceof Error ? e.message : 'Test failed' }); }
-    finally { setTesting(false); }
-  }
-  return <div className="rounded-lg border border-gridline p-3">
-    <div className="mb-2 flex items-center justify-between gap-3">
-      <div><h3 className="text-sm font-medium text-ink">{label}</h3><p className="text-xs text-ink-secondary">{caption}</p></div>
-      <button onClick={() => void run()} disabled={testing} className="shrink-0 rounded-lg border border-gridline px-3 py-2 text-sm font-medium text-ink disabled:opacity-40">{testing ? 'Testing…' : 'Test'}</button>
-    </div>
-    {result && <div role="status" className={`flex items-start gap-2 rounded-lg px-3 py-2 text-sm ${result.ok ? 'bg-good/15 text-good' : 'bg-critical/15 text-critical'}`}>
-      {result.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /> : <XCircle className="mt-0.5 h-4 w-4 shrink-0" />}
-      <span>{result.mode ? <strong className="mr-1">[{result.mode}]</strong> : null}{result.status_detail}</span>
-    </div>}
-  </div>;
-}
-
-/** "AI Analysis" section: provider dropdown, model field, per-provider
- * setup instructions, and a Test button -- see docs/ai-setup.md for the
- * full walkthrough this section summarises inline. */
+/** "AI Analysis" section: provider dropdown, model field, and per-provider
+ * setup instructions -- see docs/ai-setup.md for the full walkthrough this
+ * section summarises inline. Its connectivity test lives on the Diagnostics
+ * screen, alongside every other connector's -- see Diagnostics.tsx. */
 function AIAnalysisSection({ onChanged }: { onChanged: () => void }) {
   const [config, setConfig] = useState<AIConfig | null>(null);
   const [provider, setProvider] = useState<'none' | 'anthropic' | 'openai'>('none');
@@ -119,11 +96,6 @@ function AIAnalysisSection({ onChanged }: { onChanged: () => void }) {
       </ol>
       <p className="mt-1">Keys start with <code>sk-</code>. Billing is pay-per-use, billed to your OpenAI account. Check current model names/pricing at platform.openai.com.</p>
     </div>}
-
-    {provider !== 'none' && <div className="mt-3">
-      <ConnectivityTest source="ai" label="AI connectivity"
-        caption="Runs one minimal classification call against the configured provider using the saved API key -- no secret is ever echoed back." />
-    </div>}
   </section>;
 }
 
@@ -146,24 +118,12 @@ export function Configuration() {
     try { await api.deleteCredential(item.name); await load(); setMessage(`${item.label} removed.`); }
     catch (e) { setMessage(e instanceof Error ? e.message : 'Unable to remove credential.'); }
   }
-  const hasReddit = items.some((item) => item.name.startsWith('reddit'));
-  const hasX = items.some((item) => item.name.startsWith('x_'));
   return <div className="flex flex-col gap-5 p-6">
     <header><h1 className="text-lg font-semibold text-ink">Configuration</h1><p className="text-sm text-ink-secondary">Add API credentials without storing secrets in ClaudeTrade files or its database.</p></header>
     <div className="rounded-xl border border-gridline bg-surface p-4 text-sm text-ink-secondary"><KeyRound className="mr-2 inline h-4 w-4 text-accent" />Secrets are written to your operating system credential store. Existing values are never returned to this page.</div>
     {message && <div role="status" className="rounded-lg border border-gridline px-3 py-2 text-sm text-ink">{message}</div>}
 
     <AIAnalysisSection onChanged={load} />
-
-    {(hasReddit || hasX) && <section className="rounded-xl border border-gridline bg-surface p-4">
-      <h2 className="mb-2 font-medium text-ink">Social source connectivity</h2>
-      <div className="grid gap-3">
-        {hasReddit && <ConnectivityTest source="reddit" label="Reddit connectivity"
-          caption="Makes one small live request using whichever Reddit credentials are currently configured -- no secret is ever echoed back." />}
-        {hasX && <ConnectivityTest source="x" label="X connectivity"
-          caption="Makes one small live request using whichever X credentials are currently configured (official API or session cookies) -- no secret is ever echoed back." />}
-      </div>
-    </section>}
 
     {loading ? <p className="text-sm text-ink-secondary">Loading credentials…</p> : <div className="grid gap-3">
       {items.map((item) => <section key={item.name} className="rounded-xl border border-gridline bg-surface p-4">

@@ -18,7 +18,22 @@ import { RejectionFunnelPanel } from '../components/RejectionFunnelPanel';
 import { formatPrice, formatRatio, daysToEarningsLabel } from '../lib/format';
 
 const columnDefs: ColDef<SignalRow>[] = [
-  { field: 'symbol', headerName: 'Symbol', pinned: 'left', width: 100, sortable: true, cellClass: 'font-semibold text-ink' },
+  {
+    field: 'symbol',
+    headerName: 'Symbol',
+    pinned: 'left',
+    width: 150,
+    sortable: true,
+    cellRenderer: (p: ICellRendererParams<SignalRow>) => {
+      const companyName = p.data?.company_name;
+      return (
+        <div className="flex h-full flex-col justify-center leading-tight">
+          <span className="font-semibold text-ink">{p.data?.symbol}</span>
+          {companyName && <span className="truncate text-xs text-ink-secondary">{companyName}</span>}
+        </div>
+      );
+    },
+  },
   { field: 'strategy', headerName: 'Strategy', width: 170, sortable: true },
   {
     field: 'direction',
