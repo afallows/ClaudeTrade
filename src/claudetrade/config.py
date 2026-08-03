@@ -779,6 +779,12 @@ class AdanosConfig(BaseModel):
     #: not yet confirmed live -- the adapter degrades that one feed cleanly
     #: on a 404 rather than failing the whole provider.
     feed_polymarket: bool = True
+    #: Fetch the financial-news feed (``proxy-news`` /
+    #: ``news/stocks/v1/trending``; site endpoint confirmed live 2026-08-02).
+    #: News rows carry ``source_count`` (distinct outlets) instead of an
+    #: engagement metric. Official-API path is inferred like Polymarket's and
+    #: degrades cleanly on a 404.
+    feed_news: bool = True
     site_base_url: str = "https://adanos.org/api"
     official_base_url: str = "https://api.adanos.org"
     #: Use ``official_base_url`` with a key instead of the keyless site

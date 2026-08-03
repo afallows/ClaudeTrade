@@ -1881,23 +1881,33 @@ Other filters ApeWisdom publishes include `wallstreetbets`, `stocks`,
 `options`, `investing`, and `stockmarket`; crypto-only filters are
 deliberately not defaults, since this application screens US equities.
 
-### Adanos -- X/Reddit/Polymarket aggregator (Default, Live, No Credentials Required)
+### Adanos -- X/Reddit/Polymarket/News aggregator (Default, Live, No Credentials Required)
 
 **Module**: `src/claudetrade/providers/social/adanos.py`
 
 Reads [adanos.org](https://adanos.org)'s pre-aggregated per-ticker buzz and
-sentiment across **three** platforms -- X/Twitter, Reddit and Polymarket --
-refreshed hourly. Same family as ApeWisdom above (a hosted aggregator
-serving finished rows, not individual posts) but richer in the one way that
-matters: alongside volume, Adanos reports real polarity.
+sentiment across **four** feeds -- X/Twitter, Reddit, Polymarket and
+financial news -- refreshed hourly. Same family as ApeWisdom above (a hosted
+aggregator serving finished rows, not individual posts) but richer in the
+one way that matters: alongside volume, Adanos reports real polarity.
 
 | | ApeWisdom | Adanos |
 |---|---|---|
-| Platforms | Reddit, 4chan (combined tally) | X, Reddit, Polymarket (separate rows) |
+| Platforms | Reddit, 4chan (combined tally) | X, Reddit, Polymarket, News (separate rows) |
 | Volume | mentions, upvotes | `buzz_score`, mentions/trade count, `trend`, 7-point `trend_history` |
 | Direction | **none — attention only** | `sentiment_score` (-1..1), `bullish_pct`/`bearish_pct` |
 | Storage | `symbol_sentiment_daily` (`apewisdom:<filter>` source) | its own table, `adanos_snapshots` |
 | Backfillable | no -- rolling 24h window, no history endpoint | no -- hourly rolling snapshot, no history endpoint |
+
+**The news feed differs from the other three in one field.** Instead of an
+engagement total (`total_upvotes` for X/Reddit, `total_liquidity` for
+Polymarket), news rows carry `source_count` -- the number of distinct news
+outlets reporting on the ticker. There is no engagement analogue for a news
+aggregation, so `source_count` is stored through the same
+`AdanosSnapshotRow.engagement` column the other three feeds already use for
+their own per-platform number (see `providers.social.adanos._ENGAGEMENT_FIELD`)
+rather than a dedicated column -- one more platform-specific meaning for a
+column that already carries two, not a schema change for a single float.
 
 **Why this is not a `SocialProvider` (same reasoning as ApeWisdom, restated
 because it matters more here).** Adanos serves pre-aggregated rows with no
@@ -1934,11 +1944,13 @@ aggregate that strategies score against, and not `SymbolAttention`/
 "page-equivalent cadence" -- one request per feed per collection cycle is
 what a logged-out browser tab would generate.
 
-**Polymarket official endpoint**: `api.adanos.org/polymarket/stocks/v1/trending`
-is inferred from the X/Reddit URL pattern, not independently confirmed. If it
-404s at runtime, only the Polymarket feed degrades (reported as
-`adanos_polymarket` in `degraded_sources`) -- the X and Reddit feeds are
-unaffected.
+**Polymarket and news official endpoints**:
+`api.adanos.org/polymarket/stocks/v1/trending` and
+`api.adanos.org/news/stocks/v1/trending` are both inferred from the X/Reddit
+URL pattern, not independently confirmed (the news *site* endpoint,
+`proxy-news`, was itself confirmed live 2026-08-02). If either 404s at
+runtime, only that one feed degrades (reported as `adanos_polymarket` or
+`adanos_news` in `degraded_sources`) -- the other feeds are unaffected.
 
 **Licensing** (adanos.org/terms, checked 2026-08-02): commercial use is
 permitted subject to the vendor's terms; raw API data may not be
@@ -1954,6 +1966,7 @@ enabled = true
 feed_x = true
 feed_reddit = true
 feed_polymarket = true
+feed_news = true
 prefer_official_api = false        # true = use the keyed API when api_key_credential resolves
 api_key_credential = "adanos_api_key"
 monthly_budget = 250

@@ -488,9 +488,9 @@ class AdanosSnapshotRow(Base):
     platform: Mapped[str] = mapped_column(String(20))
     company_name: Mapped[str] = mapped_column(String(120), default="")
     buzz_score: Mapped[float] = mapped_column(Float, default=0.0)
-    #: ``mentions`` for x/reddit, ``trade_count`` for polymarket -- one
-    #: column, source-specific meaning, matching how ``total_engagement``
-    #: already does double duty (upvotes vs liquidity) below.
+    #: ``mentions`` for x/reddit/news, ``trade_count`` for polymarket -- one
+    #: column, source-specific meaning, matching how ``engagement`` already
+    #: does multiple duty (upvotes vs liquidity vs source count) below.
     mentions: Mapped[int] = mapped_column(Integer, default=0)
     trend: Mapped[str] = mapped_column(String(10), default="")
     #: ``None`` when the vendor reported no score for this row -- distinct
@@ -499,7 +499,9 @@ class AdanosSnapshotRow(Base):
     sentiment_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     bullish_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     bearish_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
-    #: ``total_upvotes`` (x/reddit) or ``total_liquidity`` (polymarket).
+    #: ``total_upvotes`` (x/reddit), ``total_liquidity`` (polymarket), or
+    #: ``source_count`` -- distinct news outlets -- for the ``"news"``
+    #: platform, which has no upvotes/likes/liquidity analogue.
     engagement: Mapped[float] = mapped_column(Float, default=0.0)
     #: The vendor's own 7-point trailing buzz series, oldest first, stored
     #: as reported -- see ``domain.AdanosSnapshot``.

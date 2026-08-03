@@ -785,8 +785,8 @@ class AdanosSnapshot:
     ``symbol_sentiment_daily``'s ``"all"`` aggregate that strategies score
     against.
 
-    ``platform`` is one of ``"x"``, ``"reddit"``, ``"polymarket"`` --
-    Adanos's three source feeds, each fetched and stored separately because
+    ``platform`` is one of ``"x"``, ``"reddit"``, ``"polymarket"``, ``"news"``
+    -- Adanos's four source feeds, each fetched and stored separately because
     the same ticker can read very differently across them.
 
     ``trend_history`` is the vendor's own 7-point trailing buzz series
@@ -804,6 +804,11 @@ class AdanosSnapshot:
     sentiment_score: float | None = None
     bullish_pct: float | None = None
     bearish_pct: float | None = None
+    #: Platform-specific engagement number: ``total_upvotes`` (x/reddit),
+    #: ``total_liquidity`` (polymarket), or ``source_count`` -- distinct news
+    #: outlets reporting on the ticker -- for the ``"news"`` platform, which
+    #: has no upvotes/likes/liquidity analogue. See
+    #: ``providers.social.adanos._ENGAGEMENT_FIELD``.
     engagement: float = 0.0
     trend_history: list[float] = field(default_factory=list)
     observed_at: dt.datetime | None = None

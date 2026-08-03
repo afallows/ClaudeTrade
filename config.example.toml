@@ -222,14 +222,16 @@ rate_limit_per_minute = 30
 request_timeout_s = 20.0
 
 [adanos]
-# Adanos (adanos.org) pre-aggregated buzz/sentiment across X, Reddit and
-# Polymarket -- same family as [apewisdom] above (a hosted aggregator
-# serving finished per-ticker rows, not individual posts), but richer: it
-# also reports real polarity (sentiment_score, bullish_pct, bearish_pct)
-# across THREE platforms, refreshed hourly. Stored in its own table
+# Adanos (adanos.org) pre-aggregated buzz/sentiment across X, Reddit,
+# Polymarket and financial news -- same family as [apewisdom] above (a
+# hosted aggregator serving finished per-ticker rows, not individual posts),
+# but richer: it also reports real polarity (sentiment_score, bullish_pct,
+# bearish_pct) across FOUR feeds, refreshed hourly. Stored in its own table
 # (adanos_snapshots), never as SocialPost rows -- see providers.social.adanos
 # for why pre-aggregated vendor data must never be turned into fabricated
-# per-post rows.
+# per-post rows. The news feed reports source_count (distinct outlets)
+# instead of an engagement metric -- see providers.social.adanos for how
+# that's stored.
 #
 # Two access modes:
 #   * Default keyless "site" mode hits adanos.org's own public-page proxy
@@ -250,6 +252,7 @@ enabled = true
 feed_x = true                             # X/Twitter feed
 feed_reddit = true                        # Reddit feed
 feed_polymarket = true                    # Polymarket feed
+feed_news = true                          # Financial news feed (source_count instead of engagement)
 site_base_url = "https://adanos.org/api"
 official_base_url = "https://api.adanos.org"
 prefer_official_api = false               # true = use official_base_url + X-API-Key when the credential resolves

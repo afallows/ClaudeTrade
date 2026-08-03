@@ -1,11 +1,11 @@
 """Adanos (``adanos.org``) pre-aggregated buzz and sentiment across X,
-Reddit and Polymarket.
+Reddit, Polymarket and financial news.
 
 Same family as ``providers.social.apewisdom``: a hosted aggregator that
 serves the finished per-ticker tally rather than individual posts. Adanos is
 richer than ApeWisdom in one load-bearing way -- it reports real polarity
 (``sentiment_score``, ``bullish_pct``, ``bearish_pct``) alongside volume, and
-does so across three separate platforms, refreshed hourly.
+does so across four separate feeds, refreshed hourly.
 
 **This is PRE-AGGREGATED data. Never fabricate ``SocialPost`` rows from it.**
 See the warning in ``providers.social.hosted_api``'s module docstring for
@@ -32,6 +32,7 @@ arrays, no auth)::
     GET {site_base_url}/proxy-x/trending?limit=N&from=YYYY-MM-DD&to=YYYY-MM-DD
     GET {site_base_url}/proxy/trending?limit=N&from=YYYY-MM-DD&to=YYYY-MM-DD
     GET {site_base_url}/proxy-polymarket/trending?limit=N&from=YYYY-MM-DD&to=YYYY-MM-DD
+    GET {site_base_url}/proxy-news/trending?limit=N&from=YYYY-MM-DD&to=YYYY-MM-DD
 
 Official authenticated API (header ``X-API-Key: sk_live_...``), same row
 shapes::
@@ -39,11 +40,23 @@ shapes::
     GET {official_base_url}/x/stocks/v1/trending
     GET {official_base_url}/reddit/stocks/v1/trending
     GET {official_base_url}/polymarket/stocks/v1/trending
+    GET {official_base_url}/news/stocks/v1/trending
 
-The Polymarket *official* path is inferred from the X/Reddit pattern, not
-independently confirmed -- if it 404s at runtime, only that feed degrades
-(see ``_get_json``'s 404-in-official-mode handling); the X and Reddit feeds
-are unaffected.
+The Polymarket and news *official* paths are inferred from the X/Reddit
+pattern, not independently confirmed -- if either 404s at runtime, only that
+one feed degrades (see ``_get_json``'s 404-in-official-mode handling); the X
+and Reddit feeds are unaffected. The news *site* endpoint (``proxy-news``)
+was itself confirmed live 2026-08-02.
+
+News rows have one further difference worth flagging: they carry
+``source_count`` (distinct news outlets reporting on the ticker) instead of
+an engagement total -- there is no upvotes/likes/liquidity analogue for a
+news aggregation. ``source_count`` is stored through the same
+``AdanosSnapshot.engagement`` field the other three feeds use for their own
+per-platform engagement number (see ``_ENGAGEMENT_FIELD`` below and
+``domain.AdanosSnapshot.engagement``'s docstring) -- one more platform-
+specific meaning for a column that already does double duty, not a fourth
+column, since the value is honestly a single float either way.
 
 **Two access modes.** Default is keyless "site" mode: one request per
 enabled feed per collection cycle, honest User-Agent, paced by the shared
@@ -100,6 +113,7 @@ _SITE_PATHS = {
     "x": "proxy-x/trending",
     "reddit": "proxy/trending",
     "polymarket": "proxy-polymarket/trending",
+    "news": "proxy-news/trending",
 }
 
 #: Official-API path segments, relative to ``config.official_base_url``.
@@ -107,15 +121,23 @@ _OFFICIAL_PATHS = {
     "x": "x/stocks/v1/trending",
     "reddit": "reddit/stocks/v1/trending",
     "polymarket": "polymarket/stocks/v1/trending",
+    "news": "news/stocks/v1/trending",
 }
 
-#: Which row field carries the "how many times" count -- x/reddit share
+#: Which row field carries the "how many times" count -- x/reddit/news share
 #: ``mentions``, polymarket reports ``trade_count`` instead.
-_COUNT_FIELD = {"x": "mentions", "reddit": "mentions", "polymarket": "trade_count"}
+_COUNT_FIELD = {"x": "mentions", "reddit": "mentions", "polymarket": "trade_count", "news": "mentions"}
 
 #: Which row field carries the engagement total -- x/reddit report
-#: ``total_upvotes``, polymarket reports ``total_liquidity`` instead.
-_ENGAGEMENT_FIELD = {"x": "total_upvotes", "reddit": "total_upvotes", "polymarket": "total_liquidity"}
+#: ``total_upvotes``, polymarket reports ``total_liquidity``, and news
+#: reports ``source_count`` (distinct outlets, its nearest analogue to an
+#: engagement number) instead.
+_ENGAGEMENT_FIELD = {
+    "x": "total_upvotes",
+    "reddit": "total_upvotes",
+    "polymarket": "total_liquidity",
+    "news": "source_count",
+}
 
 
 def _current_month(now: dt.datetime | None = None) -> str:
@@ -240,8 +262,8 @@ class AdanosProvider:
         self._last_error: str | None = None
         self._last_success: dt.datetime | None = None
         #: Per-feed failure messages from the most recent ``fetch_snapshots``
-        #: call, keyed ``"adanos_x"``/``"adanos_reddit"``/``"adanos_polymarket"``
-        #: -- read by ``data.ingest.DataIngestor.ingest_adanos`` and folded
+        #: call, keyed ``"adanos_x"``/``"adanos_reddit"``/``"adanos_polymarket"``/
+        #: ``"adanos_news"`` -- read by ``data.ingest.DataIngestor.ingest_adanos`` and folded
         #: into ``IngestReport.provider_failures`` / ``degraded_sources``, so
         #: one feed's outage is visible by name rather than merged into a
         #: single opaque "adanos failed" entry.
@@ -259,6 +281,8 @@ class AdanosProvider:
             platforms.append("reddit")
         if self.config.feed_polymarket:
             platforms.append("polymarket")
+        if self.config.feed_news:
+            platforms.append("news")
         return platforms
 
     # --- status ---------------------------------------------------------
@@ -306,6 +330,7 @@ class AdanosProvider:
                 "x": self.config.feed_x,
                 "reddit": self.config.feed_reddit,
                 "polymarket": self.config.feed_polymarket,
+                "news": self.config.feed_news,
                 "official_mode": self.mode == "official",
             },
         )

@@ -160,6 +160,55 @@ class TestParsingPolymarketFeed:
         assert tsla.bearish_pct is None
 
 
+class TestParsingNewsFeed:
+    def test_reads_mentions_and_source_count_instead_of_engagement(self) -> None:
+        """News rows share ``mentions`` with x/reddit but have no
+        engagement metric -- ``source_count`` (distinct outlets) is stored
+        through the ``engagement`` field instead, same mechanism as
+        polymarket's ``total_liquidity``."""
+        rows = {
+            r.symbol: r
+            for r in _parse_feed_rows(_fixture("news_trending"), platform="news", observed_at=None)
+        }
+        spcx = rows["SPCX"]
+        assert spcx.platform == "news"
+        assert spcx.company_name == "Space Exploration Technologies Corp"
+        assert spcx.buzz_score == pytest.approx(63.5)
+        assert spcx.trend == "falling"
+        assert spcx.mentions == 22
+        assert spcx.engagement == pytest.approx(12.0)  # source_count
+        assert spcx.sentiment_score == pytest.approx(0.191)
+        assert spcx.bullish_pct == pytest.approx(41.0)
+        assert spcx.bearish_pct == pytest.approx(5.0)
+        assert spcx.trend_history == [66.7, 67.7, 64.1, 65.6, 64.5, 55.7, 63.5]
+
+    def test_numeric_string_mentions_parse_identically_to_numbers(self) -> None:
+        rows = {
+            r.symbol: r
+            for r in _parse_feed_rows(_fixture("news_trending"), platform="news", observed_at=None)
+        }
+        assert rows["NVDA"].mentions == 38  # arrived as "38"
+
+    def test_null_sentiment_stays_none_not_fabricated_zero(self) -> None:
+        rows = {
+            r.symbol: r
+            for r in _parse_feed_rows(_fixture("news_trending"), platform="news", observed_at=None)
+        }
+        assert rows["NVDA"].sentiment_score is None
+
+    def test_crypto_tickers_are_dropped(self) -> None:
+        symbols = {
+            r.symbol
+            for r in _parse_feed_rows(_fixture("news_trending"), platform="news", observed_at=None)
+        }
+        assert "BTC" not in symbols
+        assert "SPCX" in symbols
+
+    def test_junk_rows_are_skipped_not_fatal(self) -> None:
+        rows = _parse_feed_rows(_fixture("news_trending"), platform="news", observed_at=None)
+        assert {r.symbol for r in rows} == {"SPCX", "NVDA"}
+
+
 class TestParseDrift:
     def test_unexpected_top_level_shape_raises_rather_than_degrading_silently(self) -> None:
         """Adanos is a documented, versioned API -- unlike ApeWisdom's
@@ -217,21 +266,22 @@ class TestFetchSiteMode:
                 "proxy-x/trending": _fixture("x_trending"),
                 "proxy/trending": _fixture("reddit_trending"),
                 "proxy-polymarket/trending": _fixture("polymarket_trending"),
+                "proxy-news/trending": _fixture("news_trending"),
             }
         )
         provider = AdanosProvider(_config(), client=client)
         rows = provider.fetch_snapshots()
 
-        assert {r.platform for r in rows} == {"x", "reddit", "polymarket"}
-        # NVDA appears in all three feeds and stays three distinct rows --
+        assert {r.platform for r in rows} == {"x", "reddit", "polymarket", "news"}
+        # NVDA appears in all four feeds and stays four distinct rows --
         # collapsing them would lose which platform is talking.
-        assert sum(1 for r in rows if r.symbol == "NVDA") == 3
-        assert len(client.calls) == 3  # type: ignore[attr-defined]
+        assert sum(1 for r in rows if r.symbol == "NVDA") == 4
+        assert len(client.calls) == 4  # type: ignore[attr-defined]
 
     def test_disabled_feed_is_not_requested(self) -> None:
         client = _client({"proxy-x/trending": _fixture("x_trending")})
         provider = AdanosProvider(
-            _config(feed_reddit=False, feed_polymarket=False), client=client
+            _config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client
         )
         rows = provider.fetch_snapshots()
         assert {r.platform for r in rows} == {"x"}
@@ -239,7 +289,7 @@ class TestFetchSiteMode:
 
     def test_no_api_key_header_sent_in_site_mode(self) -> None:
         client = _client({"proxy-x/trending": _fixture("x_trending")})
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False), client=client)
+        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
         provider.fetch_snapshots()
         assert "X-API-Key" not in client.calls[0].headers  # type: ignore[attr-defined]
 
@@ -250,19 +300,56 @@ class TestFetchSiteMode:
         assert client.calls == []  # type: ignore[attr-defined]
 
     def test_one_failing_feed_does_not_lose_the_others(self) -> None:
-        client = _client({"proxy-x/trending": _fixture("x_trending")})  # reddit/polymarket 404
+        client = _client({"proxy-x/trending": _fixture("x_trending")})  # reddit/polymarket/news 404
         provider = AdanosProvider(_config(), client=client)
         rows = provider.fetch_snapshots()
         assert {r.platform for r in rows} == {"x"}
-        assert set(provider.last_feed_failures) == {"adanos_reddit", "adanos_polymarket"}
+        assert set(provider.last_feed_failures) == {
+            "adanos_reddit",
+            "adanos_polymarket",
+            "adanos_news",
+        }
+
+    def test_news_feed_alone_can_be_disabled(self) -> None:
+        """Mirrors ``test_disabled_feed_is_not_requested`` for the fourth
+        feed specifically."""
+        client = _client(
+            {
+                "proxy-x/trending": _fixture("x_trending"),
+                "proxy/trending": _fixture("reddit_trending"),
+                "proxy-polymarket/trending": _fixture("polymarket_trending"),
+            }
+        )
+        provider = AdanosProvider(_config(feed_news=False), client=client)
+        rows = provider.fetch_snapshots()
+        assert {r.platform for r in rows} == {"x", "reddit", "polymarket"}
+        assert len(client.calls) == 3  # type: ignore[attr-defined]
+
+    def test_news_feed_failure_is_reported_by_name(self) -> None:
+        client = _client(
+            {
+                "proxy-x/trending": _fixture("x_trending"),
+                "proxy/trending": _fixture("reddit_trending"),
+                "proxy-polymarket/trending": _fixture("polymarket_trending"),
+                # proxy-news/trending intentionally unregistered -> 404
+            }
+        )
+        provider = AdanosProvider(_config(), client=client)
+        rows = provider.fetch_snapshots()
+        assert {r.platform for r in rows} == {"x", "reddit", "polymarket"}
+        assert "adanos_news" in provider.last_feed_failures
 
 
 class TestFetchOfficialMode:
     def _provider(self, client, **overrides) -> AdanosProvider:
-        return AdanosProvider(
-            _config(prefer_official_api=True, feed_reddit=False, feed_polymarket=False, **overrides),
-            client=client,
-        )
+        base = {
+            "prefer_official_api": True,
+            "feed_reddit": False,
+            "feed_polymarket": False,
+            "feed_news": False,
+        }
+        base.update(overrides)
+        return AdanosProvider(_config(**base), client=client)
 
     def _make(self, client, monkeypatch, cache_dir=None, **overrides) -> AdanosProvider:
         import claudetrade.providers.social.adanos as adanos_module
@@ -271,11 +358,14 @@ class TestFetchOfficialMode:
         monkeypatch.setattr(
             adanos_module, "get_secret", lambda name: SecretValue(name, "sk_live_test", "keyring")
         )
-        return AdanosProvider(
-            _config(prefer_official_api=True, feed_reddit=False, feed_polymarket=False, **overrides),
-            client=client,
-            cache_dir=cache_dir,
-        )
+        base = {
+            "prefer_official_api": True,
+            "feed_reddit": False,
+            "feed_polymarket": False,
+            "feed_news": False,
+        }
+        base.update(overrides)
+        return AdanosProvider(_config(**base), client=client, cache_dir=cache_dir)
 
     def test_x_api_key_header_present_in_official_mode(self, monkeypatch) -> None:
         client = _client({"x/stocks/v1/trending": _fixture("x_trending")})
@@ -291,17 +381,38 @@ class TestFetchOfficialMode:
         assert "api.adanos.org" in url
         assert "proxy" not in url
 
+    def test_news_official_url_uses_the_inferred_news_stocks_path(self, monkeypatch) -> None:
+        """Same inferred-path posture as Polymarket's official endpoint (see
+        the module docstring) -- ``news/stocks/v1/trending`` under
+        ``official_base_url``, no ``proxy-news`` segment."""
+        client = _client({"news/stocks/v1/trending": _fixture("news_trending")})
+        provider = self._make(client, monkeypatch, feed_x=False, feed_news=True)
+        provider.fetch_snapshots()
+        url = str(client.calls[0].url)  # type: ignore[attr-defined]
+        assert url.startswith("https://api.adanos.org/news/stocks/v1/trending")
+        assert "proxy-news" not in url
+
+    def test_news_official_404_degrades_only_the_news_feed(self, monkeypatch) -> None:
+        """Mirrors the module docstring's Polymarket posture: an unconfirmed
+        official-mode path 404ing degrades cleanly rather than failing the
+        whole provider."""
+        client = _client({"x/stocks/v1/trending": _fixture("x_trending")})  # news 404s
+        provider = self._make(client, monkeypatch, feed_x=True, feed_news=True)
+        rows = provider.fetch_snapshots()
+        assert {r.platform for r in rows} == {"x"}
+        assert "adanos_news" in provider.last_feed_failures
+
 
 class TestErrorTaxonomy:
     def test_429_raises_rate_limit_error(self) -> None:
         client = _client({"proxy-x/trending": {}}, status=429)
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False), client=client)
+        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
         with pytest.raises(RateLimitError):
             provider._fetch_platform("x", None)
 
     def test_site_mode_401_is_source_blocked_not_authentication(self) -> None:
         client = _client({"proxy-x/trending": {}}, status=401)
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False), client=client)
+        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
         with pytest.raises(SourceBlockedError):
             provider._fetch_platform("x", None)
 
@@ -314,28 +425,28 @@ class TestErrorTaxonomy:
         )
         client = _client({"x/stocks/v1/trending": {}}, status=403)
         provider = AdanosProvider(
-            _config(prefer_official_api=True, feed_reddit=False, feed_polymarket=False), client=client
+            _config(prefer_official_api=True, feed_reddit=False, feed_polymarket=False, feed_news=False), client=client
         )
         with pytest.raises(AuthenticationError):
             provider._fetch_platform("x", None)
 
     def test_5xx_is_retryable_provider_error(self) -> None:
         client = _client({"proxy-x/trending": {}}, status=503)
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False), client=client)
+        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
         with pytest.raises(ProviderError) as exc_info:
             provider._fetch_platform("x", None)
         assert exc_info.value.retryable is True
 
     def test_non_json_body_is_source_blocked(self) -> None:
         client = _client({"proxy-x/trending": "<html>captcha</html>"})
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False), client=client)
+        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
         with pytest.raises(SourceBlockedError):
             provider._fetch_platform("x", None)
 
     def test_no_retries_on_failure(self) -> None:
         """One failed request per feed per call -- never a retry loop."""
         client = _client({"proxy-x/trending": {}}, status=500)
-        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False), client=client)
+        provider = AdanosProvider(_config(feed_reddit=False, feed_polymarket=False, feed_news=False), client=client)
         rows = provider.fetch_snapshots()
         assert rows == []
         assert len(client.calls) == 1  # type: ignore[attr-defined]
@@ -355,6 +466,7 @@ class TestMonthlyBudget:
                 prefer_official_api=True,
                 feed_reddit=False,
                 feed_polymarket=False,
+                feed_news=False,
                 monthly_budget=250,
                 monthly_reserve=15,
             ),
@@ -387,6 +499,7 @@ class TestMonthlyBudget:
                 prefer_official_api=True,
                 feed_reddit=False,
                 feed_polymarket=False,
+                feed_news=False,
                 monthly_budget=250,
                 monthly_reserve=15,
             ),
@@ -412,6 +525,7 @@ class TestMonthlyBudget:
                 prefer_official_api=True,
                 feed_reddit=False,
                 feed_polymarket=False,
+                feed_news=False,
                 monthly_budget=5,
                 monthly_reserve=2,
             ),
@@ -449,6 +563,7 @@ class TestMonthlyBudget:
                 prefer_official_api=True,
                 feed_reddit=False,
                 feed_polymarket=False,
+                feed_news=False,
                 monthly_budget=1,
                 monthly_reserve=0,
             ),
@@ -482,7 +597,7 @@ class TestMonthlyBudget:
         )
         client = _client({"x/stocks/v1/trending": _fixture("x_trending")})
         cfg = _config(
-            prefer_official_api=True, feed_reddit=False, feed_polymarket=False, monthly_budget=250
+            prefer_official_api=True, feed_reddit=False, feed_polymarket=False, feed_news=False, monthly_budget=250
         )
         AdanosProvider(cfg, client=client, cache_dir=tmp_path).fetch_snapshots()
 
