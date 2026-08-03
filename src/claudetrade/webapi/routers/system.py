@@ -161,12 +161,19 @@ def signal_weights(config: AppConfig = Depends(get_config)) -> SignalWeightsOut:
     weights are normalised at use, so the raw sum need not be 1.0).
     """
     weights = dict(config.signals.component_weights)
+    # ADR-0009 block: mode + the promoted weight table. getattr keeps a
+    # pre-ADR-0009 config tolerable (block omitted rather than 500ing).
+    mode = getattr(config.signals, "promoted_scoring_mode", None)
+    promoted_table = getattr(config.signals, "promoted_component_weights", None)
+    promoted = (
+        {"mode": mode, "weights": dict(promoted_table)}
+        if mode is not None and promoted_table is not None
+        else None
+    )
     return SignalWeightsOut(
         weights=weights,
         normalised=_normalised(weights),
-        # A future score-promotion field, not yet on SignalConfig -- absence
-        # is expected right now, not an error.
-        promoted_scoring=getattr(config.signals, "promoted_scoring", None),
+        promoted_scoring=promoted,
     )
 
 

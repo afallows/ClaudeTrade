@@ -186,7 +186,13 @@ class TestSignalWeightsEndpoint:
         assert body["weights"] == tmp_app_config.signals.component_weights
         assert pytest.approx(sum(body["weights"].values()), abs=1e-9) == 1.0
         assert pytest.approx(sum(body["normalised"].values()), abs=1e-9) == 1.0
-        assert body["promoted_scoring"] is None
+        # ADR-0009: the promoted block reports the shadow-default mode and a
+        # promoted table that sums to 1.00, distinct from the baseline table.
+        assert body["promoted_scoring"]["mode"] == "shadow"
+        promoted = body["promoted_scoring"]["weights"]
+        assert pytest.approx(sum(promoted.values()), abs=1e-9) == 1.0
+        assert promoted != body["weights"]
+        assert "analyst_sentiment" in promoted
 
     def test_put_applies_immediately_and_reports_unpersisted(self, client, tmp_app_config) -> None:
         response = client.put(

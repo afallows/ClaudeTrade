@@ -363,14 +363,18 @@ class SignalWeightsOut(BaseModel):
     weights are normalised at use, so their raw sum need not be 1.0, but the
     UI shows both so an operator can see when it has drifted far from 1.0.
 
-    ``promoted_scoring`` is a placeholder for an upcoming score-promotion
-    config field (not yet present on ``SignalConfig``) -- ``None`` until
-    that field exists, never an error.
+    ``promoted_scoring`` is the ADR-0009 block: ``{"mode": "off"|"shadow"|
+    "live", "weights": {component: weight}}`` from
+    ``SignalConfig.promoted_scoring_mode`` / ``promoted_component_weights``.
+    ``weights`` above stays the BASELINE table (what ranks in off/shadow);
+    in ``live`` mode the promoted table ranks instead -- the UI should say
+    which table is ranking based on ``mode``. ``None`` only on configs
+    predating ADR-0009.
     """
 
     weights: dict[str, float]
     normalised: dict[str, float]
-    promoted_scoring: dict[str, float] | None = None
+    promoted_scoring: dict[str, object] | None = None
 
 
 class SignalWeightsUpdate(BaseModel):
