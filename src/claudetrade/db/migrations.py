@@ -350,6 +350,27 @@ def _m011_analyst_snapshots(session: Session) -> None:
     AnalystSnapshotRow.__table__.create(session.get_bind(), checkfirst=True)
 
 
+def _m012_institutional_snapshots(session: Session) -> None:
+    """Create the ``institutional_snapshots`` table (TipRanks insider/hedge-
+    fund sentiment rows).
+
+    Same fresh-vs-migrated shape as ``_m011_analyst_snapshots``: a brand-new
+    database already gets the table from ``_m001_create_schema``'s
+    ``create_all`` (the ORM model exists now), so ``checkfirst=True`` makes
+    this a no-op there and real work only on a database that reached
+    version 11 before the model did.
+
+    No append-only triggers, for the same reason migrations 010/011 have
+    none: ``data.ingest.DataIngestor.ingest_institutional_snapshots``
+    re-collects and upserts this table every cycle (dedup key
+    ``(session, symbol)``), it is not an immutable ledger. See
+    ``db.models.InstitutionalSnapshotRow`` for the full column rationale.
+    """
+    from claudetrade.db.models import InstitutionalSnapshotRow
+
+    InstitutionalSnapshotRow.__table__.create(session.get_bind(), checkfirst=True)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_schema", _m001_create_schema, "Initial tables, indexes and constraints"),
     Migration(2, "immutability_triggers", _m002_immutability_triggers, "Append-only ledger guards"),
@@ -391,6 +412,12 @@ MIGRATIONS: tuple[Migration, ...] = (
         "analyst_snapshots",
         _m011_analyst_snapshots,
         "Per-(session, symbol) TipRanks analyst-consensus/rating-action snapshot rows",
+    ),
+    Migration(
+        12,
+        "institutional_snapshots",
+        _m012_institutional_snapshots,
+        "Per-(session, symbol) TipRanks insider/hedge-fund sentiment snapshot rows",
     ),
 )
 

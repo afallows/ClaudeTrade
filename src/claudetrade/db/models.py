@@ -578,6 +578,102 @@ class AnalystSnapshotRow(Base):
     fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class InstitutionalSnapshotRow(Base):
+    """One TipRanks-sourced insider/hedge-fund ("institutional") sentiment
+    snapshot for one symbol on one session.
+
+    Parsed entirely from fields already present in the ``dataForTicker``
+    ``overview`` payload -- see ``providers.market.tipranks_institutional``
+    for the parser and scoring function, and ``domain.InstitutionalSnapshot``
+    for what each field means and where it comes from.
+
+    Same **mutable daily snapshot, not the immutable signal ledger** posture
+    as ``AnalystSnapshotRow`` immediately above: dedup/upsert is on
+    ``(session, symbol)``, no immutability trigger, re-collected and
+    upserted every refresh cycle (see ``data.ingest.DataIngestor
+    .ingest_institutional_snapshots``).
+
+    The ``score``/``*_subscore``/``*_weight_applied``/``*_age_days`` columns
+    are the computed output of ``tipranks_institutional.institutional_score``
+    at INGEST time (``as_of`` = this row's own ``session``), stored alongside
+    the raw fields that produced them -- a self-contained, diffable record:
+    a caller reading an old row does not need to re-run the scoring formula
+    (which may itself change constants over time) to see what this
+    installation computed on the day it was collected. List-shaped sub-data
+    is stored as JSON, mirroring ``AnalystSnapshotRow``'s own
+    ``consensus_over_time``/``recent_rating_actions`` columns for the same
+    reasons (read-mostly, bounded-length, always read whole).
+
+    **Not fed into ``signals.scoring.ComponentScores`` or any strategy** --
+    see ``domain.InstitutionalSnapshot``'s own docstring.
+    """
+
+    __tablename__ = "institutional_snapshots"
+    __table_args__ = (
+        UniqueConstraint("session", "symbol", name="uq_institutional_snapshot"),
+        Index("ix_institutional_snapshot_lookup", "symbol", "session"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    session: Mapped[dt.date] = mapped_column(Date, index=True)
+
+    #: List of ``{month, year, shares_bought, insiders_buy_count,
+    #: shares_sold, insiders_sell_count, trans_buy_count, trans_sell_count,
+    #: trans_buy_amount, trans_sell_amount, informative_buy_count,
+    #: informative_sell_count, informative_buy_amount,
+    #: informative_sell_amount}`` dicts, month-ascending, bounded by
+    #: ``tipranks_institutional.INSIDER_MONTHLY_MAX``.
+    insider_monthly: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    #: This module's own derived trailing-3-month net insider $ flow (see
+    #: ``tipranks_institutional._insider_net_3m_usd``) -- the figure the
+    #: insider scoring axis actually uses.
+    insider_net_3m_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: The vendor's own ``overview.insiderslast3MonthsSum`` figure, kept
+    #: separately for display/cross-check -- see
+    #: ``domain.InstitutionalSnapshot``'s docstring for why the two are not
+    #: assumed to match exactly.
+    insider_net_3m_usd_vendor: Mapped[float | None] = mapped_column(Float, nullable=True)
+    insider_confidence_stock_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    insider_confidence_sector_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    insider_confidence_raw_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    num_of_insiders: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: List of ``{name, is_officer, is_director, is_ten_percent_owner,
+    #: officer_title, action, operation_description, amount,
+    #: number_of_shares, r_date, estimated_shares_value, link}`` dicts,
+    #: ranked by ``|estimated_shares_value|`` descending, bounded by
+    #: ``tipranks_institutional.RECENT_INSIDER_TRANSACTIONS_MAX``.
+    recent_insider_transactions: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+
+    hedge_fund_sentiment: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hedge_fund_trend_action: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    hedge_fund_trend_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: List of ``{date, holding_amount, institution_holding_percentage,
+    #: net_shares_change, number_of_shares_bought, number_of_shares_sold,
+    #: is_complete}`` dicts, date-ascending, bounded by
+    #: ``tipranks_institutional.HEDGE_FUND_HOLDINGS_MAX``.
+    hedge_fund_holdings_by_quarter: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    #: List of ``{manager_name, institution_name, action, effective_date,
+    #: value, change_pct, change_amount, percentage_of_portfolio, stars,
+    #: is_active}`` dicts, ranked by ``|change_amount|`` descending, bounded
+    #: by ``tipranks_institutional.NOTABLE_HOLDER_MOVES_MAX``.
+    notable_holder_moves: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    market_cap_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    #: ``tipranks_institutional.institutional_score(snapshot, session)``'s
+    #: output, computed and stored at ingest time -- see this class's own
+    #: docstring for why.
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    insider_subscore: Mapped[float | None] = mapped_column(Float, nullable=True)
+    insider_weight_applied: Mapped[float] = mapped_column(Float, default=0.0)
+    insider_age_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    hedge_fund_subscore: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hedge_fund_weight_applied: Mapped[float] = mapped_column(Float, default=0.0)
+    hedge_fund_age_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 # --------------------------------------------------------------------------
 # Features, signals, ledger
 # --------------------------------------------------------------------------

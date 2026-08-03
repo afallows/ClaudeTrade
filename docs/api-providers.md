@@ -820,6 +820,160 @@ this is a read-only research surface (Streamlit + the MCP tool) only.
   `dataForTicker_TECK_B.json`) over a mocked transport, never fabricated
   data (see `tests/test_tipranks_provider.py`).
 
+**Institutional sentiment (`get_institutional_snapshots`, `providers.market
+.tipranks_institutional`) -- harvested from the SAME `dataForTicker`
+response, ZERO new HTTP calls**: sibling to the analyst-sentiment harvest
+immediately above, same posture -- `overview` also carries a separate
+insider-transaction and hedge-fund-holdings layer this adapter used to
+discard entirely. Both committed fixtures carry REAL insider and hedge-fund
+data (unlike some other TipRanks sub-payloads, there is no observed "nulls
+path" for this block specifically).
+
+Fields consumed, and where each comes from:
+
+- `insider_monthly` -- `overview.corporateInsiderTransactions[]`, monthly
+  aggregates capped at `tipranks_institutional.INSIDER_MONTHLY_MAX` (12),
+  chronological. Each row carries both a RAW tally (`trans_buy_amount`/
+  `trans_sell_amount`) and TipRanks' own "informative" subset
+  (`informative_buy_amount`/`informative_sell_amount` -- open-market
+  buys/sells, as opposed to option exercises, gifts, or scheduled 10b5-1
+  sales); either can be individually `null` on a given row even though both
+  fields are always structurally present.
+- `insider_net_3m_usd` -- **this module's own derived figure**, summed over
+  the `tipranks_institutional.INSIDER_NET_FLOW_MONTHS` (3) most-recent
+  monthly buckets, preferring each side's `informative_*_amount` and
+  falling back to the raw `trans_*_amount` only when the informative figure
+  is `null` for that side. Deliberately **not** the vendor's own
+  `overview.insiderslast3MonthsSum` (kept separately as
+  `insider_net_3m_usd_vendor` for display/cross-check) -- the vendor
+  total's own informative-vs-raw mixing rule is undocumented, so this
+  module computes its own figure rather than trust an opaque one for
+  scoring. The two are not expected to match exactly.
+- `insider_confidence_stock_score`/`insider_confidence_sector_score` --
+  `overview.insidrConfidenceSignal.stockScore`/`.sectorScore` (the vendor's
+  own typo, preserved only in the raw field name). **Not vendor-documented**
+  as a 0..1 scale; treated as best-effort on the strength of two
+  corroborating signals: it is the same number as `overview.
+  portfolioHoldingData.insiderSentimentData.stockScore` (co-located with the
+  CONFIRMED-0..1 `hedgeFundSentimentData.score` under one parent object),
+  and both fixtures show a below-0.5 value (INTC 0.29, TECK.B 0.08)
+  alongside a negative vendor 3-month sum (net insider SELLING) -- the same
+  direction `hedgeFundData.sentiment` independently confirms. Corroborating,
+  not proof.
+- `recent_insider_transactions` -- `overview.insiders[]`, the
+  `tipranks_institutional.RECENT_INSIDER_TRANSACTIONS_MAX` (5) largest
+  transactions by `|estimatedSharesValue|`, for display/audit only (not an
+  input to scoring, which reads the monthly aggregates instead). Role flags
+  (`isOfficer`/`isDirector`/`isTenPercentOwner`), the vendor's own
+  human-readable `insiderOperationDescription` (e.g. `"Buy"`,
+  `"Grant/Award/Other Disposal"`), and an SEC EDGAR/SmartInsider `link` are
+  carried through for evidence. The numeric `action`/`insiderOperationId`/
+  `insiderOperationTypeId` codes are **not** confirmed by either fixture
+  (unlike analyst's `ratingId`/`actionId`) and are stored raw, never
+  guessed.
+- `hedge_fund_sentiment`/`hedge_fund_trend_action`/`hedge_fund_trend_value`
+  -- `overview.hedgeFundData.sentiment`/`.trendAction`/`.trendValue`.
+  `sentiment` is CONFIRMED 0..1 (cross-checked against
+  `portfolioHoldingData.hedgeFundSentimentData.score`, an identical value
+  alongside a separate opaque `rating`).
+- `hedge_fund_holdings_by_quarter` -- `overview.hedgeFundData
+  .holdingsByTime[]`, capped at `tipranks_institutional.
+  HEDGE_FUND_HOLDINGS_MAX` (20) quarterly points, chronological. **SEC
+  13F-lagged by construction** -- the most recent row is routinely 1-3
+  months stale even the day it first appears in the vendor feed.
+- `notable_holder_moves` -- `overview.hedgeFundData.institutionalHoldings[]`,
+  the `tipranks_institutional.NOTABLE_HOLDER_MOVES_MAX` (5) largest reported
+  moves by `|changeAmount|`, with the vendor's own manager `stars` rating
+  carried through. The numeric `action` code is not confirmed by either
+  fixture and is stored raw.
+- `num_of_insiders`/`market_cap_usd` -- `overview.numOfInsiders`/
+  `.marketCapUSD` (the same market-cap field the universe floor and the
+  analyst-sentiment normalization elsewhere already read), used here for
+  scoring normalization only.
+
+**Scoring (`tipranks_institutional.institutional_score(snapshot, as_of) ->
+[-1, +1] | None`)** -- a pure function, no I/O, safe to call at read time
+against any stored snapshot (the Streamlit block and the MCP tool both
+recompute it live rather than trust a possibly-stale stored value). Two
+axes, each a weighted blend of two components:
+
+- **Insider axis** (base weight `0.65` of the blend -- weighted ABOVE the
+  hedge-fund axis: an insider transaction is filed within days, SEC Form 4
+  T+2, and is one individual's real capital commitment): `0.6 *
+  log_damped_flow_ratio(insider_net_3m_usd, market_cap_usd) + 0.4 *
+  scaled(insidrConfidenceSignal.stockScore)`. The flow ratio puts BOTH the
+  net dollar flow and the market cap on a log scale
+  (`sign(net) * log1p(|net|) / log1p(cap)`, clamped to [-1, 1]) rather than
+  a raw `net / cap` ratio, which would read every mega-cap as permanently
+  ~0 regardless of real insider activity (INTC's own vendor-reported 3-month
+  sum against its $435B cap is a raw ratio of about `-6e-6`) -- the log
+  transform instead compares the two in "orders of magnitude" terms, so a
+  meaningful flow relative to a company's OWN size scale still registers.
+  Staleness: linear decay from full weight (newest monthly bucket dated
+  this session) to zero at `tipranks_institutional.
+  INSIDER_STALENESS_FULL_DECAY_DAYS` (90 days, ~1 quarter -- TipRanks'
+  insider feed is itself monthly cadence, so a full quarter with no fresh
+  bucket means the feed has gone quiet for this symbol).
+- **Hedge-fund axis** (base weight `0.35`): `0.6 *
+  scaled(hedgeFundData.sentiment) + 0.4 * clamp((latest_quarter
+  .netSharesChange / latest_quarter.holdingAmount) * 3.0)`. The vendor's own
+  `sentiment` is understood to already synthesize broader holdings history
+  than one quarter's flow, so it carries the larger half. Staleness: linear
+  decay from full weight (latest quarter dated this session) to zero at
+  `tipranks_institutional.HEDGE_FUND_STALENESS_FULL_DECAY_DAYS` (182 days,
+  ~2 calendar quarters) -- directly implementing "near zero at 2 quarters
+  old"; a single stale quarter (~91 days, roughly unavoidable given SEC 13F
+  filing lag) still carries about half weight.
+- Both `scaled(...)` mappings are `2x - 1`, projecting the vendor's 0..1
+  scale onto -1..+1.
+- The two axes are blended by their STALENESS-DISCOUNTED weights
+  (`base_weight * staleness_weight`), renormalized over whichever axis
+  actually has a value -- an absent (or fully stale) axis redistributes its
+  weight to the other rather than pulling the blend toward zero, and BOTH
+  absent/fully-stale yields `score=None`, never a fabricated `0.0`.
+  `institutional_score` always returns the full breakdown (`insider_
+  subscore`/`hedge_fund_subscore`/`*_weight_applied`/`*_age_days`), not just
+  the blended number, so a caller can show its work.
+
+**Storage**: `db.models.InstitutionalSnapshotRow` (`institutional_snapshots`
+table, migration 012), one row per `(session, symbol)` -- same mutable
+daily-snapshot posture as `analyst_snapshots`: a re-refresh within the same
+session upserts/replaces the row. The computed score/subscores/weights/ages
+are stored alongside the raw fields at INGEST time (`as_of` = that row's own
+session), so a stored row is self-contained and diffable even if the
+formula's constants change later. `data.ingest.DataIngestor
+.ingest_institutional_snapshots` wires this into the market pass immediately
+after `ingest_analyst_snapshots`, keyed to the current trading session; a
+symbol with no institutional content at all contributes no row, and any
+fetch/parse failure degrades per symbol (logged, counted in
+`IngestReport.institutional_snapshots_upserted`/`provider_failures`, never
+aborting the refresh).
+
+**Diffs**: `data.institutional.institutional_delta(current, previous)` is a
+pure, read-time comparison between two stored snapshots -- net-flow change,
+hedge-fund-sentiment change, and any notable holder moves/insider
+transactions dated after the previous snapshot's own session (a score delta
+is computed separately by the caller, recomputing `institutional_score`
+against each snapshot's own `as_of_session`, since the raw domain snapshot
+carries no `score` field to diff directly). `data.institutional
+.latest_and_previous_snapshots` is the same two-query batched read
+`data.analyst.latest_and_previous_snapshots` uses, one table over.
+
+**Not fed to `ComponentScores`/strategy scoring** -- explicitly deferred,
+same as analyst sentiment; this is a read-only research surface (Streamlit
++ the `get_institutional_sentiment` MCP tool) only.
+
+**Limitations**: same unauthenticated-partner-widget caveat as analyst
+sentiment above (no SLA); hedge-fund holdings are SEC-lagged by
+construction (routinely 1-3 months stale on arrival); `insidrConfidenceSignal
+.stockScore`'s 0..1 scale is corroborated, not vendor-confirmed;
+`InsiderTransaction.action`/`HedgeFundHolderMove.action` numeric codes are
+stored raw, unmapped, on both fixtures. Exercised only against the same two
+committed fixtures the analyst-sentiment tests use (this sandbox cannot
+reach TipRanks directly) -- see
+`tests/test_tipranks_institutional_parsing.py` and
+`tests/test_institutional_score.py`.
+
 **Licence**: Personal/research use only, same posture as stooq/Yahoo's free
 tiers; unsuitable for commercial use; fails closed per ADR-0008 Decision 1.
 

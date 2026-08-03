@@ -25,12 +25,16 @@ from sqlalchemy import func, select
 
 from claudetrade.config import AppConfig
 from claudetrade.data.analyst import snapshot_to_row_fields
+from claudetrade.data.institutional import (
+    snapshot_to_row_fields as institutional_snapshot_to_row_fields,
+)
 from claudetrade.data.quality import DataQualityChecker, QualityReport
 from claudetrade.db.models import (
     AdanosSnapshotRow,
     AnalystSnapshotRow,
     CorporateActionRow,
     EarningsEventRow,
+    InstitutionalSnapshotRow,
     PaperTradeRow,
     PriceBar,
     Security,
@@ -51,6 +55,7 @@ from claudetrade.domain import (
 )
 from claudetrade.logging_setup import get_logger
 from claudetrade.providers.base import ProviderError
+from claudetrade.providers.market.tipranks_institutional import institutional_score
 from claudetrade.sentiment.entity_resolution import TickerResolver
 from claudetrade.utils.timeutils import (
     current_trading_session,
@@ -118,6 +123,12 @@ class IngestReport:
     #: every resolved symbol had no analyst-coverage layer -- both honest,
     #: not a failure.
     analyst_snapshots_upserted: int = 0
+    #: Rows written/replaced in ``institutional_snapshots`` this run (see
+    #: ``DataIngestor.ingest_institutional_snapshots``). Zero on an
+    #: installation with no TipRanks-backed market/earnings provider
+    #: configured, or when every resolved symbol had no insider/hedge-fund
+    #: content -- both honest, not a failure.
+    institutional_snapshots_upserted: int = 0
     posts_inserted: int = 0
     mentions_inserted: int = 0
     provider_failures: dict[str, str] = field(default_factory=dict)
@@ -138,6 +149,7 @@ class IngestReport:
             "bars_revised": self.bars_revised,
             "earnings": self.earnings_upserted,
             "analyst_snapshots": self.analyst_snapshots_upserted,
+            "institutional_snapshots": self.institutional_snapshots_upserted,
             "posts": self.posts_inserted,
             "mentions": self.mentions_inserted,
             "quality_errors": len(self.quality.errors),
@@ -1401,6 +1413,113 @@ class DataIngestor:
         )
         return written
 
+    # --- institutional sentiment (zero-new-calls harvest of the tipranks overview) ---
+
+    def _tipranks_institutional_provider(self) -> object | None:
+        """The TipRanks adapter instance to harvest institutional snapshots
+        through -- same selection posture as ``_tipranks_analyst_provider``
+        immediately above (see that method's own docstring for why either
+        instance costs zero extra HTTP calls): prefers ``self.earnings``
+        since ``ingest_earnings``/``ingest_analyst_snapshots`` already
+        resolved every one of ``symbols`` through it moments earlier.
+        """
+        earnings = self.earnings
+        if getattr(earnings, "name", None) == "tipranks" and hasattr(
+            earnings, "get_institutional_snapshots"
+        ):
+            return earnings
+        return self._market_provider_named("tipranks")
+
+    def ingest_institutional_snapshots(
+        self, symbols: list[str], session_date: dt.date, report: IngestReport
+    ) -> int:
+        """Harvest insider/hedge-fund ("institutional") sentiment snapshots
+        from the SAME ``overview`` responses ``ingest_earnings``/
+        ``ingest_analyst_snapshots`` already fetched or served from cache for
+        ``symbols`` this refresh -- ZERO additional HTTP calls (see
+        ``providers.market.tipranks.TipRanksProvider
+        .get_institutional_snapshots`` and
+        ``providers.market.tipranks_institutional``).
+
+        The ``institutional_score`` computed here (``as_of=session_date``) is
+        stored alongside the raw fields that produced it -- see
+        ``db.models.InstitutionalSnapshotRow``'s own docstring for why.
+
+        Written into ``db.models.InstitutionalSnapshotRow``, one row per
+        ``(session_date, symbol)`` -- re-collection within the same session
+        replaces the existing row rather than duplicating it, the same
+        posture ``ingest_analyst_snapshots`` applies to ``analyst_snapshots``:
+        this is a mutable daily snapshot, not the immutable signal ledger.
+
+        A symbol with no institutional content at all contributes no row
+        (see ``tipranks_institutional.parse_institutional_snapshot``'s
+        "returns None" contract) -- an empty snapshot must never be stored.
+        No configured TipRanks-backed provider at all is an honest zero, not
+        a failure. A genuine fetch/parse failure degrades per symbol --
+        logged and skipped, never aborting the rest of the batch or the
+        refresh -- and is reflected in ``report.provider_failures`` when it
+        affects the whole capability.
+        """
+        provider = self._tipranks_institutional_provider()
+        get_snapshots = getattr(provider, "get_institutional_snapshots", None)
+        if provider is None or get_snapshots is None:
+            return 0
+
+        try:
+            snapshots = get_snapshots(symbols, as_of_session=session_date)
+        except Exception as exc:
+            log.warning("institutional snapshot fetch failed: %s", exc, exc_info=True)
+            report.provider_failures["tipranks_institutional"] = str(exc)
+            return 0
+        if not snapshots:
+            return 0
+
+        with self.db.read_session() as session:
+            known = {row[0] for row in session.execute(select(Security.symbol)).all()}
+
+        written = 0
+        failed = 0
+        for chunk in _chunks(list(snapshots.items()), PERSIST_CHUNK_ROWS):
+            with self.db.session() as session:
+                for symbol, snapshot in chunk:
+                    if symbol not in known:
+                        continue
+                    try:
+                        score_result = institutional_score(snapshot, session_date)
+                        existing = (
+                            session.query(InstitutionalSnapshotRow)
+                            .filter_by(symbol=symbol, session=session_date)
+                            .one_or_none()
+                        )
+                        row = existing or InstitutionalSnapshotRow(
+                            symbol=symbol, session=session_date
+                        )
+                        for field_name, value in institutional_snapshot_to_row_fields(
+                            snapshot, score_result
+                        ).items():
+                            setattr(row, field_name, value)
+                        if existing is None:
+                            session.add(row)
+                        written += 1
+                    except Exception:
+                        log.warning(
+                            "failed to persist institutional snapshot for %s",
+                            symbol,
+                            exc_info=True,
+                        )
+                        failed += 1
+
+        report.institutional_snapshots_upserted += written
+        if failed:
+            report.provider_failures.setdefault(
+                "tipranks_institutional_persist", f"{failed} symbol(s) failed to persist"
+            )
+        log.info(
+            "institutional snapshots: stored %d row(s) for %s%s",
+            written, session_date, f" ({failed} failed)" if failed else "",
+        )
+        return written
+
     # --- social ---------------------------------------------------------------
 
     def _social_symbol_hints(self, candidates: list[str] | None) -> list[str] | None:
@@ -2031,6 +2150,10 @@ class DataIngestor:
         # attention/adanos blocks below, not the ``[start, end]`` backfill
         # window ``ingest_earnings`` uses for historical events.
         self.ingest_analyst_snapshots(symbols, current_trading_session(), report)
+        # Same TipRanks ``overview`` responses, same zero-additional-HTTP-cost
+        # posture -- harvests the insider/hedge-fund fields immediately after
+        # the analyst-consensus fields above.
+        self.ingest_institutional_snapshots(symbols, current_trading_session(), report)
 
         if self.social:
             self._report_progress("sentiment", 0, 1)

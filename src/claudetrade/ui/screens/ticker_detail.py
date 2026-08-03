@@ -20,12 +20,19 @@ from claudetrade.ui.components.tables import empty_state
 from claudetrade.ui.data_access import (
     analyst_sentiment,
     earnings_dates,
+    institutional_sentiment,
     known_symbols,
     price_bars,
     research_overlay,
     sentiment_timeline,
 )
-from claudetrade.ui.formatting import format_confidence, format_date, format_price, format_status
+from claudetrade.ui.formatting import (
+    format_confidence,
+    format_date,
+    format_large_number,
+    format_price,
+    format_status,
+)
 from claudetrade.ui.state import get_config, get_pipeline
 
 
@@ -80,6 +87,7 @@ def page_ticker_detail() -> None:
     _render_current_signal(config, pipeline, symbol, signals)
     _render_chart(config, pipeline, symbol, signals)
     _render_analyst_sentiment(pipeline, symbol)
+    _render_institutional_sentiment(pipeline, symbol)
     _render_signal_history(pipeline, signals)
 
 
@@ -349,6 +357,157 @@ def _render_analyst_sentiment(pipeline, symbol: str) -> None:
             "actionId semantics beyond 'upgrade'/'reiterate' are not documented by "
             "TipRanks; an unrecognised action shows its raw id rather than a guessed "
             "label -- see docs/api-providers.md."
+        )
+
+
+def _render_institutional_sentiment(pipeline, symbol: str) -> None:
+    """TipRanks-sourced insider/hedge-fund ("institutional") sentiment
+    block: blended score with per-axis breakdown and staleness, recent
+    insider transactions (role flags + SEC links), and notable hedge-fund
+    holder moves. Never makes a network call -- reads only what the last
+    ``claudetrade refresh`` already stored (see
+    ``ui.data_access.institutional_sentiment``).
+
+    **Research overlay only** -- this score is not fed into
+    ``signals.scoring.ComponentScores`` or any scan/backtest strategy (see
+    ``providers.market.tipranks_institutional.institutional_score``'s own
+    docstring).
+    """
+    st.subheader("Institutional Sentiment")
+    try:
+        overlay = institutional_sentiment(pipeline.db, symbol)
+    except Exception as exc:
+        st.error(f"Could not load institutional sentiment: {exc}")
+        return
+
+    if not overlay.available or overlay.snapshot is None:
+        empty_state(
+            f"No stored institutional-sentiment snapshot for {symbol} -- either "
+            "this installation has not refreshed since this feature was added, "
+            "or TipRanks has no insider/hedge-fund content for this symbol at all.",
+            "claudetrade refresh",
+        )
+        return
+
+    snap = overlay.snapshot
+    delta = overlay.delta
+    score = overlay.score
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Score", f"{score.score:+.2f}" if score is not None and score.score is not None else "n/a")
+        if overlay.score_change is not None:
+            st.caption(f"vs prior session: {overlay.score_change:+.2f}")
+        st.caption("Not used in scan/backtest scoring -- research overlay only")
+    with col2:
+        insider_sub = score.insider_subscore if score is not None else None
+        st.metric("Insider Axis", f"{insider_sub:+.2f}" if insider_sub is not None else "n/a")
+        if score is not None:
+            st.caption(
+                f"weight {score.insider_weight_applied:.2f}, "
+                f"age {score.insider_age_days if score.insider_age_days is not None else 'n/a'}d"
+            )
+    with col3:
+        hf_sub = score.hedge_fund_subscore if score is not None else None
+        st.metric("Hedge-Fund Axis", f"{hf_sub:+.2f}" if hf_sub is not None else "n/a")
+        if score is not None:
+            st.caption(
+                f"weight {score.hedge_fund_weight_applied:.2f}, "
+                f"age {score.hedge_fund_age_days if score.hedge_fund_age_days is not None else 'n/a'}d"
+            )
+    with col4:
+        flow = format_large_number(snap.insider_net_3m_usd) if snap.insider_net_3m_usd is not None else "n/a"
+        st.metric("Net Insider Flow (3m)", flow)
+        if delta is not None and delta.has_previous and delta.net_flow_change is not None:
+            st.caption(f"vs prior: {format_large_number(delta.net_flow_change)}")
+
+    detail_col1, detail_col2 = st.columns(2)
+    with detail_col1:
+        confidence = (
+            f"{snap.insider_confidence_stock_score:.2f}"
+            if snap.insider_confidence_stock_score is not None
+            else "n/a"
+        )
+        st.caption(
+            f"Insider confidence (vendor stockScore, 0-1): {confidence} | "
+            f"# insiders: {snap.num_of_insiders if snap.num_of_insiders is not None else 'n/a'}"
+        )
+    with detail_col2:
+        hf_sentiment = (
+            f"{snap.hedge_fund_sentiment:.2f}" if snap.hedge_fund_sentiment is not None else "n/a"
+        )
+        st.caption(
+            f"Hedge-fund sentiment (vendor, 0-1): {hf_sentiment} | "
+            f"market cap: {format_large_number(snap.market_cap_usd)}"
+        )
+
+    with st.expander("Recent insider transactions", expanded=False):
+        if not snap.recent_insider_transactions:
+            st.caption("No individual insider transactions stored for this symbol.")
+        else:
+            rows = [
+                {
+                    "Date": t.r_date,
+                    "Name": t.name,
+                    "Role": (
+                        "Officer" if t.is_officer else "Director" if t.is_director else
+                        "10% Owner" if t.is_ten_percent_owner else "n/a"
+                    ),
+                    "Title": t.officer_title,
+                    "Operation": t.operation_description,
+                    "Shares": t.number_of_shares,
+                    "Est. Value": t.estimated_shares_value,
+                    "Link": t.link,
+                }
+                for t in snap.recent_insider_transactions
+            ]
+            st.dataframe(
+                rows,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Date": st.column_config.DateColumn(),
+                    "Est. Value": st.column_config.NumberColumn(format="$%.0f"),
+                    "Link": st.column_config.LinkColumn(),
+                },
+            )
+        st.caption(
+            "insiderOperationId/action codes are not documented by TipRanks; the "
+            "vendor's own operation description text is trusted for display, the "
+            "raw numeric code is never re-labelled -- see docs/api-providers.md."
+        )
+
+    with st.expander("Notable hedge-fund holder moves", expanded=False):
+        if not snap.notable_holder_moves:
+            st.caption("No institutional holder moves stored for this symbol.")
+        else:
+            rows = [
+                {
+                    "Manager": m.manager_name,
+                    "Institution": m.institution_name,
+                    "Effective Date": m.effective_date,
+                    "Change": m.change_pct,
+                    "Change $": m.change_amount,
+                    "% of Portfolio": m.percentage_of_portfolio,
+                    "Stars": m.stars,
+                    "Active": m.is_active,
+                }
+                for m in snap.notable_holder_moves
+            ]
+            st.dataframe(
+                rows,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Effective Date": st.column_config.DateColumn(),
+                    "Change $": st.column_config.NumberColumn(format="$%.0f"),
+                    "Stars": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
+        st.caption(
+            "Hedge-fund holdings are SEC 13F-lagged by construction -- the latest "
+            "quarter shown here is routinely 1-3 months stale even on the day it "
+            "first appears in the vendor feed."
         )
 
 

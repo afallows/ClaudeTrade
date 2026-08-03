@@ -17,9 +17,20 @@ from sqlalchemy import func, select
 
 from claudetrade.config import AppConfig
 from claudetrade.data.analyst import AnalystDelta, analyst_delta, latest_and_previous_snapshots
+from claudetrade.data.institutional import (
+    InstitutionalDelta,
+    institutional_delta,
+)
+from claudetrade.data.institutional import (
+    latest_and_previous_snapshots as latest_and_previous_institutional_snapshots,
+)
 from claudetrade.db.models import EarningsEventRow, PriceBar, SymbolSentimentDaily
 from claudetrade.db.session import Database
-from claudetrade.domain import AnalystSnapshot, Bar, Signal
+from claudetrade.domain import AnalystSnapshot, Bar, InstitutionalSnapshot, Signal
+from claudetrade.providers.market.tipranks_institutional import (
+    InstitutionalScoreResult,
+    institutional_score,
+)
 from claudetrade.signals.research import ResearchLedger
 from claudetrade.signals.scoring import adjusted_overall
 
@@ -228,6 +239,69 @@ def analyst_sentiment(db: Database, symbol: str) -> AnalystOverlay:
     return AnalystOverlay(available=True, snapshot=latest, delta=analyst_delta(latest, previous))
 
 
+@dataclass(slots=True, frozen=True)
+class InstitutionalOverlay:
+    """Read-time insider/hedge-fund ("institutional") sentiment picture for
+    one symbol (``institutional_snapshots``), for the ticker-detail screen's
+    "Institutional sentiment" block.
+
+    ``available=False`` (with ``snapshot``/``delta``/``score`` all ``None``)
+    means this installation has never stored a snapshot for the symbol --
+    never an error; see ``data.institutional.latest_and_previous_snapshots``.
+
+    ``score`` is ``providers.market.tipranks_institutional
+    .institutional_score(snapshot, snapshot.as_of_session)`` -- recomputed
+    here at read time (pure function, no I/O) rather than read back from the
+    row's own stored ``score`` column, so a screen always reflects the
+    current scoring formula even against an older stored row.
+
+    ``score_change`` is ``score.score`` minus the SAME pure recomputation
+    against the previous stored snapshot (at ITS OWN ``as_of_session``, so
+    each side's staleness discount reflects what was actually known as of
+    that snapshot's date) -- ``None`` when there is no previous snapshot, or
+    either side's blended score itself is ``None``. ``InstitutionalDelta``
+    (``delta`` above) intentionally leaves its own ``score_change`` field
+    unset (see ``data.institutional.institutional_delta``'s docstring) since
+    it has no ``score`` field on the raw domain snapshot to diff directly --
+    this is the computed value that field's docstring points callers to.
+    """
+
+    available: bool
+    snapshot: InstitutionalSnapshot | None
+    delta: InstitutionalDelta | None
+    score: InstitutionalScoreResult | None
+    score_change: float | None = None
+
+
+def institutional_sentiment(db: Database, symbol: str) -> InstitutionalOverlay:
+    """Latest institutional-sentiment snapshot, its computed score, and its
+    delta vs. the previous stored session, for one symbol.
+
+    Goes through the same batched ``data.institutional
+    .latest_and_previous_snapshots`` helper the ``get_institutional_sentiment``
+    MCP tool uses -- see ``analyst_sentiment`` immediately above for why a
+    single-symbol list is still exactly one batched call.
+    """
+    latest, previous = latest_and_previous_institutional_snapshots(db, [symbol])[symbol]
+    if latest is None:
+        return InstitutionalOverlay(available=False, snapshot=None, delta=None, score=None)
+
+    latest_score = institutional_score(latest, latest.as_of_session)
+    score_change: float | None = None
+    if previous is not None:
+        previous_score = institutional_score(previous, previous.as_of_session)
+        if latest_score.score is not None and previous_score.score is not None:
+            score_change = latest_score.score - previous_score.score
+
+    return InstitutionalOverlay(
+        available=True,
+        snapshot=latest,
+        delta=institutional_delta(latest, previous),
+        score=latest_score,
+        score_change=score_change,
+    )
+
+
 def known_symbols(db: Database, *, limit: int = 5000) -> list[str]:
     """Every symbol with at least one stored bar, for the ticker-detail picker."""
     with db.read_session() as session:
@@ -244,11 +318,13 @@ def known_symbols(db: Database, *, limit: int = 5000) -> list[str]:
 __all__ = [
     "AnalystOverlay",
     "DataFreshness",
+    "InstitutionalOverlay",
     "ResearchOverlay",
     "SentimentPoint",
     "analyst_sentiment",
     "data_freshness",
     "earnings_dates",
+    "institutional_sentiment",
     "known_symbols",
     "price_bars",
     "research_overlay",

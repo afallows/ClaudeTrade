@@ -456,6 +456,184 @@ def get_analyst_sentiment(pipeline: Pipeline, symbol: str) -> dict[str, Any]:
     }
 
 
+def _insider_transaction_month_payload(month) -> dict[str, Any]:
+    return {
+        "month": month.month,
+        "year": month.year,
+        "shares_bought": month.shares_bought,
+        "insiders_buy_count": month.insiders_buy_count,
+        "shares_sold": month.shares_sold,
+        "insiders_sell_count": month.insiders_sell_count,
+        "trans_buy_count": month.trans_buy_count,
+        "trans_sell_count": month.trans_sell_count,
+        "trans_buy_amount": month.trans_buy_amount,
+        "trans_sell_amount": month.trans_sell_amount,
+        "informative_buy_count": month.informative_buy_count,
+        "informative_sell_count": month.informative_sell_count,
+        "informative_buy_amount": month.informative_buy_amount,
+        "informative_sell_amount": month.informative_sell_amount,
+    }
+
+
+def _insider_transaction_payload(txn) -> dict[str, Any]:
+    return {
+        "name": txn.name,
+        "is_officer": txn.is_officer,
+        "is_director": txn.is_director,
+        "is_ten_percent_owner": txn.is_ten_percent_owner,
+        "officer_title": txn.officer_title,
+        "action": txn.action,
+        "operation_description": txn.operation_description,
+        "amount": txn.amount,
+        "number_of_shares": txn.number_of_shares,
+        "r_date": txn.r_date.isoformat() if txn.r_date else None,
+        "estimated_shares_value": txn.estimated_shares_value,
+        "link": txn.link,
+    }
+
+
+def _hedge_fund_holding_quarter_payload(quarter) -> dict[str, Any]:
+    return {
+        "date": quarter.date.isoformat(),
+        "holding_amount": quarter.holding_amount,
+        "institution_holding_percentage": quarter.institution_holding_percentage,
+        "net_shares_change": quarter.net_shares_change,
+        "number_of_shares_bought": quarter.number_of_shares_bought,
+        "number_of_shares_sold": quarter.number_of_shares_sold,
+        "is_complete": quarter.is_complete,
+    }
+
+
+def _hedge_fund_holder_move_payload(move) -> dict[str, Any]:
+    return {
+        "manager_name": move.manager_name,
+        "institution_name": move.institution_name,
+        "action": move.action,
+        "effective_date": move.effective_date.isoformat() if move.effective_date else None,
+        "value": move.value,
+        "change_pct": move.change_pct,
+        "change_amount": move.change_amount,
+        "percentage_of_portfolio": move.percentage_of_portfolio,
+        "stars": move.stars,
+        "is_active": move.is_active,
+    }
+
+
+def _institutional_snapshot_payload(snapshot, score_result) -> dict[str, Any]:
+    return {
+        "as_of_session": snapshot.as_of_session.isoformat(),
+        "insider_monthly": [
+            _insider_transaction_month_payload(m) for m in snapshot.insider_monthly
+        ],
+        "insider_net_3m_usd": snapshot.insider_net_3m_usd,
+        "insider_net_3m_usd_vendor": snapshot.insider_net_3m_usd_vendor,
+        "insider_confidence_stock_score": snapshot.insider_confidence_stock_score,
+        "insider_confidence_sector_score": snapshot.insider_confidence_sector_score,
+        "insider_confidence_raw_score": snapshot.insider_confidence_raw_score,
+        "num_of_insiders": snapshot.num_of_insiders,
+        "recent_insider_transactions": [
+            _insider_transaction_payload(t) for t in snapshot.recent_insider_transactions
+        ],
+        "hedge_fund_sentiment": snapshot.hedge_fund_sentiment,
+        "hedge_fund_trend_action": snapshot.hedge_fund_trend_action,
+        "hedge_fund_trend_value": snapshot.hedge_fund_trend_value,
+        "hedge_fund_holdings_by_quarter": [
+            _hedge_fund_holding_quarter_payload(h) for h in snapshot.hedge_fund_holdings_by_quarter
+        ],
+        "notable_holder_moves": [
+            _hedge_fund_holder_move_payload(m) for m in snapshot.notable_holder_moves
+        ],
+        "market_cap_usd": snapshot.market_cap_usd,
+        "fetched_at": snapshot.fetched_at.isoformat() if snapshot.fetched_at else None,
+        "score": score_result.score,
+        "insider_subscore": score_result.insider_subscore,
+        "insider_weight_applied": score_result.insider_weight_applied,
+        "insider_age_days": score_result.insider_age_days,
+        "hedge_fund_subscore": score_result.hedge_fund_subscore,
+        "hedge_fund_weight_applied": score_result.hedge_fund_weight_applied,
+        "hedge_fund_age_days": score_result.hedge_fund_age_days,
+    }
+
+
+def get_institutional_sentiment(pipeline: Pipeline, symbol: str) -> dict[str, Any]:
+    """Read-only. TipRanks-sourced insider/hedge-fund ("institutional")
+    sentiment snapshot for one symbol.
+
+    Reads ``data.institutional.latest_and_previous_snapshots`` -- the same
+    batched read helper the Streamlit ticker-detail screen's "Institutional
+    sentiment" block uses -- for the latest stored ``institutional_snapshots``
+    row plus the prior stored session, and ``data.institutional
+    .institutional_delta`` for the comparison between them.
+    ``providers.market.tipranks_institutional.institutional_score`` is
+    recomputed here (pure, no I/O) rather than read back from the row's own
+    stored ``score`` column, so the reported score always reflects the
+    current scoring formula even against an older stored row. Nothing here
+    makes a network call: this only reads what the last ``claudetrade
+    refresh`` already harvested from TipRanks' ``dataForTicker`` response for
+    this symbol (see ``providers.market.tipranks_institutional`` for the
+    field mapping and the scoring formula's own documented weights/
+    staleness half-lives).
+
+    ``available=False`` (with ``snapshot``/``delta`` both ``None``) means
+    this installation has never stored a snapshot for the symbol -- either
+    it has not been refreshed yet, or TipRanks has no institutional content
+    for it at all (common for small/illiquid names) -- never an error.
+
+    **Not fed into ``signals.scoring.ComponentScores`` or any strategy** --
+    see ``domain.InstitutionalSnapshot``'s own docstring. This is a
+    read-only research overlay.
+    """
+    from claudetrade.data.institutional import institutional_delta, latest_and_previous_snapshots
+    from claudetrade.providers.market.tipranks_institutional import institutional_score
+
+    symbol = symbol.strip().upper()
+    latest, previous = latest_and_previous_snapshots(pipeline.db, [symbol])[symbol]
+    if latest is None:
+        return {
+            "symbol": symbol,
+            "available": False,
+            "snapshot": None,
+            "delta": None,
+            "note": (
+                f"No stored institutional-sentiment snapshot for {symbol}. Either "
+                "this installation has not refreshed since this feature was added, "
+                "or TipRanks has no insider/hedge-fund content for this symbol at "
+                "all (common for small/illiquid names) -- run `claudetrade refresh` "
+                "(or the trigger_refresh tool) and check again."
+            ),
+        }
+
+    latest_score = institutional_score(latest, latest.as_of_session)
+    score_change: float | None = None
+    if previous is not None:
+        previous_score = institutional_score(previous, previous.as_of_session)
+        if latest_score.score is not None and previous_score.score is not None:
+            score_change = latest_score.score - previous_score.score
+
+    delta = institutional_delta(latest, previous)
+    return {
+        "symbol": symbol,
+        "available": True,
+        "snapshot": _institutional_snapshot_payload(latest, latest_score),
+        "delta": {
+            "previous_session": (
+                delta.previous_session.isoformat() if delta.previous_session else None
+            ),
+            "has_previous": delta.has_previous,
+            "score_change": score_change,
+            "net_flow_change": delta.net_flow_change,
+            "hedge_fund_sentiment_change": delta.hedge_fund_sentiment_change,
+            "new_holder_moves": [
+                _hedge_fund_holder_move_payload(m) for m in delta.new_holder_moves
+            ],
+            "new_insider_transactions": [
+                _insider_transaction_payload(t) for t in delta.new_insider_transactions
+            ],
+        },
+        "note": None,
+    }
+
+
 def get_trending(pipeline: Pipeline, *, limit: int = 20, source: str = "auto") -> dict[str, Any]:
     """Read-only. Symbols ranked by recent mention volume.
 
@@ -1196,6 +1374,34 @@ def build_server(pipeline: Pipeline, config: AppConfig) -> FastMCP:
             "get_analyst_sentiment",
             config.mcp.tool_timeout_seconds,
             lambda: get_analyst_sentiment(pipeline, symbol),
+        )
+
+    @server.tool(
+        name="get_institutional_sentiment",
+        description=(
+            "Read-only. TipRanks-sourced insider/hedge-fund ('institutional') "
+            "sentiment snapshot for one symbol: monthly insider buy/sell "
+            "transaction aggregates, a derived trailing-3-month net insider $ "
+            "flow (market-cap-normalized), the vendor's insider confidence "
+            "signal, recent individual insider transactions (role flags, SEC "
+            "link), hedge-fund sentiment/trend, quarterly institutional-holdings "
+            "history, and notable holder moves. Includes a blended [-1, +1] "
+            "score with per-axis subscores, applied weights and staleness ages "
+            "(see the tool's snapshot payload). Also reports the delta against "
+            "the previous stored session (score/net-flow/hedge-fund-sentiment "
+            "changes, plus holder moves and insider transactions dated after "
+            "that prior session). Makes no network call -- reads only what the "
+            "last `claudetrade refresh` already stored; available=false (never "
+            "an error) means no snapshot has been stored yet, or TipRanks has "
+            "no institutional content for this symbol at all. Research signal "
+            "only, not fed into any scan/backtest strategy."
+        ),
+    )
+    async def _get_institutional_sentiment(symbol: str) -> dict[str, Any]:
+        return await _call_bounded(
+            "get_institutional_sentiment",
+            config.mcp.tool_timeout_seconds,
+            lambda: get_institutional_sentiment(pipeline, symbol),
         )
 
     @server.tool(

@@ -406,6 +406,177 @@ class AnalystSnapshot:
     fetched_at: dt.datetime | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class InsiderTransactionMonth:
+    """One monthly aggregate row from TipRanks' ``overview.
+    corporateInsiderTransactions[]``.
+
+    TipRanks reports both a RAW tally (``trans_buy_amount``/
+    ``trans_sell_amount``, every Form-4-reportable transaction) and an
+    "informative" subset (``informative_buy_amount``/
+    ``informative_sell_amount`` -- transactions TipRanks itself judges
+    meaningful, e.g. open-market buys/sells, as opposed to option exercises,
+    gifts, or scheduled 10b5-1 plan sales that carry little signal about the
+    insider's own view). See ``providers.market.tipranks_institutional`` for
+    exactly how this module prefers the informative figure and falls back to
+    the raw one only when informative is ``None`` for that side.
+    """
+
+    month: int
+    year: int
+    shares_bought: int | None = None
+    insiders_buy_count: int = 0
+    shares_sold: int | None = None
+    insiders_sell_count: int = 0
+    trans_buy_count: int = 0
+    trans_sell_count: int = 0
+    trans_buy_amount: float | None = None
+    trans_sell_amount: float | None = None
+    informative_buy_count: int = 0
+    informative_sell_count: int = 0
+    informative_buy_amount: float | None = None
+    informative_sell_amount: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InsiderTransaction:
+    """One individual insider's transaction, from ``overview.insiders[]`` --
+    evidence-level detail (as opposed to :class:`InsiderTransactionMonth`'s
+    monthly aggregates), kept for display and audit, not for scoring.
+
+    ``action``/``operation_description``: TipRanks' own numeric ``action``
+    code is NOT independently confirmed by either committed fixture (unlike
+    ``tipranks_analyst``'s ``ratingId``/``actionId``, which have headline-text
+    confirmation) -- it is stored raw, alongside the vendor's own
+    human-readable ``insiderOperationDescription`` string (e.g. ``"Buy"``,
+    ``"Grant/Award/Other Disposal"``), which this module trusts as display
+    text without re-deriving a label from the numeric code.
+    """
+
+    name: str
+    is_officer: bool = False
+    is_director: bool = False
+    is_ten_percent_owner: bool = False
+    officer_title: str | None = None
+    action: int | None = None
+    operation_description: str | None = None
+    amount: float | None = None
+    number_of_shares: int | None = None
+    r_date: dt.date | None = None
+    estimated_shares_value: float | None = None
+    link: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HedgeFundHoldingQuarter:
+    """One quarterly point from ``overview.hedgeFundData.holdingsByTime[]``.
+
+    Institutional 13F holdings are SEC-lagged by construction -- a quarter's
+    row is only ever published weeks after the quarter closes, so the most
+    recent row here is routinely 1-3 months stale even on the day it first
+    appears. ``is_complete`` is the vendor's own flag for whether a quarter's
+    figures are still being amended (seen ``True`` on every row in both
+    committed fixtures; the flag exists in the schema for a not-yet-fully-
+    reported quarter, which neither fixture happens to carry).
+    """
+
+    date: dt.date
+    holding_amount: int | None = None
+    institution_holding_percentage: float | None = None
+    net_shares_change: int | None = None
+    number_of_shares_bought: int | None = None
+    number_of_shares_sold: int | None = None
+    is_complete: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class HedgeFundHolderMove:
+    """One notable institutional holder's latest reported move, from
+    ``overview.hedgeFundData.institutionalHoldings[]``.
+
+    ``action``: TipRanks' own numeric code, NOT independently confirmed by
+    either fixture -- stored raw, same posture as ``InsiderTransaction.action``.
+    ``stars``: the vendor's own track-record rating for this manager (higher
+    is better), unrelated to ``change``/``change_amount`` (the position move
+    itself).
+    """
+
+    manager_name: str
+    institution_name: str
+    action: int | None = None
+    effective_date: dt.date | None = None
+    value: float | None = None
+    change_pct: float | None = None
+    change_amount: float | None = None
+    percentage_of_portfolio: float | None = None
+    stars: float | None = None
+    is_active: bool = True
+
+
+@dataclass(slots=True)
+class InstitutionalSnapshot:
+    """TipRanks-sourced insider/hedge-fund ("institutional") sentiment
+    snapshot for one symbol, one session.
+
+    Harvested from the SAME ``dataForTicker`` ``overview`` payload
+    ``providers.market.tipranks.TipRanksProvider`` already fetches/caches for
+    reference data, market caps, earnings and (as of the prior feature)
+    analyst consensus -- this object adds no new HTTP calls of its own. See
+    ``providers.market.tipranks_institutional`` for the parser, the fixture
+    cross-references behind each field mapping, and ``institutional_score``
+    for the pure scoring function built on top of this object.
+
+    ``insider_net_3m_usd`` is this module's OWN derived figure -- summed from
+    ``insider_monthly``'s most recent (up to three) rows, preferring each
+    month's ``informative_*_amount`` over its raw ``trans_*_amount`` per
+    ``InsiderTransactionMonth``'s own docstring -- NOT the vendor's own
+    ``overview.insiderslast3MonthsSum`` figure, which is kept separately as
+    ``insider_net_3m_usd_vendor`` for display/cross-check. The two will
+    usually be close but need not match exactly: the vendor total's own
+    informative-vs-raw mixing rule is not documented, so this module computes
+    its own figure rather than trust an opaque one for scoring.
+
+    ``insider_confidence_stock_score``/``insider_confidence_sector_score``
+    come from ``overview.insidrConfidenceSignal`` (the vendor's own typo,
+    preserved in the raw field name only, not here). Best-effort CONFIRMED
+    0..1 scale (see ``tipranks_institutional``'s module docstring): both
+    committed fixtures show a value below the 0.5 midpoint (INTC 0.29, TECK.B
+    0.08) alongside a negative ``insider_net_3m_usd_vendor`` on both -- i.e.
+    lower-than-midpoint tracks net insider SELLING on both available
+    fixtures, the same direction ``hedgeFundData.sentiment``'s independently
+    documented 0..1 scale uses. Not vendor-documented, so treated as
+    best-effort corroborating evidence rather than an authoritative label.
+
+    An empty/no-institutional-content symbol (no insider transactions, no
+    insider confidence signal, no hedge-fund data at all) parses to ``None``
+    from ``tipranks_institutional.parse_institutional_snapshot`` rather than
+    an all-``None`` instance of this class -- see that function's docstring.
+
+    **Not fed into ``signals.scoring.ComponentScores`` or any strategy.**
+    This is a read-only research overlay (Streamlit ticker-detail block, the
+    ``get_institutional_sentiment`` MCP tool) -- see ``institutional_score``'s
+    own docstring for the same caveat stated at the scoring-function level.
+    """
+
+    symbol: str
+    as_of_session: dt.date
+    insider_monthly: list[InsiderTransactionMonth] = field(default_factory=list)
+    insider_net_3m_usd: float | None = None
+    insider_net_3m_usd_vendor: float | None = None
+    insider_confidence_stock_score: float | None = None
+    insider_confidence_sector_score: float | None = None
+    insider_confidence_raw_score: int | None = None
+    num_of_insiders: int | None = None
+    recent_insider_transactions: list[InsiderTransaction] = field(default_factory=list)
+    hedge_fund_sentiment: float | None = None
+    hedge_fund_trend_action: int | None = None
+    hedge_fund_trend_value: float | None = None
+    hedge_fund_holdings_by_quarter: list[HedgeFundHoldingQuarter] = field(default_factory=list)
+    notable_holder_moves: list[HedgeFundHolderMove] = field(default_factory=list)
+    market_cap_usd: float | None = None
+    fetched_at: dt.datetime | None = None
+
+
 # --------------------------------------------------------------------------
 # Social data
 # --------------------------------------------------------------------------
