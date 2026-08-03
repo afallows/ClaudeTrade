@@ -895,11 +895,18 @@ class TestProbeHostList:
 
 
 # ---------------------------------------------------------------------------
-# Hybrid mode: on-demand official calls (fetch_stock_detail / fetch_explain)
+# Hybrid mode: on-demand calls (fetch_stock_detail / fetch_explain /
+# fetch_market_sentiment), site-first with official fallback
 #
 # Independent of site-vs-official trending mode -- see the module docstring's
-# "Hybrid mode" section. These are ALWAYS official and ALWAYS budget-guarded
-# whenever a key resolves at all, regardless of ``prefer_official_api``.
+# "Hybrid mode" section. Revised 2026-08-03: the site proxy mirrors these
+# on-demand routes too, so all three now run a two-rung ladder (site first,
+# official fallback -- reversed by ``prefer_official_api``) and NEVER raise;
+# every outcome (success, a structured vendor "no", or both rungs failing)
+# comes back as a dict. Fixtures ending ``_site`` are the site-proxy shape;
+# ``x_stock_detail``/``x_stock_explain`` (no suffix) are the official shape,
+# used to exercise the fallback rung by leaving the site route unregistered
+# (which the shared ``_client`` helper 404s by default -- a real failure).
 # ---------------------------------------------------------------------------
 
 
@@ -924,18 +931,126 @@ def _hybrid_provider(
 
 class TestHybridModeKeyResolution:
     def test_key_resolves_regardless_of_prefer_official_api(self, monkeypatch) -> None:
-        """The whole point of hybrid mode: on-demand calls need a key even
-        when trending stays in its site-mode default."""
         provider = _hybrid_provider(_client({}), monkeypatch)  # prefer_official_api defaults False
         assert provider.mode == "site"  # trending mode is unaffected
-        assert provider.budget_status()["key_resolved"] is True  # on-demand calls ARE available
+        assert provider.budget_status()["key_resolved"] is True
 
-    def test_no_key_means_on_demand_calls_are_unavailable(self, monkeypatch) -> None:
+    def test_no_key_means_official_fallback_is_unavailable(self, monkeypatch) -> None:
+        """The key only matters for the official FALLBACK rung now -- the
+        site rung (tried first) never needed one."""
         provider = _hybrid_provider(_client({}), monkeypatch, key=None)
         assert provider.budget_status()["key_resolved"] is False
 
 
+class TestOnDemandLadderOrdering:
+    """The two-rung ladder itself: site first by default, official only as a
+    fallback, ``prefer_official_api`` reversing the order -- shared by
+    ``fetch_stock_detail``/``fetch_explain``/``fetch_market_sentiment``.
+    Exercised here via ``fetch_stock_detail`` as the representative case."""
+
+    def test_site_is_tried_first_by_default(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/NVDA": _fixture("x_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is True
+        assert result["mode"] == "site"
+        assert result["quota_spent"] is False
+        assert len(client.calls) == 1  # type: ignore[attr-defined]
+        assert "proxy-x" in str(client.calls[0].url)  # type: ignore[attr-defined]
+
+    def test_official_is_tried_only_as_a_fallback(self, monkeypatch, tmp_path) -> None:
+        # Site route is unregistered -> the shared _client 404s it -> the
+        # ladder falls back to the (registered) official route.
+        client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is True
+        assert result["mode"] == "official"
+        assert result["quota_spent"] is True
+        assert len(client.calls) == 2  # type: ignore[attr-defined]
+        assert "proxy-x" in str(client.calls[0].url)  # type: ignore[attr-defined]
+        assert "api.adanos.org" in str(client.calls[1].url)  # type: ignore[attr-defined]
+
+    def test_prefer_official_api_reverses_the_order(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, prefer_official_api=True
+        )
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is True
+        assert result["mode"] == "official"
+        assert result["quota_spent"] is True
+        assert len(client.calls) == 1  # type: ignore[attr-defined]  # site never tried
+        assert "api.adanos.org" in str(client.calls[0].url)  # type: ignore[attr-defined]
+
+    def test_prefer_official_api_falls_back_to_site_when_official_fails(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        client = _client({"proxy-x/stock/NVDA": _fixture("x_stock_detail_site")})
+        provider = _hybrid_provider(
+            client, monkeypatch, cache_dir=tmp_path, prefer_official_api=True
+        )
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is True
+        assert result["mode"] == "site"
+        # The failed official attempt still reached the vendor and spent
+        # quota, even though the site rung ultimately answered.
+        assert result["quota_spent"] is True
+        used, _ = provider._budget.snapshot()
+        assert used == 1
+
+
 class TestFetchStockDetailUrlConstruction:
+    def test_per_platform_site_url_no_api_key(self, monkeypatch, tmp_path) -> None:
+        cases = {
+            "x": "proxy-x/stock/NVDA",
+            "reddit": "proxy/stock/NVDA",
+            "polymarket": "proxy-polymarket/stock/NVDA",
+            "news": "proxy-news/stock/NVDA",
+        }
+        for platform, expected_path in cases.items():
+            client = _client({expected_path: _fixture("x_stock_detail_site")})
+            provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+            result = provider.fetch_stock_detail("nvda", platform=platform)
+            assert result["accepted"] is True, (platform, result)
+            assert result["mode"] == "site"
+            url = str(client.calls[0].url)  # type: ignore[attr-defined]
+            assert url.startswith(f"https://adanos.org/api/{expected_path}")
+            assert "X-API-Key" not in client.calls[0].headers  # type: ignore[attr-defined]
+            assert len(client.calls) == 1  # type: ignore[attr-defined]  # no official fallback needed
+
+    def test_unsupported_platform_is_a_refusal_not_a_request(self, monkeypatch, tmp_path) -> None:
+        client = _client({})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("NVDA", platform="bogus")
+        assert result["accepted"] is False
+        assert result["mode"] is None
+        assert result["quota_spent"] is False
+        assert client.calls == []  # type: ignore[attr-defined]
+
+
+class TestFetchStockDetailSiteDaysParam:
+    """The site rung takes ``days`` (a window size), not ``from``/``to`` like
+    the official API -- ``_days_param`` translates one into the other."""
+
+    def test_from_to_translated_to_a_day_count(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/NVDA": _fixture("x_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        provider.fetch_stock_detail(
+            "NVDA", platform="x", from_date="2026-07-26", to_date="2026-08-02"
+        )
+        url = str(client.calls[0].url)  # type: ignore[attr-defined]
+        assert "days=7" in url
+
+    def test_no_dates_omits_the_days_param(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/NVDA": _fixture("x_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        provider.fetch_stock_detail("NVDA")
+        url = str(client.calls[0].url)  # type: ignore[attr-defined]
+        assert "days=" not in url
+
+
+class TestFetchStockDetailOfficialFallbackUrlConstruction:
     def test_per_platform_url_and_auth_header(self, monkeypatch, tmp_path) -> None:
         cases = {
             "x": "x/stocks/v1/stock/NVDA",
@@ -944,13 +1059,16 @@ class TestFetchStockDetailUrlConstruction:
             "news": "news/stocks/v1/stock/NVDA",
         }
         for platform, expected_path in cases.items():
+            # Site route deliberately unregistered -> falls back to official.
             client = _client({expected_path: _fixture("x_stock_detail")})
             provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
             result = provider.fetch_stock_detail("nvda", platform=platform)
             assert result["accepted"] is True
-            url = str(client.calls[0].url)  # type: ignore[attr-defined]
+            assert result["mode"] == "official"
+            official_call = client.calls[-1]  # type: ignore[attr-defined]
+            url = str(official_call.url)
             assert url.startswith(f"https://api.adanos.org/{expected_path}")
-            assert client.calls[0].headers["x-api-key"] == "sk_live_test"  # type: ignore[attr-defined]
+            assert official_call.headers["x-api-key"] == "sk_live_test"
 
     def test_from_to_params_are_passed_through(self, monkeypatch, tmp_path) -> None:
         client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
@@ -958,26 +1076,21 @@ class TestFetchStockDetailUrlConstruction:
         provider.fetch_stock_detail(
             "NVDA", platform="x", from_date="2026-07-01", to_date="2026-08-01"
         )
-        url = str(client.calls[0].url)  # type: ignore[attr-defined]
+        url = str(client.calls[-1].url)  # type: ignore[attr-defined]
         assert "from=2026-07-01" in url
         assert "to=2026-08-01" in url
 
-    def test_unsupported_platform_is_a_refusal_not_a_request(self, monkeypatch, tmp_path) -> None:
-        client = _client({})
-        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
-        result = provider.fetch_stock_detail("NVDA", platform="bogus")
-        assert result["accepted"] is False
-        assert client.calls == []  # type: ignore[attr-defined]
-
 
 class TestFetchStockDetailParsing:
-    def test_normalized_header_and_raw_passthrough(self, monkeypatch, tmp_path) -> None:
-        client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
+    def test_normalized_header_and_raw_passthrough_site_mode(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/NVDA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
         result = provider.fetch_stock_detail("NVDA")
 
         assert result["symbol"] == "NVDA"
         assert result["platform"] == "x"
+        assert result["mode"] == "site"
+        assert result["quota_spent"] is False
         assert result["buzz_score"] == pytest.approx(87.5)
         assert result["sentiment_score"] == pytest.approx(0.42)
         assert result["bullish_pct"] == pytest.approx(68.0)
@@ -985,10 +1098,60 @@ class TestFetchStockDetailParsing:
         assert result["mentions"] == 950
         # Nothing invented -- the vendor's own fields pass through untouched.
         assert result["raw"]["daily_trend"][0]["date"] == "2026-07-27"
-        assert result["raw"]["sentiment_breakdown"]["bullish"] == 68.0
+        assert result["raw"]["period_days"] == 7
         assert "budget" in result
 
-    def test_spends_exactly_one_official_call(self, monkeypatch, tmp_path) -> None:
+    def test_polymarket_detail_uses_trade_count_for_the_normalized_mentions_field(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        client = _client({"proxy-polymarket/stock/TSLA": _fixture("polymarket_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("TSLA", platform="polymarket")
+        assert result["accepted"] is True
+        assert result["mentions"] == 1200  # trade_count -- polymarket has no "mentions" field
+        assert result["raw"]["unique_traders"] == 400
+        assert result["raw"]["total_liquidity"] == pytest.approx(250000.5)
+
+    def test_news_detail_tolerates_a_daily_trend_shorter_than_seven_days(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Coordinator-verified live 2026-08-03: a quiet day can be omitted
+        from ``daily_trend`` -- must not assume a fixed 7-entry window."""
+        client = _client({"proxy-news/stock/NVDA": _fixture("news_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("NVDA", platform="news")
+        assert result["accepted"] is True
+        assert len(result["raw"]["daily_trend"]) == 6
+        assert result["raw"]["source_count"] == 12
+
+    def test_text_snippets_in_top_tweets_are_sanitised(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/NVDA": _fixture("x_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("NVDA")
+
+        first = result["raw"]["top_tweets"][0]["text_snippet"]
+        assert "[url]" in first
+        assert "example.com" not in first
+        assert "[email]" in first
+        assert "trader@example.com" not in first
+        # sentiment_score alongside the snippet is untouched -- only the text
+        # field under a known snippet key is rewritten.
+        assert result["raw"]["top_tweets"][0]["sentiment_score"] == pytest.approx(0.6)
+
+        second = result["raw"]["top_tweets"][1]["text_snippet"]
+        assert "[user]" in second
+        assert "some_trader" not in second
+
+    def test_spends_no_quota_in_site_mode(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/NVDA": _fixture("x_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, monthly_budget=250)
+        provider.fetch_stock_detail("NVDA")
+        used, _ = provider._budget.snapshot()
+        assert used == 0
+
+    def test_spends_exactly_one_official_call_when_falling_back(
+        self, monkeypatch, tmp_path
+    ) -> None:
         client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, monthly_budget=250)
         provider.fetch_stock_detail("NVDA")
@@ -996,35 +1159,99 @@ class TestFetchStockDetailParsing:
         assert used == 1
 
 
-class TestFetchStockDetailBudgetGuard:
-    def test_no_key_returns_a_structured_refusal_without_sending_a_request(
+class TestFetchStockDetailStructuredAnswers:
+    """The vendor's two distinct "no" shapes (observed live 2026-08-03) --
+    neither is an exception, and neither triggers the ladder's fallback,
+    since the vendor has already given a definitive answer."""
+
+    def test_found_false_is_a_structured_refusal_not_an_exception(
         self, monkeypatch, tmp_path
     ) -> None:
-        client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
+        client = _client({"proxy-x/stock/ZZZZ": _fixture("stock_detail_not_found")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("ZZZZ")
+        assert result["accepted"] is False
+        assert "found: false" in result["reason"]
+        assert result["mode"] == "site"
+        assert result["quota_spent"] is False
+        assert len(client.calls) == 1  # type: ignore[attr-defined]  # official never tried
+
+    def test_unsupported_ticker_error_code_is_a_distinct_structured_refusal(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        client = _client(
+            {"proxy-x/stock/ZZZZFAKE": _fixture("stock_detail_unsupported_ticker")}, status=404
+        )
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("ZZZZFAKE")
+        assert result["accepted"] is False
+        assert "unsupported ticker" in result["reason"].lower()
+        assert "ZZZZFAKE" in result["reason"]
+        assert result["mode"] == "site"
+        assert len(client.calls) == 1  # type: ignore[attr-defined]  # official never tried
+
+    def test_endpoint_absent_error_body_is_a_site_failure_not_data(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """``{"error": "Not found"}`` -- unlike ``{"found": false}`` or the
+        unsupported-ticker shape -- means the ROUTE itself does not exist on
+        this proxy base, so it must trigger the ladder's fallback rather
+        than being parsed as an answer."""
+        client = _client(
+            {
+                "proxy-x/stock/NVDA": _fixture("endpoint_absent"),
+                "x/stocks/v1/stock/NVDA": _fixture("x_stock_detail"),
+            }
+        )
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is True
+        assert result["mode"] == "official"
+
+
+class TestFetchStockDetailBudgetGuard:
+    def test_no_key_still_succeeds_via_site(self, monkeypatch, tmp_path) -> None:
+        """Unlike before the site-first ladder, on-demand detail no longer
+        requires a key to succeed at all."""
+        client = _client({"proxy-x/stock/NVDA": _fixture("x_stock_detail_site")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, key=None)
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is True
+        assert result["mode"] == "site"
+        assert result["quota_spent"] is False
+
+    def test_no_key_and_site_failure_is_a_refusal_without_an_official_request(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        client = _client({"proxy-x/stock/NVDA": {}}, status=500)
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, key=None)
         result = provider.fetch_stock_detail("NVDA")
         assert result["accepted"] is False
         assert "no adanos_api_key" in result["reason"]
-        assert result["budget"]["key_resolved"] is False
-        assert client.calls == []  # type: ignore[attr-defined]
+        assert len(client.calls) == 1  # type: ignore[attr-defined]  # site only, no unmetered fallback
 
-    def test_fails_closed_at_the_reserve_floor_without_sending_a_request(
+    def test_fails_closed_at_the_reserve_floor_without_sending_an_official_request(
         self, monkeypatch, tmp_path
     ) -> None:
+        # Site left unregistered -> every attempt falls back to official,
+        # spending budget, until the reserve floor is reached.
         client = _client({"x/stocks/v1/stock/NVDA": _fixture("x_stock_detail")})
         provider = _hybrid_provider(
             client, monkeypatch, cache_dir=tmp_path, monthly_budget=5, monthly_reserve=2
         )
         for _ in range(3):
             provider.fetch_stock_detail("NVDA")  # used -> 3, remaining -> 2 (== reserve)
-        assert len(client.calls) == 3  # type: ignore[attr-defined]
+        assert len(client.calls) == 6  # type: ignore[attr-defined]  # 3x (site attempt + official)
 
         result = provider.fetch_stock_detail("NVDA")
         assert result["accepted"] is False
         assert "resets" in result["reason"]
-        assert len(client.calls) == 3  # type: ignore[attr-defined]  # no new request sent
+        assert result["quota_spent"] is False
+        assert len(client.calls) == 7  # type: ignore[attr-defined]  # +1 site attempt; no official sent
 
-    def test_refusals_never_touch_the_budget_counter(self, monkeypatch, tmp_path) -> None:
+    def test_refusals_never_touch_the_budget_counter_when_no_key_resolves(
+        self, monkeypatch, tmp_path
+    ) -> None:
         client = _client({})
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, key=None)
         provider.fetch_stock_detail("NVDA")
@@ -1037,74 +1264,91 @@ class TestFetchStockDetailBudgetGuard:
             headers={"X-RateLimit-Remaining-Monthly": "1"},
         )
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, monthly_budget=250)
-        provider.fetch_stock_detail("NVDA")
+        provider.fetch_stock_detail("NVDA")  # site unregistered -> falls back to official
         used, _ = provider._budget.snapshot()
         assert used == 249  # max(local increment of 1, 250 - 1)
 
 
 class TestFetchStockDetailErrorTaxonomy:
-    def test_401_is_authentication_error(self, monkeypatch, tmp_path) -> None:
+    """``fetch_stock_detail`` never raises -- a genuine HTTP failure on
+    either rung is recorded, not raised, and only surfaces as a refusal if
+    EVERY available rung failed (see ``_ladder_refusal``). The site rung is
+    left unregistered in most of these so it fails "naturally" via the
+    shared ``_client`` helper's 404 default, isolating each case to the
+    official rung's behaviour."""
+
+    def test_both_rungs_failing_returns_a_refusal_naming_both(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/NVDA": {}, "x/stocks/v1/stock/NVDA": {}}, status=500)
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is False
+        assert result["mode"] is None
+        assert "site:" in result["reason"]
+        assert "official:" in result["reason"]
+
+    def test_401_on_official_rung_is_recorded_not_raised(self, monkeypatch, tmp_path) -> None:
         client = _client({"x/stocks/v1/stock/NVDA": {}}, status=401)
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
-        with pytest.raises(AuthenticationError):
-            provider.fetch_stock_detail("NVDA")
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is False
+        assert "official:" in result["reason"]
+        assert "401" in result["reason"]
 
     def test_403_names_the_history_window(self, monkeypatch, tmp_path) -> None:
         client = _client({"x/stocks/v1/stock/NVDA": {}}, status=403)
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
-        with pytest.raises(ProviderError) as exc_info:
-            provider.fetch_stock_detail("NVDA")
-        assert "history window" in str(exc_info.value)
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is False
+        assert "history window" in result["reason"]
 
-    def test_429_is_rate_limit_error(self, monkeypatch, tmp_path) -> None:
+    def test_429_is_recorded_not_raised(self, monkeypatch, tmp_path) -> None:
         client = _client({"x/stocks/v1/stock/NVDA": {}}, status=429)
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
-        with pytest.raises(RateLimitError):
-            provider.fetch_stock_detail("NVDA")
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is False
+        assert "official:" in result["reason"]
 
-    def test_404_names_unsupported_ticker(self, monkeypatch, tmp_path) -> None:
-        client = _client({"x/stocks/v1/stock/NVDA": {}}, status=404)
-        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
-        with pytest.raises(ProviderError) as exc_info:
-            provider.fetch_stock_detail("NVDA")
-        assert "unsupported" in str(exc_info.value).lower()
-
-    def test_5xx_is_retryable(self, monkeypatch, tmp_path) -> None:
+    def test_5xx_is_recorded_not_raised(self, monkeypatch, tmp_path) -> None:
         client = _client({"x/stocks/v1/stock/NVDA": {}}, status=503)
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
-        with pytest.raises(ProviderError) as exc_info:
-            provider.fetch_stock_detail("NVDA")
-        assert exc_info.value.retryable is True
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is False
+        assert "official:" in result["reason"]
 
     def test_no_retries_on_failure(self, monkeypatch, tmp_path) -> None:
-        client = _client({"x/stocks/v1/stock/NVDA": {}}, status=500)
+        client = _client({})  # both rungs fail via the shared 404 default
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
-        with pytest.raises(ProviderError):
-            provider.fetch_stock_detail("NVDA")
-        assert len(client.calls) == 1  # type: ignore[attr-defined]
+        provider.fetch_stock_detail("NVDA")
+        # Exactly one attempt per rung -- site then official, no retry loop.
+        assert len(client.calls) == 2  # type: ignore[attr-defined]
 
-    def test_a_failed_call_still_counts_against_the_budget(self, monkeypatch, tmp_path) -> None:
+    def test_a_failed_official_attempt_still_counts_against_the_budget(
+        self, monkeypatch, tmp_path
+    ) -> None:
         """The vendor served (and presumably counted) the request even
         though it errored -- the local counter must reflect that."""
         client = _client({"x/stocks/v1/stock/NVDA": {}}, status=500)
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
-        with pytest.raises(ProviderError):
-            provider.fetch_stock_detail("NVDA")
+        result = provider.fetch_stock_detail("NVDA")
+        assert result["accepted"] is False
+        assert result["quota_spent"] is True
         used, _ = provider._budget.snapshot()
         assert used == 1
 
 
 class TestFetchExplain:
-    def test_url_construction(self, monkeypatch, tmp_path) -> None:
-        client = _client({"x/stocks/v1/stock/NVDA/explain": _fixture("x_stock_explain")})
+    def test_site_url_construction(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/NVDA/explain": _fixture("x_stock_explain_site")})
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
         result = provider.fetch_explain("nvda")
         assert result["accepted"] is True
+        assert result["mode"] == "site"
+        assert result["quota_spent"] is False
         url = str(client.calls[0].url)  # type: ignore[attr-defined]
-        assert url == "https://api.adanos.org/x/stocks/v1/stock/NVDA/explain"
+        assert url == "https://adanos.org/api/proxy-x/stock/NVDA/explain"
 
     def test_returns_explanation_cached_and_generated_at(self, monkeypatch, tmp_path) -> None:
-        client = _client({"x/stocks/v1/stock/NVDA/explain": _fixture("x_stock_explain")})
+        client = _client({"proxy-x/stock/NVDA/explain": _fixture("x_stock_explain_site")})
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
         result = provider.fetch_explain("NVDA")
         assert "AI chip demand" in result["explanation"]
@@ -1112,28 +1356,131 @@ class TestFetchExplain:
         assert result["generated_at"] == "2026-08-02T00:00:00+00:00"
         assert "budget" in result
 
-    def test_no_key_is_a_structured_refusal(self, monkeypatch, tmp_path) -> None:
+    def test_falls_back_to_official_when_the_site_rung_fails(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/stock/NVDA/explain": _fixture("x_stock_explain")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_explain("NVDA")
+        assert result["accepted"] is True
+        assert result["mode"] == "official"
+        assert result["quota_spent"] is True
+        url = str(client.calls[-1].url)  # type: ignore[attr-defined]
+        assert url == "https://api.adanos.org/x/stocks/v1/stock/NVDA/explain"
+
+    def test_polymarket_explain_skips_the_site_rung_entirely(self, monkeypatch, tmp_path) -> None:
+        """Confirmed absent by a live probe 2026-08-03: the site proxy never
+        mirrors explain for Polymarket (``{"error": "Not found"}``) -- unlike
+        Polymarket's other on-demand routes. ``fetch_explain`` must go
+        straight to the official rung rather than wasting a network
+        round-trip on a route already known not to exist."""
+        client = _client({"polymarket/stocks/v1/stock/TSLA/explain": _fixture("x_stock_explain")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_explain("TSLA", platform="polymarket")
+        assert result["accepted"] is True
+        assert result["mode"] == "official"
+        assert len(client.calls) == 1  # type: ignore[attr-defined]  # no site round-trip at all
+        assert "proxy-polymarket" not in str(client.calls[0].url)  # type: ignore[attr-defined]
+
+    def test_polymarket_explain_with_no_key_names_the_confirmed_absence(
+        self, monkeypatch, tmp_path
+    ) -> None:
         client = _client({})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, key=None)
+        result = provider.fetch_explain("TSLA", platform="polymarket")
+        assert result["accepted"] is False
+        assert "confirmed absent" in result["reason"]
+        assert client.calls == []  # type: ignore[attr-defined]  # neither rung sent a request
+
+    def test_no_key_and_site_failure_is_a_structured_refusal(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/stock/NVDA/explain": {}}, status=500)
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, key=None)
         result = provider.fetch_explain("NVDA")
         assert result["accepted"] is False
-        assert client.calls == []  # type: ignore[attr-defined]
+        assert client.calls  # type: ignore[attr-defined]  # the free site attempt was still made
 
-    def test_budget_refusal_names_the_reset_date(self, monkeypatch, tmp_path) -> None:
+    def test_budget_refusal_names_the_reset_date_when_both_rungs_fail(
+        self, monkeypatch, tmp_path
+    ) -> None:
         client = _client({"x/stocks/v1/stock/NVDA/explain": _fixture("x_stock_explain")})
         provider = _hybrid_provider(
             client, monkeypatch, cache_dir=tmp_path, monthly_budget=1, monthly_reserve=0
         )
-        provider.fetch_explain("NVDA")  # spends the one call -> remaining 0 == reserve
-        result = provider.fetch_explain("NVDA")
+        provider.fetch_explain("NVDA")  # site fails, official spends the one call -> remaining 0
+        result = provider.fetch_explain("NVDA")  # site fails again, official now budget-guarded
         assert result["accepted"] is False
         assert "resets" in result["reason"]
 
-    def test_401_is_authentication_error(self, monkeypatch, tmp_path) -> None:
+    def test_401_on_official_rung_is_recorded_not_raised(self, monkeypatch, tmp_path) -> None:
         client = _client({"x/stocks/v1/stock/NVDA/explain": {}}, status=401)
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
-        with pytest.raises(AuthenticationError):
-            provider.fetch_explain("NVDA")
+        result = provider.fetch_explain("NVDA")
+        assert result["accepted"] is False
+        assert "official:" in result["reason"]
+
+
+class TestFetchMarketSentiment:
+    def test_site_success_for_x(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/market-sentiment": _fixture("market_sentiment_x")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_market_sentiment("x")
+
+        assert result["accepted"] is True
+        assert result["mode"] == "site"
+        assert result["quota_spent"] is False
+        assert "symbol" not in result  # service-level, not per-ticker
+        assert result["buzz_score"] == pytest.approx(72.0)
+        assert result["sentiment_score"] == pytest.approx(0.18)
+        assert result["bullish_pct"] == pytest.approx(55.0)
+        assert result["bearish_pct"] == pytest.approx(45.0)
+        assert result["mentions"] == 15400
+        assert result["active_tickers"] == 340
+        assert len(result["drivers"]) == 5
+        assert result["drivers"][0]["ticker"] == "NVDA"
+        assert "budget" in result
+
+    def test_polymarket_uses_trade_count_for_the_normalized_mentions_field(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        client = _client(
+            {"proxy-polymarket/market-sentiment": _fixture("market_sentiment_polymarket")}
+        )
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_market_sentiment("polymarket")
+        assert result["accepted"] is True
+        assert result["mentions"] == 5000  # trade_count -- polymarket has no "mentions" field
+
+    def test_default_platform_is_x(self, monkeypatch, tmp_path) -> None:
+        client = _client({"proxy-x/market-sentiment": _fixture("market_sentiment_x")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_market_sentiment()
+        assert result["accepted"] is True
+        assert result["platform"] == "x"
+
+    def test_falls_back_to_official_when_the_site_rung_fails(self, monkeypatch, tmp_path) -> None:
+        client = _client({"x/stocks/v1/market-sentiment": _fixture("market_sentiment_x")})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_market_sentiment("x")
+        assert result["accepted"] is True
+        assert result["mode"] == "official"
+        assert result["quota_spent"] is True
+        url = str(client.calls[-1].url)  # type: ignore[attr-defined]
+        assert url.startswith("https://api.adanos.org/x/stocks/v1/market-sentiment")
+
+    def test_unsupported_platform_is_a_refusal_not_a_request(self, monkeypatch, tmp_path) -> None:
+        client = _client({})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_market_sentiment("bogus")
+        assert result["accepted"] is False
+        assert client.calls == []  # type: ignore[attr-defined]
+
+    def test_both_rungs_failing_is_a_structured_refusal(self, monkeypatch, tmp_path) -> None:
+        client = _client({})
+        provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path)
+        result = provider.fetch_market_sentiment("x")
+        assert result["accepted"] is False
+        assert result["mode"] is None
+        assert "site:" in result["reason"]
+        assert "official:" in result["reason"]
+        assert "budget" in result
 
 
 class TestBudgetStatus:
@@ -1203,9 +1550,9 @@ class TestEnrichTopCandidates:
     def test_one_call_per_symbol_up_to_the_configured_top_n(self, monkeypatch, tmp_path) -> None:
         client = _client(
             {
-                "x/stocks/v1/stock/AAA": _fixture("x_stock_detail"),
-                "x/stocks/v1/stock/BBB": _fixture("x_stock_detail"),
-                "x/stocks/v1/stock/CCC": _fixture("x_stock_detail"),
+                "proxy-x/stock/AAA": _fixture("x_stock_detail_site"),
+                "proxy-x/stock/BBB": _fixture("x_stock_detail_site"),
+                "proxy-x/stock/CCC": _fixture("x_stock_detail_site"),
             }
         )
         provider = _hybrid_provider(
@@ -1215,12 +1562,14 @@ class TestEnrichTopCandidates:
         assert spent == 2
         urls = {str(c.url).split("?")[0] for c in client.calls}  # type: ignore[attr-defined]
         assert urls == {
-            "https://api.adanos.org/x/stocks/v1/stock/AAA",
-            "https://api.adanos.org/x/stocks/v1/stock/BBB",
+            "https://adanos.org/api/proxy-x/stock/AAA",
+            "https://adanos.org/api/proxy-x/stock/BBB",
         }
+        used, _ = provider._budget.snapshot()
+        assert used == 0  # site mode -- ordinary enrichment spends zero official quota
 
     def test_writes_a_cache_file_per_enriched_symbol(self, monkeypatch, tmp_path) -> None:
-        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(
             client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=3
         )
@@ -1230,15 +1579,17 @@ class TestEnrichTopCandidates:
         assert path.exists()
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["symbol"] == "AAA"
+        assert data["mode"] == "site"
+        assert data["quota_spent"] is False
         assert data["enriched_at_session"] == self.SESSION.isoformat()
 
     def test_a_symbol_already_cached_this_session_is_not_spent_again(
         self, monkeypatch, tmp_path
     ) -> None:
         """The mechanism behind "no double spend same session": a re-scan of
-        the same trading session must not re-enrich (and re-spend for) a
+        the same trading session must not re-enrich (and re-fetch for) a
         symbol it already enriched."""
-        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(
             client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=3
         )
@@ -1251,14 +1602,14 @@ class TestEnrichTopCandidates:
         assert len(client.calls) == 1  # type: ignore[attr-defined]
 
     def test_disabled_makes_no_calls(self, monkeypatch, tmp_path) -> None:
-        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, enrich_enabled=False)
         spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
         assert spent == 0
         assert client.calls == []  # type: ignore[attr-defined]
 
     def test_zero_top_candidates_disables_enrichment(self, monkeypatch, tmp_path) -> None:
-        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(
             client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=0
         )
@@ -1266,22 +1617,26 @@ class TestEnrichTopCandidates:
         assert spent == 0
         assert client.calls == []  # type: ignore[attr-defined]
 
-    def test_no_key_skips_silently(self, monkeypatch, tmp_path) -> None:
-        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+    def test_no_key_still_enriches_via_site(self, monkeypatch, tmp_path) -> None:
+        """Unlike before the site-first ladder, enrichment no longer requires
+        ``adanos_api_key`` to resolve at all -- ``fetch_stock_detail`` works
+        keylessly via the free site rung."""
+        client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(client, monkeypatch, cache_dir=tmp_path, key=None)
         spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
-        assert spent == 0
-        assert client.calls == []  # type: ignore[attr-defined]
+        assert spent == 1
+        assert len(client.calls) == 1  # type: ignore[attr-defined]
 
     def test_no_cache_dir_skips_silently(self, monkeypatch) -> None:
-        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(client, monkeypatch, cache_dir=None)
         spent = provider.enrich_top_candidates(["AAA"], session=self.SESSION)
         assert spent == 0
         assert client.calls == []  # type: ignore[attr-defined]
 
     def test_one_symbols_failure_does_not_abort_the_rest(self, monkeypatch, tmp_path) -> None:
-        client = _client({"x/stocks/v1/stock/BBB": _fixture("x_stock_detail")})  # AAA 404s
+        # AAA: both rungs fail (neither route registered). BBB: site succeeds.
+        client = _client({"proxy-x/stock/BBB": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(
             client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=2
         )
@@ -1290,12 +1645,18 @@ class TestEnrichTopCandidates:
         assert provider._detail_cache_path("BBB", self.SESSION).exists()
         assert not provider._detail_cache_path("AAA", self.SESSION).exists()
 
-    def test_budget_guard_stops_early_rather_than_skipping_one_by_one(
+    def test_budget_exhaustion_only_affects_symbols_whose_site_lookup_fails(
         self, monkeypatch, tmp_path
     ) -> None:
+        """No more "stop early once budget-guarded" -- that assumed every
+        call spent the shared official budget, which is no longer true in
+        site mode. Each symbol is judged independently: AAA's free site hit
+        succeeds regardless of the official budget; BBB's site lookup fails
+        and falls back to an already-exhausted official rung; CCC fails both
+        rungs outright."""
         client = _client(
             {
-                "x/stocks/v1/stock/AAA": _fixture("x_stock_detail"),
+                "proxy-x/stock/AAA": _fixture("x_stock_detail_site"),
                 "x/stocks/v1/stock/BBB": _fixture("x_stock_detail"),
             }
         )
@@ -1305,16 +1666,20 @@ class TestEnrichTopCandidates:
             cache_dir=tmp_path,
             enrich_top_candidates=3,
             monthly_budget=1,
-            monthly_reserve=0,
+            monthly_reserve=1,  # official rung starts already at its reserve floor
         )
         spent = provider.enrich_top_candidates(["AAA", "BBB", "CCC"], session=self.SESSION)
-        assert spent == 1  # AAA spends the only unit of budget; BBB/CCC never attempted
-        assert len(client.calls) == 1  # type: ignore[attr-defined]
+        assert spent == 1
+        assert provider._detail_cache_path("AAA", self.SESSION).exists()
+        assert not provider._detail_cache_path("BBB", self.SESSION).exists()
+        assert not provider._detail_cache_path("CCC", self.SESSION).exists()
+        used, _ = provider._budget.snapshot()
+        assert used == 0  # official was never actually reached -- pre-emptively refused each time
 
     def test_never_raises_even_on_an_unexpected_exception(self, monkeypatch, tmp_path) -> None:
         """Belt and suspenders: even a non-ProviderError raised from inside
         the loop must not escape -- a scan's success can never hinge on this."""
-        client = _client({"x/stocks/v1/stock/AAA": _fixture("x_stock_detail")})
+        client = _client({"proxy-x/stock/AAA": _fixture("x_stock_detail_site")})
         provider = _hybrid_provider(
             client, monkeypatch, cache_dir=tmp_path, enrich_top_candidates=1
         )

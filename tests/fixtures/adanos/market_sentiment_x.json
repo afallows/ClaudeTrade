@@ -1,0 +1,23 @@
+{
+  "buzz_score": 72.0,
+  "trend": "rising",
+  "mentions": 15400,
+  "unique_tweets": 9000,
+  "unique_authors": 4200,
+  "total_upvotes": 88000,
+  "active_tickers": 340,
+  "sentiment_score": 0.18,
+  "positive_count": 6000,
+  "negative_count": 3000,
+  "neutral_count": 6400,
+  "bullish_pct": 55.0,
+  "bearish_pct": 45.0,
+  "trend_history": [60.0, 62.0, 65.0, 68.0, 70.0, 71.0, 72.0],
+  "drivers": [
+    {"ticker": "NVDA", "mentions": 950, "buzz_score": 87.5, "sentiment_score": 0.42},
+    {"ticker": "TSLA", "mentions": 800, "buzz_score": 80.0, "sentiment_score": 0.10},
+    {"ticker": "AAPL", "mentions": 700, "buzz_score": 75.0, "sentiment_score": 0.05},
+    {"ticker": "AMD", "mentions": 600, "buzz_score": 70.0, "sentiment_score": 0.02},
+    {"ticker": "MSFT", "mentions": 500, "buzz_score": 65.0, "sentiment_score": 0.01}
+  ]
+}

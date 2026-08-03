@@ -243,15 +243,23 @@ request_timeout_s = 20.0
 #     gated by a persistent monthly budget that fails closed at the reserve
 #     floor rather than ever falling back to extra site-proxy calls.
 #
-# SEPARATELY -- hybrid mode -- whenever api_key_credential resolves to a
-# real key AT ALL (independent of prefer_official_api above), the provider
-# also exposes two ON-DEMAND, per-ticker official calls that spend the same
-# monthly budget: fetch_stock_detail and fetch_explain (surfaced as the MCP
-# tools get_adanos_detail/get_adanos_explain). enrich_top_candidates/
-# enrich_enabled below tune the one automatic consumer of that budget: a
-# bounded detail call for each of a scan's top-scoring candidates. See
-# docs/api-providers.md's "Hybrid mode / spending the free tier" subsection
-# for the budget arithmetic.
+# SEPARATELY -- hybrid mode, revised 2026-08-03 -- the provider always
+# exposes three ON-DEMAND calls: fetch_stock_detail, fetch_explain and
+# fetch_market_sentiment (surfaced as the MCP tools get_adanos_detail/
+# get_adanos_explain/get_adanos_market_sentiment). These run their OWN
+# site-first, official-fallback ladder, independent of prefer_official_api/
+# api_key_credential above: the keyless site proxy mirrors these routes too
+# (not just trending), so the free site rung is tried first and the
+# official rung -- budget-guarded, same monthly_budget/monthly_reserve pool
+# as above -- is tried only as a fallback when the site rung fails and a key
+# resolves with budget to spend. No key is required for on-demand calls to
+# work at all anymore. enrich_top_candidates/enrich_enabled below tune the
+# one automatic consumer (bounded detail calls for a scan's top-scoring
+# candidates), which inherits this same site-first behaviour and therefore
+# spends ZERO official-API quota in ordinary operation -- the free tier is
+# now a durability reserve, not the primary path. See docs/api-providers.md's
+# "Hybrid mode / spending the free tier" subsection for the revised budget
+# arithmetic.
 #
 # Licensing (adanos.org/terms): commercial use permitted subject to the
 # vendor's terms; raw API data may not be redistributed as a competing
@@ -266,16 +274,16 @@ feed_polymarket = true                    # Polymarket feed
 feed_news = true                          # Financial news feed (source_count instead of engagement)
 site_base_url = "https://adanos.org/api"
 official_base_url = "https://api.adanos.org"
-prefer_official_api = false               # true = use official_base_url + X-API-Key for BULK TRENDING when the credential resolves
-api_key_credential = "adanos_api_key"     # Environment variable or keyring lookup name (optional)
+prefer_official_api = false               # true = official-first for BOTH bulk trending AND on-demand calls, site as fallback
+api_key_credential = "adanos_api_key"     # Environment variable or keyring lookup name (optional -- durability fallback only)
 calls_per_minute = 10
-monthly_budget = 250                      # Free-tier monthly cap on official-mode requests (trending + on-demand combined)
+monthly_budget = 250                      # Free-tier monthly cap on official-mode requests (fallback reserve, not the primary path)
 monthly_reserve = 15                      # Official calls fail closed for the rest of the month at this floor
 limit = 100                               # Rows requested per feed per cycle
 request_timeout_s = 20.0
 detail_platform_default = "x"             # Platform get_adanos_detail/get_adanos_explain/enrichment use by default
 enrich_top_candidates = 3                 # Post-scan: ONE fetch_stock_detail call for each of the top N scoring symbols (0 disables)
-enrich_enabled = true                     # Master switch for post-scan enrichment (effective only when the key resolves)
+enrich_enabled = true                     # Master switch for post-scan enrichment (works keylessly via the site rung by default)
 
 [ai]
 # Optional LLM-assisted sentiment classification -- an ensemble ADJUNCT,

@@ -1,0 +1,28 @@
+{
+  "ticker": "TSLA",
+  "company_name": "Tesla Inc",
+  "found": true,
+  "buzz_score": 55.0,
+  "sentiment_score": 0.10,
+  "positive_count": 300,
+  "negative_count": 250,
+  "neutral_count": 50,
+  "trend": "stable",
+  "bullish_pct": 55.0,
+  "bearish_pct": 45.0,
+  "period_days": 7,
+  "trade_count": 1200,
+  "market_count": 8,
+  "current_market_count": 3,
+  "unique_traders": 400,
+  "total_liquidity": 250000.5,
+  "daily_trend": [
+    {"date": "2026-07-27", "trade_count": 150, "sentiment_score": 0.02, "buzz_score": 40.0, "bullish_pct": 50.0, "bearish_pct": 50.0},
+    {"date": "2026-07-28", "trade_count": 160, "sentiment_score": 0.04, "buzz_score": 42.0, "bullish_pct": 51.0, "bearish_pct": 49.0},
+    {"date": "2026-07-29", "trade_count": 170, "sentiment_score": 0.05, "buzz_score": 45.0, "bullish_pct": 52.0, "bearish_pct": 48.0},
+    {"date": "2026-07-30", "trade_count": 175, "sentiment_score": 0.06, "buzz_score": 47.0, "bullish_pct": 53.0, "bearish_pct": 47.0},
+    {"date": "2026-07-31", "trade_count": 180, "sentiment_score": 0.08, "buzz_score": 50.0, "bullish_pct": 54.0, "bearish_pct": 46.0},
+    {"date": "2026-08-01", "trade_count": 185, "sentiment_score": 0.09, "buzz_score": 53.0, "bullish_pct": 55.0, "bearish_pct": 45.0},
+    {"date": "2026-08-02", "trade_count": 1200, "sentiment_score": 0.10, "buzz_score": 55.0, "bullish_pct": 55.0, "bearish_pct": 45.0}
+  ]
+}

@@ -761,15 +761,24 @@ class AdanosConfig(BaseModel):
       falling back to hammering the site proxy harder than page-equivalent
       cadence -- see ``providers.social.adanos`` for the budget mechanism.
 
-    **Hybrid mode.** Independent of ``prefer_official_api``/the two modes
-    above: whenever ``api_key_credential`` resolves to a real key AT ALL,
-    ``AdanosProvider`` also exposes on-demand, per-ticker official calls
-    (``fetch_stock_detail``, ``fetch_explain``) that spend the same monthly
-    budget -- funding on-demand per-ticker research is the whole point of
-    keeping a free-tier key configured, while bulk trending collection stays
-    keyless (site mode) by default so it never touches that budget. See
-    ``detail_platform_default``/``enrich_top_candidates``/``enrich_enabled``
-    below for the one automatic consumer (bounded post-scan enrichment).
+    **Hybrid mode -- site-first on-demand calls, official as a fallback
+    reserve (revised 2026-08-03).** ``AdanosProvider`` always exposes three
+    on-demand calls -- ``fetch_stock_detail``, ``fetch_explain``,
+    ``fetch_market_sentiment`` -- that run their OWN two-rung ladder,
+    independent of ``prefer_official_api``/the two trending modes above and
+    independent of whether a key is configured at all: the keyless site
+    proxy mirrors these routes too (not just trending), so the site rung is
+    tried first for free, and the official rung -- budget-guarded, same as
+    trending's official mode -- is tried only as a FALLBACK when the site
+    rung fails and a key resolves with budget to spend.
+    ``prefer_official_api = true`` reverses that order for these three calls
+    too. Net effect: on-demand research no longer requires a key to work at
+    all, and normal operation (site healthy) spends zero official-API
+    quota -- the free tier is now purely a durability reserve for when the
+    site proxy is down or rate-limited. See ``detail_platform_default``/
+    ``enrich_top_candidates``/``enrich_enabled`` below for the one automatic
+    consumer (bounded post-scan enrichment, which inherits this same
+    site-first behaviour).
 
     Licensing (adanos.org/terms, checked 2026-08-02): commercial use is
     permitted subject to the vendor's terms; raw API data may not be
@@ -837,16 +846,18 @@ class AdanosConfig(BaseModel):
     detail_platform_default: str = "x"
     #: How many of a scan's top-scoring, distinct-by-symbol candidates get
     #: ONE ``fetch_stock_detail`` call each after the scan completes. ``0``
-    #: disables enrichment entirely. Budget arithmetic at the default: 3
-    #: candidates/session x ~22 trading sessions/month =~ 66 official calls,
-    #: comfortably under ``monthly_budget - monthly_reserve`` (235 by
-    #: default) with headroom left for interactive ``get_adanos_detail``/
-    #: ``get_adanos_explain`` calls the same month.
+    #: disables enrichment entirely. Since ``fetch_stock_detail`` runs the
+    #: site-first ladder, this ordinarily spends ZERO official-API quota --
+    #: see ``docs/api-providers.md``'s "Hybrid mode / spending the free
+    #: tier" for the revised budget arithmetic (the free tier is now a
+    #: fallback reserve, not the primary path).
     enrich_top_candidates: int = 3
-    #: Master switch for post-scan enrichment. Effective only when
-    #: ``api_key_credential`` also resolves to a real key -- bulk trending
-    #: collection is unaffected either way, since enrichment is a purely
-    #: additive, budget-guarded extra rather than a fallback path for it.
+    #: Master switch for post-scan enrichment. Effective regardless of
+    #: whether ``api_key_credential`` resolves -- ``fetch_stock_detail``
+    #: works keylessly via the site rung by default (see
+    #: ``providers.social.adanos``'s Hybrid mode section); a resolved key
+    #: only matters as a per-symbol fallback when that symbol's site lookup
+    #: fails. Bulk trending collection is unaffected either way.
     enrich_enabled: bool = True
 
     @field_validator("enrich_top_candidates")
@@ -1032,9 +1043,7 @@ class UniverseConfig(BaseModel):
     #: Set to ``[]`` to disable this fallback and start from a genuinely empty
     #: universe. See ``data.universe.load_packaged_universe`` for what each
     #: name covers and its honest coverage caveats.
-    packaged_universes: list[str] = Field(
-        default_factory=lambda: ["us_default", "ca_default"]
-    )
+    packaged_universes: list[str] = Field(default_factory=lambda: ["us_default", "ca_default"])
     #: ADR-0008 Decision 3: the durable, authoritative fix for "the universe is
     #: too small" is computed at refresh time, not the packaged seed files
     #: (those are bootstrap coverage only -- see ``data/universes/*.csv``).

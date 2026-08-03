@@ -1,0 +1,6 @@
+{
+  "detail": {
+    "error_code": "unsupported_ticker",
+    "message": "Unsupported ticker $ZZZZFAKE -- not tracked by adanos"
+  }
+}

@@ -1976,65 +1976,93 @@ enrich_top_candidates = 3          # 0 disables post-scan enrichment
 enrich_enabled = true
 ```
 
-**Credentials**: none required for the default site mode.
-`claudetrade secrets set adanos_api_key` (optional) enables official mode
-once `prefer_official_api = true` is also set. **A key also unlocks hybrid
-mode's on-demand calls (below) regardless of `prefer_official_api`** -- see
-the next subsection.
+**Credentials**: none required for ANY mode as of the 2026-08-03 revision
+below -- bulk trending's default site mode, AND the on-demand calls, both
+work keylessly. `claudetrade secrets set adanos_api_key` (optional) enables
+official mode for bulk trending once `prefer_official_api = true` is also
+set, and -- independent of that flag -- lets on-demand calls fall back to
+the official API when the site proxy fails. See the next subsection.
 
-#### Hybrid mode / spending the free tier
+#### Hybrid mode / spending the free tier (revised 2026-08-03: site-first on-demand calls)
 
-The owner's requirement this feature exists to satisfy, verbatim: *"I want
-to utilize the free tier and then use the official api ALONG with the site
-mode. I'm using the free tier API which would get used up quickly."* Two
-rules follow from that, and the code enforces both:
+The owner's original requirement this feature exists to satisfy, verbatim:
+*"I want to utilize the free tier and then use the official api ALONG with
+the site mode. I'm using the free tier API would get used up quickly."* The
+site proxy later turned out to mirror the on-demand per-ticker/service
+routes too, not just trending -- so as of 2026-08-03 the on-demand calls
+also default to the free, keyless path, and the official API's role shrank
+from "the only way to do on-demand research" to "a fallback reserve for
+when the site proxy is unavailable." Three rules follow, and the code
+enforces all three:
 
 1. **Bulk trending collection never spends the free tier unless you ask it
    to.** `fetch_snapshots` (what a data refresh calls) stays on the keyless
    site endpoints -- which serve the exact same trending rows -- unless
-   `prefer_official_api = true` is explicitly set. There is no reason to pay
-   for data the site proxy already gives away for free.
-2. **On-demand, per-ticker calls are what the free tier is FOR.** The moment
-   `api_key_credential` resolves to a real key -- independent of
-   `prefer_official_api` -- `AdanosProvider` exposes two additional calls
-   that only make sense with a key:
+   `prefer_official_api = true` is explicitly set. Unchanged from before.
+2. **On-demand, per-ticker/service calls now run a two-rung ladder, site
+   first.** `AdanosProvider` always exposes three calls -- no key required
+   for any of them to work:
    - `fetch_stock_detail(ticker, platform)` -- full per-ticker detail (daily
-     trend, sentiment breakdown, top mentions/authors), surfaced as the MCP
-     tool `get_adanos_detail`.
+     trend, sentiment breakdown, platform-specific top mentions/authors/
+     tweets/subreddits/sources), surfaced as the MCP tool `get_adanos_detail`.
    - `fetch_explain(ticker, platform)` -- the vendor's AI trend explanation
-     (cached 6h server-side), surfaced as `get_adanos_explain`.
+     (cached 6h server-side), surfaced as `get_adanos_explain`. Polymarket is
+     hard-excluded from the site rung here specifically (confirmed absent by
+     a live probe) -- it goes straight to the official rung.
+   - `fetch_market_sentiment(platform)` -- a service-level buzz/sentiment
+     snapshot (overall trend, activity, top momentum `drivers`), not
+     per-ticker, surfaced as `get_adanos_market_sentiment`.
 
-   Both spend one request from the same `monthly_budget`/`monthly_reserve`
-   pool trending's official mode uses, and both are ALWAYS budget-guarded --
-   they return a structured `{"accepted": false, "reason": ...}` refusal
-   (never an unmetered fallback) once remaining budget reaches
-   `monthly_reserve`, naming the reset date. `AdanosProvider.budget_status()`
-   (surfaced free, read-only, via the `get_adanos_budget` MCP tool) reports
-   used/remaining/reserve/month at any time.
+   Each tries the keyless site proxy first (free -- `quota_spent: false` in
+   the response envelope). Only if the site rung fails (HTTP error, block,
+   an `{"error": ...}` endpoint-absent body, or unparseable shape) AND
+   `api_key_credential` resolves to a real key AND there is budget to spend
+   does it fall back to the official API (`quota_spent: true`), from the
+   same `monthly_budget`/`monthly_reserve` pool trending's official mode
+   uses. `prefer_official_api = true` reverses the order for these calls
+   too (official first, site fallback). If every available rung fails, the
+   call returns a structured `{"accepted": false, "reason": ...}` refusal
+   naming each rung's failure -- never an exception. A definitive vendor "no"
+   (an unsupported ticker, or a tracked ticker with no data in the requested
+   window) is ALSO a structured, non-raising refusal, distinguished from an
+   endpoint failure and never triggering the other rung, since the vendor
+   has already answered. Every envelope -- success or refusal -- carries
+   `mode: "site" | "official" | null` (which rung answered) and
+   `quota_spent: bool`, plus a `budget` block regardless of mode.
+3. **The official API is now a durability reserve, not the primary path.**
+   `AdanosProvider.budget_status()` (surfaced free, read-only, via the
+   `get_adanos_budget` MCP tool) reports used/remaining/reserve/month at any
+   time; in ordinary operation (site proxy healthy) that counter simply
+   never moves for on-demand calls.
 
-**The one automatic consumer of this budget: bounded top-candidate
-enrichment.** After a scan completes, if `enrich_enabled` is true and a key
-resolves, the pipeline fetches ONE `fetch_stock_detail` call (on
+**The one automatic consumer of this ladder: bounded top-candidate
+enrichment.** After a scan completes, if `enrich_enabled` is true (no key
+required), the pipeline fetches ONE `fetch_stock_detail` call (on
 `detail_platform_default`) for each of the session's top
 `enrich_top_candidates` distinct, best-scoring symbols
 (`pipeline.Pipeline._enrich_adanos_top_candidates` ->
-`AdanosProvider.enrich_top_candidates`). Results are cached to
-`cache_dir/adanos/detail/{symbol}-{session}.json` -- a re-scan of the same
-session, or a later `get_adanos_detail` call for the same symbol, is served
-from that cache with `from_cache: true` and spends nothing. Enrichment is
-wrapped end to end and can never fail a scan: a per-symbol error (network,
-vendor, disk) is logged at INFO and skipped, and the budget guard stops
-early (not one-by-one) once the reserve floor is hit.
+`AdanosProvider.enrich_top_candidates`), inheriting the same site-first
+ladder. Results are cached to `cache_dir/adanos/detail/{symbol}-{session}.json`
+-- a re-scan of the same session, or a later `get_adanos_detail` call for
+the same symbol, is served from that cache and spends nothing. Enrichment is
+wrapped end to end and can never fail a scan: a per-symbol failure (either
+rung failed, or a genuine vendor "no") is logged at INFO and skipped; there
+is no more "stop early once the budget guard refuses" special case, since
+most symbols now succeed for free regardless of the official budget's state
+-- each symbol is judged independently.
 
-**Budget arithmetic at the defaults** (`monthly_budget = 250`,
-`monthly_reserve = 15`, `enrich_top_candidates = 3`): 3 candidates/session x
-~22 trading sessions/month =~ 66 official calls/month for enrichment alone,
-comfortably under `monthly_budget - monthly_reserve` = 235, leaving roughly
-169 requests/month of headroom for interactive `get_adanos_detail`/
-`get_adanos_explain` calls (e.g. via an MCP client) in the same month.
-Raise/lower `enrich_top_candidates` (0-10) to trade automatic coverage
-against that headroom; set `enrich_enabled = false` to keep the key for
-purely interactive use.
+**Budget arithmetic, revised.** Because ordinary enrichment (site proxy
+healthy) spends zero official-API quota, `monthly_budget - monthly_reserve`
+(235 at the defaults: `monthly_budget = 250`, `monthly_reserve = 15`) is no
+longer split between automatic enrichment and interactive headroom -- it is
+now effectively THE WHOLE interactive/fallback headroom available for the
+month, there to absorb `get_adanos_detail`/`get_adanos_explain`/
+`get_adanos_market_sentiment` calls whenever the site proxy is down,
+rate-limited, or changes shape, plus any explicit `prefer_official_api =
+true` usage. Raise/lower `enrich_top_candidates` (0-10) still trades
+automatic coverage against that reserve in the degraded case where the site
+proxy is unavailable; set `enrich_enabled = false` to disable automatic
+enrichment entirely if even the free site-mode traffic is unwanted.
 
 **Surfacing**: not currently wired into `get_trending`'s `source` option --
 that function's query is built directly against `symbol_sentiment_daily`'s

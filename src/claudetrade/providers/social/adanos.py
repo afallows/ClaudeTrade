@@ -48,6 +48,64 @@ one feed degrades (see ``_get_json``'s 404-in-official-mode handling); the X
 and Reddit feeds are unaffected. The news *site* endpoint (``proxy-news``)
 was itself confirmed live 2026-08-02.
 
+**The site proxy also mirrors the official API's per-ticker/service routes**
+(confirmed live 2026-08-03 by both the owner and a follow-up TSLA probe),
+not just ``/trending``::
+
+    GET {site_base_url}/{proxy_base}/stock/{ticker}?days=N
+    GET {site_base_url}/{proxy_base}/stock/{ticker}/explain
+    GET {site_base_url}/{proxy_base}/market-sentiment
+
+where ``proxy_base`` is the same per-platform segment ``_SITE_PATHS`` uses
+for trending (``proxy-x``, ``proxy``, ``proxy-polymarket``, ``proxy-news``).
+Verified live: ``/stock`` and ``/market-sentiment`` on all FOUR bases;
+``/stock/.../explain`` on ``proxy``/``proxy-x``/``proxy-news`` only --
+Polymarket's explain route is CONFIRMED ABSENT (``{"error": "Not found"}``,
+official API only), not merely unconfirmed, so ``_site_explain`` skips the
+network round-trip for that one platform+kind combination rather than
+probing a route known not to exist. ``/compare`` is NOT proxied either
+(``{"error": "Not found"}``) -- official API only, not wired here. See
+``docs/adanos-api-reference.md`` for the full verified/unverified table.
+
+``/stock/{ticker}`` returns a COMMON header (``ticker``, ``company_name``,
+``found``, ``buzz_score``, ``sentiment_score``, ``positive_count``/
+``negative_count``/``neutral_count``, ``trend``, ``bullish_pct``/
+``bearish_pct``, ``period_days``, ``daily_trend`` -- a list of per-day
+``{date, <activity>, sentiment_score, buzz_score, bullish_pct,
+bearish_pct}`` objects) plus per-base extras: X adds ``mentions``/
+``unique_tweets``/``total_upvotes`` and ``top_tweets`` (``text_snippet``,
+``sentiment_score``); Reddit adds ``mentions``/``unique_posts``/
+``subreddit_count``/``total_upvotes`` and ``top_subreddits``; News adds
+``mentions``/``source_count`` (no engagement field) and ``top_sources``
+plus ``top_mentions`` (``text_snippet``); Polymarket adds ``trade_count``/
+``market_count``/``current_market_count``/``unique_traders``/
+``total_liquidity``. ``daily_trend``'s per-day activity key follows the
+same split (``mentions`` for X/Reddit/News, ``trade_count`` for
+Polymarket) -- and its length is NOT guaranteed to be 7: a quiet day can be
+omitted (observed on News), so nothing here assumes a fixed window length.
+``/market-sentiment`` follows the same common-header-plus-per-base-extras
+pattern, with ``trend_history`` (7 entries) and ``drivers`` (top 5,
+``{ticker, buzz_score, sentiment_score}`` plus the per-base activity field)
+replacing ``daily_trend``.
+
+Two response shapes matter for these on-demand routes, and they are NOT the
+same signal (see ``_is_structured_vendor_answer``):
+
+* ``{"found": false, ...}`` (HTTP 200) means the vendor recognises and
+  tracks this ticker but has no data for it in the requested window -- a
+  normal, structured "no data" answer, not a failure.
+* ``{"detail": {"error_code": "unsupported_ticker", "message": ...}}``
+  (observed under HTTP 404, but the body is checked regardless of status)
+  means the vendor does not track this ticker AT ALL -- a different,
+  equally normal "unsupported ticker" answer.
+
+Both end the ladder (see below) at whichever rung produced them; the other
+rung is not tried, since the vendor has already given a definitive answer.
+By contrast, ``{"error": "...", ...}`` (HTTP 200 *or* a non-2xx status,
+and lacking both ``found`` and a ``detail.error_code``) means the ROUTE
+ITSELF does not exist on that proxy base -- endpoint-absent, not data. This
+IS a rung failure and triggers the ladder's fallback.
+
 News rows have one further difference worth flagging: they carry
 ``source_count`` (distinct news outlets reporting on the ticker) instead of
 an engagement total -- there is no upvotes/likes/liquidity analogue for a
@@ -68,29 +126,76 @@ resolves to a real key; it is gated by a persistent monthly budget (see
 rather than ever falling back to hammering the site proxy harder than its
 normal one-request-per-feed-per-cycle cadence.
 
-**Hybrid mode -- funding the free tier without burning it (owner's explicit
-requirement: "I want to utilize the free tier and then use the official api
-ALONG with the site mode").** Trending collection (``fetch_snapshots``)
-NEVER spends the official-API budget unless ``config.prefer_official_api``
-is true: the site endpoints serve the exact same trending rows keylessly, so
-there is no reason to ever pay for them. Separately, and regardless of
-``prefer_official_api``, whenever ``config.api_key_credential`` resolves to
-a real key this provider ALSO exposes two on-demand, per-ticker official
-calls that only make sense with a key at all --
+**Hybrid mode -- site-first on-demand calls, official as fallback (revised
+2026-08-03: the site proxy turned out to mirror the on-demand routes too,
+not just trending).** Trending collection (``fetch_snapshots``) NEVER spends
+the official-API budget unless ``config.prefer_official_api`` is true: the
+site endpoints serve the exact same trending rows keylessly, so there is no
+reason to ever pay for them -- this part is unchanged.
+
+The three on-demand calls --
 :meth:`AdanosProvider.fetch_stock_detail` (full per-ticker detail: daily
-trend, sentiment breakdown, top mentions/authors) and
+trend, sentiment breakdown, top mentions/authors),
 :meth:`AdanosProvider.fetch_explain` (the vendor's AI trend explanation,
-cached 6h server-side). Both are ALWAYS budget-guarded through the same
-``_MonthlyBudgetStore`` trending's official mode uses -- the free tier's
-~250 requests/month is meant to fund exactly this on-demand research use,
-not bulk collection the site proxy already covers for free, and both refuse
-with a structured, non-raising ``{"accepted": false, "reason": ...}`` payload
-(naming the reset date) rather than ever silently degrading to an
-unmetered call. See ``config.AdanosConfig.enrich_top_candidates`` /
-``enrich_enabled`` for the one automatic consumer of this budget (bounded
-top-candidate enrichment after a scan, wired in ``pipeline.Pipeline
-._enrich_adanos_top_candidates``) and :meth:`AdanosProvider.budget_status`
-for the read-only, free status surfaced by ``mcp_server.get_adanos_budget``.
+cached 6h server-side), and
+:meth:`AdanosProvider.fetch_market_sentiment` (service-level buzz/sentiment
+snapshot with top momentum drivers, not per-ticker) -- now run the SAME
+two-rung ladder as trending, independent of ``self.mode``:
+
+1. **Site rung first** (free, no budget touch) -- the mirrored
+   ``{proxy_base}/stock/{ticker}``, ``.../explain``, ``.../market-sentiment``
+   routes described above. No API key required.
+2. **Official rung as fallback**, tried only when the site rung fails (HTTP
+   error, block, an ``{"error": ...}`` body, schema drift -- see the two
+   response shapes above) AND ``config.api_key_credential`` resolves to a
+   real key AND the monthly budget has room. Budget-guarded exactly like
+   before (see ``_MonthlyBudgetStore`` / ``_budget_refusal_reason``): fails
+   closed at the reserve floor rather than ever making extra site calls to
+   compensate.
+
+``config.prefer_official_api = true`` reverses the rung order for these
+three calls too (official first, site fallback) -- consistent with what it
+already means for trending. If BOTH rungs fail (or the only available rung
+fails), the method returns a structured, non-raising
+``{"accepted": false, "reason": ...}`` refusal naming both failures -- these
+methods no longer raise ``ProviderError`` for an ordinary HTTP failure, since
+the whole point of the ladder is that one rung's failure is not fatal.
+Either structured vendor "no" (``{"found": false}`` or ``{"detail":
+{"error_code": "unsupported_ticker", ...}}`` -- see above) from either rung
+is handled as its own structured, non-raising refusal (``accepted: false``
+with a reason distinguishing the two cases), not an exception and not a
+trigger to try the other rung.
+
+Every envelope (success, structured "no", or both-rungs-failed refusal) now
+carries ``mode: "site" | "official" | None`` (which rung actually answered;
+``None`` only in the both-failed case) and ``quota_spent: bool`` (whether an
+official request actually reached the vendor this call -- ``False`` for a
+site-mode answer, and also ``False`` when the official rung was
+pre-emptively skipped for lacking a key or budget) alongside the existing
+``budget`` block (present regardless of mode, so a caller -- the MCP layer
+in particular -- can always report remaining budget).
+
+**Net effect: normal operation (no key configured, or a key configured but
+the site rung healthy) never spends the official-API budget for on-demand
+calls either.** The free tier's ~250 requests/month is now purely a
+fallback/durability reserve for when the site proxy is down or rate-limited,
+not the primary path -- see ``docs/api-providers.md``'s "Hybrid mode /
+spending the free tier" for the revised budget arithmetic. See
+``config.AdanosConfig.enrich_top_candidates`` / ``enrich_enabled`` for the
+one automatic consumer of this ladder (bounded top-candidate enrichment
+after a scan, wired in ``pipeline.Pipeline._enrich_adanos_top_candidates`` --
+this, too, now runs keylessly via the site rung by default) and
+:meth:`AdanosProvider.budget_status` for the read-only, free status surfaced
+by ``mcp_server.get_adanos_budget``.
+
+**Text sanitisation.** ``fetch_stock_detail``'s ``raw`` passthrough may
+include third-party text snippets (``top_tweets``/``top_mentions`` etc.,
+under a ``text``/``text_snippet``/``snippet`` key, platform-dependent). These
+are untrusted external text same as any Reddit/X post body -- see
+``utils.text.sanitize_social_text`` -- and are run through that same
+sanitiser (URL/email/phone/username stripping, prompt-injection
+neutralisation) before being returned; every other field in ``raw`` passes
+through untouched.
 
 **Licensing** (adanos.org/terms, checked 2026-08-02): commercial use is
 permitted subject to the vendor's terms; raw API data may not be
@@ -106,6 +211,7 @@ import datetime as dt
 import json
 import logging
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -122,6 +228,7 @@ from claudetrade.providers.base import (
     SourceBlockedError,
 )
 from claudetrade.secrets import get_secret
+from claudetrade.utils.text import sanitize_social_text
 from claudetrade.utils.timeutils import utc_now
 
 log = logging.getLogger(__name__)
@@ -150,7 +257,12 @@ _OFFICIAL_PATHS = {
 
 #: Which row field carries the "how many times" count -- x/reddit/news share
 #: ``mentions``, polymarket reports ``trade_count`` instead.
-_COUNT_FIELD = {"x": "mentions", "reddit": "mentions", "polymarket": "trade_count", "news": "mentions"}
+_COUNT_FIELD = {
+    "x": "mentions",
+    "reddit": "mentions",
+    "polymarket": "trade_count",
+    "news": "mentions",
+}
 
 #: Which row field carries the engagement total -- x/reddit report
 #: ``total_upvotes``, polymarket reports ``total_liquidity``, and news
@@ -174,6 +286,87 @@ def _stock_base(platform: str) -> str:
     return _OFFICIAL_PATHS[platform].rsplit("/trending", 1)[0]
 
 
+def _site_base(platform: str) -> str:
+    """The site-proxy per-platform base path for on-demand routes (mirrors
+    ``_stock_base`` but for ``site_base_url``) -- e.g. ``proxy-x/trending``
+    -> ``proxy-x`` -- since the vendor's proxy shares the same base segment
+    across trending, stock detail, explain and market-sentiment for a given
+    platform (see the module docstring's verified facts)."""
+    return _SITE_PATHS[platform].rsplit("/trending", 1)[0]
+
+
+def _days_param(from_date: str | None, to_date: str | None) -> int | None:
+    """Best-effort translation of an explicit ``from``/``to`` range into the
+    site proxy's ``days``-back window parameter -- the mirrored on-demand
+    endpoint takes ``days``, not ``from``/``to`` like the official API and
+    like this provider's own trending requests (see the module docstring's
+    verified facts). Returns ``None`` (the vendor's own default, observed as
+    7) when either bound is missing or unparseable -- a bare ``to_date`` with
+    no ``from_date`` (or vice versa) is not enough information to compute a
+    day count, so this falls back to the default rather than guessing."""
+    if not from_date or not to_date:
+        return None
+    try:
+        start = dt.date.fromisoformat(from_date)
+        end = dt.date.fromisoformat(to_date)
+    except ValueError:
+        return None
+    days = (end - start).days
+    return days if days > 0 else None
+
+
+def _is_structured_vendor_answer(payload: dict[str, Any]) -> bool:
+    """``True`` for either shape the site proxy uses to give a definitive
+    "no" for an on-demand lookup, observed live 2026-08-03 -- distinct from
+    an endpoint-absent ``{"error": ...}`` body, and NOT a rung failure (see
+    ``AdanosProvider._site_get``/the module docstring):
+
+    * ``{"found": false, ...}`` -- a ticker the vendor tracks, but with no
+      data in the requested window.
+    * ``{"detail": {"error_code": "unsupported_ticker", ...}}`` -- a ticker
+      the vendor does not track at all.
+    """
+    if payload.get("found") is False:
+        return True
+    detail = payload.get("detail")
+    return isinstance(detail, dict) and detail.get("error_code") == "unsupported_ticker"
+
+
+#: Keys under which a vendor detail payload may carry untrusted third-party
+#: text (``top_tweets``/``top_mentions``/``top_posts``/``top_articles`` etc,
+#: platform-dependent field name) -- these get the same sanitisation applied
+#: to any other Reddit/X post text (see ``utils.text.sanitize_social_text``)
+#: before being returned under ``raw``. Every other field is vendor-computed
+#: numbers/labels and passes through untouched.
+_SNIPPET_KEYS = frozenset({"text", "text_snippet", "snippet"})
+
+
+def _sanitize_raw_snippets(value: Any) -> Any:
+    """Recursively sanitise any string found under a known snippet-bearing
+    key inside a vendor on-demand payload passed through under ``raw``.
+
+    Untrusted third-party text (a tweet, a Reddit post, a news headline)
+    reaching a downstream prompt unsanitised is exactly the failure mode
+    ``utils.text.sanitize_social_text`` exists to prevent for
+    ``SocialPost`` rows elsewhere in this codebase; Adanos's own
+    ``top_tweets``/``top_mentions``-style snippets are no more trustworthy
+    just because they arrived pre-aggregated. Nothing here invents or drops
+    a vendor-computed number -- only string values under one of
+    ``_SNIPPET_KEYS`` are rewritten, everything else (including strings under
+    other keys, e.g. ``trend``) passes through unchanged.
+    """
+    if isinstance(value, dict):
+        return {
+            key: sanitize_social_text(item)
+            if key in _SNIPPET_KEYS and isinstance(item, str)
+            else _sanitize_raw_snippets(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_raw_snippets(item) for item in value]
+    return value
+
+
 def _current_month(now: dt.datetime | None = None) -> str:
     current = now or utc_now()
     return f"{current.year:04d}-{current.month:02d}"
@@ -186,7 +379,9 @@ def _seconds_until_next_month(now: dt.datetime | None = None) -> float:
             year=current.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0
         )
     else:
-        nxt = current.replace(month=current.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        nxt = current.replace(
+            month=current.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0
+        )
     return max(0.0, (nxt - current).total_seconds())
 
 
@@ -315,7 +510,9 @@ class AdanosProvider:
         #: ``adanos/detail/`` -- see ``enrich_top_candidates``). ``None``
         #: only in tests that construct a provider with no ``cache_dir``.
         self._cache_dir = Path(cache_dir) if cache_dir else None
-        budget_path = (self._cache_dir / "adanos" / "monthly_budget.json") if self._cache_dir else None
+        budget_path = (
+            (self._cache_dir / "adanos" / "monthly_budget.json") if self._cache_dir else None
+        )
         self._budget = _MonthlyBudgetStore(budget_path)
         self._lock = threading.Lock()
         self._calls = 0
@@ -478,7 +675,9 @@ class AdanosProvider:
                 hint = int(header)
             except ValueError:
                 hint = None
-        self._budget.record_call(month=month, remaining_hint=hint, budget=self.config.monthly_budget)
+        self._budget.record_call(
+            month=month, remaining_hint=hint, budget=self.config.monthly_budget
+        )
 
     def _get_json(self, url: str, *, headers: dict[str, str], platform: str) -> Any:
         if self.mode == "official":
@@ -487,7 +686,9 @@ class AdanosProvider:
         self._limiter.acquire()
         try:
             if self._client is not None:
-                response = self._client.get(url, headers=headers, timeout=self.config.request_timeout_s)
+                response = self._client.get(
+                    url, headers=headers, timeout=self.config.request_timeout_s
+                )
             else:
                 with httpx.Client(
                     timeout=self.config.request_timeout_s, follow_redirects=True, headers=headers
@@ -565,14 +766,14 @@ class AdanosProvider:
             self._last_success = utc_now()
         return payload
 
-    # --- hybrid mode: on-demand official calls ------------------------------
+    # --- hybrid mode: on-demand calls, site-first with official fallback ----
     #
     # Independent of ``self.mode`` (the trending-collection selector above):
-    # these methods are available whenever ``self._api_key`` resolves at
-    # all, regardless of ``config.prefer_official_api``. See the module
-    # docstring's Hybrid mode section -- the owner's explicit requirement is
-    # that bulk trending never spends the free tier, while on-demand
-    # per-ticker research always can, budget permitting.
+    # these methods try the keyless site proxy first (free, no key needed)
+    # and fall back to the official API only when the site rung fails and a
+    # key resolves with budget to spend -- ``config.prefer_official_api``
+    # reverses the rung order, same as it does for trending. See the module
+    # docstring's Hybrid mode section.
 
     def budget_status(self) -> dict[str, Any]:
         """Read-only, free -- calling this never counts against the budget.
@@ -609,22 +810,256 @@ class AdanosProvider:
             )
         return None
 
-    def _refusal(self, symbol: str, platform: str, reason: str) -> dict[str, Any]:
-        """The structured, ``accepted: false`` shape ``fetch_stock_detail``/
-        ``fetch_explain`` return (never raise) for the two EXPECTED refusal
-        cases -- no key, or budget at the reserve floor -- so a caller (an
-        MCP client, or ``enrich_top_candidates`` below) can branch on
-        ``accepted`` without a try/except. A genuine HTTP-level failure
-        (401/403/429/404/5xx) still raises a typed ``ProviderError``
-        subclass, same taxonomy as ``_get_json``/``fetch_snapshots``, since
-        that is unexpected rather than an ordinary, budget-aware refusal."""
+    def _refusal(
+        self,
+        symbol: str,
+        platform: str,
+        reason: str,
+        *,
+        mode: str | None = None,
+        quota_spent: bool = False,
+    ) -> dict[str, Any]:
+        """The structured, ``accepted: false`` envelope every on-demand
+        refusal shares -- preflight (unsupported platform), both-rungs-failed
+        (see ``_ladder_refusal``), and unknown-ticker (``_unknown_ticker_
+        refusal``) alike -- so a caller (an MCP client, or
+        ``enrich_top_candidates`` below) can branch on ``accepted`` without a
+        try/except and always finds ``mode``/``quota_spent``/``budget`` keys
+        present regardless of which refusal shape it got. ``mode``/
+        ``quota_spent`` stay at their defaults (``None``/``False``) for a
+        preflight refusal, since no rung was ever attempted."""
         return {
             "accepted": False,
             "symbol": symbol,
             "platform": platform,
             "reason": reason,
+            "mode": mode,
+            "quota_spent": quota_spent,
             "budget": self.budget_status(),
         }
+
+    def _rung_order(self) -> list[str]:
+        """``["site", "official"]`` by default -- the site proxy is tried
+        first since it is free and keyless. ``config.prefer_official_api``
+        reverses this, consistent with what it already means for trending
+        (see the module docstring)."""
+        return ["official", "site"] if self.config.prefer_official_api else ["site", "official"]
+
+    def _official_unavailable_reason(self) -> str | None:
+        """``None`` when the official rung is worth attempting (a key
+        resolves and there is budget); otherwise why it was skipped WITHOUT
+        sending a request -- folded into the ladder's failure list so a
+        both-rungs-failed refusal can name this even though no HTTP call was
+        ever made for it."""
+        if self._api_key is None:
+            return (
+                "no adanos_api_key credential resolves on this installation -- the official "
+                "fallback is unavailable (site-first on-demand calls still work without one)"
+            )
+        return self._budget_refusal_reason()
+
+    def _run_ladder(
+        self, *, site_fn: Callable[[], Any], official_fn: Callable[[], Any]
+    ) -> tuple[str | None, Any, dict[str, str], bool]:
+        """Try ``site_fn``/``official_fn`` in ``_rung_order()``, stopping at
+        the first rung that returns a payload without raising.
+
+        Returns ``(mode, payload, failures, quota_spent)``:
+
+        * ``mode`` -- which rung answered (``"site"`` or ``"official"``), or
+          ``None`` if every available rung failed.
+        * ``payload`` -- that rung's decoded JSON body, or ``None`` when
+          ``mode`` is ``None``.
+        * ``failures`` -- ``{"site": reason, "official": reason}`` for
+          whichever rungs did NOT answer (a rung that was never tried because
+          an earlier one already answered is simply absent from this dict).
+        * ``quota_spent`` -- ``True`` iff an official request actually
+          reached the vendor during this call (determined by diffing the
+          budget counter, not merely by whether the official rung was
+          attempted -- a pre-flight refusal from ``_official_unavailable_
+          reason`` never sends a request at all, so it must not count).
+
+        Any ``ProviderError`` (its whole subclass family -- rate limit,
+        auth, source-blocked, or a bare schema-drift/HTTP-status failure)
+        from either ``_fn`` is caught here and recorded, never re-raised --
+        the ladder's entire point is that one rung's failure is not fatal.
+        """
+        failures: dict[str, str] = {}
+        quota_spent = False
+        for rung in self._rung_order():
+            if rung == "official":
+                reason = self._official_unavailable_reason()
+                if reason is not None:
+                    failures["official"] = reason
+                    continue
+                used_before, _ = self._budget.snapshot()
+                try:
+                    payload = official_fn()
+                except ProviderError as exc:
+                    failures["official"] = str(exc)
+                    continue
+                except Exception as exc:  # pragma: no cover - defensive
+                    failures["official"] = f"unexpected error: {exc}"
+                    continue
+                finally:
+                    used_after, _ = self._budget.snapshot()
+                    if used_after > used_before:
+                        quota_spent = True
+            else:
+                try:
+                    payload = site_fn()
+                except ProviderError as exc:
+                    failures["site"] = str(exc)
+                    continue
+                except Exception as exc:  # pragma: no cover - defensive
+                    failures["site"] = f"unexpected error: {exc}"
+                    continue
+            return rung, payload, failures, quota_spent
+        return None, None, failures, quota_spent
+
+    def _ladder_refusal(
+        self, symbol: str, platform: str, failures: dict[str, str], *, quota_spent: bool
+    ) -> dict[str, Any]:
+        """Both rungs failed (or the only available one did) -- a structured
+        refusal naming each failure by rung, per the module docstring."""
+        detail = "; ".join(f"{rung}: {reason}" for rung, reason in failures.items())
+        return self._refusal(
+            symbol,
+            platform,
+            f"adanos on-demand lookup failed on every available rung -- {detail}",
+            mode=None,
+            quota_spent=quota_spent,
+        )
+
+    def _structured_answer_reason(
+        self, data: dict[str, Any], symbol: str, platform: str
+    ) -> str | None:
+        """``None`` when ``data`` is real data; otherwise the human-readable
+        refusal reason for whichever structured "no" it is (see
+        ``_is_structured_vendor_answer``) -- distinguishing "unsupported
+        ticker" (the vendor does not track this symbol at all, observed as
+        ``{"detail": {"error_code": "unsupported_ticker", ...}}``) from
+        "found: false" (a tracked ticker with no data in the requested
+        window), since those are different situations worth reporting
+        differently even though both stop the ladder the same way."""
+        detail = data.get("detail")
+        if isinstance(detail, dict) and detail.get("error_code") == "unsupported_ticker":
+            message = (
+                detail.get("message") or f"{symbol} is not a ticker adanos tracks on {platform}"
+            )
+            return f"adanos: unsupported ticker -- {message}"
+        if data.get("found") is False:
+            return (
+                f"adanos has no {platform} data for {symbol} in the requested window (found: false)"
+            )
+        return None
+
+    def _vendor_answer_refusal(
+        self, symbol: str, platform: str, reason: str, *, mode: str, quota_spent: bool
+    ) -> dict[str, Any]:
+        """The vendor gave a definitive, structured "no" rather than failing
+        -- either ``{"found": false}`` (a ticker it tracks, no data in the
+        requested window) or a ``{"detail": {"error_code":
+        "unsupported_ticker", ...}}`` body (a ticker it does not track at
+        all) -- see ``_is_structured_vendor_answer``/the module docstring.
+        Either way this is a normal result, not an exception, and NOT a
+        reason to try the other rung: the vendor has already answered."""
+        return self._refusal(symbol, platform, reason, mode=mode, quota_spent=quota_spent)
+
+    def _site_get(self, url: str, *, platform: str, kind: str) -> Any:
+        """One keyless site-proxy on-demand request (stock detail / explain
+        / market-sentiment). Returns the decoded JSON body on success, which
+        may itself be a structured "no" answer -- ``{"found": false}`` (see
+        ``_is_structured_vendor_answer``) -- rather than the requested data;
+        that is NOT an error (see the module docstring). Raises a typed
+        ``ProviderError`` subclass on anything that should count as this
+        rung failing: an HTTP error status with no recognisable structured
+        body, a non-JSON body, or a JSON body shaped ``{"error": ...}`` with
+        neither a ``found`` nor a ``detail.error_code`` key (endpoint-absent,
+        not data).
+
+        A structured vendor answer can arrive on a non-2xx status too --
+        observed live 2026-08-03: an unsupported ticker returns
+        ``{"detail": {"error_code": "unsupported_ticker", "message": ...}}``
+        possibly under HTTP 404 -- so the body is inspected before falling
+        back to treating a non-2xx status as an unconditional failure.
+        """
+        headers = {"User-Agent": self.config.user_agent, "Accept": "application/json"}
+        response = self._send_request(url, headers=headers)
+        with self._lock:
+            self._calls += 1
+
+        if response.status_code == 429:
+            self._last_error = f"HTTP 429 for site {kind} ({platform})"
+            raise RateLimitError(
+                f"adanos site proxy rate limit reached for {kind} ({platform})",
+                provider=self.name,
+                retry_after_s=60.0,
+            )
+        if response.status_code in (401, 403):
+            self._last_error = f"HTTP {response.status_code} for site {kind} ({platform})"
+            raise SourceBlockedError(
+                f"adanos site proxy answered HTTP {response.status_code} for {kind} ({platform}) "
+                "-- unexpected for a keyless page-proxy endpoint, treated as a block signal",
+                provider=self.name,
+            )
+
+        try:
+            payload = response.json()
+            parsed_ok = True
+        except Exception:
+            payload = None
+            parsed_ok = False
+
+        if response.status_code >= 400:
+            if parsed_ok and isinstance(payload, dict) and _is_structured_vendor_answer(payload):
+                # A structured "no" (see the docstring above) riding on a
+                # non-2xx status -- NOT a rung failure.
+                with self._lock:
+                    self._last_success = utc_now()
+                return payload
+            # Any other non-2xx: an unconfirmed/absent site route (e.g. the
+            # confirmed-absent Polymarket /explain -- see the module
+            # docstring) or a shape change, not a per-ticker answer.
+            self._last_error = f"HTTP {response.status_code} for site {kind} ({platform})"
+            raise ProviderError(
+                f"adanos site proxy returned HTTP {response.status_code} for {kind} ({platform})",
+                provider=self.name,
+                retryable=response.status_code >= 500,
+            )
+
+        if not parsed_ok:
+            self._last_error = f"non-JSON response for site {kind} ({platform})"
+            raise SourceBlockedError(
+                f"adanos site proxy returned a non-JSON body for {kind} ({platform}) -- "
+                "unexpected for a documented JSON API, treated as a possible block/challenge "
+                "response",
+                provider=self.name,
+            )
+
+        if not isinstance(payload, dict):
+            self._last_error = f"unexpected payload shape for site {kind} ({platform})"
+            raise ProviderError(
+                f"adanos site proxy returned an unexpected payload shape for {kind} ({platform})",
+                provider=self.name,
+            )
+        if _is_structured_vendor_answer(payload):
+            with self._lock:
+                self._last_success = utc_now()
+            return payload
+        if "error" in payload:
+            # {"error": "Not found"} (200 or a would-be-404 masqueraded as
+            # 200) -- the route itself does not exist on this proxy base,
+            # not a per-ticker answer (see the module docstring).
+            self._last_error = f"endpoint-absent for site {kind} ({platform})"
+            raise ProviderError(
+                f"adanos site proxy has no {kind} route for {platform} ({payload.get('error')!r})",
+                provider=self.name,
+            )
+
+        with self._lock:
+            self._last_success = utc_now()
+        return payload
 
     def _detail_cache_path(self, symbol: str, session: dt.date) -> Path | None:
         if self._cache_dir is None:
@@ -676,19 +1111,20 @@ class AdanosProvider:
             ) from exc
 
     def _ondemand_request(
-        self, url: str, *, headers: dict[str, str], platform: str, ticker: str, kind: str
+        self, url: str, *, headers: dict[str, str], platform: str, kind: str, ticker: str = ""
     ) -> Any:
-        """One on-demand official call (stock detail / explain) -- ALWAYS
-        official regardless of ``self.mode``, since these endpoints have no
-        keyless site-proxy equivalent (only the four trending endpoints do
-        -- see ``docs/adanos-api-reference.md``). The caller must already
-        have confirmed there is budget to spend (``_budget_refusal_reason``)
-        -- this only sends the request, records it against the monthly
-        budget, and translates the response. No retries."""
+        """One on-demand OFFICIAL call (stock detail / explain / market
+        sentiment) -- the official rung of the site-first ladder (see the
+        module docstring). The caller must already have confirmed there is a
+        key and budget to spend (``_official_unavailable_reason``) -- this
+        only sends the request, records it against the monthly budget, and
+        translates the response. No retries. ``ticker`` is omitted for the
+        platform-level market-sentiment endpoint, which has none."""
+        subject = f" for {ticker}" if ticker else ""
         try:
             response = self._send_request(url, headers=headers)
         except ProviderError:
-            self._last_error = f"network error for {kind} ({ticker}/{platform})"
+            self._last_error = f"network error for {kind}{subject} ({platform})"
             raise
 
         with self._lock:
@@ -696,54 +1132,54 @@ class AdanosProvider:
         self._record_official_call(response)
 
         if response.status_code == 401:
-            self._last_error = f"HTTP 401 for {kind} ({ticker}/{platform})"
+            self._last_error = f"HTTP 401 for {kind}{subject} ({platform})"
             raise AuthenticationError(
-                f"adanos rejected the API key (HTTP 401) for {kind} of {ticker} -- check the "
+                f"adanos rejected the API key (HTTP 401) for {kind}{subject} -- check the "
                 f"{self.config.api_key_credential} credential",
                 provider=self.name,
             )
         if response.status_code == 403:
-            self._last_error = f"HTTP 403 for {kind} ({ticker}/{platform})"
+            self._last_error = f"HTTP 403 for {kind}{subject} ({platform})"
             raise ProviderError(
-                f"adanos refused {kind} for {ticker}: the requested history window exceeds "
-                "this account's tier depth (HTTP 403) -- request a shorter from/to range or "
-                "upgrade the tier",
+                f"adanos refused {kind}{subject}: the requested history window exceeds this "
+                "account's tier depth (HTTP 403) -- request a shorter from/to range or upgrade "
+                "the tier",
                 provider=self.name,
             )
         if response.status_code == 429:
-            self._last_error = f"HTTP 429 for {kind} ({ticker}/{platform})"
+            self._last_error = f"HTTP 429 for {kind}{subject} ({platform})"
             raise RateLimitError(
-                f"adanos burst rate limit reached for {kind} of {ticker}",
+                f"adanos burst rate limit reached for {kind}{subject}",
                 provider=self.name,
                 retry_after_s=60.0,
             )
         if response.status_code == 404:
-            self._last_error = f"HTTP 404 for {kind} ({ticker}/{platform})"
+            self._last_error = f"HTTP 404 for {kind}{subject} ({platform})"
             raise ProviderError(
-                f"adanos has no {kind} for {ticker} on {platform} (HTTP 404) -- unsupported "
-                "or unknown ticker",
+                f"adanos official API has no {kind}{subject} on {platform} (HTTP 404) -- "
+                "unsupported or unknown ticker",
                 provider=self.name,
             )
         if response.status_code >= 500:
-            self._last_error = f"HTTP {response.status_code} for {kind} ({ticker}/{platform})"
+            self._last_error = f"HTTP {response.status_code} for {kind}{subject} ({platform})"
             raise ProviderError(
-                f"adanos returned HTTP {response.status_code} for {kind} of {ticker}",
+                f"adanos returned HTTP {response.status_code} for {kind}{subject}",
                 provider=self.name,
                 retryable=True,
             )
         if response.status_code >= 400:
-            self._last_error = f"HTTP {response.status_code} for {kind} ({ticker}/{platform})"
+            self._last_error = f"HTTP {response.status_code} for {kind}{subject} ({platform})"
             raise ProviderError(
-                f"adanos returned HTTP {response.status_code} for {kind} of {ticker}",
+                f"adanos returned HTTP {response.status_code} for {kind}{subject}",
                 provider=self.name,
             )
 
         try:
             payload = response.json()
         except Exception as exc:
-            self._last_error = f"non-JSON response for {kind} ({ticker}/{platform})"
+            self._last_error = f"non-JSON response for {kind}{subject} ({platform})"
             raise SourceBlockedError(
-                f"adanos returned a non-JSON body for {kind} of {ticker} -- unexpected for a "
+                f"adanos returned a non-JSON body for {kind}{subject} -- unexpected for a "
                 "documented JSON API, treated as a possible block/challenge response",
                 provider=self.name,
             ) from exc
@@ -752,49 +1188,11 @@ class AdanosProvider:
             self._last_success = utc_now()
         return payload
 
-    def fetch_stock_detail(
-        self,
-        ticker: str,
-        platform: str = "x",
-        *,
-        from_date: str | None = None,
-        to_date: str | None = None,
-    ) -> dict[str, Any]:
-        """One ticker's full official-API detail: daily trend, sentiment
-        breakdown, top mentions/authors/subreddits/tweets -- whatever the
-        vendor's ``GET /stock/{ticker}`` returns for ``platform``, parsed
-        defensively (missing keys tolerated, nothing invented) and passed
-        through under ``raw``, alongside a normalized header block
-        (``buzz_score``/``sentiment_score``/``bullish_pct``/``bearish_pct``/
-        ``mentions``). **Spends one official-API request** -- always
-        budget-guarded (``_budget_refusal_reason``), regardless of
-        ``self.mode``: this is the on-demand half of hybrid mode, available
-        whenever ``self._api_key`` resolves at all (see the module
-        docstring). Returns a structured ``{"accepted": false, "reason":
-        ...}`` refusal (never raises) when no key resolves or the budget is
-        at its reserve floor; raises the usual ``ProviderError`` taxonomy
-        for a genuine HTTP failure (401/403/429/404/5xx).
-        """
-        symbol = ticker.strip().upper()
-        platform = platform.strip().lower()
-        if platform not in _OFFICIAL_PATHS:
-            return self._refusal(
-                symbol,
-                platform,
-                f"unsupported platform '{platform}' -- expected one of {sorted(_OFFICIAL_PATHS)}",
-            )
-        if self._api_key is None:
-            return self._refusal(
-                symbol,
-                platform,
-                "no adanos_api_key credential resolves on this installation -- on-demand "
-                "detail spends the official-API quota and requires a key even though bulk "
-                "trending collection never does",
-            )
-        reason = self._budget_refusal_reason()
-        if reason is not None:
-            return self._refusal(symbol, platform, reason)
+    # --- official rung builders (URL/header construction only) -------------
 
+    def _official_stock_detail(
+        self, symbol: str, platform: str, from_date: str | None, to_date: str | None
+    ) -> Any:
         params = []
         if from_date:
             params.append(f"from={from_date}")
@@ -804,36 +1202,208 @@ class AdanosProvider:
         base = self.config.official_base_url.rstrip("/")
         url = f"{base}/{_stock_base(platform)}/stock/{symbol}{query}"
         headers = {
-            "X-API-Key": self._api_key,
+            "X-API-Key": self._api_key or "",
             "User-Agent": self.config.user_agent,
             "Accept": "application/json",
         }
-        payload = self._ondemand_request(
-            url, headers=headers, platform=platform, ticker=symbol, kind="stock detail"
+        return self._ondemand_request(
+            url, headers=headers, platform=platform, kind="stock detail", ticker=symbol
         )
-        data = payload if isinstance(payload, dict) else {}
+
+    def _official_explain(self, symbol: str, platform: str) -> Any:
+        base = self.config.official_base_url.rstrip("/")
+        url = f"{base}/{_stock_base(platform)}/stock/{symbol}/explain"
+        headers = {
+            "X-API-Key": self._api_key or "",
+            "User-Agent": self.config.user_agent,
+            "Accept": "application/json",
+        }
+        return self._ondemand_request(
+            url, headers=headers, platform=platform, kind="explain", ticker=symbol
+        )
+
+    def _official_market_sentiment(self, platform: str) -> Any:
+        base = self.config.official_base_url.rstrip("/")
+        url = f"{base}/{_stock_base(platform)}/market-sentiment"
+        headers = {
+            "X-API-Key": self._api_key or "",
+            "User-Agent": self.config.user_agent,
+            "Accept": "application/json",
+        }
+        return self._ondemand_request(
+            url, headers=headers, platform=platform, kind="market sentiment"
+        )
+
+    # --- site rung builders (URL construction only) -------------------------
+
+    def _site_stock_detail(
+        self, symbol: str, platform: str, from_date: str | None, to_date: str | None
+    ) -> Any:
+        base = self.config.site_base_url.rstrip("/")
+        days = _days_param(from_date, to_date)
+        query = f"?days={days}" if days is not None else ""
+        url = f"{base}/{_site_base(platform)}/stock/{symbol}{query}"
+        return self._site_get(url, platform=platform, kind="stock detail")
+
+    def _site_explain(self, symbol: str, platform: str) -> Any:
+        if platform == "polymarket":
+            # Confirmed absent by live probe 2026-08-03:
+            # proxy-polymarket/stock/{ticker}/explain returns
+            # {"error": "Not found"} -- unlike Polymarket's OTHER on-demand
+            # routes (stock detail, market-sentiment), explain is not mirrored
+            # here at all. Skip the network round-trip entirely rather than
+            # probing a route already known not to exist (see the module
+            # docstring) -- this still counts as a normal site-rung failure
+            # for the ladder, which falls back to official.
+            raise ProviderError(
+                "adanos site proxy does not mirror explain for polymarket (confirmed absent -- "
+                "official API only)",
+                provider=self.name,
+            )
+        base = self.config.site_base_url.rstrip("/")
+        url = f"{base}/{_site_base(platform)}/stock/{symbol}/explain"
+        return self._site_get(url, platform=platform, kind="explain")
+
+    def _site_market_sentiment(self, platform: str) -> Any:
+        base = self.config.site_base_url.rstrip("/")
+        url = f"{base}/{_site_base(platform)}/market-sentiment"
+        return self._site_get(url, platform=platform, kind="market sentiment")
+
+    # --- envelope builders ---------------------------------------------------
+
+    def _detail_success_envelope(
+        self, symbol: str, platform: str, data: dict[str, Any], *, mode: str, quota_spent: bool
+    ) -> dict[str, Any]:
         return {
             "accepted": True,
             "symbol": symbol,
             "platform": platform,
+            "mode": mode,
+            "quota_spent": quota_spent,
             "fetched_at": utc_now().isoformat(),
             "buzz_score": _as_float(data.get("buzz_score")),
             "sentiment_score": _as_float(data.get("sentiment_score")),
             "bullish_pct": _as_float(data.get("bullish_pct")),
             "bearish_pct": _as_float(data.get("bearish_pct")),
             "mentions": _as_int(data.get(_COUNT_FIELD.get(platform, "mentions"))),
-            "raw": data,
+            # Platform-specific extras (top_tweets/top_authors/daily_trend/
+            # sentiment_breakdown/... -- whatever this platform's response
+            # shape carries) pass through untouched EXCEPT for known
+            # text-snippet fields, which get the same sanitisation as any
+            # other untrusted social text (see the module docstring).
+            "raw": _sanitize_raw_snippets(data),
             "budget": self.budget_status(),
         }
 
+    def _explain_success_envelope(
+        self, symbol: str, platform: str, data: dict[str, Any], *, mode: str, quota_spent: bool
+    ) -> dict[str, Any]:
+        return {
+            "accepted": True,
+            "symbol": symbol,
+            "platform": platform,
+            "mode": mode,
+            "quota_spent": quota_spent,
+            "explanation": data.get("explanation"),
+            "cached": data.get("cached"),
+            "generated_at": data.get("generated_at"),
+            "budget": self.budget_status(),
+        }
+
+    def _market_sentiment_success_envelope(
+        self, platform: str, data: dict[str, Any], *, mode: str, quota_spent: bool
+    ) -> dict[str, Any]:
+        drivers = data.get("drivers")
+        return {
+            "accepted": True,
+            "platform": platform,
+            "mode": mode,
+            "quota_spent": quota_spent,
+            "fetched_at": utc_now().isoformat(),
+            "buzz_score": _as_float(data.get("buzz_score")),
+            "sentiment_score": _as_float(data.get("sentiment_score")),
+            "bullish_pct": _as_float(data.get("bullish_pct")),
+            "bearish_pct": _as_float(data.get("bearish_pct")),
+            # Activity count: "mentions" for x/reddit/news, "trade_count" for
+            # polymarket -- same per-platform field as _detail_success_
+            # envelope's "mentions", via the shared _COUNT_FIELD mapping.
+            "mentions": _as_int(data.get(_COUNT_FIELD.get(platform, "mentions"))),
+            "trend": data.get("trend"),
+            "active_tickers": _as_int(data.get("active_tickers")),
+            #: Top momentum drivers (``{"ticker", "buzz_score",
+            #: "sentiment_score"}`` plus "mentions" or "trade_count"
+            #: per-platform, per the verified shape) -- vendor-computed
+            #: numbers, nothing to sanitise, but run through the same helper
+            #: for uniformity/future-proofing in case a future vendor version
+            #: adds a text field here.
+            "drivers": _sanitize_raw_snippets(drivers) if isinstance(drivers, list) else [],
+            "raw": _sanitize_raw_snippets(data),
+            "budget": self.budget_status(),
+        }
+
+    # --- public on-demand entry points ---------------------------------------
+
+    def fetch_stock_detail(
+        self,
+        ticker: str,
+        platform: str = "x",
+        *,
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> dict[str, Any]:
+        """One ticker's full detail: daily trend, sentiment breakdown, top
+        mentions/authors/subreddits/tweets -- whatever the vendor's
+        ``GET /stock/{ticker}`` returns for ``platform``, parsed defensively
+        (missing keys tolerated, nothing invented) and passed through under
+        ``raw`` (text-snippet fields sanitised -- see the module docstring),
+        alongside a normalized header block (``buzz_score``/
+        ``sentiment_score``/``bullish_pct``/``bearish_pct``/``mentions``).
+
+        **Site-first, official fallback** (module docstring, Hybrid mode):
+        tries the keyless site proxy first (free, ``quota_spent: false``),
+        falling back to the official API only if the site rung fails and a
+        key resolves with budget to spend (``quota_spent: true`` in that
+        case). ``config.prefer_official_api`` reverses the rung order.
+        **Never raises**: an unsupported platform, a ``{"found": false}``
+        answer from whichever rung answered, or every available rung failing
+        all come back as a structured ``{"accepted": false, ...}`` refusal
+        (see ``_refusal``/``_vendor_answer_refusal``/``_ladder_refusal``).
+        """
+        symbol = ticker.strip().upper()
+        platform = platform.strip().lower()
+        if platform not in _OFFICIAL_PATHS:
+            return self._refusal(
+                symbol,
+                platform,
+                f"unsupported platform '{platform}' -- expected one of {sorted(_OFFICIAL_PATHS)}",
+            )
+
+        mode, payload, failures, quota_spent = self._run_ladder(
+            site_fn=lambda: self._site_stock_detail(symbol, platform, from_date, to_date),
+            official_fn=lambda: self._official_stock_detail(symbol, platform, from_date, to_date),
+        )
+        if mode is None:
+            return self._ladder_refusal(symbol, platform, failures, quota_spent=quota_spent)
+        data = payload if isinstance(payload, dict) else {}
+        reason = self._structured_answer_reason(data, symbol, platform)
+        if reason is not None:
+            return self._vendor_answer_refusal(
+                symbol, platform, reason, mode=mode, quota_spent=quota_spent
+            )
+        return self._detail_success_envelope(
+            symbol, platform, data, mode=mode, quota_spent=quota_spent
+        )
+
     def fetch_explain(self, ticker: str, platform: str = "x") -> dict[str, Any]:
         """The vendor's AI trend explanation (llama-3.1-8b, cached
-        server-side for 6h) for one ticker. **Spends one official-API
-        request** -- even a cache hit on the VENDOR's side still spends
-        this installation's quota, since the vendor still counts the call;
-        the returned ``cached``/``generated_at`` fields say whether the text
-        was freshly generated or served from the vendor's own cache. Same
-        budget-guard/refusal/error-taxonomy contract as
+        server-side for 6h) for one ticker. Same site-first/official-fallback
+        ladder as ``fetch_stock_detail`` (module docstring). Note that even
+        an official-side CACHE HIT on the vendor's own end still spends this
+        installation's quota once the official rung is reached, since the
+        vendor still counts the call -- the returned ``cached``/
+        ``generated_at`` fields describe whether ITS text was freshly
+        generated, which is orthogonal to whether OUR request spent local
+        quota (``quota_spent``). **Never raises** -- same refusal contract as
         ``fetch_stock_detail``.
         """
         symbol = ticker.strip().upper()
@@ -844,38 +1414,65 @@ class AdanosProvider:
                 platform,
                 f"unsupported platform '{platform}' -- expected one of {sorted(_OFFICIAL_PATHS)}",
             )
-        if self._api_key is None:
-            return self._refusal(
-                symbol,
-                platform,
-                "no adanos_api_key credential resolves on this installation -- on-demand "
-                "explain spends the official-API quota and requires a key even though bulk "
-                "trending collection never does",
-            )
-        reason = self._budget_refusal_reason()
-        if reason is not None:
-            return self._refusal(symbol, platform, reason)
 
-        base = self.config.official_base_url.rstrip("/")
-        url = f"{base}/{_stock_base(platform)}/stock/{symbol}/explain"
-        headers = {
-            "X-API-Key": self._api_key,
-            "User-Agent": self.config.user_agent,
-            "Accept": "application/json",
-        }
-        payload = self._ondemand_request(
-            url, headers=headers, platform=platform, ticker=symbol, kind="explain"
+        mode, payload, failures, quota_spent = self._run_ladder(
+            site_fn=lambda: self._site_explain(symbol, platform),
+            official_fn=lambda: self._official_explain(symbol, platform),
         )
+        if mode is None:
+            return self._ladder_refusal(symbol, platform, failures, quota_spent=quota_spent)
         data = payload if isinstance(payload, dict) else {}
-        return {
-            "accepted": True,
-            "symbol": symbol,
-            "platform": platform,
-            "explanation": data.get("explanation"),
-            "cached": data.get("cached"),
-            "generated_at": data.get("generated_at"),
-            "budget": self.budget_status(),
-        }
+        reason = self._structured_answer_reason(data, symbol, platform)
+        if reason is not None:
+            return self._vendor_answer_refusal(
+                symbol, platform, reason, mode=mode, quota_spent=quota_spent
+            )
+        return self._explain_success_envelope(
+            symbol, platform, data, mode=mode, quota_spent=quota_spent
+        )
+
+    def fetch_market_sentiment(self, platform: str = "x") -> dict[str, Any]:
+        """Service-level buzz/sentiment snapshot for ``platform``: overall
+        trend, activity, and the top momentum ``drivers`` (ticker-level
+        breakdown). NOT a per-ticker lookup -- unlike ``fetch_stock_detail``/
+        ``fetch_explain`` the envelope carries no ``symbol`` and there is no
+        ``{"found": false}`` case. Same site-first/official-fallback ladder
+        and envelope conventions (``mode``, ``quota_spent``, ``budget``) as
+        the module docstring's Hybrid mode section describes. **Never
+        raises.**
+        """
+        platform = platform.strip().lower()
+        if platform not in _OFFICIAL_PATHS:
+            return {
+                "accepted": False,
+                "platform": platform,
+                "reason": (
+                    f"unsupported platform '{platform}' -- expected one of "
+                    f"{sorted(_OFFICIAL_PATHS)}"
+                ),
+                "mode": None,
+                "quota_spent": False,
+                "budget": self.budget_status(),
+            }
+
+        mode, payload, failures, quota_spent = self._run_ladder(
+            site_fn=lambda: self._site_market_sentiment(platform),
+            official_fn=lambda: self._official_market_sentiment(platform),
+        )
+        if mode is None:
+            detail = "; ".join(f"{rung}: {reason}" for rung, reason in failures.items())
+            return {
+                "accepted": False,
+                "platform": platform,
+                "reason": f"adanos market-sentiment lookup failed on every available rung -- {detail}",
+                "mode": None,
+                "quota_spent": quota_spent,
+                "budget": self.budget_status(),
+            }
+        data = payload if isinstance(payload, dict) else {}
+        return self._market_sentiment_success_envelope(
+            platform, data, mode=mode, quota_spent=quota_spent
+        )
 
     def enrich_top_candidates(self, symbols: list[str], *, session: dt.date) -> int:
         """Bounded, best-effort post-scan enrichment: up to
@@ -885,27 +1482,35 @@ class AdanosProvider:
         ``fetch_stock_detail`` call each on ``config.detail_platform_default``,
         cached to ``cache_dir/adanos/detail/{symbol}-{session}.json``.
 
-        Effective only when ``config.enrich_enabled`` and an
-        ``adanos_api_key`` credential resolves -- bulk trending collection is
-        never affected either way. Skips (INFO log, not an error) a symbol
-        already cached for this session -- the whole point of the cache is
-        that a re-scan of the same session, or a later
+        Effective whenever ``config.enrich_enabled`` -- unlike before the
+        site-first ladder existed, this no longer requires
+        ``adanos_api_key`` to resolve: ``fetch_stock_detail`` now works
+        keylessly via the site rung by default, so ordinary enrichment spends
+        ZERO official-API quota (see the module docstring's Hybrid mode
+        section). A resolved key only matters as a per-symbol fallback when
+        that symbol's site lookup fails. Skips (INFO log, not an error) a
+        symbol already cached for this session -- the whole point of the
+        cache is that a re-scan of the same session, or a later
         ``AdanosProvider.cached_detail``/``mcp_server.get_adanos_detail``
-        call for the same symbol, must not spend quota twice. Stops early,
-        rather than skipping one-by-one, once the budget guard refuses --
-        the remaining symbols are simply not enriched this session.
+        call for the same symbol, must not re-fetch it.
+
+        Each symbol's ``fetch_stock_detail`` result is judged independently:
+        there is no more "stop early once the budget guard refuses" special
+        case (that assumed every call spent the shared official budget,
+        which is no longer true in site mode) -- a refusal for one symbol
+        (every rung failed, or a genuine ``{"found": false}``) is simply
+        skipped, same as any other per-symbol failure, and the loop moves on.
 
         **Never raises.** A scan must never fail because enrichment
         degraded; any per-symbol failure (network, vendor error, disk) is
         logged and the loop continues to the next symbol. Returns the number
-        of NEW official calls actually made (i.e. quota actually spent), for
-        logging/tests.
+        of symbols newly cached this call (for logging/tests) -- NOT
+        necessarily the number of official-API requests spent, since most
+        will be free site-mode hits; each cached entry's own
+        ``quota_spent`` field records that individually.
         """
         if self._cache_dir is None:
             log.info("adanos enrichment skipped: no cache_dir configured")
-            return 0
-        if self._api_key is None:
-            log.info("adanos enrichment skipped: no adanos_api_key credential resolves")
             return 0
         if not self.config.enrich_enabled or self.config.enrich_top_candidates <= 0:
             return 0
@@ -927,19 +1532,13 @@ class AdanosProvider:
                         session,
                     )
                     continue
-                reason = self._budget_refusal_reason()
-                if reason is not None:
-                    log.info("adanos enrichment: budget-guarded, stopping early (%s)", reason)
-                    break
                 try:
                     result = self.fetch_stock_detail(symbol, platform=platform)
-                except ProviderError as exc:
+                except Exception as exc:  # pragma: no cover - fetch_stock_detail no longer raises
                     log.info("adanos enrichment: %s failed (%s); skipping", symbol, exc)
                     continue
                 if not result.get("accepted", True):
-                    log.info(
-                        "adanos enrichment: %s refused (%s)", symbol, result.get("reason")
-                    )
+                    log.info("adanos enrichment: %s refused (%s)", symbol, result.get("reason"))
                     continue
                 result["enriched_at_session"] = session.isoformat()
                 try:
@@ -954,9 +1553,7 @@ class AdanosProvider:
                     continue
                 spent += 1
         except Exception:  # pragma: no cover - defensive, see docstring
-            log.warning(
-                "adanos enrichment raised unexpectedly; scan is unaffected", exc_info=True
-            )
+            log.warning("adanos enrichment raised unexpectedly; scan is unaffected", exc_info=True)
         return spent
 
 
@@ -973,7 +1570,9 @@ def _extract_rows(payload: Any) -> list | None:
     return None
 
 
-def _parse_feed_rows(payload: Any, *, platform: str, observed_at: dt.datetime) -> list[AdanosSnapshot]:
+def _parse_feed_rows(
+    payload: Any, *, platform: str, observed_at: dt.datetime
+) -> list[AdanosSnapshot]:
     """Convert one feed's response into snapshot rows.
 
     Unlike ``apewisdom._parse_results`` (which returns ``[]`` for any

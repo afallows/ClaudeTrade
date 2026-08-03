@@ -1,0 +1,36 @@
+{
+  "ticker": "NVDA",
+  "company_name": "NVIDIA Corp",
+  "found": true,
+  "buzz_score": 87.5,
+  "sentiment_score": 0.42,
+  "positive_count": 620,
+  "negative_count": 290,
+  "neutral_count": 40,
+  "trend": "rising",
+  "bullish_pct": 68.0,
+  "bearish_pct": 32.0,
+  "period_days": 7,
+  "mentions": 950,
+  "unique_tweets": 900,
+  "total_upvotes": 12000,
+  "daily_trend": [
+    {"date": "2026-07-27", "mentions": 700, "sentiment_score": 0.30, "buzz_score": 70.0, "bullish_pct": 60.0, "bearish_pct": 40.0},
+    {"date": "2026-07-28", "mentions": 720, "sentiment_score": 0.32, "buzz_score": 75.0, "bullish_pct": 61.0, "bearish_pct": 39.0},
+    {"date": "2026-07-29", "mentions": 800, "sentiment_score": 0.34, "buzz_score": 80.0, "bullish_pct": 63.0, "bearish_pct": 37.0},
+    {"date": "2026-07-30", "mentions": 830, "sentiment_score": 0.36, "buzz_score": 82.0, "bullish_pct": 65.0, "bearish_pct": 35.0},
+    {"date": "2026-07-31", "mentions": 900, "sentiment_score": 0.38, "buzz_score": 85.0, "bullish_pct": 66.0, "bearish_pct": 34.0},
+    {"date": "2026-08-01", "mentions": 930, "sentiment_score": 0.40, "buzz_score": 86.0, "bullish_pct": 67.0, "bearish_pct": 33.0},
+    {"date": "2026-08-02", "mentions": 950, "sentiment_score": 0.42, "buzz_score": 87.5, "bullish_pct": 68.0, "bearish_pct": 32.0}
+  ],
+  "top_tweets": [
+    {
+      "text_snippet": "NVDA breaking out on huge volume, see https://example.com/chart -- DM me at trader@example.com",
+      "sentiment_score": 0.6
+    },
+    {"text_snippet": "not sure about /u/some_trader's take on this one", "sentiment_score": -0.1}
+  ],
+  "top_authors": [
+    {"author_hash": "abc123", "mentions": 12}
+  ]
+}
